@@ -20,9 +20,12 @@
 //! the jar through a channel on a later, ordinary run-loop turn; the async
 //! caller awaits it with a deadline. Nothing pumps, so nothing re-enters.
 //!
-//! Other Unix targets keep `Webview::cookies()`: WebKitGTK's implementation
-//! does not pump. Windows keeps its hand-rolled `ICoreWebView2CookieManager`
-//! path inside the auth services and never calls into here.
+//! Linux keeps the runtime-generic `Webview::cookies()`. Under CEF that call
+//! visits the profile's cookie manager on Chromium's UI thread and blocks the
+//! caller until the visit completes, so it runs on a blocking thread under
+//! the same deadline, never on the main thread. Windows keeps its hand-rolled
+//! `ICoreWebView2CookieManager` path inside the auth services and never
+//! calls into here.
 
 /// The slice of a cookie the auth services consume.
 #[derive(Debug, Clone)]
@@ -47,7 +50,7 @@ const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// itself would send.
 #[cfg(not(windows))]
 pub async fn cookies_for_origin(
-    app: &tauri::AppHandle,
+    app: &crate::rt::AppHandle,
     window_label: &str,
     origin: &str,
 ) -> anyhow::Result<Vec<CookieRow>> {
@@ -82,7 +85,7 @@ fn domain_matches(cookie_domain: &str, host: &str) -> bool {
 #[cfg(target_os = "macos")]
 #[allow(unused_unsafe)]
 async fn all_cookies(
-    app: &tauri::AppHandle,
+    app: &crate::rt::AppHandle,
     window_label: &str,
 ) -> anyhow::Result<Vec<CookieRow>> {
     use anyhow::anyhow;
@@ -142,9 +145,81 @@ async fn all_cookies(
     }
 }
 
+/// Whether a cookie set for `cookie_domain` belongs to `site`: set for the
+/// site itself or for any subdomain of it. `domain_matches` with the roles
+/// turned round.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn belongs_to(cookie_domain: &str, site: &str) -> bool {
+    domain_matches(site, &cookie_domain.trim_start_matches('.').to_ascii_lowercase())
+}
+
+/// Delete every cookie in `window_label`'s store that belongs to one of
+/// `sites` (see `belongs_to`), and say how many were asked to go.
+///
+/// For signing a platform out on macOS, where its sign-in pages share one store
+/// with the main window and every other account, and clearing all of it would
+/// sign the app out of everything (see `services::sign_in_profile`). WebKit
+/// deletes asynchronously, so a caller that must know the cookies are gone
+/// reads the jar again.
+#[cfg(target_os = "macos")]
+#[allow(unused_unsafe)]
+pub async fn delete_site_cookies(
+    app: &crate::rt::AppHandle,
+    window_label: &str,
+    sites: &[&str],
+) -> anyhow::Result<usize> {
+    use anyhow::anyhow;
+    use block2::RcBlock;
+    use objc2_foundation::{NSArray, NSHTTPCookie};
+    use objc2_web_kit::WKWebView;
+    use std::ptr::NonNull;
+    use tauri::Manager;
+
+    let webview = app
+        .get_webview_window(window_label)
+        .ok_or_else(|| anyhow!("webview window '{window_label}' unavailable"))?;
+    let sites: Vec<String> = sites.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+
+    // The same shape as `all_cookies` and for the same reason: blocks handed
+    // to WebKit from the main thread, answered on a later run-loop turn, so
+    // nothing pumps a nested run loop.
+    webview
+        .with_webview(move |platform_webview| {
+            // SAFETY: as in `all_cookies`. The block that deletes holds its
+            // own reference to the store.
+            unsafe {
+                let wk: &WKWebView = &*(platform_webview.inner() as *const WKWebView);
+                let store = wk.configuration().websiteDataStore().httpCookieStore();
+                let deleter = store.clone();
+                let block = RcBlock::new(move |cookies: NonNull<NSArray<NSHTTPCookie>>| {
+                    let mut asked = 0;
+                    for c in cookies.as_ref().to_vec() {
+                        let domain = c.domain().to_string();
+                        if sites.iter().any(|s| belongs_to(&domain, s)) {
+                            deleter.deleteCookie_completionHandler(&c, None);
+                            asked += 1;
+                        }
+                    }
+                    let _ = tx.send(asked);
+                });
+                store.getAllCookies(&block);
+            }
+        })
+        .map_err(|e| anyhow!("with_webview: {e}"))?;
+
+    match tokio::time::timeout(READ_TIMEOUT, rx.recv()).await {
+        Ok(Some(asked)) => Ok(asked),
+        Ok(None) => Err(anyhow!("the cookie store closed without answering")),
+        Err(_) => Err(anyhow!(
+            "the cookie store did not answer within {READ_TIMEOUT:?}"
+        )),
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 async fn all_cookies(
-    app: &tauri::AppHandle,
+    app: &crate::rt::AppHandle,
     window_label: &str,
 ) -> anyhow::Result<Vec<CookieRow>> {
     use anyhow::anyhow;
@@ -153,23 +228,48 @@ async fn all_cookies(
     let webview = app
         .get_webview_window(window_label)
         .ok_or_else(|| anyhow!("webview window '{window_label}' unavailable"))?;
-    let jar = webview
-        .cookies()
-        .map_err(|e| anyhow!("cookies() failed: {e}"))?;
-    Ok(jar
-        .into_iter()
-        .map(|c| CookieRow {
-            name: c.name().to_string(),
-            value: c.value().to_string(),
-            domain: c.domain().unwrap_or("").to_string(),
-            secure: c.secure().unwrap_or(false),
-        })
-        .collect())
+    // The read blocks until the engine's cookie visitor has run (on CEF, on
+    // its UI thread), so it goes to a blocking thread under a deadline: a
+    // wedged store must not pin a tokio worker or a harvest.
+    let read = tokio::task::spawn_blocking(move || {
+        webview
+            .cookies()
+            .map(|jar| {
+                jar.into_iter()
+                    .map(|c| CookieRow {
+                        name: c.name().to_string(),
+                        value: c.value().to_string(),
+                        domain: c.domain().unwrap_or("").to_string(),
+                        secure: c.secure().unwrap_or(false),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .map_err(|e| anyhow!("cookies() failed: {e}"))
+    });
+    match tokio::time::timeout(READ_TIMEOUT, read).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => Err(anyhow!("the cookie read task failed: {e}")),
+        Err(_) => Err(anyhow!(
+            "the cookie store did not answer within {READ_TIMEOUT:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::domain_matches;
+    use super::{belongs_to, domain_matches};
+
+    #[test]
+    fn a_sites_cookies_are_its_own_and_its_subdomains_and_nothing_else() {
+        assert!(belongs_to(".google.com", "google.com"));
+        assert!(belongs_to("accounts.google.com", "google.com"));
+        assert!(belongs_to(".id.kick.com", "kick.com"));
+        assert!(belongs_to("WWW.TikTok.com", "tiktok.com"), "case is not identity");
+        assert!(!belongs_to(".twitch.tv", "kick.com"));
+        assert!(!belongs_to("notgoogle.com", "google.com"));
+        assert!(!belongs_to("google.com.evil.example", "google.com"));
+        assert!(!belongs_to("", "google.com"));
+    }
 
     #[test]
     fn a_domain_cookie_matches_the_host_and_its_subdomains() {

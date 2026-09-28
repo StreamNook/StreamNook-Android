@@ -8,7 +8,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use crate::rt::AppHandle;
+use tauri::Emitter;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -21,7 +22,7 @@ const CLIENT_URL: &str = "https://www.twitch.tv";
 // Persisted-query hash for the Inventory GQL operation (same one the Twitch
 // web client sends). Shared by the UI inventory fetch and the monitor's
 // progress overlay.
-const INVENTORY_QUERY_HASH: &str =
+pub(crate) const INVENTORY_QUERY_HASH: &str =
     "d86775d0ef16a63a33ad52e80eaff963b2d5b72fada7c991504a57496e1d8e4b";
 
 // Your app's client ID (for reference - used for other Helix API calls)
@@ -37,6 +38,36 @@ struct GraphQLResponse<T> {
 struct GraphQLError {
     message: String,
 }
+/// What a claim mutation actually did.
+///
+/// The auto-claim path used to treat any HTTP 200 without an `errors` array as
+/// a fresh claim. Twitch answers 200 for an already-granted reward and for a
+/// `dropInstanceID` that does not resolve, so every cold start re-"claimed" the
+/// same finished drop and announced it. Only `ELIGIBLE_FOR_ALL` means the
+/// reward was granted by THIS call.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ClaimOutcome {
+    /// Granted just now. The only outcome worth notifying about.
+    Claimed,
+    /// Twitch had already granted it. Resolved, but not news.
+    AlreadyClaimed,
+}
+
+/// Map `data.claimDropRewards.status` onto an outcome.
+///
+/// `None` means the claim did not take: either the payload carried no status
+/// (a `dropInstanceID` that did not resolve, which the generated
+/// `user#campaign#drop` fallback produces routinely) or the status is one we do
+/// not recognise. Unrecognised is deliberately NOT optimistic, because
+/// announcing a claim that never happened is the bug this exists to prevent.
+fn claim_outcome_from_status(status: Option<&str>) -> Option<ClaimOutcome> {
+    match status {
+        Some("ELIGIBLE_FOR_ALL") => Some(ClaimOutcome::Claimed),
+        Some("DROP_INSTANCE_ALREADY_CLAIMED") => Some(ClaimOutcome::AlreadyClaimed),
+        _ => None,
+    }
+}
+
 
 #[derive(Debug, Deserialize)]
 struct DropCampaignsData {
@@ -155,13 +186,75 @@ pub struct DropsService {
     current_channel: Arc<RwLock<Option<(String, String)>>>, // (channel_id, channel_name)
     cached_active_campaigns_count: Arc<RwLock<i32>>, // Cache campaign count to avoid repeated API calls
     cached_campaigns: Arc<RwLock<Option<(Vec<DropCampaign>, DateTime<Utc>)>>>, // Cache campaigns with timestamp
-    attempted_claims: Arc<RwLock<std::collections::HashSet<String>>>, // Track drops we've already attempted to claim
+    /// Drops already settled with Twitch (claimed now, or reported already
+    /// claimed), mapped to when that was decided. Persisted, so a restart
+    /// does not re-attempt every finished drop.
+    attempted_claims: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
     device_id: String,
     session_id: String,
 }
 
 /// File (in the app data dir) that persists lifetime drops-automation stats across sessions.
 const LIFETIME_STATS_FILE: &str = "drops_lifetime_stats.json";
+
+/// Drops already settled with Twitch, so a restart does not re-attempt every
+/// finished drop. Values are the settle time, used only for pruning.
+const ATTEMPTED_CLAIMS_FILE: &str = "drops_attempted_claims.json";
+
+/// How long a settled drop id is remembered. Campaigns run days to weeks, so
+/// anything older than this can never come back as claimable and would only
+/// grow the file forever.
+const ATTEMPTED_CLAIMS_RETAIN_DAYS: i64 = 60;
+
+fn attempted_claims_path() -> Option<std::path::PathBuf> {
+    crate::services::cache_service::get_app_data_dir()
+        .ok()
+        .map(|dir| dir.join(ATTEMPTED_CLAIMS_FILE))
+}
+
+/// Settled drop ids from previous sessions, pruned on the way in. Absent or
+/// unreadable means an empty set, which costs one no-op claim attempt per
+/// finished drop rather than a wrong answer.
+fn load_attempted_claims() -> HashMap<String, DateTime<Utc>> {
+    let Some(path) = attempted_claims_path() else {
+        return HashMap::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let parsed: HashMap<String, DateTime<Utc>> =
+        serde_json::from_str(&contents).unwrap_or_default();
+    prune_attempted_claims(parsed, Utc::now())
+}
+
+/// Drop ids still worth remembering at `now`.
+fn prune_attempted_claims(
+    claims: HashMap<String, DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> HashMap<String, DateTime<Utc>> {
+    let cutoff = now - chrono::Duration::days(ATTEMPTED_CLAIMS_RETAIN_DAYS);
+    claims.into_iter().filter(|(_, at)| *at > cutoff).collect()
+}
+
+/// Best-effort persist; IO errors are ignored, exactly like the lifetime stats.
+/// A lost write costs one redundant claim attempt next launch, which is a no-op
+/// against Twitch and now announces nothing.
+fn save_attempted_claims(claims: &HashMap<String, DateTime<Utc>>) {
+    if let Some(path) = attempted_claims_path() {
+        if let Ok(json) = serde_json::to_string(claims) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// Forget every settled drop. Called on drops logout: the set is per ACCOUNT,
+/// and carrying it into a different one would suppress claims that account has
+/// genuinely not made.
+pub fn clear_attempted_claims() {
+    if let Some(path) = attempted_claims_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 fn lifetime_stats_path() -> Option<std::path::PathBuf> {
     crate::services::cache_service::get_app_data_dir()
@@ -221,7 +314,7 @@ impl DropsService {
             current_channel: Arc::new(RwLock::new(None)),
             cached_active_campaigns_count: Arc::new(RwLock::new(0)),
             cached_campaigns: Arc::new(RwLock::new(None)),
-            attempted_claims: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            attempted_claims: Arc::new(RwLock::new(load_attempted_claims())),
             device_id,
             session_id,
         }
@@ -234,7 +327,7 @@ impl DropsService {
 
     /// Builds the Android-client GQL headers from owned values, so the detached
     /// watched-channel monitor task can issue authenticated reads without `&self`.
-    fn gql_headers(token: &str, device_id: &str, session_id: &str) -> HeaderMap {
+    pub(crate) fn gql_headers(token: &str, device_id: &str, session_id: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert("Client-ID", HeaderValue::from_static(CLIENT_ID));
         headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
@@ -353,23 +446,17 @@ impl DropsService {
         let now = Utc::now();
 
         for campaign_json in &campaigns_array {
-            // Parse game info
-            let game = &campaign_json["game"];
-            if game.is_null() {
+            // A campaign that runs across categories has no game; it is still a
+            // drop, grouped for display under its owner or its own name.
+            let Some(crate::services::reward_drops::DisplayGroup {
+                game_id,
+                game_name,
+                mut image_url,
+                has_category,
+            }) = crate::services::reward_drops::display_group(campaign_json)
+            else {
                 continue;
-            }
-
-            let game_id = game["id"].as_str().unwrap_or("").to_string();
-            let game_name = game["displayName"]
-                .as_str()
-                .or_else(|| game["name"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let image_url = game["boxArtURL"].as_str().unwrap_or("").to_string();
-
-            if game_name.is_empty() {
-                continue;
-            }
+            };
 
             // Parse dates
             let start_at = campaign_json["startAt"]
@@ -518,6 +605,7 @@ impl DropsService {
                             is_claimed,
                             last_updated: Utc::now(),
                             drop_instance_id, // Store the dropInstanceID for claiming!
+                            twitch_progress: None,
                         });
                     } else {
                         // Check claimed_benefits to determine if claimed
@@ -550,6 +638,10 @@ impl DropsService {
                         progress,
                         // Drops with 0 required minutes are event-based/badge drops that cannot be auto-collected
                         is_collectible: required_minutes > 0,
+                        required_subs: drop_json["requiredSubs"].as_u64().unwrap_or(0) as u32,
+                        required_days: 0,
+                        random_of: None,
+                        next_reward: None,
                     });
                 }
             }
@@ -563,6 +655,10 @@ impl DropsService {
             let is_account_connected = campaign_json["self"]["isAccountConnected"]
                 .as_bool()
                 .unwrap_or(true);
+
+            if image_url.is_empty() {
+                image_url = crate::services::reward_drops::first_reward_image(&time_based_drops);
+            }
 
             let campaign = DropCampaign {
                 id: campaign_json["id"].as_str().unwrap_or("").to_string(),
@@ -582,6 +678,9 @@ impl DropsService {
                 is_acl_based,
                 details_url: None,
                 account_link: None,
+                separate_progress: false,
+                has_category,
+                category_ids: Vec::new(),
             };
 
             items.push(InventoryItem {
@@ -592,6 +691,37 @@ impl DropsService {
                 claimed_drops,
                 drops_in_progress,
             });
+        }
+
+        // The viewer's started drops from Twitch's second list, like the rest.
+        // The campaign load just fetched it (and the watch loop keeps it fresh),
+        // so reuse that rather than asking Twitch again.
+        let second_list = match crate::services::reward_drops::cached_within(
+            crate::services::reward_drops::REUSE_FOR_INVENTORY_SECS,
+        ) {
+            Some(c) => c,
+            None => match crate::services::reward_drops::fetch(
+                &self.client,
+                &token,
+                &self.device_id,
+                &self.session_id,
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("[fetch_inventory] Twitch's second drops list: {e}");
+                    crate::services::reward_drops::cached()
+                }
+            },
+        };
+        let known: std::collections::HashSet<String> =
+            items.iter().map(|i| i.campaign.id.clone()).collect();
+        for item in crate::services::reward_drops::inventory_items(&second_list) {
+            if !known.contains(&item.campaign.id) {
+                active_count += 1;
+                items.push(item);
+            }
         }
 
         let total_campaigns = items.len() as i32;
@@ -685,6 +815,18 @@ impl DropsService {
         Self::fetch_active_campaigns(&self.client, &self.device_id, &self.session_id).await
     }
 
+    /// The cached active campaigns at any age, without fetching and without
+    /// touching the live progress map. After a claim the Drops page rebuilds
+    /// from these: a re-fetch would reset the progress map and make the title
+    /// bar's collection progress snap backwards.
+    pub async fn cached_campaigns_snapshot(&self) -> Option<Vec<DropCampaign>> {
+        self.cached_campaigns
+            .read()
+            .await
+            .as_ref()
+            .map(|(campaigns, _)| campaigns.clone())
+    }
+
     /// Overwrite the active-campaign cache without touching the live progress map. Used by the
     /// connection-status refresh, which must not disturb in-flight automation progress the way a
     /// full `update_campaigns_and_progress` would.
@@ -717,6 +859,16 @@ impl DropsService {
                 debug!("[get_all_active_campaigns] Failed to get token: {}", e);
                 return Err(e);
             }
+        };
+
+        // Twitch's second drops list, fetched alongside the standard one rather
+        // than after it, so it adds no wait of its own. Joined at the end.
+        let second_list = {
+            let (client, token) = (client.clone(), token.clone());
+            let (device_id, session_id) = (device_id.to_string(), session_id.to_string());
+            tokio::spawn(async move {
+                crate::services::reward_drops::fetch(&client, &token, &device_id, &session_id).await
+            })
         };
 
         debug!("Fetching drops campaigns using Android app client ID...");
@@ -756,11 +908,13 @@ impl DropsService {
                         id
                         name
                         requiredMinutesWatched
+                        requiredSubs
                         benefitEdges {
                             benefit {
                                 id
                                 name
                                 imageAssetURL
+                                distributionType
                             }
                         }
                         self {
@@ -851,24 +1005,17 @@ impl DropsService {
                     continue;
                 }
 
-                // Parse game info - handle null game gracefully
-                let game = &campaign_json["game"];
-                if game.is_null() {
+                // A campaign that runs across categories has no game; it is
+                // still a drop, grouped for display under its owner or name.
+                let Some(crate::services::reward_drops::DisplayGroup {
+                    game_id,
+                    game_name,
+                    mut image_url,
+                    has_category,
+                }) = crate::services::reward_drops::display_group(campaign_json)
+                else {
                     continue;
-                }
-
-                let game_id = game["id"].as_str().unwrap_or("").to_string();
-                let game_name = game["displayName"]
-                    .as_str()
-                    .or_else(|| game["name"].as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let image_url = game["boxArtURL"].as_str().unwrap_or("").to_string();
-
-                if game_name.is_empty() {
-                    continue;
-                }
+                };
 
                 // Parse allowed channels (ACL)
                 // If allow.channels exists and is not empty, this is an ACL-restricted campaign
@@ -973,6 +1120,7 @@ impl DropsService {
                                     is_claimed: self_data["isClaimed"].as_bool().unwrap_or(false),
                                     last_updated: Utc::now(),
                                     drop_instance_id,
+                                    twitch_progress: None,
                                 })
                             } else {
                                 None
@@ -995,6 +1143,10 @@ impl DropsService {
                             benefit_edges,
                             progress,
                             is_collectible,
+                            required_subs: drop_json["requiredSubs"].as_u64().unwrap_or(0) as u32,
+                            required_days: 0,
+                            random_of: None,
+                            next_reward: None,
                         });
                     }
                 }
@@ -1033,6 +1185,11 @@ impl DropsService {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
+                if image_url.is_empty() {
+                    image_url =
+                        crate::services::reward_drops::first_reward_image(&time_based_drops);
+                }
+
                 result.push(DropCampaign {
                     id: campaign_json["id"].as_str().unwrap_or("").to_string(),
                     name: campaign_json["name"].as_str().unwrap_or("").to_string(),
@@ -1053,8 +1210,24 @@ impl DropsService {
                     is_acl_based,
                     details_url,
                     account_link,
+                    separate_progress: false,
+                    has_category,
+                    category_ids: Vec::new(),
                 });
             }
+        }
+
+        // Twitch lists its container and daily-watch drops apart from the
+        // standard list; they are drops all the same. A failure there must never
+        // cost the standard list.
+        match second_list.await {
+            Ok(Ok(more)) => {
+                let known: std::collections::HashSet<String> =
+                    result.iter().map(|c| c.id.clone()).collect();
+                result.extend(more.into_iter().filter(|c| !known.contains(&c.id)));
+            }
+            Ok(Err(e)) => debug!("[Drops] Twitch's second drops list: {e}"),
+            Err(e) => debug!("[Drops] Twitch's second drops list task: {e}"),
         }
 
         debug!("Returning {} total campaigns (unfiltered)", result.len());
@@ -1213,6 +1386,7 @@ impl DropsService {
                         drop_instance_id: self_data["dropInstanceID"]
                             .as_str()
                             .map(String::from),
+                        twitch_progress: None,
                     },
                 );
             }
@@ -1725,6 +1899,7 @@ impl DropsService {
         let monitoring_active = self.monitoring_active.clone();
         let current_channel = self.current_channel.clone();
         let attempted_claims = self.attempted_claims.clone();
+        let cached_campaigns = self.cached_campaigns.clone();
         let client = self.client.clone();
         let device_id = self.device_id.clone();
         let session_id = self.session_id.clone();
@@ -1822,18 +1997,26 @@ impl DropsService {
                     }
 
                     // Check for claimable drops from the refreshed progress map.
-                    // attempted_claims holds SUCCESSFUL claims only; failures live
-                    // in failed_claims with a retry budget.
+                    // attempted_claims holds drops already SETTLED with Twitch and
+                    // survives restarts; failures live in failed_claims with a
+                    // retry budget and do not.
                     let claimable_drops: Vec<DropProgress> = {
                         let progress_map = drop_progress.read().await;
                         let attempted = attempted_claims.read().await;
                         progress_map
                             .values()
                             .filter(|p| {
-                                !p.is_claimed
-                                    && p.current_minutes_watched >= p.required_minutes_watched
-                                    && p.required_minutes_watched > 0 // Only collectible drops
-                                    && !attempted.contains(&p.drop_id) // Skip already-claimed
+                                let earned = match &p.twitch_progress {
+                                    // Twitch says outright when a reward is earned
+                                    // and waiting (subscription rewards have no
+                                    // minutes to compare).
+                                    Some(t) => t.ready_to_claim && p.drop_instance_id.is_some(),
+                                    None => {
+                                        p.current_minutes_watched >= p.required_minutes_watched
+                                            && p.required_minutes_watched > 0 // Only collectible drops
+                                    }
+                                };
+                                !p.is_claimed && earned && !attempted.contains_key(&p.drop_id) // Skip already-settled
                             })
                             .cloned()
                             .collect()
@@ -1867,31 +2050,64 @@ impl DropsService {
                             )
                             .await
                             {
-                                Ok(_) => {
-                                    debug!("Auto-claimed drop: {}", progress.drop_id);
+                                Ok(outcome) => {
+                                    debug!(
+                                        "Auto-claim for {} returned {:?}",
+                                        progress.drop_id, outcome
+                                    );
                                     failed_claims.remove(&progress.drop_id);
-                                    attempted_claims
-                                        .write()
-                                        .await
-                                        .insert(progress.drop_id.clone());
+                                    {
+                                        let mut settled = attempted_claims.write().await;
+                                        settled.insert(progress.drop_id.clone(), Utc::now());
+                                        save_attempted_claims(&settled);
+                                    }
 
-                                    // Create claimed drop record
-                                    let claimed = ClaimedDrop {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        campaign_id: progress.campaign_id.clone(),
-                                        drop_id: progress.drop_id.clone(),
-                                        drop_name: "Drop".to_string(), // Would need to fetch from campaign
-                                        game_name: "Game".to_string(),
-                                        benefit_name: "Reward".to_string(),
-                                        benefit_image_url: String::new(),
-                                        claimed_at: Utc::now(),
-                                    };
+                                    // Only a reward granted by THIS call is
+                                    // news. An already-claimed one still reaches
+                                    // here whenever the settled set does not cover
+                                    // it: a fresh install, a cleared profile, or a
+                                    // drop claimed on another device.
+                                    if outcome == ClaimOutcome::Claimed {
+                                        let described = Self::describe_drop(
+                                            &*cached_campaigns.read().await,
+                                            &progress.drop_id,
+                                        );
+                                        if described.is_none() {
+                                            info!(
+                                                "[Auto] Claimed {} but no cached campaign names it",
+                                                progress.drop_id
+                                            );
+                                        }
+                                        // An empty game name renders without the
+                                        // parenthetical rather than inventing one.
+                                        let (drop_name, game_name, benefit_name, benefit_image_url) =
+                                            described.unwrap_or_else(|| (
+                                                "Drop reward".to_string(),
+                                                String::new(),
+                                                String::new(),
+                                                String::new(),
+                                            ));
 
-                                    let mut claimed_drops_lock = claimed_drops.write().await;
-                                    claimed_drops_lock.push(claimed.clone());
+                                        let claimed = ClaimedDrop {
+                                            id: uuid::Uuid::new_v4().to_string(),
+                                            campaign_id: progress.campaign_id.clone(),
+                                            drop_id: progress.drop_id.clone(),
+                                            drop_name,
+                                            game_name,
+                                            benefit_name,
+                                            benefit_image_url,
+                                            claimed_at: Utc::now(),
+                                        };
 
-                                    if current_settings.notify_on_drop_claimed {
-                                        let _ = app_handle.emit("drop-claimed", &claimed);
+                                        claimed_drops.write().await.push(claimed.clone());
+
+                                        // A claimed reward can be a badge; the
+                                        // missing-badges list should drop it now.
+                                        crate::services::badge_standing::collection_may_have_changed(&app_handle);
+
+                                        if current_settings.notify_on_drop_claimed {
+                                            let _ = app_handle.emit("drop-claimed", &claimed);
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -1958,6 +2174,7 @@ impl DropsService {
                 is_claimed: false,
                 last_updated: Utc::now(),
                 drop_instance_id: None, // Will be populated when we fetch from API
+                twitch_progress: None,
             };
             progress_map.insert(drop_id.clone(), progress);
 
@@ -2006,11 +2223,13 @@ impl DropsService {
                         id
                         name
                         requiredMinutesWatched
+                        requiredSubs
                         benefitEdges {
                             benefit {
                                 id
                                 name
                                 imageAssetURL
+                                distributionType
                             }
                         }
                         self {
@@ -2063,6 +2282,7 @@ impl DropsService {
                             is_claimed: self_progress.is_claimed,
                             last_updated: Utc::now(),
                             drop_instance_id: None, // Internal query doesn't return dropInstanceID
+                            twitch_progress: None,
                         };
                         progress_map.insert(drop.id.clone(), progress);
                     }
@@ -2083,6 +2303,10 @@ impl DropsService {
                             .collect(),
                         progress: None,
                         is_collectible: drop.required_minutes_watched > 0,
+                        required_subs: 0,
+                        required_days: 0,
+                        random_of: None,
+                        next_reward: None,
                     }
                 })
                 .collect();
@@ -2110,17 +2334,43 @@ impl DropsService {
                 is_acl_based: false,
                 details_url: None, // Will be populated from the main fetch method
                 account_link: None,
+                separate_progress: false,
+                has_category: true,
+                category_ids: Vec::new(),
             });
         }
 
         Ok(result)
     }
 
+    /// Real names for a claimed drop, from the cached campaign list.
+    ///
+    /// Matched on the drop id across every campaign rather than on
+    /// `campaign_id`, because progress entries created from the websocket carry
+    /// an empty campaign id until an API refresh fills it in.
+    fn describe_drop(
+        campaigns: &Option<(Vec<DropCampaign>, DateTime<Utc>)>,
+        drop_id: &str,
+    ) -> Option<(String, String, String, String)> {
+        let (list, _) = campaigns.as_ref()?;
+        let campaign = list
+            .iter()
+            .find(|c| c.time_based_drops.iter().any(|d| d.id == drop_id))?;
+        let drop = campaign.time_based_drops.iter().find(|d| d.id == drop_id)?;
+        let benefit = drop.benefit_edges.first();
+        Some((
+            drop.name.clone(),
+            campaign.game_name.clone(),
+            benefit.map(|b| b.name.clone()).unwrap_or_default(),
+            benefit.map(|b| b.image_url.clone()).unwrap_or_default(),
+        ))
+    }
+
     async fn claim_drop_internal(
         client: &Client,
         drop_id: &str,
         drop_progress: &Arc<RwLock<HashMap<String, DropProgress>>>,
-    ) -> Result<()> {
+    ) -> Result<ClaimOutcome> {
         let token = DropsAuthService::get_token().await?;
 
         // First, check if we have a stored drop_instance_id from the API response
@@ -2228,13 +2478,122 @@ impl DropsService {
             return Err(anyhow::anyhow!("GraphQL errors: {:?}", errors));
         }
 
-        // Update progress to mark as claimed
+        // A null payload means the dropInstanceID did not resolve, which the
+        // generated `user#campaign#drop` fallback above produces routinely.
+        // Treated as a failure so it rides the existing retry budget instead of
+        // reporting a claim that never happened.
+        let status = response_json
+            .pointer("/data/claimDropRewards/status")
+            .and_then(|s| s.as_str());
+        let Some(outcome) = claim_outcome_from_status(status) else {
+            // Logged at info so an unrecognised status surfaces rather than
+            // being silently announced as a claim.
+            info!(
+                "[Auto] Claim for {} did not take (status: {})",
+                drop_id,
+                status.unwrap_or("no claimDropRewards in response")
+            );
+            return Err(anyhow::anyhow!(
+                "claim did not take: {}",
+                status.unwrap_or("null payload")
+            ));
+        };
+
+        // Both outcomes mean the drop is settled, so stop reconsidering it.
         let mut progress_map = drop_progress.write().await;
         if let Some(progress) = progress_map.get_mut(drop_id) {
             progress.is_claimed = true;
             progress.last_updated = Utc::now();
         }
 
-        Ok(())
+        Ok(outcome)
+    }
+}
+
+#[cfg(test)]
+mod claim_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_fresh_grant_counts_as_claimed() {
+        assert_eq!(
+            claim_outcome_from_status(Some("ELIGIBLE_FOR_ALL")),
+            Some(ClaimOutcome::Claimed)
+        );
+    }
+
+    #[test]
+    fn an_already_claimed_drop_is_settled_but_not_news() {
+        // Reached whenever the settled set does not cover a finished drop: a
+        // fresh install, a cleared profile, or one claimed on another device.
+        // Calling it a claim is what produced a phantom "Drop Claimed" on every
+        // boot, back when the settled set was in-memory only.
+        assert_eq!(
+            claim_outcome_from_status(Some("DROP_INSTANCE_ALREADY_CLAIMED")),
+            Some(ClaimOutcome::AlreadyClaimed)
+        );
+    }
+
+    #[test]
+    fn a_missing_payload_is_not_a_claim() {
+        // Twitch answers HTTP 200 with a null claimDropRewards when the
+        // dropInstanceID does not resolve, and there is no errors array. The
+        // old code read that as success.
+        assert_eq!(claim_outcome_from_status(None), None);
+    }
+
+    #[test]
+    fn an_unknown_status_is_not_assumed_good() {
+        assert_eq!(claim_outcome_from_status(Some("SOMETHING_NEW")), None);
+    }
+}
+
+#[cfg(test)]
+mod attempted_claims_tests {
+    use super::*;
+
+    fn at(days_ago: i64, now: DateTime<Utc>) -> DateTime<Utc> {
+        now - chrono::Duration::days(days_ago)
+    }
+
+    #[test]
+    fn a_recently_settled_drop_is_remembered() {
+        let now = Utc::now();
+        let mut claims = HashMap::new();
+        claims.insert("drop-a".to_string(), at(1, now));
+        let kept = prune_attempted_claims(claims, now);
+        assert!(kept.contains_key("drop-a"));
+    }
+
+    #[test]
+    fn an_ancient_drop_is_forgotten() {
+        // Campaigns run days to weeks, so a drop id this old can never come
+        // back as claimable. Keeping it would grow the file forever.
+        let now = Utc::now();
+        let mut claims = HashMap::new();
+        claims.insert("drop-old".to_string(), at(ATTEMPTED_CLAIMS_RETAIN_DAYS + 1, now));
+        assert!(prune_attempted_claims(claims, now).is_empty());
+    }
+
+    #[test]
+    fn pruning_keeps_the_recent_and_drops_the_rest() {
+        let now = Utc::now();
+        let mut claims = HashMap::new();
+        claims.insert("keep".to_string(), at(ATTEMPTED_CLAIMS_RETAIN_DAYS - 1, now));
+        claims.insert("drop".to_string(), at(ATTEMPTED_CLAIMS_RETAIN_DAYS + 5, now));
+        let kept = prune_attempted_claims(claims, now);
+        assert_eq!(kept.len(), 1);
+        assert!(kept.contains_key("keep"));
+    }
+
+    #[test]
+    fn a_future_timestamp_survives_a_clock_change() {
+        // A clock that jumped backwards must not wipe the set: forgetting a
+        // settled drop costs a redundant claim attempt, but doing it wholesale
+        // on every launch would defeat persisting at all.
+        let now = Utc::now();
+        let mut claims = HashMap::new();
+        claims.insert("ahead".to_string(), now + chrono::Duration::days(3));
+        assert_eq!(prune_attempted_claims(claims, now).len(), 1);
     }
 }

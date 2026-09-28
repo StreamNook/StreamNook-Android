@@ -14,14 +14,13 @@
 //! `connect()`, which opens the system browser, still depends on binding
 //! localhost:3000. See `PendingAuth` for why that distinction is load-bearing.
 //!
-//! First slice keeps the token IN MEMORY (per session); keyring persistence like
-//! the Twitch tokens is an easy follow-up.
+//! The token is cached in memory and sealed to `.kick_token` (see `token_vault`),
+//! so a login survives restarts.
 
-use crate::services::twitch_service::get_app_data_dir;
+use crate::services::token_vault::CachedCredential;
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,12 +37,6 @@ const TOKEN_URL: &str = "https://id.kick.com/oauth/token";
 // (events:subscribe is for the future Activity-feed work; its scope string is
 // unverified, and an unknown scope makes the whole authorize page bounce.)
 const SCOPES: &str = "user:read channel:read chat:write moderation:ban moderation:chat_message:manage";
-// Persisted so a Kick login survives app restarts (the token was in-memory only
-// before). Keyring is primary; an obfuscated file is the fallback for machines
-// where the OS keyring is unavailable.
-const KEYRING_SERVICE: &str = "streamnook_kick_token";
-const KEYRING_USER: &str = "default";
-const OBF_KEY: &[u8] = b"StreamNookKickKey2026";
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct KickToken {
@@ -56,59 +49,29 @@ struct KickToken {
     /// in rather than just which platform. Backfilled beside the username.
     #[serde(default)]
     avatar_url: Option<String>,
+    /// Kick's own numeric id for this account, as a string.
+    ///
+    /// This is what a Kick chat message carries as its sender id, so it is the
+    /// value that lets a member's StreamNook cosmetics find them in Kick chat.
+    /// Backfilled beside the username and picture, from the same response.
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
-static TOKEN: OnceLock<Mutex<Option<KickToken>>> = OnceLock::new();
+static TOKEN: CachedCredential<KickToken> = CachedCredential::new(".kick_token");
 
 fn token_cell() -> &'static Mutex<Option<KickToken>> {
-    // Seed from persisted storage on first access, so a prior login is restored.
-    TOKEN.get_or_init(|| Mutex::new(load_persisted()))
+    TOKEN.cell()
 }
 
-fn token_path() -> Option<PathBuf> {
-    get_app_data_dir().ok().map(|d| d.join(".kick_token"))
-}
-
-fn obfuscate(data: &[u8]) -> Vec<u8> {
-    data.iter()
-        .enumerate()
-        .map(|(i, b)| b ^ OBF_KEY[i % OBF_KEY.len()])
-        .collect()
-}
-
-fn persist(tok: &KickToken) {
-    let Ok(json) = serde_json::to_string(tok) else {
-        return;
-    };
-    if let Ok(entry) = crate::services::secure_store::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        let _ = entry.set_password(&json);
+fn persist(value: &KickToken) {
+    if let Err(e) = TOKEN.store(value) {
+        log::warn!("could not store the Kick token: {e:#}");
     }
-    if let Some(p) = token_path() {
-        let _ = std::fs::write(p, obfuscate(json.as_bytes()));
-    }
-}
-
-fn load_persisted() -> Option<KickToken> {
-    if let Ok(entry) = crate::services::secure_store::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        if let Ok(json) = entry.get_password() {
-            if let Ok(t) = serde_json::from_str::<KickToken>(&json) {
-                return Some(t);
-            }
-        }
-    }
-    let p = token_path()?;
-    let raw = std::fs::read(p).ok()?;
-    let json = String::from_utf8(obfuscate(&raw)).ok()?;
-    serde_json::from_str(&json).ok()
 }
 
 fn clear_persisted() {
-    if let Ok(entry) = crate::services::secure_store::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        let _ = entry.delete_credential();
-    }
-    if let Some(p) = token_path() {
-        let _ = std::fs::remove_file(p);
-    }
+    TOKEN.remove_file();
 }
 
 fn now() -> u64 {
@@ -160,20 +123,22 @@ pub fn account_avatar() -> Option<String> {
 /// first call. One request covers them, so they are backfilled together rather
 /// than making the avatar a second round trip.
 pub async fn account_identity() -> (Option<String>, Option<String>) {
-    let cached = token_cell()
-        .lock()
-        .ok()
-        .and_then(|t| t.as_ref().map(|k| (k.username.clone(), k.avatar_url.clone())));
-    // Both, or fetch. Returning early on a cached NAME alone would mean an
+    let cached = token_cell().lock().ok().and_then(|t| {
+        t.as_ref()
+            .map(|k| (k.username.clone(), k.avatar_url.clone(), k.user_id.clone()))
+    });
+    // ALL THREE, or fetch. Returning early on a cached NAME alone would mean an
     // account connected before the avatar was captured could never backfill it —
-    // the picture would stay missing for the life of that token.
-    if let Some((Some(name), Some(avatar))) = cached.clone() {
+    // the picture would stay missing for the life of that token. The id arrived
+    // later still, so every token stored before it existed has to be able to
+    // fill it in the same way.
+    if let Some((Some(name), Some(avatar), Some(_))) = cached.clone() {
         return (Some(name), Some(avatar));
     }
     let Some(access) = access_token().await else {
         return (None, None);
     };
-    let Some((name, avatar)) = fetch_identity(&access).await else {
+    let Some((name, avatar, user_id)) = fetch_identity(&access).await else {
         return (None, None);
     };
     let mut updated: Option<KickToken> = None;
@@ -181,6 +146,7 @@ pub async fn account_identity() -> (Option<String>, Option<String>) {
         if let Some(tok) = t.as_mut() {
             tok.username = Some(name.clone());
             tok.avatar_url = avatar.clone();
+            tok.user_id = user_id.clone();
             updated = Some(tok.clone());
         }
     }
@@ -190,10 +156,24 @@ pub async fn account_identity() -> (Option<String>, Option<String>) {
     (Some(name), avatar)
 }
 
-/// Fetch the authenticated Kick user's username via the official API (user:read);
-/// no query params returns the token owner.
-async fn fetch_identity(access_token: &str) -> Option<(String, Option<String>)> {
-    let client = reqwest::Client::new();
+/// Kick's numeric id for the connected account, if it has been read yet.
+///
+/// A pure cache read. `account_identity` is what fills it, from the same
+/// response it takes the name and picture out of, so calling this straight after
+/// that costs nothing.
+pub fn account_id() -> Option<String> {
+    token_cell()
+        .lock()
+        .ok()
+        .and_then(|t| t.as_ref().and_then(|k| k.user_id.clone()))
+}
+
+/// Fetch the authenticated Kick user's username, picture and numeric id via the
+/// official API (user:read); no query params returns the token owner.
+async fn fetch_identity(
+    access_token: &str,
+) -> Option<(String, Option<String>, Option<String>)> {
+    let client = crate::services::http::client_unbounded();
     let resp = match client
         .get("https://api.kick.com/public/v1/users")
         .bearer_auth(access_token)
@@ -227,7 +207,21 @@ async fn fetch_identity(access_token: &str) -> Option<(String, Option<String>)> 
         .iter()
         .find_map(|p| v.pointer(p).and_then(|x| x.as_str()))
         .map(String::from);
-    Some((name?, avatar))
+    // Kick's schema calls this `user_id` and types it as an integer, but at
+    // least one published client models it as `id`, so read both. Take the
+    // number out properly rather than stringifying the JSON value: that would
+    // keep the quotes and every lookup built on it would miss in silence.
+    let user_id = ["/data/0/user_id", "/data/0/id"].iter().find_map(|p| {
+        v.pointer(p).and_then(|x| {
+            x.as_i64()
+                .map(|n| n.to_string())
+                .or_else(|| x.as_str().map(String::from))
+        })
+    });
+    if user_id.is_none() {
+        log::warn!("[Kick] fetch_identity: no numeric account id in response: {v}");
+    }
+    Some((name?, avatar, user_id))
 }
 
 /// Ask Kick whether the stored USER token is still accepted.
@@ -241,13 +235,20 @@ async fn fetch_identity(access_token: &str) -> Option<(String, Option<String>)> 
 /// 1. Use `read_token()`. That falls back to the client-credentials APP token,
 ///    which is always valid, so a signed-out user would validate as connected.
 ///    `access_token()` is the user token specifically.
-/// 2. Treat 403 as revoked. Kick's public API returns 403 "Request blocked by
-///    security policy" to server-side callers holding a perfectly good token
-///    (KickDevDocs #281), so only a 401 is real evidence. Signing someone out on
-///    a 403 would log them out at random.
+/// 2. Treat 403 as revoked. Kick answers 403 "Request blocked by security
+///    policy" for reasons that have nothing to do with the token: an edge rule
+///    tripping under load, or a request aimed at one of their internal
+///    endpoints. Only a 401 is evidence the token itself was rejected, so
+///    signing someone out on a 403 would log them out at random.
+///
+///    An earlier version of this comment said Kick blocks server-side callers
+///    as a matter of policy. That is not correct, and the issue it cited says
+///    the opposite: the reporter was calling the wrong API and closed it
+///    themselves, and Kick confirmed public API requests are not blocked. The
+///    behaviour below is still right; the reason given for it was not.
 pub async fn validate_session() -> Option<bool> {
     let token = access_token().await?;
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http::client_unbounded()
         .get("https://api.kick.com/public/v1/users")
         .bearer_auth(&token)
         .timeout(Duration::from_secs(8))
@@ -480,7 +481,7 @@ pub async fn connect() -> Result<()> {
 
 /// Swap an authorization code for a token and store it.
 async fn exchange_code(cid: &str, secret: &str, verifier: &str, code: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = crate::services::http::client_unbounded();
     let resp = client
         .post(TOKEN_URL)
         .form(&[
@@ -504,8 +505,9 @@ async fn exchange_code(cid: &str, secret: &str, verifier: &str, code: &str) -> R
         access_token: tr.access_token,
         refresh_token: tr.refresh_token.unwrap_or_default(),
         expires_at: now() + tr.expires_in.unwrap_or(3600),
-        username: identity.as_ref().map(|(n, _)| n.clone()),
-        avatar_url: identity.and_then(|(_, a)| a),
+        username: identity.as_ref().map(|(n, _, _)| n.clone()),
+        avatar_url: identity.as_ref().and_then(|(_, a, _)| a.clone()),
+        user_id: identity.and_then(|(_, _, i)| i),
     });
     Ok(())
 }
@@ -611,7 +613,7 @@ pub async fn app_access_token() -> Option<String> {
         }
     }
     let (cid, secret) = (client_id()?, client_secret()?);
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http::client_unbounded()
         .post(TOKEN_URL)
         .form(&[
             ("grant_type", "client_credentials"),
@@ -680,7 +682,7 @@ pub async fn refresh_now() -> RefreshOutcome {
     if cur.refresh_token.is_empty() {
         return RefreshOutcome::TryLater;
     }
-    let client = reqwest::Client::new();
+    let client = crate::services::http::client_unbounded();
     let resp = match client
         .post(TOKEN_URL)
         .form(&[
@@ -720,10 +722,12 @@ pub async fn refresh_now() -> RefreshOutcome {
             tr.refresh_token.unwrap()
         },
         expires_at: now() + tr.expires_in.unwrap_or(3600),
-        // A refresh renews the token, not the identity — carry both across so a
-        // silent refresh can't blank the name and picture in Accounts.
+        // A refresh renews the token, not the identity — carry all of it across
+        // so a silent refresh can't blank the name and picture in Accounts, or
+        // drop the account id and with it the member's cosmetics in Kick chat.
         username: cur.username,
         avatar_url: cur.avatar_url,
+        user_id: cur.user_id,
     });
     log::debug!("[Kick] user token refreshed");
     RefreshOutcome::Refreshed(access)

@@ -22,7 +22,7 @@ import {
     X,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
-import { IS_MOBILE } from '../utils/platform';
+import { IS_LINUX, IS_MOBILE } from '../utils/platform';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../stores/AppStore';
 import streamnookLogo from '../assets/streamnook-logo-256.webp';
@@ -37,6 +37,7 @@ import {
 } from '../themes';
 import { getSidebarSettings, saveSidebarSettings, type SidebarMode } from './settings/InterfaceSettings';
 import { TwitchGlyph } from './ui/TwitchGlyph';
+import { WindowCaptionButtons } from './titlebar/WindowCaptionButtons';
 
 import { Logger } from '../utils/logger';
 import { ANNOUNCEMENTS_BASELINE_PENDING_KEY } from './AnnouncementsBanner';
@@ -1250,10 +1251,18 @@ const SetupWizard = ({ isOpen, onClose }: SetupWizardProps) => {
                 }}
             />
 
+            {/* On Linux the strip sits above the step content, which fills the
+                whole window and otherwise takes every press meant for it, and
+                below the caption buttons. Elsewhere it keeps its place under
+                the content. */}
             <div
                 data-tauri-drag-region
-                className="absolute top-0 left-0 right-0 h-12 z-0"
+                className={`absolute top-0 left-0 right-0 h-12 ${IS_LINUX ? 'z-20' : 'z-0'}`}
             />
+
+            {/* The wizard covers the title bar, and the window has no OS frame,
+                so it carries the window's own controls in the same corner. */}
+            <WindowCaptionButtons className="absolute top-0 right-0 z-30" />
 
             <div className="relative h-full w-full flex flex-col">
                 {/* Mobile back control. Pinned to the top-left the way onboarding

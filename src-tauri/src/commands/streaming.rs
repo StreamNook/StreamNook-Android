@@ -160,6 +160,12 @@ pub struct VodStartInfo {
     /// known; on a `recording` VOD that means not yet determined, not "none".
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub muted_segments: Vec<crate::services::muted_segments::MutedRange>,
+    /// Category changes over the broadcast, for the chapter marks and list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub chapters: Vec<crate::services::vod_chapters::Chapter>,
+    /// Seek-preview sprite sheets. Finished VODs only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storyboard: Option<crate::services::vod_storyboard::Storyboard>,
 }
 
 /// What we actually KNOW about a channel's liveness.
@@ -236,6 +242,47 @@ pub(crate) async fn confirm_kick_liveness(channel: &str) -> Liveness {
 }
 
 
+/// Why `start_stream` failed. A plain message serializes as the bare string it
+/// always was, so every existing caller reads it unchanged; a stream the
+/// platform only serves to a signed-in account arrives as
+/// `{ "sign_in": { provider, channel, message } }`, which the player turns into
+/// a sign-in prompt.
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum StartError {
+    Message(String),
+    SignIn {
+        sign_in: crate::services::providers::source::SignInRequired,
+    },
+}
+
+impl From<String> for StartError {
+    fn from(message: String) -> Self {
+        StartError::Message(message)
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::Message(m) => f.write_str(m),
+            StartError::SignIn { sign_in } => f.write_str(&sign_in.message),
+        }
+    }
+}
+
+impl StartError {
+    fn from_resolve(e: anyhow::Error) -> Self {
+        let sign_in = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::services::providers::source::SignInRequired>());
+        match sign_in {
+            Some(s) => StartError::SignIn { sign_in: s.clone() },
+            None => StartError::Message(e.to_string()),
+        }
+    }
+}
+
 /// Resolve and serve a non-Twitch live stream.
 ///
 /// The platform adapter hands back a media-playlist (or direct stream) URL; from
@@ -247,7 +294,7 @@ async fn start_provider_stream(
     provider: &'static str,
     channel: &str,
     quality: &str,
-) -> Result<StreamStartResult, String> {
+) -> Result<StreamStartResult, StartError> {
     let source = crate::services::providers::registry()
         .await
         .get_source(provider)
@@ -256,7 +303,7 @@ async fn start_provider_stream(
     let resolved = source
         .resolve_playback(crate::services::stream_server::SOLO_STREAM_ID, channel, quality)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(StartError::from_resolve)?;
 
     log::info!(
         "[Streaming] {}:{} '{}' → '{}' ({:?}) variants={}",
@@ -385,22 +432,33 @@ async fn start_provider_stream(
         // DASH-backed 1440p/2160p renditions). Sending it through the relay
         // would proxy a local server through another local server and rewrite
         // playlists that are already exactly what the player needs.
-        PlaybackKind::LocalHls => Ok(StreamStartResult {
-            url: resolved.url,
-            quality: resolved.quality,
-            mode: None,
-            entitled: false,
-            proxy_region: None,
-            available: hls_master::quality_names(&resolved.qualities),
-            clip_source: None,
-            vod: None,
-            kind: Some("hls".to_string()),
-        }),
-        // FLV/MP4 platforms land here once their adapters ship (TikTok).
+        PlaybackKind::LocalHls => {
+            // The relay is not used on this path, so a refresher registered by
+            // an EARLIER stream would otherwise stay installed for the rest of
+            // the session: `StreamServer::stop` clears the proxy url but not
+            // the refresher. Inert while nothing re-signs, and wrong the moment
+            // something does.
+            crate::services::stream_server::set_manifest_refresher(None).await;
+            Ok(StreamStartResult {
+                url: resolved.url,
+                quality: resolved.quality,
+                mode: None,
+                entitled: false,
+                proxy_region: None,
+                available: hls_master::quality_names(&resolved.qualities),
+                clip_source: None,
+                vod: None,
+                kind: Some("hls".to_string()),
+            })
+        }
+        // Nothing returns these: an adapter whose upstream is FLV serves it
+        // through its own local relay and reports `LocalHls`, so the player
+        // never needs a second media engine.
         other => Err(format!(
             "{} playback kind {:?} is not wired up yet",
             provider, other
-        )),
+        )
+        .into()),
     }
 }
 
@@ -417,7 +475,7 @@ fn channel_from_url(url: &str) -> Option<String> {
 }
 
 /// The localhost URL the player polls, with a cache-busting timestamp.
-fn local_player_url(port: u16) -> String {
+pub(crate) fn local_player_url(port: u16) -> String {
     format!(
         "http://localhost:{}/stream.m3u8?t={}",
         port,
@@ -460,7 +518,7 @@ pub async fn start_stream(
     url: String,
     quality: String,
     state: State<'_, AppState>,
-) -> Result<StreamStartResult, String> {
+) -> Result<StreamStartResult, StartError> {
     debug!("[Streaming] start_stream called for URL: {}", url);
 
     // Clear the prior solo session up front; only a live resolve below
@@ -505,7 +563,9 @@ pub async fn start_stream(
 
     // VOD → HLS media playlist, relayed through the local stream server.
     if let Some(vod_id) = tr::vod_id_from_url(&url) {
-        return start_vod(&vod_id, oauth.as_deref(), &quality, &state, None).await;
+        return start_vod(&vod_id, oauth.as_deref(), &quality, &state, None)
+            .await
+            .map_err(StartError::from);
     }
 
     // Live channel.
@@ -643,6 +703,8 @@ async fn start_vod(
             start_position_secs: start_position,
             rewound_from_live: false,
             muted_segments: info.muted_segments,
+            chapters: info.chapters,
+            storyboard: info.storyboard,
         }),
     })
 }
@@ -781,6 +843,8 @@ pub async fn stop_stream() -> Result<(), String> {
     // Without it a stopped stream's session stayed registered, held its init
     // segments and cache, and counted against the relay cap.
     crate::services::youtube_dash::stop(crate::services::stream_server::SOLO_STREAM_ID).await;
+    // Same for the TikTok relay, and same reasoning: unknown ids are a no-op.
+    crate::services::tiktok_relay::stop(crate::services::stream_server::SOLO_STREAM_ID);
     StreamServer::stop().await.map_err(|e| e.to_string())
 }
 
@@ -792,6 +856,17 @@ pub async fn stop_stream() -> Result<(), String> {
 #[tauri::command]
 pub fn get_stream_low_latency() -> bool {
     crate::services::stream_server::is_low_latency()
+}
+
+/// Whether the broadcast itself is low-latency (Twitch sends PREFETCH hints),
+/// independent of whether the parts origin took it over. With the origin off
+/// the player still rides such a channel on promoted in-progress segments,
+/// which is a tighter, thinner ride than a normal-latency broadcast, so the
+/// automatic live-edge gap needs the distinction. Read once at construction,
+/// after `get_stream_low_latency`.
+#[tauri::command]
+pub fn get_stream_prefetch_present() -> bool {
+    crate::services::ll_origin::upstream_has_prefetch()
 }
 
 /// Enable or disable the experimental parts-based low-latency origin at runtime.
@@ -922,7 +997,7 @@ pub async fn change_stream_quality(
 ) -> Result<StreamStartResult, String> {
     // Don't stop the server - just update the stream URL.
     // The server keeps running on the same port.
-    start_stream(url, quality, state).await
+    start_stream(url, quality, state).await.map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -965,10 +1040,8 @@ pub async fn youtube_sabr_probe(video_id: String) -> Result<String, String> {
         .await
         .map_err(|e| format!("could not resolve streams: {}", e))?;
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Shared client; the probe's 60 s deadline rides on each request.
+    let http = crate::services::http::client();
 
     // No `&sq=`, which asks for the live edge and is also the cheapest way to
     // learn the head sequence number.
@@ -980,6 +1053,7 @@ pub async fn youtube_sabr_probe(video_id: String) -> Result<String, String> {
         let started = std::time::Instant::now();
         let resp = http
             .get(url)
+            .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
             .map_err(|e| format!("{}: request failed: {}", label, e))?;
@@ -1091,5 +1165,38 @@ mod liveness_tests {
     #[test]
     fn slug_match_is_case_insensitive() {
         assert_eq!(verdict_for(&[row("bigaust", true)], "BigAust"), Liveness::Live);
+    }
+}
+
+#[cfg(test)]
+mod start_error_tests {
+    use super::*;
+    use crate::services::providers::source::SignInRequired;
+
+    #[test]
+    fn a_plain_failure_is_still_a_bare_string_on_the_wire() {
+        let e: StartError = "someone isn't live right now".to_string().into();
+        assert_eq!(serde_json::to_value(&e).unwrap(), serde_json::json!("someone isn't live right now"));
+    }
+
+    #[test]
+    fn a_sign_in_is_typed_on_the_wire_even_under_context() {
+        let err = anyhow::Error::new(SignInRequired {
+            provider: "tiktok",
+            channel: "someone".into(),
+            message: "@someone's LIVE is 18+. Sign in to TikTok to watch it.".into(),
+        })
+        .context("resolving someone");
+        let e = StartError::from_resolve(err);
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            serde_json::json!({ "sign_in": {
+                "provider": "tiktok",
+                "channel": "someone",
+                "message": "@someone's LIVE is 18+. Sign in to TikTok to watch it."
+            }})
+        );
+        // Callers that only want words still get the message.
+        assert_eq!(e.to_string(), "@someone's LIVE is 18+. Sign in to TikTok to watch it.");
     }
 }

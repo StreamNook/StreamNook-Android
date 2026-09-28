@@ -9,10 +9,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 /// How the resolved stream is delivered, which decides the player path:
-/// `Hls` rides the localhost HLS relay; `Flv` rides the streaming FLV relay
-/// (mpegts.js on the frontend); `Mp4` is a direct `video.src` URL; `LocalHls`
-/// is HLS the adapter is ALREADY serving from localhost, so it must be handed
-/// to the player untouched rather than proxied a second time.
+/// `Hls` rides the shared localhost HLS relay; `Mp4` is a direct `video.src`
+/// URL; `LocalHls` is HLS the adapter is ALREADY serving from localhost, so it
+/// must be handed to the player untouched rather than proxied a second time.
+///
+/// `Flv` is unused. The page runs one media engine, so an adapter whose
+/// upstream is FLV rewrites the container in Rust and serves `LocalHls`
+/// instead of asking the frontend to load a second one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaybackKind {
@@ -47,6 +50,26 @@ pub struct ResolvedPlayback {
     /// Quality menu, best-first.
     pub qualities: Vec<PlaybackQuality>,
 }
+
+/// A stream the platform serves only to a signed-in account, returned as the
+/// error of `resolve_playback`. Typed rather than worded, so the player can put
+/// the sign-in right where the stream failed instead of naming a settings page.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SignInRequired {
+    /// The platform whose account unlocks the stream ("tiktok").
+    pub provider: &'static str,
+    pub channel: String,
+    /// What to tell the person, complete on its own.
+    pub message: String,
+}
+
+impl std::fmt::Display for SignInRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SignInRequired {}
 
 /// What a platform adapter supports in this build. The frontend renders
 /// browse/search/follow affordances from this instead of hard-coding platforms.

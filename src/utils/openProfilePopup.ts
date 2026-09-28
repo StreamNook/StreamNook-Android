@@ -1,6 +1,9 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Logger } from './logger';
+import { IS_LINUX } from './platform';
 import { historyKey } from './chatterIdentity';
+import { memberIdFor } from './memberIdentity';
+import { getStreamNookUserNumber } from '../services/supabaseService';
 
 /**
  * Open the cursor-anchored user-profile popout window (the `/#/profile`
@@ -47,8 +50,14 @@ export async function openProfilePopup(opts: {
 
     // Logical card size. These MUST match the width/height we request for the
     // window below, since the clamp converts them to physical via the scale.
-    const cardWidth = 402;
-    const cardHeight = 680;
+    // A StreamNook member's card is their whole StreamNook profile plus the
+    // chatter card, so it opens wider and taller (UserProfileCard's
+    // MEMBER_CARD_WIDTH). Chat already knows who is a member, linked Kick and
+    // YouTube accounts included.
+    const chatKey = !opts.provider || opts.provider === 'twitch' ? opts.userId : `${opts.provider}:${opts.userId}`;
+    const isMember = getStreamNookUserNumber(memberIdFor(chatKey)) !== null;
+    const cardWidth = isMember ? 760 : 440;
+    let cardHeight = isMember ? 960 : 760;
     const gap = 10;
 
     // Cursor position in physical desktop pixels (falls back to this window's
@@ -58,7 +67,7 @@ export async function openProfilePopup(opts: {
 
     // Card footprint and spacing in physical pixels, for clamping.
     const cardW = cardWidth * scale;
-    const cardH = cardHeight * scale;
+    let cardH = cardHeight * scale;
     const margin = 8 * scale;
     const gapPx = gap * scale;
 
@@ -84,6 +93,15 @@ export async function openProfilePopup(opts: {
         monitor = await currentMonitor();
       } catch {
         /* ignore, clamp is skipped below */
+      }
+    }
+
+    // A tall member card never outgrows the monitor it opens on.
+    if (monitor) {
+      const fit = Math.floor(monitor.size.height / scale) - 24;
+      if (cardHeight > fit) {
+        cardHeight = fit;
+        cardH = cardHeight * scale;
       }
     }
 
@@ -201,7 +219,9 @@ export async function openProfilePopup(opts: {
       decorations: false,
       alwaysOnTop: true,
       skipTaskbar: true,
-      transparent: true,
+      // Linux: the runtime cannot paint a transparent window; the card sits
+      // on the app's own dark ground instead.
+      ...(IS_LINUX ? { backgroundColor: '#0c0c0d' } : { transparent: true }),
       // Created hidden and shown after it is positioned, so the corrective move
       // can't flash the card at the wrong spot (or on the wrong monitor).
       visible: false,

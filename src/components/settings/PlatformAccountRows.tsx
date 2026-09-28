@@ -23,7 +23,7 @@ import { Tooltip } from '../ui/Tooltip';
  * "import", "sync", "OAuth" or "session".
  */
 
-const PLATFORMS: PlatformId[] = ['kick', 'youtube'];
+const PLATFORMS: PlatformId[] = ['kick', 'youtube', 'tiktok'];
 
 export default function PlatformAccountRows() {
   return (
@@ -36,7 +36,12 @@ export default function PlatformAccountRows() {
       ))}
       <p className="text-xs text-textMuted">
         Watching on one of these uses that account — for following, chatting and
-        anything it unlocks.
+        anything it unlocks. Your StreamNook badge and atmosphere also appear on
+        your messages there, for anyone else watching in StreamNook.
+      </p>
+      <p className="text-xs text-textMuted">
+        On TikTok, signing in also shows which creators you follow are live and
+        plays 18+ LIVEs. Your StreamNook badge does not appear on TikTok messages.
       </p>
     </div>
   );
@@ -60,13 +65,34 @@ function PlatformRow({ provider }: { provider: PlatformId }) {
   const title = connected ? (name ?? meta.label) : meta.label;
   // A step message replaces the subtitle while something is happening, so the row
   // says what it is doing instead of freezing on a stale line.
+  // Whether cosmetics can follow them here yet. `id` is what that platform's
+  // chat stamps on a message, so without it there is nothing to match a chatter
+  // against. Null is a real state, not an error: a YouTube account with no
+  // channel of its own never has one.
+  // TikTok is never recorded as a linked account, so cosmetics cannot follow
+  // anyone there whatever id the session carries.
+  const cosmeticsFollow = provider !== 'tiktok' && connected && !!state.id;
+  // TikTok imports nothing, so its row has no channels to count. It names the
+  // account by @handle instead: a TikTok nickname can be stylized past
+  // recognition, and the handle says which account it is.
   const subtitle =
     step ??
-    (connected
-      ? channelCount > 0
-        ? `${meta.label} · ${channelCount} channel${channelCount === 1 ? '' : 's'}`
-        : meta.label
-      : 'Not connected');
+    (provider === 'tiktok'
+      ? connected
+        ? state.handle
+          ? `@${state.handle}`
+          : meta.label
+        : 'Not connected'
+      : connected
+        ? [
+            channelCount > 0
+              ? `${meta.label} · ${channelCount} channel${channelCount === 1 ? '' : 's'}`
+              : meta.label,
+            cosmeticsFollow ? 'cosmetics on' : null,
+          ]
+            .filter(Boolean)
+            .join(' · ')
+        : 'Not connected');
 
   return (
     <div className="flex items-center gap-3 rounded-lg px-3 py-2.5 bg-white/[0.03]">

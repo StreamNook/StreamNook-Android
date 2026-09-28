@@ -83,7 +83,9 @@ impl KickProvider {
     pub fn new() -> Self {
         Self {
             conns: Mutex::new(HashMap::new()),
-            http: reqwest::Client::new(),
+            // A clone of the shared default-config client: same behaviour as a
+            // fresh `Client::new()`, one pool fewer.
+            http: crate::services::http::client_unbounded().clone(),
         }
     }
 }
@@ -92,6 +94,10 @@ impl KickProvider {
 impl ChatProvider for KickProvider {
     fn id(&self) -> &'static str {
         "kick"
+    }
+
+    fn open_channel_count(&self) -> Option<usize> {
+        self.conns.try_lock().ok().map(|c| c.len())
     }
 
     async fn connect(&self, channel: &str, window: &str) -> Result<()> {
@@ -422,7 +428,7 @@ pub async fn ban_user(
     if let Some(r) = reason.filter(|r| !r.is_empty()) {
         body["reason"] = json!(r.chars().take(100).collect::<String>());
     }
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http::client_unbounded()
         .post("https://api.kick.com/public/v1/moderation/bans")
         .bearer_auth(&token)
         .json(&body)
@@ -441,7 +447,7 @@ pub async fn unban_user(broadcaster_user_id: u64, target_user_id: u64) -> Result
     let token = crate::services::kick_auth_service::access_token()
         .await
         .ok_or_else(|| anyhow!("Connect your Kick account to moderate"))?;
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http::client_unbounded()
         .delete("https://api.kick.com/public/v1/moderation/bans")
         .bearer_auth(&token)
         .json(&json!({
@@ -465,7 +471,7 @@ pub async fn delete_message(message_id: &str) -> Result<()> {
         .await
         .ok_or_else(|| anyhow!("Connect your Kick account to moderate"))?;
     let url = format!("https://api.kick.com/public/v1/chat/{}", message_id);
-    let resp = reqwest::Client::new()
+    let resp = crate::services::http::client_unbounded()
         .delete(&url)
         .bearer_auth(&token)
         .send()
@@ -725,7 +731,7 @@ async fn resolve_via_webview(_slug: &str) -> Result<u64> {
 /// `kick_account.rs:145` and `youtube_auth_service.rs:408` use it: `close()` is
 /// a request the page can defer, and this one is pointed at kick.com.
 #[cfg(desktop)]
-struct ResolverWindow(Option<tauri::WebviewWindow>);
+struct ResolverWindow(Option<crate::rt::WebviewWindow>);
 
 #[cfg(desktop)]
 impl Drop for ResolverWindow {
@@ -738,7 +744,8 @@ impl Drop for ResolverWindow {
 
 #[cfg(desktop)]
 async fn resolve_via_webview(slug: &str) -> Result<u64> {
-    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    use crate::rt::WebviewWindowBuilder;
+    use tauri::WebviewUrl;
 
     let app = app_handle().ok_or_else(|| anyhow!("app handle not available for Kick resolver"))?;
     let slug_lc = slug.to_lowercase();
@@ -777,6 +784,9 @@ async fn resolve_via_webview(slug: &str) -> Result<u64> {
 
     let win = match WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::External(parsed))
         .data_directory(profile)
+        // The folder is ignored on macOS; this keeps the resolver apart from the
+        // Kick sign-in there too (see `platform::webview_store`).
+        .data_store_identifier(crate::platform::webview_store::own_store("kick-resolver"))
         .initialization_script(&script)
         .visible(false)
         .skip_taskbar(true)
@@ -865,7 +875,7 @@ async fn resolve_via_webview(slug: &str) -> Result<u64> {
 /// The persistent WebView2 profile for kick.com. Shared by the playback
 /// resolver and the account sync, so signing in once also clears Cloudflare for
 /// the resolver and survives restarts.
-pub fn resolve_profile_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+pub fn resolve_profile_dir(app: &crate::rt::AppHandle) -> std::path::PathBuf {
     kick_resolve_profile_dir(app)
 }
 
@@ -876,13 +886,13 @@ pub fn resolve_profile_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
 /// challenge state that then breaks the resolver — which would take playback
 /// down with it. Playback needs no login, so the two stay isolated and a bad
 /// sign-in can only ever cost you sign-in.
-pub fn account_profile_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+pub fn account_profile_dir(app: &crate::rt::AppHandle) -> std::path::PathBuf {
     use tauri::Manager;
     let base = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("platform_web_profiles").join("kick-account");
+    let dir = crate::platform::webview_store::profile_dir(base, "platform_web_profiles/kick-account");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -907,13 +917,13 @@ fn take_profile_reset(dir: &std::path::Path) {
     }
 }
 
-fn kick_resolve_profile_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
+fn kick_resolve_profile_dir(app: &crate::rt::AppHandle) -> std::path::PathBuf {
     use tauri::Manager;
     let base = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
-    let dir = base.join("platform_web_profiles").join("kick");
+    let dir = crate::platform::webview_store::profile_dir(base, "platform_web_profiles/kick");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -2230,6 +2240,112 @@ pub(crate) async fn browser_get(url: &str, slug: &str) -> Option<reqwest::Respon
         return None;
     }
     Some(resp)
+}
+
+/// What Kick's channel API says about one exact slug.
+enum SlugAnswer {
+    /// The channel exists, under this slug as Kick spells it.
+    Found(String),
+    /// Kick answered 404: no channel has this slug.
+    Missing,
+    /// No answer worth trusting (network, the edge's bot check, a bad body).
+    Unreachable,
+}
+
+async fn ask_kick_for_slug(slug: &str) -> SlugAnswer {
+    let url = format!("https://kick.com/api/v2/channels/{}", slug);
+    let resp = match HTTP_RESOLVE.get(&url).headers(browser_headers(slug)).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("[Kick] slug lookup for {} failed: {}", slug, e);
+            return SlugAnswer::Unreachable;
+        }
+    };
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return SlugAnswer::Missing;
+    }
+    if !resp.status().is_success() {
+        log::warn!("[Kick] slug lookup for {} returned {}", slug, resp.status());
+        return SlugAnswer::Unreachable;
+    }
+    match resp.json::<Value>().await {
+        Ok(v) => match v.get("slug").and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+            Some(found) => SlugAnswer::Found(found.to_lowercase()),
+            None => SlugAnswer::Unreachable,
+        },
+        Err(_) => SlugAnswer::Unreachable,
+    }
+}
+
+/// Every spelling a Kick name could mean, as typed first.
+///
+/// Kick's API answers only the exact slug, and whether a username's
+/// underscores became hyphens in its slug depends on the account (one
+/// `Some_Name` is `some-name` on Kick, another keeps `other_name`). Usernames
+/// hold underscores, never hyphens, so a slug is all one or the other: the
+/// other spelling swaps every `_` for `-`, or every `-` for `_`.
+fn kick_slug_spellings(name: &str) -> Vec<String> {
+    let mut out = vec![name.to_string()];
+    for other in [name.replace('_', "-"), name.replace('-', "_")] {
+        if !out.contains(&other) {
+            out.push(other);
+        }
+    }
+    out
+}
+
+/// The slug Kick knows a typed channel name by.
+///
+/// `Ok` carries Kick's own spelling when it knows the channel. When Kick can't
+/// be asked, the name comes back unchanged, so an add still goes through the
+/// way it did before this lookup existed. `Err` means Kick answered and has no
+/// channel under any spelling of the name; it is worded for the add box.
+pub async fn resolve_slug(name: &str) -> Result<String, String> {
+    let name = name.trim().trim_start_matches('@').to_ascii_lowercase();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err("That isn't a Kick channel name.".to_string());
+    }
+    let mut unreachable = false;
+    for spelling in kick_slug_spellings(&name) {
+        match ask_kick_for_slug(&spelling).await {
+            SlugAnswer::Found(slug) => return Ok(slug),
+            SlugAnswer::Missing => {}
+            SlugAnswer::Unreachable => unreachable = true,
+        }
+    }
+    if unreachable {
+        Ok(name)
+    } else {
+        Err(format!("No Kick channel called \"{}\". Check the spelling.", name))
+    }
+}
+
+#[cfg(test)]
+mod slug_spelling_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_is_tried_as_typed_then_with_the_other_separator() {
+        assert_eq!(kick_slug_spellings("some_name"), vec!["some_name", "some-name"]);
+        assert_eq!(kick_slug_spellings("some-name"), vec!["some-name", "some_name"]);
+        assert_eq!(kick_slug_spellings("xqc"), vec!["xqc"]);
+    }
+
+    /// Hit Kick's API with two real accounts found on its live list, one whose
+    /// slug turned the underscore into a hyphen and one that kept it. Opt-in
+    /// because it needs the network (and those accounts could be renamed):
+    ///
+    /// ```text
+    /// cargo test --no-default-features resolves_both_kick_spellings -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn resolves_both_kick_spellings() {
+        assert_eq!(resolve_slug("Sali_Vali97").await.unwrap(), "sali-vali97");
+        assert_eq!(resolve_slug("azizos-chafchaa").await.unwrap(), "azizos_chafchaa");
+        assert!(resolve_slug("no_such_channel_zz9").await.is_err());
+        assert!(resolve_slug("two words").await.is_err());
+    }
 }
 
 #[cfg(test)]

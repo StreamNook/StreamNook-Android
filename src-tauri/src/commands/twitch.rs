@@ -8,10 +8,11 @@ use crate::services::whisper_history_service::{
 };
 use crate::services::whisper_service::WhisperService;
 use anyhow::Result;
-use log::{debug, error};
+use log::{debug, error, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, State, WebviewUrl};
+use crate::rt::AppHandle;
+use tauri::{Manager, State, WebviewUrl};
 use tokio::sync::Mutex as TokioMutex;
 
 // Device Code Flow - the main login command
@@ -74,8 +75,8 @@ pub async fn get_live_broadcast(broadcaster_id: String) -> Result<LiveBroadcast,
 // Helix Create Clip is live-only; clipping a VOD at a timestamp uses Twitch's
 // web GQL flow (CreateRawMedia -> CreateClipFromRawMedia). Reuses the Android-
 // client, no-integrity GQL pattern the watch-event path's sendSpadeEvents uses,
-// with the drops (Android-client) token. Hashes/shape were reverse-engineered
-// from a real capture (see Brain: references/Twitch_Clip_Creation_GQL).
+// with the drops (Android-client) token. Hashes and shape were
+// reverse-engineered from live traffic; there is no published schema.
 
 const ANDROID_CLIENT_ID: &str = env!("TWITCH_ANDROID_CLIENT_ID");
 const H_CREATE_RAW_MEDIA: &str = "19cbfe94f0aff2e1338fd8ee472d90c8d334e17a84ebe8b06dcb236bd9394dfd";
@@ -732,6 +733,97 @@ fn active_twitch_web_profile_dir() -> Result<PathBuf, String> {
 #[cfg(any(windows, test))]
 const CONTAIN_POPUPS_IN_OVERLAY: &[&str] = &["youtube-login"];
 
+/// Overlays whose sign-in hands off to a provider popup that answers the page
+/// that OPENED it, so the popup has to be a real window that keeps
+/// `window.opener`. Navigating the overlay to it, the way the YouTube sign-in
+/// contains its account picker, would cut that link and the sign-in would
+/// finish into nothing.
+///
+/// TikTok's page does this for Apple (`appleid.apple.com/auth/authorize` with
+/// `response_mode=web_message`) and Google (`accounts.google.com` with
+/// `redirect_uri=gis_transform`). Unhandled, both were refused and TikTok
+/// said `popup_blocked_by_browser`.
+///
+/// On Linux the CEF runtime never consults a builder's `on_new_window` (a
+/// webview that installs one only gets its popups denied), so the same list
+/// drives the process-wide popup policy in `linux_cef` instead, and the popup
+/// is a native Chromium window on the overlay's profile.
+#[cfg(any(desktop, test))]
+pub(crate) const OPENER_POPUPS_IN_OVERLAY: &[&str] = &["tiktok-login"];
+
+#[cfg(desktop)]
+static SIGN_IN_POPUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Every sign-in popup of an overlay starts with this. No capability names it,
+/// so a provider's page gets no bridge into the app.
+#[cfg(any(desktop, test))]
+fn sign_in_popup_prefix(owner_label: &str) -> String {
+    format!("{owner_label}-popup-")
+}
+
+#[cfg(any(desktop, test))]
+fn sign_in_popup_label(owner_label: &str, n: u64) -> String {
+    format!("{}{n}", sign_in_popup_prefix(owner_label))
+}
+
+/// Open a sign-in popup as a real window: placed and sized as the page asked,
+/// owned by the overlay so it stays above it, and sharing the overlay's web
+/// profile through `window_features`, so the session the provider completes
+/// lands in the cookie jar the sign-in reads.
+///
+/// Not on Linux: the CEF runtime opens the popup itself under the policy in
+/// `linux_cef`, and a builder that installs this handler would get every
+/// popup denied instead.
+#[cfg(all(desktop, not(target_os = "linux")))]
+fn sign_in_popup(
+    app: &AppHandle,
+    owner_label: &str,
+    url: tauri::Url,
+    features: tauri::webview::NewWindowFeatures,
+) -> crate::rt::NewWindowResponse {
+    use crate::rt::NewWindowResponse;
+
+    // A provider's page is https; a scripted popup starts blank and is pointed
+    // somewhere afterwards. Nothing else gets a window.
+    if url.scheme() != "https" && url.as_str() != "about:blank" {
+        log::warn!("[overlay] refused a popup to {}", url);
+        return NewWindowResponse::Deny;
+    }
+    let n = SIGN_IN_POPUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let label = sign_in_popup_label(owner_label, n);
+    let Ok(blank) = "about:blank".parse() else {
+        return NewWindowResponse::Deny;
+    };
+    let builder = crate::rt::WebviewWindowBuilder::new(app, &label, WebviewUrl::External(blank))
+        .window_features(features)
+        .title("Sign in")
+        .on_document_title_changed(|window, title| {
+            let _ = window.set_title(&title);
+        })
+        .skip_taskbar(true)
+        .focused(true);
+    let builder = match app.get_webview_window(owner_label) {
+        Some(owner) => match builder.parent(&owner) {
+            Ok(b) => b,
+            Err(e) => {
+                error!("[overlay] couldn't own the sign-in popup to '{}': {}", owner_label, e);
+                return NewWindowResponse::Deny;
+            }
+        },
+        None => builder,
+    };
+    match builder.build() {
+        Ok(window) => {
+            debug!("[overlay] sign-in popup '{}' -> {}", label, url);
+            NewWindowResponse::Create { window }
+        }
+        Err(e) => {
+            error!("[overlay] couldn't open the sign-in popup: {}", e);
+            NewWindowResponse::Deny
+        }
+    }
+}
+
 /// Make a popup from `win`'s page navigate the overlay itself instead of opening a
 /// separate window.
 ///
@@ -742,7 +834,7 @@ const CONTAIN_POPUPS_IN_OVERLAY: &[&str] = &["youtube-login"];
 /// script approach silently leaves the popup escaping. `NewWindowRequested` fires
 /// for the whole webview whichever frame asked, which is why it is the right seam.
 #[cfg(windows)]
-fn contain_overlay_popups(win: &tauri::WebviewWindow) {
+fn contain_overlay_popups(win: &crate::rt::WebviewWindow) {
     use webview2_com::take_pwstr;
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2;
     use webview2_com::NewWindowRequestedEventHandler;
@@ -895,7 +987,7 @@ pub async fn mount_twitch_overlay(
     // so a sign-in lands in the right cookie jar.
     profile: Option<String>,
 ) -> Result<(), String> {
-    use tauri::WebviewWindowBuilder;
+    use crate::rt::WebviewWindowBuilder;
 
     debug!(
         "[overlay] open '{}' at screen ({}, {}) {}x{} -> {}",
@@ -913,6 +1005,7 @@ pub async fn mount_twitch_overlay(
     let profile = match profile.as_deref() {
         Some("kick-account") => crate::services::providers::kick::account_profile_dir(&app),
         Some("youtube-account") => crate::services::youtube_auth_service::youtube_profile_dir(),
+        Some("tiktok-account") => crate::services::tiktok_auth_service::tiktok_profile_dir(),
         _ => active_twitch_web_profile_dir()?,
     };
     let parsed = url.parse().map_err(|e| format!("Invalid URL: {}", e))?;
@@ -938,15 +1031,37 @@ pub async fn mount_twitch_overlay(
         });
     }
 
-    let win = builder
+    // Provider popups that must keep their opener (see OPENER_POPUPS_IN_OVERLAY).
+    // Linux: the CEF runtime never calls this handler; the popup policy in
+    // linux_cef allows these overlays' popups process-wide instead.
+    #[cfg(not(target_os = "linux"))]
+    if OPENER_POPUPS_IN_OVERLAY.contains(&label.as_str()) {
+        let popup_app = app.clone();
+        let owner = label.clone();
+        builder = builder
+            .on_new_window(move |url, features| sign_in_popup(&popup_app, &owner, url, features));
+    }
+
+    // Owned by the main window: it stays above it, hides with it, and is not a
+    // task of its own. The CEF runtime answers `parent()` with an error on
+    // Linux, so there the ownership is written onto the X window after the
+    // build (WM_TRANSIENT_FOR, which is what GTK's `parent` set underneath).
+    #[cfg(not(target_os = "linux"))]
+    let builder = builder
         .parent(&main)
-        .map_err(|e| format!("Failed to own overlay to main window: {}", e))?
-        .build()
-        .map_err(|e| {
-            let msg = format!("Failed to open Twitch overlay window: {}", e);
-            error!("[overlay] {}", msg);
-            msg
-        })?;
+        .map_err(|e| format!("Failed to own overlay to main window: {}", e))?;
+    let win = builder.build().map_err(|e| {
+        let msg = format!("Failed to open Twitch overlay window: {}", e);
+        error!("[overlay] {}", msg);
+        msg
+    })?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = crate::linux_x11::make_transient_for(&win, &main) {
+            warn!("[overlay] couldn't make '{}' transient for the main window: {}", label, e);
+        }
+        linux_overlays::mounted(&label);
+    }
 
     // The content sits inside React's rounded panel frame, so it must be a crisp
     // rectangle; suppress the DWM rounded corners Win11 gives borderless windows.
@@ -970,7 +1085,7 @@ pub async fn mount_twitch_overlay(
 /// the overlay content reads as a crisp rectangle inside React's rounded panel frame.
 #[cfg(windows)]
 #[cfg(desktop)]
-fn square_window_corners(win: &tauri::WebviewWindow) {
+fn square_window_corners(win: &crate::rt::WebviewWindow) {
     use std::ffi::c_void;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{
@@ -1023,6 +1138,14 @@ pub fn dismiss_login_overlay(app: &AppHandle, label: &str) {
     if let Some(win) = app.get_webview_window(label) {
         let _ = win.close();
     }
+    // Its sign-in popups go with it. A provider page usually closes itself once
+    // it has answered, but one left open would float over the app afterwards.
+    let popup_prefix = sign_in_popup_prefix(label);
+    for (popup_label, popup) in app.webview_windows() {
+        if popup_label.starts_with(&popup_prefix) {
+            let _ = popup.close();
+        }
+    }
     crate::services::ui_hang_watchdog::set_active_overlay(None);
     let _ = app.emit("twitch-overlay-close", serde_json::json!({ "label": label }));
 }
@@ -1032,6 +1155,78 @@ pub fn dismiss_login_overlay(app: &AppHandle, label: &str) {
 #[tauri::command]
 pub fn close_login_overlay(app: AppHandle, label: String) {
     dismiss_login_overlay(&app, &label);
+}
+
+/// The half of window ownership that `WM_TRANSIENT_FOR` does not cover on
+/// Linux. An owned overlay on Windows hides when the main window hides (close
+/// to tray) and is destroyed with it; a transient X window is only iconified
+/// with its owner, so a hidden main would leave the overlay floating over the
+/// desktop. These keep the overlays with the main window instead.
+#[cfg(target_os = "linux")]
+pub mod linux_overlays {
+    use crate::rt::AppHandle;
+    use std::sync::Mutex;
+    use tauri::Manager;
+
+    /// Labels `mount_twitch_overlay` has opened; a closed one is skipped.
+    static MOUNTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    /// The overlays `hide_with_main` hid, to show again with the main window.
+    static HIDDEN_WITH_MAIN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub fn mounted(label: &str) {
+        if let Ok(mut mounted) = MOUNTED.lock() {
+            if !mounted.iter().any(|l| l == label) {
+                mounted.push(label.to_string());
+            }
+        }
+    }
+
+    fn open_overlays(app: &AppHandle) -> Vec<(String, crate::rt::WebviewWindow)> {
+        let Ok(mut mounted) = MOUNTED.lock() else {
+            return Vec::new();
+        };
+        mounted.retain(|label| app.get_webview_window(label).is_some());
+        mounted
+            .iter()
+            .filter_map(|label| app.get_webview_window(label).map(|w| (label.clone(), w)))
+            .collect()
+    }
+
+    /// The main window is hiding: hide every overlay that is showing.
+    pub fn hide_with_main(app: &AppHandle) {
+        let mut hidden = Vec::new();
+        for (label, window) in open_overlays(app) {
+            if window.is_visible().unwrap_or(false) && window.hide().is_ok() {
+                hidden.push(label);
+            }
+        }
+        if !hidden.is_empty() {
+            log::debug!("[overlay] hidden with the main window: {hidden:?}");
+        }
+        if let Ok(mut h) = HIDDEN_WITH_MAIN.lock() {
+            h.extend(hidden);
+        }
+    }
+
+    /// The main window is back: show what `hide_with_main` hid.
+    pub fn show_with_main(app: &AppHandle) {
+        let labels = HIDDEN_WITH_MAIN.lock().map(|mut h| std::mem::take(&mut *h)).unwrap_or_default();
+        for label in labels {
+            if let Some(window) = app.get_webview_window(&label) {
+                let _ = window.show();
+            }
+        }
+    }
+
+    /// The main window is gone: its overlays go with it.
+    pub fn close_with_main(app: &AppHandle) {
+        if let Ok(mut h) = HIDDEN_WITH_MAIN.lock() {
+            h.clear();
+        }
+        for (label, _) in open_overlays(app) {
+            super::dismiss_login_overlay(app, &label);
+        }
+    }
 }
 
 /// Tell the React overlay to take over the app body (or, for subscribe, a centered
@@ -1119,10 +1314,39 @@ pub fn open_subscribe_window(
         channel_login,
         chrono::Utc::now().timestamp_millis()
     );
-    // Each platform has its own subscribe page, and its own signed-in web
-    // profile to open it in — subscribing has to happen as the account the user
-    // is actually signed in as on that platform.
-    let (url, profile) = match provider.as_deref() {
+    let (url, profile) = subscribe_target(provider.as_deref(), &channel_login)?;
+    emit_overlay_open_with(&app, &label, &url, "panel", profile)?;
+    Ok(label)
+}
+
+/// The phone's Subscribe: the platform's own checkout in the login overlay.
+/// The overlay shares the app's one cookie jar, which already holds the Twitch
+/// session from the activation page and the Kick session from Kick sign-in, so
+/// the checkout opens as the signed-in account. Async so the plugin call stays
+/// off the main thread. Returns a label for parity with desktop; the phone
+/// closes the overlay with `close_mobile_login`.
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn open_subscribe_window(
+    app: AppHandle,
+    channel_login: String,
+    title: Option<String>,
+    provider: Option<String>,
+) -> Result<String, String> {
+    let (url, _) = subscribe_target(provider.as_deref(), &channel_login)?;
+    let title = title.unwrap_or_else(|| format!("Subscribe to {}", channel_login));
+    crate::twitch_login_plugin::open_overlay(&app, &url, &title)?;
+    Ok(format!("subscribe-{}", channel_login))
+}
+
+/// Each platform's subscribe page, and the signed-in web profile the desktop
+/// opens it in: subscribing has to happen as the account the user is actually
+/// signed in as on that platform.
+fn subscribe_target(
+    provider: Option<&str>,
+    channel_login: &str,
+) -> Result<(String, Option<&'static str>), String> {
+    Ok(match provider {
         Some("kick") => (
             format!("https://kick.com/{}/subscribe", channel_login),
             Some("kick-account"),
@@ -1131,18 +1355,13 @@ pub fn open_subscribe_window(
         // matches what Subscribe means on Twitch and Kick (its own free "subscribe"
         // button costs nothing and is not what this control is for).
         Some("youtube") => (
-            youtube_join_url(&channel_login).ok_or_else(|| {
+            youtube_join_url(channel_login).ok_or_else(|| {
                 "Couldn't work out which YouTube channel to open memberships for".to_string()
             })?,
             Some("youtube-account"),
         ),
-        _ => (
-            format!("https://www.twitch.tv/subs/{}", channel_login),
-            None,
-        ),
-    };
-    emit_overlay_open_with(&app, &label, &url, "panel", profile)?;
-    Ok(label)
+        _ => (format!("https://www.twitch.tv/subs/{}", channel_login), None),
+    })
 }
 
 /// Open YouTube's own channel switcher as an in-app panel, in the app's YouTube
@@ -1911,6 +2130,8 @@ fn build_vod_comment_line(node: &VcNode, channel_lc: &str) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            // Replayed rows draw their badges in the same order as live chat.
+            let badges_tag = crate::models::chat_layout::order_twitch_badge_tag(&badges_tag);
             (content, emote_groups.join("/"), badges_tag, m.user_color.clone())
         }
         None => (String::new(), String::new(), String::new(), None),
@@ -2402,6 +2623,45 @@ mod overlay_script_tests {
                 "{} must keep native popups",
                 label,
             );
+        }
+    }
+
+    /// TikTok's Apple and Google popups must keep their opener, so its overlay
+    /// opens real windows; YouTube's contains its popup instead. An overlay in
+    /// both lists would do neither properly.
+    #[test]
+    fn opener_popups_are_scoped_to_the_tiktok_login() {
+        assert!(OPENER_POPUPS_IN_OVERLAY.contains(&"tiktok-login"));
+        for label in OPENER_POPUPS_IN_OVERLAY {
+            assert!(!CONTAIN_POPUPS_IN_OVERLAY.contains(label), "{} is in both lists", label);
+        }
+        for label in ["twitch-login", "kick-login", "drops-login", "subscribe-abc-123"] {
+            assert!(!OPENER_POPUPS_IN_OVERLAY.contains(&label), "{} must keep native popups", label);
+        }
+    }
+
+    /// A sign-in popup shows a provider's page (Apple, Google). No capability
+    /// may name its window, or that page would get a bridge into the app.
+    #[test]
+    fn a_sign_in_popup_is_granted_nothing() {
+        let popup = sign_in_popup_label("tiktok-login", 7);
+        assert_eq!(popup, "tiktok-login-popup-7");
+        assert!(popup.starts_with(&sign_in_popup_prefix("tiktok-login")));
+        for file in [
+            include_str!("../../capabilities/desktop.json"),
+            include_str!("../../capabilities/remote-bridge.json"),
+            include_str!("../../capabilities/mobile.json"),
+        ] {
+            let cap: serde_json::Value = serde_json::from_str(file).expect("capability json");
+            for key in ["windows", "webviews"] {
+                for pattern in cap[key].as_array().into_iter().flatten().filter_map(|p| p.as_str()) {
+                    let matches = match pattern.strip_suffix('*') {
+                        Some(prefix) => popup.starts_with(prefix),
+                        None => popup == pattern,
+                    };
+                    assert!(!matches, "capability pattern '{}' would grant the popup '{}'", pattern, popup);
+                }
+            }
         }
     }
 

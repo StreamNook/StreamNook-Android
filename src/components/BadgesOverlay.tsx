@@ -1,11 +1,12 @@
-import { useEffect, useState, useMemo, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useState, useMemo, useSyncExternalStore } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { createPortal } from 'react-dom';
 import { X, ArrowUpDown, RefreshCw, Check, Search, ExternalLink, Lock } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../stores/AppStore';
-import { getAllUserBadgesWithEarned } from '../services/badgeService';
+import { getBadgeStanding, refetchDelay, windowStatusAt, type BadgeStanding } from '../services/badgeStanding';
+import { MissingNowStrip } from './badge/MissingNowStrip';
 import { getProfileFromMemoryCache, getFullProfileWithFallback } from '../services/cosmeticsCache';
 import { getUlidTimestamp, getFormattedCreationDate } from '../utils/ulid';
 import { Tooltip } from './ui/Tooltip';
@@ -35,7 +36,6 @@ import { ChatClientsGallery } from './ChatClientsGallery';
 import type { ChatClientBadge } from './ChatClientsGallery';
 
 import { Logger } from '../utils/logger';
-import { deriveBadgeStatus } from '../utils/badgeWindow';
 // Tab navigation types
 type AttainableTab = 'twitch-badges' | '7tv-badges' | '7tv-paints' | 'streamnook' | 'bttv' | 'chat-clients';
 // Sub-tabs within the StreamNook section (its own badges vs its atmospheres).
@@ -154,6 +154,10 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
   // Twitch badges state
   const [badgesWithMetadata, setBadgesWithMetadata] = useState<BadgeWithMetadata[]>([]);
   const [loading, setLoading] = useState(true);
+  // Set once the grid has badges to show. A reload after that (the collection
+  // refresh that runs on every open ends in `badge-standing-changed`) swaps the
+  // data in place instead of blanking the grid back to the spinner.
+  const badgesShownRef = useRef(false);
   const [loadingMetadata, setLoadingMetadata] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -186,26 +190,18 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
   const [selectedSeventvBadge, setSelectedSeventvBadge] = useState<SevenTVGlobalBadge | null>(null);
   const [selectedSeventvPaint, setSelectedSeventvPaint] = useState<SevenTVGlobalPaint | null>(null);
   
-  // User's collected global badges (Set of "setId_version" keys)
-  const [collectedBadgeKeys, setCollectedBadgeKeys] = useState<Set<string>>(() => {
-    try {
-      const user = useAppStore.getState().currentUser;
-      if (user?.user_id) {
-        const cached = localStorage.getItem(`streamnook_collected_badges_${user.user_id}`);
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed)) {
-            Logger.debug(`[BadgesOverlay] Optimistically loaded ${parsed.length} collected badges from local storage`);
-            return new Set(parsed);
-          }
-        }
-      }
-    } catch (e) {
-      Logger.error('[BadgesOverlay] Failed to parse cached collected badges:', e);
-    }
-    return new Set();
-  });
-  const [loadingUserBadges, setLoadingUserBadges] = useState(false);
+  // The signed-in account's badge standing, built in Rust: what it owns, every
+  // badge's earn window, and what it is missing that is earnable now. Rust
+  // answers from its cache (persisted across launches) and announces a
+  // background refresh with `badge-standing-changed`.
+  const [standing, setStanding] = useState<BadgeStanding | null>(null);
+  const loadStanding = (force = false) => {
+    getBadgeStanding(force)
+      .then(setStanding)
+      .catch((err) => Logger.warn('[BadgesOverlay] Badge standing unavailable:', err));
+  };
+  const ownedKeys = useMemo(() => new Set(standing?.owned ?? []), [standing]);
+  const loadingUserBadges = standing === null;
   
   // Search state
   const [searchQuery, setSearchQuery] = useState('');
@@ -237,18 +233,40 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
     loadChatClientBadges();
   }, []);
 
-  // Live-refresh the Twitch tab when the relay pushes a drop: the Rust side has
-  // already merged the badge into the global cache and stored its enrichment, so
-  // re-reading the cache surfaces the new tile (and its rich More Info) with no
-  // manual refresh.
+  // Live-refresh the Twitch tab when the relay pushes drops or the collection
+  // refresh lands: Rust has already merged the badges into the global cache and
+  // stored their enrichment, so re-reading surfaces the new tiles (and their
+  // rich More Info) with no manual refresh. One event per batch, not per drop.
   useEffect(() => {
-    const unlisten = listen('badge-metadata-amended', () => {
+    // Forced: opening Badges is the moment someone checks what they have, so
+    // the collection is re-read in the background every time (the cached one
+    // paints at once). Without it a badge earned minutes ago stays listed.
+    loadStanding(true);
+    // A collected-badges cache the page used to keep; Rust persists it now.
+    try {
+      const uid = useAppStore.getState().currentUser?.user_id;
+      if (uid) localStorage.removeItem(`streamnook_collected_badges_${uid}`);
+    } catch {
+      // Storage unavailable; nothing to clean up.
+    }
+    const unlisten = listen('badge-standing-changed', () => {
       loadBadges();
+      loadStanding();
     });
     return () => {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  // Ask again when the next earn window opens or closes, so the missing strip
+  // moves on its own. Clamped: see refetchDelay.
+  const nextChangeMs = standing?.next_change_ms;
+  useEffect(() => {
+    const delay = refetchDelay(nextChangeMs);
+    if (delay == null) return;
+    const timer = setTimeout(() => loadStanding(), delay);
+    return () => clearTimeout(timer);
+  }, [nextChangeMs]);
 
   // Deep-link to the StreamNook tab. Fires synchronously since the tab
   // content doesn't depend on async-loaded data.
@@ -346,73 +364,13 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
     return () => { cancelled = true; };
   }, [activeTab]);
 
-  // Load user's collected badges when authenticated
+  // Load the signed-in user's 7TV cosmetics for the collection counters. The
+  // Twitch collection comes with the badge standing above.
   useEffect(() => {
     if (isAuthenticated && currentUser) {
-      loadUserBadges();
       loadUser7TVCosmetics();
     }
   }, [isAuthenticated, currentUser]);
-
-  // Load user's badges using unified badge service
-  const loadUserBadges = async () => {
-    if (!currentUser) return;
-    
-    setLoadingUserBadges(true);
-    try {
-      const channelId = currentStream?.user_id || currentUser.user_id;
-      const channelName = currentStream?.user_login || currentUser.login || currentUser.username;
-      
-      // Use unified badge service with full earned badge collection
-      const badgeData = await getAllUserBadgesWithEarned(
-        currentUser.user_id,
-        currentUser.login || currentUser.username,
-        channelId,
-        channelName
-      );
-      
-      // Create a Set of badge keys the user owns (display badges + earned badges)
-      const keys = new Set<string>();
-      
-      // Add display badges
-      badgeData.displayBadges?.forEach((badge: any) => {
-        if (badge && badge.setID && badge.version) {
-          keys.add(`${badge.setID}_${badge.version}`);
-        }
-      });
-      
-      // Add earned badges
-      badgeData.earnedBadges?.forEach((badge: any) => {
-        if (badge && badge.setID && badge.version) {
-          keys.add(`${badge.setID}_${badge.version}`);
-        }
-      });
-      
-      // An empty result is far more likely a failed lookup (Twitch GQL drift,
-      // no Drops token yet, offline) than a user with zero badges, and the
-      // Rust side reports those failures as an empty list. Keep the last good
-      // set on screen and in localStorage rather than wiping it.
-      if (keys.size === 0) {
-        Logger.warn('[BadgesOverlay] Badge lookup returned no badges; keeping the cached collection');
-        return;
-      }
-
-      setCollectedBadgeKeys(keys);
-      try {
-        localStorage.setItem(
-          `streamnook_collected_badges_${currentUser.user_id}`,
-          JSON.stringify(Array.from(keys))
-        );
-      } catch (e) {
-        Logger.error('[BadgesOverlay] Failed to cache collected badges:', e);
-      }
-      Logger.debug(`[BadgesOverlay] User has ${keys.size} collected badges`);
-    } catch (err) {
-      Logger.error('[BadgesOverlay] Failed to load user badges:', err);
-    } finally {
-      setLoadingUserBadges(false);
-    }
-  };
 
   // Load user's 7TV cosmetics for collection counters
   const loadUser7TVCosmetics = async () => {
@@ -680,7 +638,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
 
   // Check if user has collected a specific badge
   const isCollected = (badge: BadgeWithMetadata): boolean => {
-    return collectedBadgeKeys.has(`${badge.set_id}_${badge.id}`);
+    return ownedKeys.has(`${badge.set_id}/${badge.id}`);
   };
 
   // Sort 7TV badges based on current sort option
@@ -826,9 +784,9 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
 
   // Count collected global badges
   const collectedCount = useMemo(() => {
-    if (collectedBadgeKeys.size === 0) return 0;
+    if (ownedKeys.size === 0) return 0;
     return globalCollectibleBadges.filter(badge => isCollected(badge)).length;
-  }, [globalCollectibleBadges, collectedBadgeKeys]);
+  }, [globalCollectibleBadges, ownedKeys]);
 
   // Total global collectible badges
   const totalGlobalBadges = globalCollectibleBadges.length;
@@ -836,7 +794,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
 
   const loadBadges = async () => {
     try {
-      setLoading(true);
+      if (!badgesShownRef.current) setLoading(true);
       setError(null);
 
       // Try to load from cache first
@@ -884,6 +842,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
         }
 
         setBadgesWithMetadata(badgesWithPreloadedMetadata);
+        badgesShownRef.current = true;
         setLoading(false);
 
         // Fetch any missing metadata in the background
@@ -908,12 +867,14 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
       );
 
       setBadgesWithMetadata(flattened);
+      badgesShownRef.current = true;
 
       // Fetch metadata for all badges in the background
       fetchAllBadgeMetadata(flattened);
     } catch (err) {
       Logger.error('Failed to load badges:', err);
-      setError('Failed to load badges. Please try again.');
+      // A failed background reload keeps the badges already on screen.
+      if (!badgesShownRef.current) setError('Failed to load badges. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -954,6 +915,8 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
         if (badgesWithMetadata.length > 0) {
           fetchAllBadgeMetadata(badgesWithMetadata);
         }
+        // The backfill can carry earn windows the standing has not seen yet.
+        loadStanding();
       }
     } catch (err) {
       Logger.error('[BadgesOverlay] Error checking for missing metadata:', err);
@@ -962,6 +925,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
 
   // Force refresh badges from Twitch API (bypasses cache)
   const forceRefreshBadges = async () => {
+    loadStanding(true);
     try {
       setRefreshing(true);
       Logger.debug('[BadgesOverlay] Force refreshing badges from Twitch API...');
@@ -1193,13 +1157,10 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
     }
   };
 
-  // Derived from the window rather than read off a stored field, so a badge
-  // whose earn period opens while the gallery is open reclassifies itself.
+  // Read against the clock at render time from the window Rust resolved, so a
+  // badge whose earn period opens while the gallery is open reclassifies itself.
   const getBadgeStatus = (badge: BadgeWithMetadata) =>
-    deriveBadgeStatus(
-      badge.badgebase_info?.more_info,
-      badge.badgebase_info?.enrichment as Record<string, unknown> | undefined
-    );
+    windowStatusAt(standing?.windows[`${badge.set_id}/${badge.id}`]);
 
   const isBadgeAvailable = (badge: BadgeWithMetadata): boolean => {
     return getBadgeStatus(badge) === 'available';
@@ -1225,20 +1186,18 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
 
     if (canUsePositions) {
       Logger.debug(`[BadgesOverlay] Using pre-computed positions for sorting (${badgesWithPositions}/${badgesWithMetadata.length} badges have positions)`);
+      // Date always leads and the rank only breaks same-day ties (it orders
+      // those by usage). Using the rank for some pairs and the date for others
+      // is not a consistent order, and the sort scrambled under it.
+      const rankOf = (x: BadgeWithMetadata) => {
+        const pos = (x.badgebase_info as any)?.position;
+        return typeof pos === 'number' ? pos : Number.MAX_SAFE_INTEGER;
+      };
       return [...badgesWithMetadata].sort((a, b) => {
-        const aPos = (a.badgebase_info as any)?.position;
-        const bPos = (b.badgebase_info as any)?.position;
-
-        // If both have positions, use them
-        if (typeof aPos === 'number' && typeof bPos === 'number') {
-          return aPos - bPos;
-        }
-
-        // If only one has a position, sort by date for fair comparison
         const dateCompare = parseDate(b.badgebase_info?.date_added) - parseDate(a.badgebase_info?.date_added);
         if (dateCompare !== 0) return dateCompare;
-
-        // Fallback to stable sort
+        const rankCompare = rankOf(a) - rankOf(b);
+        if (rankCompare !== 0) return rankCompare;
         return `${a.set_id}-${a.id}`.localeCompare(`${b.set_id}-${b.id}`);
       });
     }
@@ -1312,7 +1271,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
           return `${a.set_id}-${a.id}`.localeCompare(`${b.set_id}-${b.id}`);
       }
     });
-  }, [badgesWithMetadata, sortBy]);
+  }, [badgesWithMetadata, sortBy, standing]);
 
   // Search filter for the Twitch tab (the search box previously did nothing
   // here). Also lets a profile badge click deep-link to a specific Twitch badge
@@ -1331,7 +1290,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
       list = list.filter(b => (b.title || '').toLowerCase().includes(q));
     }
     return list;
-  }, [sortedBadges, sortBy, searchQuery]);
+  }, [sortedBadges, sortBy, searchQuery, standing]);
 
   // Message for the Twitch tab when the active view has no badges. The
   // status filters can legitimately match nothing (e.g. no badge is currently
@@ -1573,6 +1532,16 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
 
           {!loading && !error && (
             <>
+              {isAuthenticated && !searchQuery && (
+                <MissingNowStrip
+                  standing={standing}
+                  onOpenBadge={(key) => {
+                    const badge = badgesWithMetadata.find((b) => `${b.set_id}/${b.id}` === key);
+                    if (badge) onBadgeClick(badge, badge.set_id);
+                  }}
+                />
+              )}
+
               {/* Sort Controls */}
               <div className="flex items-center gap-3 mb-6">
                 <div className="flex items-center gap-2 text-textSecondary">

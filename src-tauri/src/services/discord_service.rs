@@ -434,7 +434,7 @@ impl DiscordService {
         }
 
         // Add Twitch logo as small image
-        assets = assets.small_image("https://raw.githubusercontent.com/winters27/StreamNook/refs/heads/main/src-tauri/images/logo_1704751143960.JPG");
+        assets = assets.small_image("https://raw.githubusercontent.com/StreamNook/StreamNook/refs/heads/main/src-tauri/images/logo_1704751143960.JPG");
         assets = assets.small_text("Twitch");
 
         let mut activity = Activity::new()
@@ -564,13 +564,11 @@ impl DiscordService {
             }
         }
 
-        let client = reqwest::Client::builder()
-            .user_agent("StreamNook/1.0")
-            .timeout(Duration::from_secs(6))
-            .build()?;
-
-        let response = client
+        // Shared client; the user agent and the 6 s deadline ride on the request.
+        let response = crate::services::http::client()
             .get("https://discord.com/api/v9/applications/detectable")
+            .header(reqwest::header::USER_AGENT, "StreamNook/1.0")
+            .timeout(Duration::from_secs(6))
             .send()
             .await?;
 

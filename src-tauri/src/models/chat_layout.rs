@@ -17,6 +17,71 @@ pub struct Badge {
     pub description: Option<String>,
 }
 
+/// Where a Twitch badge sits in a chat row, lowest first, in the order Twitch
+/// draws them: the chatter's role in the channel (broadcaster, staff, moderator,
+/// VIP, artist), then their subscription, then what they earned in the channel
+/// (bits, gifting, predictions), then global badges (Prime, Turbo, events).
+/// Twitch's Chat Bot badge is one of the global ones: it says what the account
+/// is, not its role here, so a bot that mods reads moderator, sub, then bot.
+/// The IRC `badges` tag carries no order of its own; USERSTATE in particular
+/// puts `subscriber` ahead of `moderator`. Kick rows keep Kick's own
+/// `sort_order` and do not use this.
+pub fn twitch_badge_rank(name: &str) -> u8 {
+    match name {
+        "broadcaster" => 0,
+        "staff" | "admin" | "global_mod" => 1,
+        "lead_moderator" | "moderator" => 2,
+        "vip" => 3,
+        "artist-badge" => 4,
+        "founder" | "subscriber" => 5,
+        "bits" | "bits-leader" | "bits-charity" | "sub-gifter" | "sub-gift-leader" | "predictions"
+        | "hype-train" | "moments" | "clip-champ" => 6,
+        _ => 7,
+    }
+}
+
+/// Put Twitch badges in chat order. Stable, so badges of one rank keep the
+/// order Twitch sent them in.
+pub fn order_twitch_badges(badges: &mut [Badge]) {
+    badges.sort_by_key(|b| twitch_badge_rank(&b.name));
+}
+
+/// The same order for a raw `name/version,...` tag (USERSTATE), so the string
+/// the page repaints own rows from is already ordered.
+pub fn order_twitch_badge_tag(tag: &str) -> String {
+    let mut parts: Vec<&str> = tag.split(',').filter(|s| !s.is_empty()).collect();
+    parts.sort_by_key(|p| twitch_badge_rank(p.split('/').next().unwrap_or("")));
+    parts.join(",")
+}
+
+#[cfg(test)]
+mod badge_order_tests {
+    use super::*;
+
+    #[test]
+    fn roles_then_subscription_then_earned_then_global() {
+        assert_eq!(
+            order_twitch_badge_tag("subscriber/3012,premium/1,moderator/1,bits/1000,vip/1"),
+            "moderator/1,vip/1,subscriber/3012,bits/1000,premium/1"
+        );
+        assert_eq!(order_twitch_badge_tag("glhf-pledge/1,broadcaster/1,founder/0"), "broadcaster/1,founder/0,glhf-pledge/1");
+        assert_eq!(order_twitch_badge_tag(""), "");
+    }
+
+    #[test]
+    fn a_bot_badge_follows_the_role_and_the_subscription() {
+        assert_eq!(
+            order_twitch_badge_tag("bot-badge/1,subscriber/12,moderator/1"),
+            "moderator/1,subscriber/12,bot-badge/1"
+        );
+    }
+
+    #[test]
+    fn badges_of_one_rank_keep_twitchs_order() {
+        assert_eq!(order_twitch_badge_tag("turbo/1,premium/1,glhf-pledge/1"), "turbo/1,premium/1,glhf-pledge/1");
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EmotePos {
     pub id: String,

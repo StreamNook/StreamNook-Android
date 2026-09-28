@@ -15,7 +15,7 @@ import {
   Keyboard,
   HardDrive,
   HelpCircle,
-  Sparkles,
+  ScrollText,
   Shield,
   MonitorPlay,
   User,
@@ -40,14 +40,15 @@ const IntegrationsSettings = lazy(() => import('./settings/IntegrationsSettings'
 const CacheSettings = lazy(() => import('./settings/CacheSettings'));
 const NotificationsSettings = lazy(() => import('./settings/NotificationsSettings'));
 const SupportSettings = lazy(() => import('./settings/SupportSettings'));
-const WhatsNewSettings = lazy(() => import('./settings/WhatsNewSettings'));
 const CommandPaletteSettings = lazy(() => import('./settings/CommandPaletteSettings'));
 const KeybindingsSettings = lazy(() => import('./settings/KeybindingsSettings'));
 const BackupSettings = lazy(() => import('./settings/BackupSettings'));
 const ProfileSettings = lazy(() => import('./settings/ProfileSettings'));
 const SettingsSearchResults = lazy(() => import('./settings/SettingsSearchResults'));
 import type { SettingsIndexEntry } from './settings/searchIndex';
+import { findSettingTarget, flashSettingRow } from './settings/settingsNavigation';
 import { Tooltip } from './ui/Tooltip';
+import { requestChangelog } from '../utils/changelogEvents';
 
 type TabMeta = {
   id: SettingsTab;
@@ -71,7 +72,6 @@ const TABS: TabMeta[] = [
   { id: 'Keybindings',     label: 'Keybindings',     icon: Keyboard,      tint: 'rgba(190, 160, 205, 0.22)', description: 'Customizable keyboard shortcuts' },
   { id: 'Backup',          label: 'Backup',          icon: HardDrive,     tint: 'rgba(150, 175, 185, 0.22)', description: 'Back up, restore, and open your settings file' },
   { id: 'Support',         label: 'Support',         icon: HelpCircle,    tint: 'rgba(215, 165, 140, 0.22)', description: 'Logs, diagnostics, and feedback' },
-  { id: "What's New",      label: "What's New",      icon: Sparkles,      tint: 'rgba(225, 195, 130, 0.20)', description: 'Recent releases and changelog' },
 ];
 
 // Profile is special — surfaced as the avatar pill at the top of the sidebar,
@@ -145,11 +145,14 @@ const SettingsDialog = () => {
   // yet on the first frames; poll by rAF (2s cap) until it does, then apply the
   // same pinned-header (data-settings-sticky) compensation as before. Sync
   // mounts resolve on the first attempt, matching the old double-rAF timing.
-  const scrollToSection = (sectionId: string) => {
+  const scrollToSection = (sectionId: string, entry?: SettingsIndexEntry) => {
     const start = performance.now();
     const attempt = () => {
-      const el = document.getElementById(sectionId);
+      // A search hit names a row: land on the row itself and flash it, since a
+      // section can run to dozens of rows. A plain deep link names a section.
+      const el = entry ? findSettingTarget(contentRef.current, entry) : document.getElementById(sectionId);
       if (el && contentRef.current) {
+        if (entry) flashSettingRow(el);
         const containerTop = contentRef.current.getBoundingClientRect().top;
         const elTop = el.getBoundingClientRect().top;
         const sticky = contentRef.current.querySelector('[data-settings-sticky]');
@@ -195,8 +198,7 @@ const SettingsDialog = () => {
   const handleResultSelect = (entry: SettingsIndexEntry) => {
     setSearchQuery('');
     setActiveTab(entry.tab as SettingsTab);
-    if (!entry.sectionId) return;
-    scrollToSection(entry.sectionId);
+    scrollToSection(entry.sectionId ?? '', entry);
   };
 
   return (
@@ -447,6 +449,25 @@ const SettingsDialog = () => {
                     </button>
                   );
                 })}
+                {/* Not a tab: the changelog is one popup, the same one that opens
+                    after an update, so it opens over Settings rather than
+                    being a second copy of it in here. */}
+                <button
+                  onClick={() => requestChangelog()}
+                  className="flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-left text-textSecondary transition-colors hover:bg-white/[0.03] hover:text-textPrimary"
+                >
+                  <span
+                    className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md"
+                    style={{
+                      background: 'rgba(225, 195, 130, 0.20)',
+                      boxShadow: TILE_BEVEL,
+                      border: '1px solid transparent',
+                    }}
+                  >
+                    <ScrollText size={14} strokeWidth={2.25} className="text-textPrimary" />
+                  </span>
+                  <span className="text-[13px] font-medium">Changelog</span>
+                </button>
               </nav>
             </aside>
 
@@ -552,7 +573,6 @@ const SettingsDialog = () => {
                     {activeTab === 'Keybindings' && <KeybindingsSettings />}
                     {activeTab === 'Backup' && <BackupSettings />}
                     {activeTab === 'Support' && <SupportSettings />}
-                    {activeTab === "What's New" && <WhatsNewSettings />}
                   </>
                 )}
                 </Suspense>

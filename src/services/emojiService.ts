@@ -95,7 +95,12 @@ export function getCachedEmojiUrl(emoji: string, cdnUrl: string): string {
 // - ZWJ sequences (family, profession emojis)
 // - Regional indicators (flags)
 // - Keycap emojis
-const EMOJI_REGEX = /(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F)(?:\p{Emoji_Modifier})?(?:\u200D(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F)(?:\p{Emoji_Modifier})?)*|\p{Regional_Indicator}{2}/gu;
+//
+// A flag is two regional-indicator letters, and each letter on its own has
+// Emoji_Presentation, so the pair has to be tried first and a lone letter kept
+// out of the general alternative. Otherwise a flag splits into its two
+// letters (1f1e7 and 1f1f7 for Brazil), neither of which has an image.
+const EMOJI_REGEX = /\p{Regional_Indicator}{2}|(?:(?!\p{Regional_Indicator})\p{Emoji_Presentation}|\p{Emoji}\uFE0F)(?:\p{Emoji_Modifier})?(?:\u200D(?:\p{Emoji_Presentation}|\p{Emoji}\uFE0F)(?:\p{Emoji_Modifier})?)*/gu;
 
 // CDN URL for Apple emoji images
 // Using jsDelivr CDN with emoji-datasource-apple package
@@ -203,20 +208,40 @@ export function parseEmojisSync(text: string): EmojiSegment[] {
     return segments.length > 0 ? segments : [{ type: 'text', content: text }];
 }
 
-/**
- * Replaces emoji shortcodes in text with their unicode equivalents
- * Only matches shortcodes wrapped in colons like :smiley: or :heart:
- * Now offloaded to Rust backend for zero JS heap allocation
- */
-async function replaceShortcodes(text: string): Promise<string> {
-    if (!text) return text;
+/** Texts waiting for the next shortcode batch, with the promises they answer. */
+let shortcodeQueue: Array<{ text: string; resolve: (converted: string) => void }> = [];
 
+/**
+ * Replaces emoji shortcodes in text with their unicode equivalents.
+ * Only matches shortcodes wrapped in colons like :smiley: or :heart:; the
+ * shortcode table lives in Rust (services/emoji_service.rs).
+ *
+ * Two things keep this off the wire: a text with fewer than two colons cannot
+ * hold a `:name:` and goes back untouched, and every text asked for in the
+ * same tick rides one round trip. A page of stream cards mounts its titles in
+ * one commit, so it used to be one call per title (28 in one boot trace),
+ * each waiting its turn behind the page's own boot work.
+ */
+function replaceShortcodes(text: string): Promise<string> {
+    if (!text || text.indexOf(':') === text.lastIndexOf(':')) return Promise.resolve(text);
+
+    return new Promise((resolve) => {
+        if (shortcodeQueue.length === 0) queueMicrotask(flushShortcodes);
+        shortcodeQueue.push({ text, resolve });
+    });
+}
+
+async function flushShortcodes(): Promise<void> {
+    const batch = shortcodeQueue;
+    shortcodeQueue = [];
     try {
-        // Call Rust backend for emoji shortcode conversion
-        return await invoke<string>('convert_emoji_shortcodes', { text });
+        const converted = await invoke<string[]>('convert_emoji_shortcodes_batch', {
+            texts: batch.map((entry) => entry.text),
+        });
+        batch.forEach((entry, i) => entry.resolve(converted[i] ?? entry.text));
     } catch (error) {
         Logger.warn('Failed to convert emoji shortcodes via Rust, returning original text:', error);
-        return text;
+        batch.forEach((entry) => entry.resolve(entry.text));
     }
 }
 

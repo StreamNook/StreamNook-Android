@@ -43,25 +43,20 @@ pub fn get_local_component_versions() -> Result<ComponentManifest, String> {
 /// Fetch remote component versions from GitHub
 #[tauri::command]
 pub async fn get_remote_component_versions() -> Result<ComponentManifest, String> {
-    let mut builder = reqwest::Client::builder().user_agent("StreamNook");
+    // Shared client (no deadline, as before); the user agent and the optional
+    // GitHub token ride on the request.
+    let mut req = crate::services::http::client_unbounded()
+        .get("https://github.com/StreamNook/StreamNook/releases/latest/download/components.json")
+        .header(reqwest::header::USER_AGENT, "StreamNook");
 
     // Inject PAT to bypass 60-req/hour limit during intense development
     if let Ok(token) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")) {
-        builder = builder.default_headers(
-            std::iter::once((
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
-            ))
-            .collect(),
-        );
+        req = req.bearer_auth(token);
     }
-
-    let client = builder.build().map_err(|e| e.to_string())?;
 
     // Directly download components.json from the latest release asset redirect
     // This entirely bypasses the api.github.com rate limit for unauthenticated users
-    let components_json: ComponentManifest = client
-        .get("https://github.com/winters27/StreamNook/releases/latest/download/components.json")
+    let components_json: ComponentManifest = req
         .send()
         .await
         .map_err(|e| format!("Failed to download components.json: {}", e))?
@@ -102,7 +97,7 @@ fn get_current_app_version() -> String {
 /// Parse a dotted version ("8.0.1") into comparable numeric components, dropping
 /// any leading `v` and any pre-release/build suffix. Returns None if it can't be
 /// read as numeric dotted parts.
-fn parse_version(v: &str) -> Option<Vec<u64>> {
+pub(crate) fn parse_version(v: &str) -> Option<Vec<u64>> {
     let core = v.trim().trim_start_matches('v');
     let core = core.split(['-', '+']).next().unwrap_or(core);
     let parts = core
@@ -143,6 +138,86 @@ fn remote_is_newer(remote: &str, current: &str) -> bool {
 /// asking our own domain instead of a GitHub release means the repo can move,
 /// be renamed, or be archived without breaking any installed client.
 const UPDATE_MANIFEST_URL: &str = "https://streamnook.app/api/v1/update";
+
+/// What the last update check did.
+///
+/// Exists because the answer to "why is this user three versions behind" was
+/// unknowable, locally and remotely. A successful check that found nothing wrote
+/// no log line at all, so "checked and up to date", "check hung forever with no
+/// timeout", "the 30-minute interval was reset before it fired" and "the
+/// component that owns the timer threw and the timer died" were all the same
+/// observable: silence.
+///
+/// Read by `services::version_report` and reported to the dashboard, so an
+/// old client can say which of those it is. Deliberately in-memory only: this
+/// describes the running session, and a stale value from a previous run would be
+/// worse than no value.
+pub(crate) mod update_check {
+    use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
+
+    #[derive(Debug, Clone)]
+    pub struct Outcome {
+        /// RFC3339, when the check finished.
+        pub checked_at: String,
+        pub ok: bool,
+        /// The manifest's version, when we got that far.
+        pub offered_version: Option<String>,
+        /// False when the manifest publishes no build for this `<os>-<arch>`.
+        /// A client can be permanently un-offered while checking perfectly.
+        pub artifact_for_platform: bool,
+        /// Whether an update was actually offered to the user.
+        pub update_available: bool,
+        /// Why the check failed, truncated. None on success.
+        pub error: Option<String>,
+    }
+
+    static LAST: Lazy<Mutex<Option<Outcome>>> = Lazy::new(|| Mutex::new(None));
+
+    /// Longest error text we keep. The column it lands in is for triage, not
+    /// forensics, and an unbounded string here would be a write amplifier.
+    const MAX_ERROR: usize = 200;
+
+    fn store(outcome: Outcome) {
+        // A poisoned lock must not take the updater down: this is reporting.
+        if let Ok(mut slot) = LAST.lock() {
+            *slot = Some(outcome);
+        }
+    }
+
+    pub fn record_success(offered_version: &str, artifact_for_platform: bool, available: bool) {
+        store(Outcome {
+            checked_at: crate::services::client_identity::now_rfc3339(),
+            ok: true,
+            offered_version: Some(offered_version.to_string()),
+            artifact_for_platform,
+            update_available: available,
+            error: None,
+        });
+    }
+
+    pub fn record_failure(error: &str) {
+        let mut detail = error.to_string();
+        if detail.len() > MAX_ERROR {
+            detail.truncate(MAX_ERROR);
+        }
+        store(Outcome {
+            checked_at: crate::services::client_identity::now_rfc3339(),
+            ok: false,
+            offered_version: None,
+            artifact_for_platform: false,
+            update_available: false,
+            error: Some(detail),
+        });
+    }
+
+    /// The last outcome, or None if no check has completed this session. None is
+    /// itself a finding: it means the timer never fired.
+    pub fn last() -> Option<Outcome> {
+        LAST.lock().ok().and_then(|slot| slot.clone())
+    }
+}
 
 /// One downloadable build. Everything here is per-platform; only `version` and
 /// `notes` are shared across them.
@@ -199,10 +274,12 @@ struct UpdateManifest {
 
 /// The `<os>-<arch>` key for the running platform.
 ///
-/// Same construction as `plugin_host::install::IndexEntry::artifact_for_platform`,
-/// deliberately: the update manifest and the plugin index share a key space.
+/// Delegates to `services::client_identity`, which owns this key space, so the
+/// artifact we LOOK UP and the platform we REPORT to the dashboard can never be
+/// two different answers. The update manifest, the plugin index and the report
+/// all key off this one string.
 fn current_update_target() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    crate::services::client_identity::current_update_target()
 }
 
 /// Default artifact filename when the manifest does not name one.
@@ -574,21 +651,38 @@ mod update_verification_tests {
 
 /// Check for updates via the self-hosted streamnook.app manifest (primary path).
 async fn check_for_bundle_update_streamnook() -> Result<BundleUpdateStatus, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("StreamNook")
-        .build()
-        .map_err(|e| e.to_string())?;
+    // The SHARED client, not a bare builder. A bare `reqwest::Client` has NO
+    // timeout, so a captive portal or a firewall that DROPs rather than REJECTs
+    // left this future pending forever: the check never completed, never
+    // errored, and never logged, which is indistinguishable from "checked and
+    // found nothing". `services::http` sets 30s for exactly this reason (its own
+    // comment says a network stall used to hang forever).
+    let client = crate::services::http::client();
 
-    let manifest: UpdateManifest = client
-        .get(UPDATE_MANIFEST_URL)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch update manifest: {}", e))?
-        .error_for_status()
-        .map_err(|e| format!("Update manifest returned an error: {}", e))?
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse update manifest: {}", e))?;
+    let manifest: UpdateManifest = match async {
+        client
+            .get(UPDATE_MANIFEST_URL)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch update manifest: {}", e))?
+            .error_for_status()
+            .map_err(|e| format!("Update manifest returned an error: {}", e))?
+            .json::<UpdateManifest>()
+            .await
+            .map_err(|e| format!("Failed to parse update manifest: {}", e))
+    }
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            // Record the failure before returning it. Without this the fleet
+            // data cannot tell a client that never checks from one that checks
+            // and is told nothing, which is the whole question behind "why are
+            // they not updating".
+            update_check::record_failure(&e);
+            return Err(e);
+        }
+    };
 
     let current_version = get_current_app_version();
 
@@ -598,18 +692,33 @@ async fn check_for_bundle_update_streamnook() -> Result<BundleUpdateStatus, Stri
     let update_available =
         artifact.is_some() && remote_is_newer(&manifest.version, &current_version);
     if artifact.is_none() {
-        log::info!(
+        // `warn`, not `info`: turning diagnostics off drops the file log to
+        // Warn, which used to silence precisely the line that explains why a
+        // whole platform is never offered an update. This is how a macOS user
+        // sits still through a release whose manifest has not been patched with
+        // the macOS keys yet.
+        log::warn!(
             "[Update] manifest {} publishes no build for {}-{}; not offering an update",
             manifest.version,
             std::env::consts::OS,
             std::env::consts::ARCH
         );
     }
+
+    // Always recorded, including the "already current" case, which previously
+    // wrote nothing at all anywhere.
+    update_check::record_success(&manifest.version, artifact.is_some(), update_available);
+
     let artifact = artifact.unwrap_or_default();
 
     let download_size = artifact
         .size
         .map(|s| format!("{:.1} MB", s as f64 / 1_048_576.0));
+    let releases_behind = if update_available {
+        crate::services::changelog::releases_behind(&current_version, &manifest.version)
+    } else {
+        None
+    };
 
     Ok(BundleUpdateStatus {
         update_available,
@@ -638,6 +747,7 @@ async fn check_for_bundle_update_streamnook() -> Result<BundleUpdateStatus, Stri
         release_notes: manifest.notes.clone(),
         sha256: artifact.sha256.clone(),
         signature: artifact.signature.clone(),
+        releases_behind,
     })
 }
 
@@ -668,27 +778,27 @@ pub async fn check_for_bundle_update() -> Result<BundleUpdateStatus, String> {
 /// from the install path again.
 #[allow(dead_code)]
 async fn check_for_bundle_update_github() -> Result<BundleUpdateStatus, String> {
-    // Fetch remote version info
-    let mut builder = reqwest::Client::builder().user_agent("StreamNook");
-
+    // Fetch remote version info through the shared client (no deadline, as
+    // before); the user agent and the optional GitHub token ride on each request.
+    let client = crate::services::http::client_unbounded();
     // Inject PAT to bypass 60-req/hour limit during intense development
-    if let Ok(token) = std::env::var("GH_TOKEN").or_else(|_| std::env::var("GITHUB_TOKEN")) {
-        builder = builder.default_headers(
-            std::iter::once((
-                reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
-            ))
-            .collect(),
-        );
-    }
-
-    let client = builder.build().map_err(|e| e.to_string())?;
+    let token = std::env::var("GH_TOKEN")
+        .or_else(|_| std::env::var("GITHUB_TOKEN"))
+        .ok();
+    let github = |req: reqwest::RequestBuilder| {
+        let req = req.header(reqwest::header::USER_AGENT, "StreamNook");
+        match &token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    };
 
     // Directly download components.json from the latest release asset redirect
     // This entirely bypasses the api.github.com rate limit for unauthenticated users
-    let remote: ComponentManifest = client
-        .get("https://github.com/winters27/StreamNook/releases/latest/download/components.json")
-        .send()
+    let remote: ComponentManifest = github(client.get(
+        "https://github.com/StreamNook/StreamNook/releases/latest/download/components.json",
+    ))
+    .send()
         .await
         .map_err(|e| format!("Failed to download remote components.json: {}", e))?
         .json()
@@ -728,11 +838,12 @@ async fn check_for_bundle_update_github() -> Result<BundleUpdateStatus, String> 
         // Until then it is reported, not silently trusted.
         sha256: None,
         signature: None,
+        releases_behind: None,
     };
 
     // Set deterministic download URLs since we bypassed the API
     let download_url = format!(
-        "https://github.com/winters27/StreamNook/releases/download/v{}/StreamNook.7z",
+        "https://github.com/StreamNook/StreamNook/releases/download/v{}/StreamNook.7z",
         remote.streamnook.version
     );
     status.bundle_name = Some("StreamNook.7z".to_string());
@@ -740,11 +851,11 @@ async fn check_for_bundle_update_github() -> Result<BundleUpdateStatus, String> 
 
     // Fetch release notes strictly from raw CHANGELOG.md to bypass the API restrictions entirely.
     let changelog_url = format!(
-        "https://raw.githubusercontent.com/winters27/StreamNook/v{}/CHANGELOG.md",
+        "https://raw.githubusercontent.com/StreamNook/StreamNook/v{}/CHANGELOG.md",
         remote.streamnook.version
     );
 
-    if let Ok(changelog_res) = client.get(&changelog_url).send().await {
+    if let Ok(changelog_res) = github(client.get(&changelog_url)).send().await {
         if let Ok(changelog_text) = changelog_res.text().await {
             // Find the start of the version section
             let pattern = format!(
@@ -766,7 +877,7 @@ async fn check_for_bundle_update_github() -> Result<BundleUpdateStatus, String> 
     }
 
     // Optionally grab the download size using an HTTP HEAD request via redirects, skipping API data
-    if let Ok(head_res) = client.head(&download_url).send().await {
+    if let Ok(head_res) = github(client.head(&download_url)).send().await {
         if let Some(content_length) = head_res.headers().get(reqwest::header::CONTENT_LENGTH) {
             if let Ok(len_str) = content_length.to_str() {
                 if let Ok(size) = len_str.parse::<u64>() {
@@ -789,7 +900,7 @@ pub async fn extract_bundled_components() -> Result<(), String> {
 
 /// Download and install bundle update
 #[tauri::command]
-pub async fn download_and_install_bundle(app_handle: tauri::AppHandle) -> Result<(), String> {
+pub async fn download_and_install_bundle(app_handle: crate::rt::AppHandle) -> Result<(), String> {
     let status = check_for_bundle_update().await?;
     if !status.update_available {
         return Err("No update available".to_string());
@@ -803,7 +914,7 @@ pub async fn download_and_install_bundle(app_handle: tauri::AppHandle) -> Result
 /// on macOS the `.app` tarball is unpacked and left in temp for a whole-bundle
 /// swap.
 async fn install_bundle_from_status(
-    app_handle: tauri::AppHandle,
+    app_handle: crate::rt::AppHandle,
     status: BundleUpdateStatus,
 ) -> Result<(), String> {
     use tauri::Emitter;
@@ -821,14 +932,12 @@ async fn install_bundle_from_status(
 
     let bundle_path = temp_dir.join(&bundle_name);
 
-    // Download the bundle
-    let client = reqwest::Client::builder()
-        .user_agent("StreamNook")
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let mut response = client
+    // Download the bundle through the shared client. Unbounded on purpose: a
+    // bundle is tens of megabytes and an overall deadline would cut a slow
+    // download short; the user agent rides on the request.
+    let mut response = crate::services::http::client_unbounded()
         .get(&download_url)
+        .header(reqwest::header::USER_AGENT, "StreamNook")
         .send()
         .await
         .map_err(|e| format!("Failed to download bundle: {}", e))?;
@@ -1074,7 +1183,7 @@ WshShell.Run """{batch}""", 0, False
 /// anything is staged: a stray archive would otherwise turn into an `rm -rf`
 /// of the installed app followed by a `mv` of nothing.
 async fn stage_macos_bundle(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::rt::AppHandle,
     temp_dir: &Path,
     bundle_path: &Path,
 ) -> Result<(), String> {
@@ -1124,7 +1233,7 @@ async fn stage_macos_bundle(
 /// and the executable bit, which is the one attribute an AppImage cannot launch
 /// without.
 async fn stage_linux_bundle(
-    app_handle: &tauri::AppHandle,
+    app_handle: &crate::rt::AppHandle,
     temp_dir: &Path,
     bundle_path: &Path,
 ) -> Result<(), String> {
@@ -1237,7 +1346,7 @@ fn running_app_bundle() -> Result<PathBuf, String> {
 /// before a hard exit, matching the flags the plugin is built with
 /// (position/size/maximized only). The window-state plugin is desktop-only,
 /// and no swap path runs on mobile (Android updates via the package installer).
-fn flush_stores_before_hard_exit(app_handle: &tauri::AppHandle) {
+fn flush_stores_before_hard_exit(app_handle: &crate::rt::AppHandle) {
     #[cfg(desktop)]
     {
         use tauri_plugin_window_state::{AppHandleExt, StateFlags};
@@ -1262,7 +1371,7 @@ fn flush_stores_before_hard_exit(app_handle: &tauri::AppHandle) {
 /// the "Restart StreamNook" button on the update-installed card, so the user
 /// controls when the swap happens instead of it firing mid-install.
 #[tauri::command]
-pub async fn restart_to_apply_update(app_handle: tauri::AppHandle) -> Result<(), String> {
+pub async fn restart_to_apply_update(app_handle: crate::rt::AppHandle) -> Result<(), String> {
     let temp_dir = std::env::temp_dir().join("StreamNook-update");
 
     // In a `tauri dev` build, current_exe() is the dev binary under target/debug.

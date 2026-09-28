@@ -31,17 +31,17 @@ use commands::moderation_tools::{
     resolve_automod_message, set_user_note, update_channel_info, upload_image,
 };
 use commands::{
-    accounts::*, announcements::*, app::*, automation::*, badge_metadata::*, badge_service::*,
-    badges::*, cache::*, channel_panels::*, channel_state::*, chat::*, chat_identity::*, components::*,
+    accounts::*, activity_history::*, announcements::*, app::*, automation::*, badge_metadata::*, badge_service::*,
+    badges::*, cache::*, channel_links::*, channel_panels::*, channel_state::*, chat::*, chat_identity::*, components::*,
     cosmetics_cache::*, diagnostic_logging::*, drops::*, emoji::*, emote_prefetch::*,
     emotes::*, eventsub::*, ffz::*, gifs::*, helix::*, home_snapshot::*, hype_train::*, identity::*, justlog::*, layout::*,
     link_preview::*, logs::*, media_glow::*, mod_log_storage::*, modroom::*, plugins::*,
     profile_cache::*, provider_browse::*,
     resub::*, session::*, settings::*, seventv::*, seventv_cosmetics::*,
-    seventv_cosmetics_fetch::*, song_id::*, streamnook_api::*, streaming::*, subscriptions::*,
+    seventv_cosmetics_fetch::*, song_id::*, spellcheck::*, streamnook_api::*, streaming::*, subscriptions::*,
     twitch::*,
     universal_cache::*,
-    user_profile::*, vod_progress::*, watch_streak::*, whisper_storage::*,
+    user_profile::*, vod_progress::*, watch_session::*, watch_streak::*, whisper_storage::*, window_state::*,
 };
 // Desktop-only feature modules, excluded from the phone app (watch/earn/chat
 // only): MultiNook tiling, Discord RPC, and profile-card screen capture.
@@ -55,7 +55,8 @@ use services::drops_service::DropsService;
 use services::live_notification_service::LiveNotificationService;
 use services::whisper_service::WhisperService;
 use std::sync::{Arc, Mutex};
-use tauri::{Builder, Emitter, Manager, WindowEvent};
+use crate::rt::Builder;
+use tauri::{Emitter, Manager, WindowEvent};
 // Tray + menu are desktop-only (no tray paradigm on Android).
 #[cfg(desktop)]
 use tauri::{
@@ -125,7 +126,7 @@ fn take_pending_watch_link(state: tauri::State<'_, PendingWatchLink>) -> Option<
 /// maximized session comes back maximized in a single ShowWindow.
 #[cfg(desktop)]
 #[tauri::command]
-fn reveal_main_window(app: tauri::AppHandle) {
+fn reveal_main_window(app: crate::rt::AppHandle) {
     use tauri_plugin_window_state::{StateFlags, WindowExt};
     if let Some(window) = app.get_webview_window("main") {
         if !window.is_visible().unwrap_or(false) {
@@ -149,14 +150,14 @@ fn reveal_main_window(app: tauri::AppHandle) {
 /// command must exist and be allowed or the invoke is denied at the ACL.
 #[cfg(mobile)]
 #[tauri::command]
-fn reveal_main_window(_app: tauri::AppHandle) {}
+fn reveal_main_window(_app: crate::rt::AppHandle) {}
 
 /// Dead-window net for the hidden-until-ready gate: if the frontend never
 /// reaches its reveal invoke (boot crash, failed chunk load, wedged webview),
 /// show the window anyway so the app can never run headless. The window paints
 /// its configured background color, so a forced early show is dark, not white.
 #[cfg(desktop)]
-fn arm_reveal_failsafe(handle: tauri::AppHandle) {
+fn arm_reveal_failsafe(handle: crate::rt::AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(5));
         if let Some(window) = handle.get_webview_window("main") {
@@ -181,8 +182,8 @@ fn arm_reveal_failsafe(handle: tauri::AppHandle) {
 /// JS twin.
 #[cfg(desktop)]
 fn main_window_chrome(
-    builder: tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle>,
-) -> tauri::WebviewWindowBuilder<'_, tauri::Wry, tauri::AppHandle> {
+    builder: crate::rt::WebviewWindowBuilder<'_, crate::rt::AppHandle>,
+) -> crate::rt::WebviewWindowBuilder<'_, crate::rt::AppHandle> {
     // cfg on `let` rebindings, the same idiom the tray builder uses below
     // (`icon_as_template`): three of the four macOS calls only exist on
     // macOS, so a plain chain would not compile on Windows.
@@ -194,6 +195,9 @@ fn main_window_chrome(
         .traffic_light_position(tauri::LogicalPosition::new(20.0, 22.0));
     #[cfg(not(target_os = "macos"))]
     let builder = builder.decorations(false);
+    // Linux: always opaque. The CEF runtime's windowed browser cannot paint a
+    // transparent window (see linux_window_frame), so there is no rounded
+    // frame to build; the config's background colour stands.
     builder
 }
 
@@ -201,11 +205,13 @@ fn main_window_chrome(
 /// and the "Show StreamNook" menu item. Restores from minimized if needed and
 /// re-shows if the window was hidden to the tray on close.
 #[cfg(desktop)]
-fn show_main_window(app: &tauri::AppHandle) {
+fn show_main_window(app: &crate::rt::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        #[cfg(target_os = "linux")]
+        commands::twitch::linux_overlays::show_with_main(app);
         return;
     }
     // Main was fully closed (the streamer went live, which destroys it to free its
@@ -228,7 +234,7 @@ fn show_main_window(app: &tauri::AppHandle) {
     } else {
         tauri::WebviewUrl::App("index.html".into())
     };
-    let builder = tauri::WebviewWindowBuilder::new(app, "main", app_url)
+    let builder = crate::rt::WebviewWindowBuilder::new(app, "main", app_url)
         .title("StreamNook")
         .inner_size(1600.0, 1000.0)
         .min_inner_size(800.0, 600.0)
@@ -240,6 +246,10 @@ fn show_main_window(app: &tauri::AppHandle) {
         // saved geometry is restored below since skip_initial_state("main")
         // covers every creation of this label, not just the first.
         .background_color(tauri::window::Color(0x0c, 0x0c, 0x0d, 0xff));
+    // Linux: downloads from the page land in the Downloads folder, as they do
+    // from the config-built window.
+    #[cfg(target_os = "linux")]
+    let builder = builder.on_download(linux_cef::on_download);
     match main_window_chrome(builder).build() {
         Ok(win) => {
             debug!("[Main] Recreated main window on demand");
@@ -256,8 +266,8 @@ fn show_main_window(app: &tauri::AppHandle) {
                 services::ui_hang_watchdog::start_for_hwnd(hwnd.0 as isize);
             }
             // Re-attach the aspect lock to the NEW window. Not `#[cfg(windows)]`
-            // any more: Linux hangs GDK geometry hints on the GtkWindow, and a
-            // recreated window is a new GtkWindow with no hints on it, so
+            // any more: Linux writes size hints on the X window, and a
+            // recreated window is a new X window with no hints on it, so
             // skipping this here would silently leave the lock off for the rest
             // of the session on that platform.
             services::window_aspect::install(&win);
@@ -273,7 +283,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 /// Keeping left/top also sidesteps the workspace-vs-screen coordinate ambiguity of
 /// `rcNormalPosition`.
 #[cfg(windows)]
-fn sanitize_restore_rect(window: &tauri::WebviewWindow) {
+fn sanitize_restore_rect(window: &crate::rt::WebviewWindow) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowPlacement, SetWindowPlacement, WINDOWPLACEMENT,
@@ -315,7 +325,7 @@ fn sanitize_restore_rect(window: &tauri::WebviewWindow) {
 /// destroyed it. Shows the existing window if it's only hidden.
 #[cfg(desktop)]
 #[tauri::command]
-fn ensure_main_window(app: tauri::AppHandle) {
+fn ensure_main_window(app: crate::rt::AppHandle) {
     show_main_window(&app);
 }
 
@@ -326,7 +336,7 @@ fn ensure_main_window(app: tauri::AppHandle) {
 /// window's IRC claims on the resulting Destroyed event.
 #[cfg(desktop)]
 #[tauri::command]
-fn close_main_window(app: tauri::AppHandle) {
+fn close_main_window(app: crate::rt::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.destroy();
     }
@@ -335,9 +345,19 @@ fn close_main_window(app: tauri::AppHandle) {
 #[cfg(target_os = "android")]
 mod android_notify;
 mod commands;
+/// Process entry for the CEF-based Linux build; `main.rs` calls `enter`
+/// before anything else.
+#[cfg(target_os = "linux")]
+pub mod linux_cef;
+mod linux_desktop_entry;
+mod linux_graphics;
+mod linux_window_frame;
+#[cfg(target_os = "linux")]
+mod linux_x11;
 mod models;
 mod platform;
 mod plugin_host;
+pub mod rt;
 mod services;
 #[cfg(target_os = "android")]
 mod twitch_login_plugin;
@@ -357,6 +377,7 @@ fn load_settings_from_file() -> Result<Settings, Box<dyn std::error::Error>> {
     repair_protocol_relative_avatars(&mut settings);
     settings.retire_legacy_live_edge_gap();
     settings.enable_low_latency_engine_once();
+    settings.scope_blend_header_marks_once();
     Ok(settings)
 }
 
@@ -455,8 +476,46 @@ fn cleanup_legacy_streamlink_bundle() {
 /// promised data. A hung source app then hung our window (macOS). The
 /// clipboard plugin's own `read_text` command is async for the same reason.
 #[tauri::command]
-async fn read_clipboard_text_native(app: tauri::AppHandle) -> Result<String, String> {
+async fn read_clipboard_text_native(app: crate::rt::AppHandle) -> Result<String, String> {
     app.clipboard().read_text().map_err(|e| e.to_string())
+}
+
+/// Development builds only: `StreamNook --print-credential <file name>` prints
+/// one stored credential (for example `.twitch_drops_token`) as JSON and exits.
+/// The hand-run probes in `scripts/` read the drops token this way, since the
+/// files are sealed by `services::token_vault`. Release builds do not contain it.
+#[cfg(all(debug_assertions, desktop))]
+pub fn print_credential_if_asked() {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--print-credential") {
+        return;
+    }
+    let code = match args.next() {
+        Some(name) if !name.is_empty() && !name.contains(['/', '\\']) => {
+            let loaded = services::twitch_service::get_app_data_dir().and_then(|dir| {
+                services::token_vault::load_json::<serde_json::Value>(&dir.join(&name))
+            });
+            match loaded {
+                Ok(Some(value)) => {
+                    println!("{value}");
+                    0
+                }
+                Ok(None) => {
+                    eprintln!("no stored credential named {name}");
+                    1
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: StreamNook --print-credential <file name, e.g. .twitch_drops_token>");
+            2
+        }
+    };
+    std::process::exit(code);
 }
 
 /// Shared app entry point. Desktop's `main.rs` calls this directly; on mobile
@@ -464,6 +523,11 @@ async fn read_clipboard_text_native(app: tauri::AppHandle) -> Result<String, Str
 /// via the `mobile_entry_point` macro.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Linux: Chromium's switches, the sandbox decision and the CEF helper
+    // hand-off all happened in `linux_cef::enter` before this function was
+    // called (CEF re-executes this binary for its helpers, which must never
+    // reach the code below). Only the log lines it produced are left to write.
+
     // Apply WebView2 browser arguments uniformly to every webview in the process.
     // Setting them via this env var (inherited by the msedgewebview2.exe child)
     // instead of on a single window in tauri.conf.json avoids HRESULT 0x8007139F
@@ -505,6 +569,11 @@ pub fn run() {
     // Initialize the logging system FIRST so all debug!/error! macros work
     services::diagnostic_logger::init_logging();
 
+    #[cfg(target_os = "linux")]
+    for line in linux_cef::take_reports() {
+        info!("{line}");
+    }
+
     // Every panic goes to streamnook.log. Without this, a panic on a
     // background thread prints to stderr, which nobody sees in a release
     // build, and the thread simply disappears: if it was the log writer or
@@ -531,7 +600,10 @@ pub fn run() {
         }));
     }
     if let Some(port) = cdp_port {
-        warn!("[Main] SN_CDP_PORT set: WebView2 remote debugging is listening on 127.0.0.1:{port} for this launch");
+        warn!(
+            "[Main] SN_CDP_PORT set: {} remote debugging is listening on 127.0.0.1:{port} for this launch",
+            if cfg!(target_os = "linux") { "Chromium" } else { "WebView2" }
+        );
     }
 
     // Clean up any leftover files from previous update attempts
@@ -567,6 +639,19 @@ pub fn run() {
         }
         Err(e) => {
             error!("[Main] Failed to purge FFZ emote cache: {}", e);
+        }
+    }
+
+    // One-time purge of cached 7TV paint images that hold a still frame, so
+    // animated paints re-download as animations.
+    match services::universal_cache_service::migrate_paint_animated_cache() {
+        Ok(purged) => {
+            if purged {
+                debug!("[Main] 7TV paint cache purged for animated re-fetch");
+            }
+        }
+        Err(e) => {
+            error!("[Main] Failed to purge 7TV paint cache: {}", e);
         }
     }
 
@@ -607,6 +692,12 @@ pub fn run() {
     ) {
         debug!("[Main] Forced one-time re-auth: all sessions cleared");
     }
+
+    // Migrate stored credentials and resolve the token vault key off the UI
+    // thread before anything reads one, so a credential-store prompt never lands
+    // on a command.
+    #[cfg(desktop)]
+    services::token_vault::warm_up();
 
     // Load settings from our custom location in the same directory as cache
     let settings = load_settings_from_file().unwrap_or_else(|_| Settings::default());
@@ -655,15 +746,26 @@ pub fn run() {
     ));
     let eventsub_service_state = commands::eventsub::EventSubServiceState(eventsub_service.clone());
 
-    let builder = Builder::default();
+    let builder = Builder::new();
     // Single-instance is desktop-only and must be registered first: it forwards a
     // streamnook:// deep link opened while the app is already running to the
     // existing instance (via the deep-link feature) instead of spawning a
     // duplicate window. No multi-process/duplicate-window concept on mobile.
-    #[cfg(desktop)]
+    #[cfg(all(desktop, not(target_os = "linux")))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
         show_main_window(app);
     }));
+    // Linux: the plugin speaks D-Bus and panics at setup when the session bus
+    // cannot be reached; without one there is nothing to forward a second
+    // launch over anyway (linux_cef logged why).
+    #[cfg(target_os = "linux")]
+    let builder = if linux_cef::session_bus_available() {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
+    } else {
+        builder
+    };
     let builder = builder
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init());
@@ -705,6 +807,10 @@ pub fn run() {
     // Android in-app Twitch login WebView overlay (native Kotlin plugin).
     #[cfg(target_os = "android")]
     let builder = builder.plugin(twitch_login_plugin::init());
+    // Linux: tells every page, before its first paint, who draws the window
+    // frame (linux_window_frame).
+    #[cfg(target_os = "linux")]
+    let builder = builder.plugin(linux_window_frame::plugin());
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -725,6 +831,36 @@ pub fn run() {
             // exits inside the single-instance plugin), so this is the proof
             // that unlocks the file log and its "==== started ====" banner.
             services::file_log::arm();
+            // Linux builds the main window here instead of from the config
+            // (tauri.linux.conf.json sets `create: false`), after every plugin
+            // has registered its init script, and always opaque: the CEF
+            // runtime cannot paint a transparent window (linux_window_frame).
+            // Every property comes from the same config entry, and it happens
+            // before anything below looks the window up.
+            #[cfg(target_os = "linux")]
+            {
+                let frame = linux_window_frame::frame();
+                info!("[LinuxFrame] frame={} transparent=false", frame.as_str());
+                let config = app
+                    .config()
+                    .app
+                    .windows
+                    .iter()
+                    .find(|w| w.label == "main")
+                    .cloned();
+                match config {
+                    Some(mut config) => {
+                        config.transparent = false;
+                        if let Err(e) = crate::rt::WebviewWindowBuilder::from_config(app.handle(), &config)
+                            .map(|builder| builder.on_download(linux_cef::on_download))
+                            .and_then(|builder| builder.build())
+                        {
+                            error!("[Main] Failed to create the main window: {e}");
+                        }
+                    }
+                    None => error!("[Main] No `main` window in the config"),
+                }
+            }
             let app_handle = app.handle().clone();
             // Mobile: resolve the app-private data dir once, up front, so every
             // file-based token/cookie/cache/settings store writes to a writable
@@ -734,6 +870,8 @@ pub fn run() {
             if let Ok(dir) = app.path().app_data_dir() {
                 services::app_paths::set_base(dir);
             }
+            #[cfg(mobile)]
+            services::token_vault::warm_up();
             // Mobile: the settings load at the top of run() executed BEFORE the
             // base above was resolvable, so it always fell back to
             // Settings::default() (setup_complete=false among everything else),
@@ -763,7 +901,7 @@ pub fn run() {
             // whole-process) and records them to the capture file. Started here,
             // inside the tokio runtime Tauri set up.
             services::runtime_watchdog::start();
-            // Process-tree memory telemetry: one [Resource] line a minute in the
+            // Process-tree memory logging: one [Resource] line a minute in the
             // file log (rust, WebView2 browser/GPU/renderers/utilities, plugin
             // children), so a "StreamNook is at 800 MB" report can be read off
             // the log without attaching anything to the user's machine.
@@ -784,7 +922,7 @@ pub fn run() {
             // frontend pushes a constraint, and the reason a locked resize
             // tracks the pointer instead of being corrected (and undone) after
             // the drag commits. Windows subclasses WM_SIZING; Linux declares
-            // GDK aspect hints and lets the window manager rubber-band. macOS
+            // X11 size hints and lets the window manager rubber-band. macOS
             // has neither yet and keeps the frontend's debounced correction,
             // which `constrains_live()` reports so only one path ever runs.
             #[cfg(desktop)]
@@ -836,16 +974,34 @@ pub fn run() {
             // Streamer mode detector (sleeps unless the setting is "auto").
             services::streamer_mode::StreamerMode::init(app_handle.clone());
 
+            // Gift subs you receive. Polls Twitch's own notification feed for
+            // the one category the app has no other source for. Settings are
+            // re-read here rather than reusing the pre-setup load because
+            // mobile only resolves app-data paths inside setup.
+            services::onsite_notifications::init(app_handle.clone());
+            // Channel-points earns, announced once per burst.
+            services::channel_points_summary::init(&app_handle);
+            // The periodic update check (the phone has its own update path).
+            #[cfg(desktop)]
+            services::update_watch::start(app_handle.clone());
+            if let Ok(startup_settings) = load_settings_from_file() {
+                services::onsite_notifications::refresh(&startup_settings);
+                // When reminders fire (timed triggers and chat keywords).
+                services::reminder_service::init(app_handle.clone(), &startup_settings);
+            }
+
             // Register deep link scheme on Windows
             #[cfg(windows)]
             {
-                // Windows-only ON PURPOSE, not an unfinished port. Windows
-                // registers a URL scheme at RUNTIME by writing registry keys,
-                // which is what register_all() does. macOS and Linux register
+                // Windows registers a URL scheme at RUNTIME by writing registry
+                // keys, which is what register_all() does. macOS registers
                 // DECLARATIVELY - the bundler copies
                 // `plugins.deep-link.desktop.schemes` into the .app's
-                // Info.plist (CFBundleURLSchemes) and the .desktop file. Calling
-                // this there would be a no-op at best.
+                // Info.plist (CFBundleURLSchemes). Linux ships as an AppImage,
+                // whose bundled .desktop file nothing installs, so
+                // linux_desktop_entry installs it (scheme handler included)
+                // below; the plugin's own Linux register() would write a
+                // separate `-handler` entry that carries no icon.
                 //
                 // Verified on the built bundle: Info.plist carries
                 // CFBundleURLSchemes = [streamnook]. Because that path depends
@@ -854,6 +1010,13 @@ pub fn run() {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let _ = app.deep_link().register_all();
             }
+
+            // Install the AppImage's desktop entry and icons, which gives the
+            // window its icon on Wayland, a launcher entry, and the
+            // streamnook:// handler. Off the setup thread: it reads files and
+            // runs xdg-mime.
+            #[cfg(target_os = "linux")]
+            std::thread::spawn(|| info!("{}", linux_desktop_entry::install()));
 
             // Resolve streamnook:// share links to a channel and hand it to the UI.
             //
@@ -965,6 +1128,14 @@ pub fn run() {
                 app_handle.clone(),
                 app_state_for_favorite_live,
             );
+
+            // "This client is alive, and this is what it is": version, OS, arch,
+            // and what the last update check did. Rust-owned because the page's
+            // one login-time write meant a client left running reported its last
+            // cold boot forever, and because this must survive the main window
+            // being destroyed on close-to-tray. Both shells run it: the phone has
+            // the same staleness problem and no devtools to notice it with.
+            services::version_report::start(app_handle.clone());
 
             // Keep the Kick OAuth pair perpetually fresh (single-flight refresh
             // on a clock), and the YouTube cookie harvest young. Both are what
@@ -1193,6 +1364,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // App commands
             get_app_version,
+            get_client_identity,
             get_app_name,
             get_app_description,
             get_app_authors,
@@ -1210,6 +1382,8 @@ pub fn run() {
             #[cfg(target_os = "android")]
             twitch_login_plugin::clear_mobile_login_cookies,
             #[cfg(target_os = "android")]
+            export_logs,
+            #[cfg(target_os = "android")]
             android_notify::push_register,
             #[cfg(target_os = "android")]
             android_notify::push_unregister,
@@ -1224,6 +1398,10 @@ pub fn run() {
             calculate_aspect_ratio_size_preserve_video,
             set_window_aspect_constraint,
             start_titlebar_drag,
+            // The chat overlay's glass slider on Linux, where the window is
+            // opaque and fades as a whole.
+            #[cfg(target_os = "linux")]
+            linux_x11::set_window_opacity,
             get_system_info,
             get_emoji_image,
             read_clipboard_text_native,
@@ -1246,7 +1424,8 @@ pub fn run() {
             open_twitch_login_window,
             #[cfg(desktop)]
             open_drops_login_window,
-            #[cfg(desktop)]
+            // Two bodies: a desktop panel, and the Android login overlay.
+            #[cfg(any(desktop, target_os = "android"))]
             open_subscribe_window,
             #[cfg(desktop)]
             open_youtube_channel_switcher,
@@ -1263,6 +1442,7 @@ pub fn run() {
             has_stored_credentials,
             list_twitch_accounts,
             get_twitch_account_count,
+            get_credential_storage,
             add_twitch_account,
             remove_twitch_account,
             set_active_twitch_account,
@@ -1326,6 +1506,7 @@ pub fn run() {
             stop_stream,
             get_ad_detection,
             get_stream_low_latency,
+            get_stream_prefetch_present,
             set_experimental_low_latency,
             set_codec_preference,
             // Allowed only by mobile-commands.toml (a phone caps its rendition
@@ -1355,6 +1536,8 @@ pub fn run() {
             stop_all_multi_nooks,
             #[cfg(desktop)]
             get_active_multi_nooks,
+            #[cfg(desktop)]
+            promote_multi_nook_tile,
             register_active_channel,
             unregister_active_channel,
             // Chat commands
@@ -1363,6 +1546,8 @@ pub fn run() {
             restart_chat_bridge,
             validate_platform_sessions,
             platform_account_info,
+            resolve_member_ids,
+            invalidate_member_aliases,
             get_youtube_channel_emojis,
             commands::streaming::youtube_sabr_probe,
             get_chat_lifecycle_log,
@@ -1387,12 +1572,14 @@ pub fn run() {
             upload_image,
             start_multi_chat,
             provider_chat_connect,
+            chat_bridge_port,
             provider_chat_disconnect,
             provider_send_message,
             provider_send_capability,
             provider_source_caps,
             provider_directory,
             provider_search,
+            search_platforms,
             provider_categories,
             provider_channel_meta,
             provider_live_check,
@@ -1401,7 +1588,7 @@ pub fn run() {
             refresh_favorites,
             kick_account_sync,
             youtube_account_sync,
-            provider_channel_avatars,
+            request_channel_avatars,
             kick_user_profile,
             youtube_user_profile,
             provider_membership,
@@ -1416,7 +1603,12 @@ pub fn run() {
             report_kick_emotes,
             get_kick_channel_meta,
             get_youtube_channel_meta,
+            resolve_youtube_legacy_channel,
+            resolve_kick_slug,
             get_tiktok_channel_meta,
+            tiktok_connect,
+            tiktok_disconnect,
+            tiktok_is_connected,
             youtube_connect,
             youtube_disconnect,
             youtube_is_connected,
@@ -1439,7 +1631,7 @@ pub fn run() {
             get_kick_channel_emotes,
             get_youtube_channel_emotes,
             load_mod_logs,
-            append_mod_log,
+            record_mod_log,
             clear_mod_logs,
             parse_historical_messages,
             load_channel_history,
@@ -1492,7 +1684,8 @@ pub fn run() {
             clear_discord_presence,
             // Settings commands
             load_settings,
-            save_settings,
+            patch_settings,
+            set_chat_user_hidden,
             get_settings_dir,
             open_settings_folder,
             export_settings,
@@ -1500,7 +1693,8 @@ pub fn run() {
             get_current_app_version,
             get_latest_app_version,
             download_and_install_app_update,
-            get_release_notes,
+            get_changelog,
+            get_android_changelog,
             send_test_notification,
             // Badge commands
             fetch_global_badges,
@@ -1532,6 +1726,8 @@ pub fn run() {
             get_bttv_pro_badge,
             get_discovered_bttv_pro_badges,
             ingest_badge_drops,
+            get_badge_standing,
+            get_badge_window,
             // Badge Metadata commands
             fetch_badge_metadata,
             // Link preview commands
@@ -1559,7 +1755,8 @@ pub fn run() {
             open_universal_cache_folder,
             assign_badge_positions,
             export_manifest,
-            download_and_cache_file,
+            asset_cache_enqueue,
+            asset_cache_set_burst,
             get_cached_file,
             get_cached_files,
             get_all_universal_cached_items,
@@ -1584,11 +1781,13 @@ pub fn run() {
             // Drops commands
             get_drops_settings,
             update_drops_settings,
+            patch_drops_settings,
             get_active_drop_campaigns,
             refresh_drops_connection_status,
             get_drops_inventory,
             get_drop_progress,
             get_campaign_eligible_channels,
+            get_streams_in_categories,
             claim_drop,
             check_channel_points,
             claim_channel_points,
@@ -1649,9 +1848,48 @@ pub fn run() {
             get_user_history_count,
             // Emoji commands
             convert_emoji_shortcodes,
+            convert_emoji_shortcodes_batch,
+            // Spellcheck commands
+            spell_warm,
+            spell_check,
+            spell_suggest,
+            // MultiChat Activity feed history
+            activity_load,
+            activity_append,
+            activity_import,
+            activity_purge,
+            activity_clear,
+            // Whisper inbox
+            whisper_set_active,
+            whisper_mark_read,
+            whisper_send,
+            whisper_import,
+            whisper_refresh,
+            // IVR account facts
+            get_ivr_user_summary,
+            get_ivr_subage_summary,
+            // Server-controlled client switches
+            get_client_config,
+            // Drops page model
+            get_drops_overview,
+            // 7TV cosmetics, resolved once for every window
+            seventv_user_cosmetics,
+            seventv_user_inventory,
+            seventv_invalidate_cosmetics,
+            seventv_clear_cosmetics,
+            // Main-window watch session
+            watch_session_start,
+            watch_session_stop,
+            watch_session_resolve_offline,
+            watch_session_refresh_presence,
+            hype_train_watch,
+            hype_train_unwatch,
+            build_own_chat_message,
+            apply_personal_emotes,
             // Emote commands
             fetch_channel_emotes,
             get_emote_by_name,
+            match_emote_tokens,
             clear_emote_cache,
             get_gif_picker_status,
             search_gifs,
@@ -1699,9 +1937,6 @@ pub fn run() {
             emit_whisper_progress,
             // Whisper Storage commands
             load_whisper_storage,
-            save_whisper_storage,
-            save_whisper_conversation,
-            append_whisper_message,
             delete_whisper_conversation,
             get_whisper_storage_path,
             migrate_whispers_from_localstorage,
@@ -1747,22 +1982,29 @@ pub fn run() {
             // Authenticated writes to StreamNook's own API. One command, path-allowlisted.
             streamnook_api_post,
             // Hype Train commands
-            get_hype_train_status,
             get_bulk_hype_train_status,
             // Home snapshot (Rust-owned Home/Sidebar data)
             get_home_snapshot,
             set_home_mounted,
             refresh_home_section,
             set_home_extra_channels,
+            set_home_sidebar,
             load_more_home_recommended,
             // Per-channel chat state + user history watches (Rust-owned polls)
             watch_channel_state,
             unwatch_channel_state,
             get_channel_state,
             submit_media_frame,
+            sample_media_glow,
+            get_window_flags,
             refresh_channel_state,
             watch_user_history,
             unwatch_user_history,
+
+            // Cross-platform channel links (one streamer, several platforms)
+            get_channel_links,
+            update_channel_link,
+            probe_channel_links,
 
             // Resub notification commands
             get_resub_notification,
@@ -1848,16 +2090,31 @@ pub fn run() {
                     // its BRIDGE_USERS count incremented for the whole session.
                     services::providers::release_window_claims(&gone).await;
                 });
+                // Its Home and Sidebar claims too. Left in place, they kept the
+                // recommended poll and the Discover lists running after Go Live,
+                // or a close to the tray, destroyed the main window.
+                services::home_snapshot::release_window(&label);
                 // Tell popouts the main window is gone so their Go Live control
                 // flips to "Live Chat" (standalone). Mirrors `main-ready`, which
                 // the main window emits when it boots.
                 if label == "main" {
                     use tauri::Emitter;
                     let _ = app_handle.emit("main-closed", ());
+                    #[cfg(target_os = "linux")]
+                    commands::twitch::linux_overlays::close_with_main(&app_handle);
                 }
             }
 
             if label == "main" {
+                // Back from the tray or a minimize, where nothing was fetched:
+                // the Discover lists refetch what went stale.
+                if let WindowEvent::Focused(true) = event {
+                    services::home_snapshot::note_main_window_focused();
+                    // Whatever brought it back (tray, a popout, the page), the
+                    // overlays hidden with it come back too.
+                    #[cfg(target_os = "linux")]
+                    commands::twitch::linux_overlays::show_with_main(&app_handle);
+                }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     let popouts_open = app_handle
                         .webview_windows()
@@ -1888,6 +2145,8 @@ pub fn run() {
                             // handler is intentionally NOT a full stopStream
                             // (which would tear down the IRC connection too).
                             let _ = main_win.emit("main-hiding-to-tray", ());
+                            #[cfg(target_os = "linux")]
+                            commands::twitch::linux_overlays::hide_with_main(&app_handle);
                             let _ = main_win.hide();
                         }
                     }
@@ -1974,6 +2233,7 @@ pub fn run() {
                 let _ = services::mod_log_storage_service::ModLogStorageService::flush_now();
                 let _ = services::whisper_storage_service::WhisperStorageService::flush_now();
                 let _ = services::vod_progress_service::flush_now();
+                let _ = services::activity_history_service::flush_now();
             let _ = services::chat_logger_service::ChatLoggerService::flush_all();
                 // Ask running plugin processes to shut down before the app
                 // process dies, waiting briefly so well-behaved plugins exit

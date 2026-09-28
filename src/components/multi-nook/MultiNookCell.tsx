@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { MultiNookSlot } from '../../types';
 import { useMultiNookPlayer } from './useMultiNookPlayer';
 import { usemultiNookStore } from '../../stores/multiNookStore';
+import { useContextMenuStore } from '../../stores/contextMenuStore';
 import { useAppStore } from '../../stores/AppStore';
 import { buildProviderUrl } from '../../utils/streamProvider';
 import { useMediaGlow } from '../../utils/mediaGlow';
@@ -27,7 +28,7 @@ import { ProviderLogo } from '../ProviderLogo';
 import { GripHorizontal, Undo2, Loader2, RefreshCcw, EyeOff, WifiOff, Maximize2, Minimize2 } from 'lucide-react';
 import { Heart, HeartBreak, X as XIcon } from 'phosphor-react';
 import { Logger } from '../../utils/logger';
-import { canGridProvider } from '../../types/providers';
+import { canGridProvider, PROVIDER_WATCH, type ProviderId } from '../../types/providers';
 
 interface MultiNookCellProps {
   slot: MultiNookSlot;
@@ -62,6 +63,15 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
   // Offline tiles show the offline overlay instead of an endless loading spinner.
   const isLoading = !streamUrl && !loadError;
 
+  // Whether the decoded picture is taller than it is wide, which decides how the
+  // tile fits it. Seeded from the platform's usual shape so a portrait source
+  // starts correct and never visibly snaps once metadata lands, then corrected
+  // from the real frame: a platform's usual shape is a default, not a promise,
+  // and a landscape broadcast on a portrait-first platform still fills the cell.
+  const [isPortrait, setIsPortrait] = useState(
+    () => PROVIDER_WATCH[provider as ProviderId]?.thumbAspect === 'portrait',
+  );
+
   // Toolbar mute-all overrides this tile's audio without touching slot.muted,
   // so unmuting restores the focus/mute mix that was playing before. Selector
   // subscription: the tile only re-renders when the flag itself flips.
@@ -74,6 +84,26 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     muted: muted || isAllMuted,
     isMinimized,
   });
+
+  // Correct the seeded orientation from the real frame once one is decoded.
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    const measure = () => {
+      if (el.videoWidth > 0 && el.videoHeight > 0) {
+        setIsPortrait(el.videoHeight > el.videoWidth);
+      }
+    };
+    // `loadedmetadata` does not fire for a stream already decoding by the time
+    // this attaches, so take a reading up front as well.
+    measure();
+    el.addEventListener('loadedmetadata', measure);
+    el.addEventListener('resize', measure);
+    return () => {
+      el.removeEventListener('loadedmetadata', measure);
+      el.removeEventListener('resize', measure);
+    };
+  }, [videoRef, streamUrl]);
 
   // Volume readout for this tile's wheel/middle-click changes.
   const { osd, showOsd } = useVolumeOsd();
@@ -370,6 +400,35 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
 
   const combinedStyle = { ...style, ...customStyle };
 
+  // Right-click anywhere on the tile that is not a control. The menu takes a
+  // channel the way every other menu in the app does, so the slot's cached
+  // identity is shaped into one here; the tile actions address the SLOT and
+  // ride along as `slotId`, because two tiles can be the same channel on two
+  // platforms and only the slot id tells them apart.
+  const handleContextMenu = (e: React.MouseEvent) => {
+    const target = e.target as HTMLElement;
+    if (target.closest('button') || target.closest('.plyr__controls') || target.closest('.plyr__menu')) {
+      return;
+    }
+    useContextMenuStore.getState().openTileMenu(
+      e,
+      {
+        id: '',
+        user_id: channelId || '',
+        user_name: channelName || channelLogin,
+        user_login: channelLogin,
+        title: title || '',
+        viewer_count: 0,
+        game_name: slot.gameName || '',
+        thumbnail_url: '',
+        profile_image_url: profileImageUrl || '',
+        started_at: new Date().toISOString(),
+        ...((provider ?? 'twitch') === 'twitch' ? {} : { provider }),
+      },
+      id,
+    );
+  };
+
   const glassButton = 'flex items-center justify-center p-1.5 glass-button rounded-lg';
 
   return (
@@ -379,6 +438,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       transition={isDragging ? { duration: 0 } : { type: 'spring', stiffness: 350, damping: 30 }}
       ref={setRefs}
       style={combinedStyle}
+      onContextMenu={handleContextMenu}
       onClick={(e) => {
         // Ignore clicks on buttons, tools, or plyr control sliders.
         const target = e.target as HTMLElement;
@@ -413,7 +473,14 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       <video
         ref={videoRef}
         className="w-full h-full"
-        style={{ backgroundColor: '#000', objectFit: isMaximized ? 'contain' : 'cover' }}
+        // `cover` trims a little off a landscape broadcast so the tile has no
+        // dead bars, which is right for every 16:9 source. For a PORTRAIT one
+        // it is not a trim: the cell keeps a slice about a third of the picture
+        // wide and throws the rest away. Those sources get `contain` instead.
+        style={{
+          backgroundColor: '#000',
+          objectFit: isMaximized || isPortrait ? 'contain' : 'cover',
+        }}
         autoPlay
         playsInline
       />

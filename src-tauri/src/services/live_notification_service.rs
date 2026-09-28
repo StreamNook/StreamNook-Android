@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use crate::rt::AppHandle;
+use tauri::Emitter;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,8 +134,8 @@ impl LiveNotificationService {
             source: None,
         };
 
-        // Emit event to frontend (for in-app notifications)
-        app_handle.emit("streamer-went-live", &notification)?;
+        // Through the one gate (dedupe, cross-platform merge, the toggles).
+        crate::services::live_announce::announce(app_handle, notification.clone());
 
         debug!(
             "[In-App Notification] {} is now live!",

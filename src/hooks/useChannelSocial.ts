@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import type { IvrSubageSummary } from '../types';
 import { useAppStore } from '../stores/AppStore';
 import { Logger } from '../utils/logger';
 import { streamProvider, followIdentifier } from '../utils/streamProvider';
@@ -7,6 +8,7 @@ import { useFollowsStore } from '../stores/followsStore';
 import { useChatConnectionStore } from '../stores/chatConnectionStore';
 import { makeKey } from '../utils/providerKey';
 import type { ProviderId } from '../types/providers';
+import { IS_MOBILE } from '../utils/platform';
 
 interface ChannelSocialTarget {
   /** Which platform this channel is on. Pass it whenever the channel is NOT the
@@ -259,13 +261,14 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
 
     const checkSubscriptionStatus = async () => {
       try {
-        const { fetchIVRSubage } = await import('../services/ivrService');
-        const subageData = await fetchIVRSubage(loginOfUser, channelLogin);
+        const subage = await invoke<IvrSubageSummary | null>('get_ivr_subage_summary', {
+          login: loginOfUser,
+          channel: channelLogin,
+        }).catch(() => null);
 
-        // IVR API uses meta.type to indicate an active sub ("paid", "gift", "prime", etc.)
-        const metaData = (subageData as unknown as Record<string, unknown>)?.meta as Record<string, unknown> | undefined;
-        const isSub = metaData?.type != null;
-        const cumMonths = subageData?.cumulative?.months ?? 0;
+        // An active sub has a type ("paid", "gift", "prime", ...).
+        const isSub = subage?.active_sub_type != null;
+        const cumMonths = subage?.cumulative_months ?? 0;
 
         setIsSubscribed(isSub);
         setHasSubHistory(cumMonths > 0 && !isSub);
@@ -386,7 +389,9 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
         );
 
         try {
-          await invoke('close_login_overlay', { label: subscribeWindowLabelRef.current });
+          // The phone has one login overlay rather than labelled panels.
+          if (IS_MOBILE) await invoke('close_mobile_login');
+          else await invoke('close_login_overlay', { label: subscribeWindowLabelRef.current });
         } catch (e) {
           Logger.warn('[useChannelSocial] Failed to close subscribe overlay:', e);
         }
@@ -412,15 +417,16 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
         channelLogin: userLogin,
         title: `Subscribe to ${userName || userLogin}`,
         // Each platform has its own subscribe page; the backend picks the URL
-        // and the signed-in web profile to open it in.
-        provider: streamProvider(useAppStore.getState().currentStream),
+        // and the signed-in web profile to open it in. The caller's platform
+        // wins, so a hand-added chat on another platform subscribes there.
+        provider,
       });
       subscribeWindowLabelRef.current = label;
     } catch (e) {
       Logger.error('[useChannelSocial] Error opening subscribe window:', e);
       subscribeWindowLabelRef.current = null;
     }
-  }, [userLogin, userName]);
+  }, [userLogin, userName, provider]);
 
   return {
     // Follow

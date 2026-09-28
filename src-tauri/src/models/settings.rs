@@ -32,6 +32,13 @@ pub struct AudioBoostSettings {
     pub release: f32, // seconds to ease back off once under the threshold
 }
 
+/// Blur behind glass, on everywhere: every desktop now renders with a
+/// Chromium-family compositor (WebView2, CEF) or WebKit on macOS, where a
+/// backdrop blur is a one-off filter rather than a per-frame layer walk.
+fn default_glass_blur() -> bool {
+    true
+}
+
 fn default_audio_gain() -> f32 {
     1.5
 }
@@ -272,9 +279,9 @@ pub struct ChatDesignSettings {
     /// (msg-id gigantified-emote-message) at 4x below the message body.
     #[serde(default = "default_true")]
     pub giant_emotes: bool,
-    /// Which half of the user card opens first: their recent messages (default)
-    /// or the profile body.
-    #[serde(default = "default_true")]
+    /// Which half of the user card opens first: the profile body (default) or
+    /// their recent messages.
+    #[serde(default)]
     pub user_card_opens_messages: bool,
     #[serde(default = "default_true")]
     pub seventv_emote_notices: bool,
@@ -412,8 +419,11 @@ impl Default for ChatDesignSettings {
         Self {
             show_dividers: false,
             alternating_backgrounds: false,
-            message_spacing: 16,
-            font_size: 18,
+            // Twitch's own chat, measured: 14px text, 4px above and below each
+            // message (spacing 8 renders as 8 / 2 per side). Emotes are 2em, so
+            // 14px text also gives Twitch's 28px emotes.
+            message_spacing: 8,
+            font_size: 14,
             font_weight: 400,
             mention_color: "#ff4444".to_string(),
             reply_color: "#ff6b6b".to_string(),
@@ -434,7 +444,7 @@ impl Default for ChatDesignSettings {
             ffz_emote_effects: true,
             bttv_emote_modifiers: true,
             giant_emotes: true,
-            user_card_opens_messages: true,
+            user_card_opens_messages: false,
             seventv_emote_notices: true,
             link_previews: true,
             link_preview_keep_link: false,
@@ -496,6 +506,16 @@ pub struct LiveNotificationSettings {
     pub show_channel_points_notifications: bool,
     #[serde(default = "default_true")]
     pub show_badge_notifications: bool,
+    /// Gift subs you RECEIVE, polled off Twitch's own notification feed.
+    /// Nothing else can see these: EventSub's gift subscription authorizes as
+    /// the broadcaster, and Hermes' sub-gift topic is channel-scoped.
+    #[serde(default = "default_true")]
+    pub show_gift_sub_notifications: bool,
+    /// Rewards Twitch tells your account about by name, off the same feed: a
+    /// badge you earned, a drop reward waiting to be claimed. The only place
+    /// that names them, whoever did the watching or the claiming.
+    #[serde(default = "default_true")]
+    pub show_twitch_reward_notifications: bool,
     // Notification method toggles (Dynamic Island vs Toast)
     #[serde(default = "default_true")]
     pub use_dynamic_island: bool,
@@ -564,6 +584,8 @@ impl Default for LiveNotificationSettings {
             show_favorite_drops_notifications: true,
             show_channel_points_notifications: true,
             show_badge_notifications: true,
+            show_gift_sub_notifications: true,
+            show_twitch_reward_notifications: true,
             use_dynamic_island: true,
             use_toast: true,
             use_native_notifications: false,
@@ -716,6 +738,12 @@ pub struct Settings {
     /// None falls back to the default (100) on the frontend.
     #[serde(default)]
     pub glass_transparency: Option<u32>,
+    /// Backdrop blur behind glass surfaces. On by default everywhere; only the
+    /// Linux build offers the switch (Settings > Theme), for machines where
+    /// the frost costs frames. A settings file written before this field
+    /// existed gets the default.
+    #[serde(default = "default_glass_blur")]
+    pub glass_blur: bool,
     #[serde(default)]
     pub setup_complete: bool,
     #[serde(default)]
@@ -753,6 +781,23 @@ pub struct Settings {
     /// `extra` because the YouTube adapter reads it when it resolves a stream.
     #[serde(default)]
     pub youtube_chat_view: YouTubeChatView,
+    /// Streamers whose channels on different platforms are known to be the same
+    /// person. Modelled here rather than left to `extra` because the link
+    /// service WRITES it (a probe result), and an untyped field the backend
+    /// writes is dropped by the next frontend save. `save_settings` re-stamps it
+    /// from backend state for the same reason.
+    #[serde(default)]
+    pub channel_links: Vec<ChannelLinkGroup>,
+    /// Merged cross-platform chat. Modelled here rather than left to `extra`
+    /// because the link service reads `enabled` to decide whether to do any work
+    /// at all.
+    #[serde(default)]
+    pub chat_blend: ChatBlendSettings,
+    /// The command palette's snippets: the user's own entries, the ones they
+    /// starred and their typed shortcuts. Kept here so a backup carries them and
+    /// every window sees one copy.
+    #[serde(default)]
+    pub snippets: SnippetSettings,
     /// Catch-all for preference groups the frontend manages but this struct does
     /// not model field-by-field: highlight phrases, custom chat commands,
     /// moderation prefs, custom themes, the OLED accent, and any future ones.
@@ -796,6 +841,102 @@ pub struct ProviderFollow {
     /// here. A re-sync may remove these; hand-added follows are never touched.
     #[serde(default)]
     pub imported: bool,
+}
+
+/// One platform's half of a streamer who broadcasts in more than one place.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LinkMember {
+    /// "twitch" | "kick" | "youtube".
+    pub provider: String,
+    /// Login / slug / UC id — whatever that platform's own live check accepts,
+    /// never a YouTube video id, which names one broadcast and never returns.
+    /// Stored with its original case: YouTube ids are case-sensitive.
+    pub channel: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+/// The channels one streamer broadcasts on, so chat from all of them can be
+/// merged into whichever one the viewer is actually watching.
+///
+/// A group is addressed by ANY of its members, not by a designated primary, so
+/// the same link works whether the viewer arrives from Twitch or from Kick.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChannelLinkGroup {
+    pub id: String,
+    pub members: Vec<LinkMember>,
+    /// Platforms the user said are NOT this streamer, so a probe never suggests
+    /// them again. Stored as `provider:channel`.
+    #[serde(default)]
+    pub dismissed: Vec<String>,
+    /// Members kept linked but left out of this streamer's combined feed, from
+    /// the platform marks in the chat header. Stored as `provider:channel`.
+    /// Per streamer on purpose: the Settings platform switches are the global
+    /// default, and a header click must never change them.
+    #[serde(default)]
+    pub hidden: Vec<String>,
+}
+
+/// One snippet the user wrote. Ids start `custom.` so they never collide with
+/// the built-in library.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CustomSnippet {
+    pub id: String,
+    pub title: String,
+    pub category: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keywords: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct SnippetSettings {
+    pub custom: Vec<CustomSnippet>,
+    /// Starred snippet ids, built-in or custom.
+    pub favorites: Vec<String>,
+    /// Snippet id -> the lowercase shortcut that boosts it in the palette.
+    pub aliases: std::collections::BTreeMap<String, String>,
+}
+
+/// Merging other platforms' chat into the normal chat panel.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ChatBlendSettings {
+    /// Master switch. Off means nothing connects, nothing probes, and the
+    /// single-channel path is untouched.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Which platforms may join a merged feed, by provider id. A platform
+    /// absent from the map is allowed; only an explicit `false` excludes it.
+    #[serde(default)]
+    pub platforms: HashMap<String, bool>,
+    /// Offer a link when a channel looks like it exists on another platform:
+    /// Kick by an exact channel lookup, YouTube through one search call (which
+    /// only sees live channels, and never a watch-page fetch).
+    #[serde(default = "default_true")]
+    pub suggest_links: bool,
+    /// Mark rows that came from a platform other than the one being watched.
+    #[serde(default = "default_true")]
+    pub show_platform_badge: bool,
+    /// Set once `scope_blend_header_marks_once` has run. The header's platform
+    /// marks used to write `platforms`, so a click meant for one streamer turned
+    /// a platform off everywhere and stopped its link suggestions too.
+    #[serde(default)]
+    pub header_marks_scoped: bool,
+}
+
+impl Default for ChatBlendSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            platforms: HashMap::new(),
+            suggest_links: true,
+            show_platform_badge: true,
+            header_marks_scoped: true,
+        }
+    }
 }
 
 /// Identity for a favourited channel, so an unfollowed favourite can still be
@@ -845,6 +986,9 @@ impl Default for Settings {
             favorite_channels: vec![],
             provider_follows: vec![],
             youtube_chat_view: YouTubeChatView::default(),
+            channel_links: vec![],
+            chat_blend: ChatBlendSettings::default(),
+            snippets: SnippetSettings::default(),
             chat_design: ChatDesignSettings::default(),
             live_notifications: LiveNotificationSettings::default(),
             last_seen_version: None,
@@ -853,6 +997,7 @@ impl Default for Settings {
             font: None,
             font_custom: None,
             glass_transparency: None,
+            glass_blur: default_glass_blur(),
             setup_complete: false, // New users need to complete setup
             compact_view: None,
             error_reporting_enabled: true, // Diagnostics enabled by default
@@ -978,12 +1123,42 @@ pub struct AppState {
 const LEGACY_LIVE_EDGE_GAP_DEFAULT: f32 = 6.0;
 
 impl Settings {
+    /// Overwrite the fields the BACKEND owns with the authoritative copies, so a
+    /// save carrying the frontend's view of them cannot clobber the real values.
+    ///
+    /// Every field here is `#[serde(default)]`, which is what makes this
+    /// necessary rather than merely tidy: a frontend save that omits the key
+    /// deserializes it to an empty value, and the save then writes that emptiness
+    /// to disk. `provider_follows` and `channel_links` lose entire user-made
+    /// lists that way; `drops` loses automation state the plugin panel wrote.
+    ///
+    /// One owner on purpose. These used to be three separate assignments inside
+    /// `save_settings`, which is exactly the shape where a fourth backend-owned
+    /// field gets added and silently not re-stamped.
+    pub fn adopt_backend_owned(&mut self, authoritative: &Settings) {
+        self.provider_follows = authoritative.provider_follows.clone();
+        self.drops = authoritative.drops.clone();
+        self.channel_links = authoritative.channel_links.clone();
+    }
+
     /// One-time flip of the low-latency engine to on for installs written before
     /// it became the default (see `low_latency_engine_defaulted`).
     pub fn enable_low_latency_engine_once(&mut self) {
         if !self.video_player.low_latency_engine_defaulted {
             self.video_player.experimental_low_latency = true;
             self.video_player.low_latency_engine_defaulted = true;
+        }
+    }
+
+    /// One-time reset of the global combined-chat platform switches, for
+    /// installs written while the chat header's marks still wrote them. Almost
+    /// every `false` there came from a header click aimed at one streamer, and
+    /// it silently kept that platform out of every feed and every suggestion.
+    /// The Settings switches stay the global control from here on.
+    pub fn scope_blend_header_marks_once(&mut self) {
+        if !self.chat_blend.header_marks_scoped {
+            self.chat_blend.platforms.clear();
+            self.chat_blend.header_marks_scoped = true;
         }
     }
 
@@ -997,6 +1172,19 @@ impl Settings {
 #[cfg(test)]
 mod backup_persistence_tests {
     use super::*;
+
+    #[test]
+    fn header_marks_reset_the_global_platform_switches_once() {
+        let mut old = Settings::default();
+        old.chat_blend.header_marks_scoped = false;
+        old.chat_blend.platforms.insert("kick".into(), false);
+        old.scope_blend_header_marks_once();
+        assert!(old.chat_blend.platforms.is_empty());
+        // A switch turned off in Settings afterwards survives the next load.
+        old.chat_blend.platforms.insert("youtube".into(), false);
+        old.scope_blend_header_marks_once();
+        assert_eq!(old.chat_blend.platforms.get("youtube"), Some(&false));
+    }
 
     #[test]
     fn the_engine_turns_on_once_and_a_later_off_stays_off() {
@@ -1040,6 +1228,32 @@ mod backup_persistence_tests {
         assert_eq!(parsed.video_player.ll_target_latency, None);
     }
 
+    /// A settings.json from before `glass_blur` existed lands on the default,
+    /// which is on for every platform (the frontend's DEFAULT_GLASS_BLUR agrees).
+    #[test]
+    fn glass_blur_defaults_on_when_absent() {
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("settings object")
+            .remove("glass_blur");
+        let parsed: Settings = serde_json::from_value(value).expect("parse without the field");
+        assert!(parsed.glass_blur);
+        assert!(Settings::default().glass_blur);
+    }
+
+    /// The viewer's choice survives the round-trip at the top level, not in `extra`.
+    #[test]
+    fn glass_blur_round_trips() {
+        let mut s = Settings::default();
+        s.glass_blur = !s.glass_blur;
+        let value = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(value.get("glass_blur").and_then(|v| v.as_bool()), Some(s.glass_blur));
+        let back: Settings = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.glass_blur, s.glass_blur);
+        assert!(!back.extra.contains_key("glass_blur"));
+    }
+
     /// A modeled top-level preference must survive the save/load round-trip, and
     /// must NOT be swallowed by the flattened `extra` map on the way back.
     #[test]
@@ -1077,10 +1291,109 @@ mod backup_persistence_tests {
         assert_eq!(loaded.youtube_chat_view, YouTubeChatView::Live);
     }
 
+    fn a_group(members: &[(&str, &str)]) -> ChannelLinkGroup {
+        ChannelLinkGroup {
+            id: "g1".into(),
+            members: members
+                .iter()
+                .map(|(provider, channel)| LinkMember {
+                    provider: (*provider).into(),
+                    channel: (*channel).into(),
+                    display_name: None,
+                    avatar: None,
+                })
+                .collect(),
+            dismissed: vec![],
+            hidden: vec![],
+        }
+    }
+
+    /// A save carrying the frontend's (empty) view of a backend-owned field must
+    /// not erase it. Every one of these is `#[serde(default)]`, so an omitted key
+    /// arrives as an empty list rather than as "leave this alone" — which is what
+    /// makes losing a user's entire follow or link list a one-line mistake.
+    #[test]
+    fn a_frontend_save_cannot_wipe_backend_owned_fields() {
+        let mut authoritative = Settings::default();
+        authoritative.channel_links = vec![a_group(&[("twitch", "xqc"), ("kick", "xqc")])];
+        authoritative.provider_follows = vec![ProviderFollow {
+            provider: "kick".into(),
+            channel: "xqc".into(),
+            display_name: None,
+            user_id: None,
+            added_at: String::new(),
+            subscribed: false,
+            avatar: None,
+            imported: false,
+        }];
+
+        // What a frontend save looks like: it never knew about either list.
+        let mut incoming = Settings::default();
+        assert!(incoming.channel_links.is_empty());
+        incoming.adopt_backend_owned(&authoritative);
+
+        assert_eq!(incoming.channel_links.len(), 1, "the link survived the save");
+        assert_eq!(incoming.provider_follows.len(), 1, "the follow survived too");
+    }
+
+    /// YouTube channel ids are case-SENSITIVE, and the link member is handed
+    /// straight to acquireChannel rather than rebuilt from a (lowercased) slice
+    /// key. A settings round trip that folded the case would point chat at a
+    /// channel that does not exist, with no error.
+    #[test]
+    fn a_youtube_link_member_keeps_its_case() {
+        let mut s = Settings::default();
+        s.channel_links = vec![a_group(&[("youtube", "UCxvT6Dy8OjXlpLFhCAyPWlQ")])];
+
+        let value = serde_json::to_value(&s).expect("serialize");
+        assert!(value.get("extra").is_none(), "modeled fields stay top level");
+        assert!(
+            value.get("channel_links").is_some(),
+            "channel_links must be a typed field, never swallowed by the catch-all",
+        );
+
+        let back: Settings = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.channel_links[0].members[0].channel, "UCxvT6Dy8OjXlpLFhCAyPWlQ");
+        assert!(!back.extra.contains_key("channel_links"));
+    }
+
+    /// Blend is off unless the user turns it on, and a settings file written
+    /// before it existed must load rather than failing the whole parse.
+    #[test]
+    fn chat_blend_defaults_to_off_and_tolerates_an_older_file() {
+        assert!(!Settings::default().chat_blend.enabled, "off by default");
+        assert!(Settings::default().chat_blend.suggest_links);
+
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        let obj = value.as_object_mut().expect("object");
+        obj.remove("chat_blend");
+        obj.remove("channel_links");
+        let parsed: Settings = serde_json::from_value(value).expect("an older file still parses");
+        assert!(!parsed.chat_blend.enabled);
+        assert!(parsed.channel_links.is_empty());
+    }
+
     /// Frontend-managed preference groups the struct doesn't model (highlight
     /// phrases, custom themes, the OLED accent, ...) must survive a save/load
     /// round-trip through the flattened `extra` map instead of being dropped,
     /// and must serialize back at the top level (not nested under "extra").
+    #[test]
+    fn snippets_are_modelled_and_survive_a_round_trip() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["snippets"] = serde_json::json!({
+            "custom": [{ "id": "custom.gg.ab12", "title": "gg", "category": "Hype", "content": "GG" }],
+            "favorites": ["custom.gg.ab12", "classic.kappa"],
+            "aliases": { "custom.gg.ab12": "gg" }
+        });
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert!(!parsed.extra.contains_key("snippets"));
+        assert_eq!(parsed.snippets.custom[0].title, "gg");
+        assert_eq!(parsed.snippets.favorites.len(), 2);
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["snippets"]["aliases"]["custom.gg.ab12"], "gg");
+        assert!(back["snippets"]["custom"][0].get("keywords").is_none());
+    }
+
     #[test]
     fn unknown_keys_round_trip_through_extra() {
         let mut value = serde_json::to_value(Settings::default()).expect("serialize defaults");

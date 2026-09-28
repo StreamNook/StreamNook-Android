@@ -21,6 +21,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { helixGet } from '../services/helix';
 import { useAppStore, clipSourceOf, type SettingsTab } from '../stores/AppStore';
+import { sectionIdFromLabel } from '../components/settings/sectionId';
 import { useChatUserStore } from '../stores/chatUserStore';
 import { useFollowsStore } from '../stores/followsStore';
 import { favoriteIdOf, favoriteMetaOf } from './favorites';
@@ -28,6 +29,7 @@ import { useSnippetStore } from '../stores/snippetStore';
 import { WATCHABLE_PROVIDERS, providerLabel, type ProviderId } from '../types/providers';
 import { usePluginUiRegistry } from '../plugins-ui/registry';
 import { Logger } from './logger';
+import { requestChangelog } from './changelogEvents';
 import { getBuiltInSnippets, type Snippet } from './commandPaletteCopypastas';
 import type { TwitchStream, TwitchVideo, TwitchClip } from '../types';
 import type { ChannelAboutData, SocialMediaLink } from '../types/panels';
@@ -313,10 +315,10 @@ function buildQuickActions(): PaletteItem[] {
     {
       id: 'qa.openWhatsNew',
       section: 'Quick Actions',
-      title: "What's New",
-      subtitle: 'Release log + component bumps',
-      keywords: 'whatsnew updates changelog release notes',
-      run: () => useAppStore.getState().openSettings("What's New"),
+      title: 'Changelog',
+      subtitle: 'Release notes for every version, and updates',
+      keywords: 'changelog whats new whatsnew updates update release notes version',
+      run: () => requestChangelog(),
     },
     {
       id: 'qa.openPaletteWiki',
@@ -754,7 +756,7 @@ function buildQuickActions(): PaletteItem[] {
       keywords: 'github issue bug report feedback help',
       run: async () => {
         try {
-          await invoke('open_browser_url', { url: 'https://github.com/winters27/StreamNook/issues/new' });
+          await invoke('open_browser_url', { url: 'https://github.com/StreamNook/StreamNook/issues/new' });
         } catch (e) {
           Logger.warn('[CommandPalette] open_browser_url failed:', e);
         }
@@ -768,7 +770,7 @@ function buildQuickActions(): PaletteItem[] {
       keywords: 'github repo source code repository',
       run: async () => {
         try {
-          await invoke('open_browser_url', { url: 'https://github.com/winters27/StreamNook' });
+          await invoke('open_browser_url', { url: 'https://github.com/StreamNook/StreamNook' });
         } catch (e) {
           Logger.warn('[CommandPalette] open_browser_url failed:', e);
         }
@@ -825,6 +827,7 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   { tab: 'Chat', section: 'Chat Placement', keywords: 'chat placement position right bottom hidden where show hide' },
   { tab: 'Chat', section: 'Channel Points', keywords: 'channel points auto claim bonus chest reward collect points' },
   { tab: 'Chat', section: 'YouTube Chat', sectionId: 'settings-section-youtube-chat', label: 'Which chat to read', keywords: 'youtube chat view live chat top chat filtered firehose every message flooding flood too fast too many messages slow down readable quality filter' },
+  { tab: 'Chat', section: 'YouTube Chat', sectionId: 'settings-section-youtube-chat', label: 'Super Chat currency', keywords: 'youtube super chat superchat super sticker currency amount money donation dollars euros convert local original' },
   { tab: 'Chat', section: 'Chat Events', sectionId: 'settings-section-chat-events', keywords: 'chat events live activity overlay show hide toggle turn off in chat' },
   { tab: 'Chat', section: 'Chat Events', sectionId: 'settings-section-chat-events', label: 'Polls', keywords: 'polls poll vote voting live poll overlay chat event show hide toggle turn off' },
   { tab: 'Chat', section: 'Chat Events', sectionId: 'settings-section-chat-events', label: 'Predictions', keywords: 'predictions prediction bet outcome channel points overlay chat event show hide toggle turn off' },
@@ -833,24 +836,28 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   { tab: 'Chat', section: 'Chat Events', sectionId: 'settings-section-chat-events', label: 'Collapse gift-sub floods', keywords: 'gift subs gifted collapse flood mystery bomb community batch spam one liner recipients sub gift show hide toggle turn off' },
   { tab: 'Chat', section: 'Chat Events', sectionId: 'settings-section-chat-events', label: 'Chat replay on clips', keywords: 'clip chat replay historical past chat vod comments beside clip player show hide toggle' },
   { tab: 'Chat', section: 'Chat Logging', keywords: 'chat logging save logs text files folder per channel timestamps events moderation record history' },
-  { tab: 'Chat', section: 'Chat Design', keywords: 'chat design font size weight spacing dividers timestamps seconds mention colors reply name separator style prefix colon dot arrow pipe dash chip bracket accent bar pinned message collapse bar alternating backgrounds' },
+  { tab: 'Chat', section: 'Message Layout', keywords: 'message layout chat design font text size weight spacing dividers lines striped rows timestamps clock seconds 24 hour entrance animation new message arrives history opacity backfill' },
+  { tab: 'Chat', section: 'Pinned Messages', keywords: 'pinned message pin pins collapsed collapse expand bar hide banner top of chat' },
+  { tab: 'Chat', section: 'Names & Badges', keywords: 'names badges name separator style prefix colon dot arrow pipe dash chip readable name colors badge size add-on third party badges profile pictures avatars at sign 7tv paints cosmetics drop shadows' },
+  { tab: 'Chat', section: 'Mentions & Replies', keywords: 'mentions replies mention color flash when mentioned highlight reply thread color parent paint mentions inline' },
   { tab: 'Chat', section: 'Link Previews', keywords: 'link preview previews load card url unfurl embed trusted sources shorten links domains clean' },
-  { tab: 'Chat', section: 'Emotes', keywords: 'emotes emote size hover preview spacing inline scale 7tv bttv ffz' },
+  { tab: 'Chat', section: 'Emotes', keywords: 'emotes emote size hover preview spacing inline scale 7tv bttv ffz emoji style animate gifs compact emote tooltips ffz effects bttv modifiers giant emotes update notices' },
   { tab: 'Chat', section: 'Chat Input', keywords: 'chat input composer bypass duplicate message quick send ctrl enter keep message repeat' },
   { tab: 'Chat', section: 'Chat Input', label: 'Check spelling as you type', keywords: 'spell check spelling typo autocorrect correction misspelled underline squiggle red wavy dictionary proofread grammar' },
   { tab: 'Chat', section: 'Chat Input', label: 'Spell check dictionary', keywords: 'dictionary custom words add word taught spell check spelling ignore list personal vocabulary' },
   { tab: 'Chat', section: 'Chat Input', label: 'Hide the placeholder text', keywords: 'hide placeholder prompt send a message empty input box composer text grey ghost hint clean minimal' },
   { tab: 'Chat', section: 'Chat Input', label: 'Hide the emote button', keywords: 'hide emote emoji button smiley face icon input box composer picker clean minimal remove' },
   { tab: 'Chat', section: 'Chat Input', label: 'Hide the points balance', keywords: 'hide channel points balance number counter button input box composer clean minimal remove' },
-  { tab: 'Chat', section: 'Emote Tab Completion', sectionId: 'settings-section-emote-tab-completion', keywords: 'emote tab completion autocomplete carousel kappa cycle shift starts contains match include chat users' },
-  { tab: 'Chat', section: 'Render Style', keywords: 'render style deleted messages strikethrough dimmed hidden shared chat paint mentions inline compact emote tooltips 7tv update notices smooth scroll resume message buffer scrollback ffz emote effects modifier wide flip rainbow shake frankerfacez bttv betterttv emote modifiers cursed party rotate zero space giant emotes gigantify gigantified power-up powerup big huge large' },
+  { tab: 'Chat', section: 'Emote Tab Completion', sectionId: 'settings-section-emote-tab-completion', keywords: 'emote tab completion autocomplete carousel kappa cycle shift starts contains match include chat users list search colon find browse global twitch' },
+  { tab: 'Chat', section: 'Chat Behavior', keywords: 'chat behavior render style deleted messages strikethrough dimmed hidden shared chat smooth scroll resume message buffer how many messages kept scrollback' },
   { tab: 'Chat', section: 'Chat Events', sectionId: 'settings-section-chat-events', label: 'Start a poll or prediction', keywords: 'poll prediction create start new make run builder composer outcomes choices duration channel points vote bet broadcaster streamer' },
+  { tab: 'Chat', section: 'Combined Chat', sectionId: 'settings-section-combined-chat', keywords: 'combined combine chat across platforms multi platform multiplatform cross platform merged unified blend blended youtube kick twitch tiktok together one feed multistream multistreamer same streamer link linked channels platform badge source mark suggest links' },
   { tab: 'Chat', section: 'Hidden Users & Bots', sectionId: 'settings-section-chat-filters', keywords: 'hide hidden users bots filter block blocklist mute ignore streamelements nightbot moobot fossabot bot spam gamble flood chat filters per channel everywhere global unhide' },
   { tab: 'Chat', section: 'Repeated Messages', sectionId: 'settings-section-repeated-messages', keywords: 'repeated messages repeat counter duplicate copypasta spam wave combo collapse fold group x2 x3 x12 count same message emote flood dedupe condense' },
   { tab: 'Chat', section: 'Repeated Messages', sectionId: 'settings-section-repeated-messages', label: 'Repeat counter colour and threshold', keywords: 'repeat counter colour color threshold window seconds sensitivity match exact nearly identical mods vips streamer exempt moderator' },
   { tab: 'Chat', section: 'User Cards', sectionId: 'settings-section-user-cards', keywords: 'user card profile popup click username open messages chat history first badges stats view default landing' },
   { tab: 'Chat', section: 'User Cards', sectionId: 'settings-section-user-cards', label: 'User card details', keywords: 'user card fields rows details show hide joined twitch account age followage following since follows channels chatters chatter count past subscriber last live relative time how long ago 7tv profile link banned suspended' },
-  { tab: 'Chat', section: '7TV Cosmetics', keywords: '7tv cosmetics paint drop shadows username paints shadow readability' },
+  { tab: 'Chat', section: 'Names & Badges', label: '7TV paint shadows', keywords: '7tv cosmetics paint drop shadows username paints shadow readability' },
   { tab: 'Chat', section: 'Highlight Appearance', keywords: 'highlight appearance display style tint opacity flash window title unfocused look' },
   { tab: 'Chat', section: 'Highlight Phrases', keywords: 'highlights phrases keywords alerts words names patterns flash match' },
   { tab: 'Chat', section: 'Built-in Event Highlights', keywords: 'built-in event highlights first-time chatters returning your own messages raid announcements auto highlight' },
@@ -881,6 +888,7 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   { tab: 'Overlay', section: 'Appearance', keywords: 'overlay appearance text color shadow legibility timestamps transparent solid background opacity scene size blur spread strength outline stroke drop shadow contrast readable' },
   { tab: 'Overlay', section: 'Chatters', label: 'Profile pictures', keywords: 'overlay profile pictures avatars pfp youtube tiktok chatter photo show hide toggle' },
   { tab: 'Overlay', section: 'Chatters', label: '@ before usernames', keywords: 'overlay at sign @ username handle youtube strip remove show hide toggle' },
+  { tab: 'Overlay', section: 'Chatters', label: 'Readable name colors', keywords: 'overlay name color readable dark names brighten lighten contrast legibility navy maroon username color adjust' },
   { tab: 'Overlay', section: 'Messages', label: 'Replies', keywords: 'overlay replying to reply context line thread mention at username old twitch style show hide toggle remove off' },
   { tab: 'Overlay', section: 'Messages', label: 'Links', keywords: 'overlay link url hyperlink blue accent color underline plain body text no underline style' },
   { tab: 'Overlay', section: 'Emotes & Badges', label: '7TV personal emotes', keywords: 'overlay 7tv personal emotes subscriber own set every channel unknown random emote not added show hide toggle' },
@@ -897,6 +905,8 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   { tab: 'Overlay', section: 'Messages', label: 'Max lines per message', keywords: 'overlay max lines truncate clamp long message copypasta ellipsis wall of text limit' },
   { tab: 'Overlay', section: 'Messages', label: 'Remove messages after', keywords: 'overlay remove expire auto clear stale old messages seconds lifetime hide after inactivity' },
   { tab: 'Overlay', section: 'Messages', label: 'Restore chat on reload', keywords: 'overlay restore keep clear chat on reload obs refresh restart stream start buffer persist blank empty last messages' },
+  { tab: 'Overlay', section: 'Messages', label: 'Recent chat on start', keywords: 'overlay recent chat history backlog previous messages load history start fill empty twitch' },
+  { tab: 'Overlay', section: 'Messages', label: 'Mod commands', keywords: 'overlay mod commands chat command refreshoverlay clearoverlay reload refresh clear moderator broadcaster obs' },
   { tab: 'Overlay', section: 'Filters', label: 'Hide messages containing', keywords: 'overlay hide messages containing words phrases profanity filter banned blocklist spoiler swear' },
   { tab: 'Overlay', section: 'Events', label: 'Outline color', keywords: 'overlay event outline color fixed ring custom platform default recolor' },
   { tab: 'Overlay', section: 'Events', label: 'Event outline animation', keywords: 'overlay event outline animate animation sheen pulse chase sweep shimmer border flash spark ring one shot repeat loop every 5 seconds' },
@@ -955,9 +965,7 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   { tab: 'Support', keywords: 'support help community discord join invite feature request updates' },
   { tab: 'Support', section: 'Community Discord', keywords: 'community discord join invite server help feature request' },
   { tab: 'Support', section: 'Diagnostics', keywords: 'diagnostics diagnostic log logs logging verbose debug error reporting bug report troubleshoot' },
-
-  // What's New
-  { tab: "What's New", keywords: 'whats new changelog release notes updates' },
+  { tab: 'Support', section: 'What your account records', keywords: 'privacy data tracking telemetry analytics collect collected what do you collect records recorded stats watch time channels emotes version platform linked accounts profile accolades' },
 
   // Analytics (admin)
   { tab: 'Analytics', keywords: 'analytics dashboard users online stats supabase' },
@@ -974,7 +982,12 @@ function buildSettingsItems(): PaletteItem[] {
       subtitle,
       keywords: `${entry.tab.toLowerCase()} ${entry.keywords ?? ''}`.trim(),
       initial: title.slice(0, 1).toUpperCase(),
-      run: () => useAppStore.getState().openSettings(entry.tab, entry.sectionId),
+      // Every section has a DOM id, declared or derived from its label, so an entry
+      // without a declared one still scrolls to its section instead of the tab top.
+      run: () =>
+        useAppStore
+          .getState()
+          .openSettings(entry.tab, entry.sectionId ?? (entry.section ? sectionIdFromLabel(entry.section) : undefined)),
     };
   });
 }

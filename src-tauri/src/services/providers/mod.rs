@@ -15,6 +15,10 @@ pub mod kick_media;
 pub mod kick_profile;
 pub mod source;
 pub mod tiktok;
+pub mod tiktok_feed;
+pub mod tiktok_following;
+pub mod tiktok_media;
+pub mod tiktok_send;
 pub mod watch_urls;
 pub mod youtube;
 pub mod youtube_account;
@@ -71,13 +75,13 @@ pub(crate) fn dec_bridge_users() {
 
 /// The app handle, stored at startup so providers can spawn the hidden webviews
 /// some platforms need (e.g. Kick's Cloudflare-gated channel lookup).
-static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+static APP_HANDLE: OnceLock<crate::rt::AppHandle> = OnceLock::new();
 
-pub fn set_app_handle(handle: tauri::AppHandle) {
+pub fn set_app_handle(handle: crate::rt::AppHandle) {
     let _ = APP_HANDLE.set(handle);
 }
 
-pub fn app_handle() -> Option<tauri::AppHandle> {
+pub fn app_handle() -> Option<crate::rt::AppHandle> {
     APP_HANDLE.get().cloned()
 }
 
@@ -126,6 +130,10 @@ pub trait ChatProvider: Send + Sync {
     ///
     /// Default: nothing, for adapters that hold no per-window state.
     async fn release_window(&self, _window: &str) {}
+    /// How many channels this adapter holds open right now, for the resource
+    /// log. `None` when its table is locked this instant: the sampler never
+    /// waits on the chat path.
+    fn open_channel_count(&self) -> Option<usize>;
     /// Send `text` to `channel` as the connected account, if any. `reply_to` is the
     /// platform message id being replied to (None for a normal message).
     async fn send(&self, channel: &str, text: &str, reply_to: Option<&str>)
@@ -176,6 +184,22 @@ impl ProviderRegistry {
 
 static REGISTRY: OnceCell<ProviderRegistry> = OnceCell::const_new();
 
+/// Open chat channels per adapter, sorted by provider id, without waiting on
+/// any of them. Empty until the registry exists, since nothing can be open
+/// before it does.
+pub fn open_channel_counts() -> Vec<(&'static str, Option<usize>)> {
+    let Some(reg) = REGISTRY.get() else {
+        return Vec::new();
+    };
+    let mut counts: Vec<_> = reg
+        .providers
+        .values()
+        .map(|p| (p.id(), p.open_channel_count()))
+        .collect();
+    counts.sort_by_key(|(id, _)| *id);
+    counts
+}
+
 /// The process-wide adapter registry, built once. Per-platform adapters are
 /// added here as each ships (Kick first); until then it is empty and the
 /// provider commands report the provider as unavailable.
@@ -189,6 +213,7 @@ pub async fn registry() -> &'static ProviderRegistry {
             // Watch/browse adapters, added per platform phase.
             reg.register_source(Arc::new(kick_media::KickSource::new()));
             reg.register_source(Arc::new(youtube_media::YouTubeSource::new()));
+            reg.register_source(Arc::new(tiktok_media::TikTokSource::new()));
             reg
         })
         .await

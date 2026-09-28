@@ -146,6 +146,10 @@ impl ChatProvider for YouTubeProvider {
         "youtube"
     }
 
+    fn open_channel_count(&self) -> Option<usize> {
+        self.conns.try_lock().ok().map(|c| c.len())
+    }
+
     async fn connect(&self, channel: &str, window: &str) -> Result<()> {
         // YouTube video + channel ids are case-sensitive, but the composite key the
         // store routes by is lowercased — so a reconnect/restore can hand us the
@@ -356,7 +360,7 @@ async fn post_innertube_authed(
         "https://www.youtube.com/youtubei/v1/live_chat/{}?key={}&prettyPrint=false",
         endpoint, api_key
     );
-    let mut req = reqwest::Client::new()
+    let mut req = crate::services::http::client_unbounded()
         .post(url)
         .header("User-Agent", USER_AGENT);
     for (k, v) in headers {
@@ -865,17 +869,24 @@ pub(crate) async fn refresh_channel_meta(
     let player = extract_json(&html, "ytInitialPlayerResponse");
     let initial = extract_json(&html, "ytInitialData");
 
-    // Only a real WATCH page carries `videoDetails`. A channel with no live
-    // broadcast serves its browse shell instead, and `extract_meta` defaults
-    // `is_live` to TRUE when the details are missing - so parsing a shell would
-    // invent a live channel, and this feeds the who's-live poller. Refusing here
-    // keeps "we could not tell" distinct from "it is live".
-    if player
+    // Only a real WATCH page carries `videoDetails`; a channel with no live
+    // broadcast serves its browse shell instead. That is a definitive OFFLINE
+    // answer, not a failed lookup, and the difference matters: the caller
+    // answers an `Err` out of the last known meta, so returning one here kept
+    // reporting a channel that had just gone offline as live for the rest of
+    // the session. Report failure only when the page is not a YouTube page at
+    // all - if `ytInitialData` parsed, we did reach YouTube and it showed us no
+    // broadcast. (`fetch_youtube_html` has already turned the consent
+    // interstitial and every transport error into an `Err` above.)
+    let has_details = player
         .as_ref()
         .and_then(|p| p.get("videoDetails"))
-        .is_none()
-    {
-        return Err(anyhow!("'{}' isn't live right now", identifier));
+        .is_some();
+    if !has_details && initial.is_none() {
+        return Err(anyhow!(
+            "couldn't read a YouTube page for '{}' (try again)",
+            identifier
+        ));
     }
 
     let mut meta = extract_meta(player.as_ref(), initial.as_ref(), &html);
@@ -897,6 +908,10 @@ pub(crate) async fn refresh_channel_meta(
         meta.visitor_data = meta.visitor_data.or(prev.visitor_data);
         meta.profile_pic = meta.profile_pic.or(prev.profile_pic);
         meta.user_id = meta.user_id.or(prev.user_id);
+        // Identity, not liveness: a browse shell carries no `author`, and
+        // dropping it left the UI labelling the row with a raw `UC...` id the
+        // moment a channel went offline.
+        meta.username = meta.username.or(prev.username);
     }
 
     store_meta(&identifier.to_lowercase(), meta.clone());
@@ -1435,6 +1450,13 @@ pub fn channel_emojis(channel: &str) -> Vec<YouTubeEmoji> {
     list
 }
 
+/// A channel's emoji set, shared rather than copied. Same key rules as
+/// `channel_emojis`.
+pub fn channel_emoji_set(channel: &str) -> Option<std::sync::Arc<Vec<YouTubeEmoji>>> {
+    let key = channel.trim().to_lowercase();
+    EMOJIS.get()?.lock().ok()?.get(&key).cloned()
+}
+
 /// Forget a channel's emoji when its chat is gone.
 pub fn clear_channel_emojis(channel: &str) {
     let key = channel.trim().to_lowercase();
@@ -1540,10 +1562,28 @@ fn extract_meta(player: Option<&Value>, initial: Option<&Value>, html: &str) -> 
         .and_then(|d| d.get("channelId"))
         .and_then(|t| t.as_str())
         .map(String::from);
-    let is_live = vd
-        .and_then(|d| d.get("isLive").or_else(|| d.get("isLiveContent")))
+    // `isLive` is the ONLY field that means "live right now". `isLiveContent`
+    // means "this video is, or once was, a broadcast", which is equally true of
+    // a finished archive and of a waiting room that never started - so reading
+    // it as a fallback put permanently-offline channels in the who's-live list.
+    // YouTube's /live redirect serves a channel's scheduled broadcast even when
+    // it was scheduled years ago and never began; measured 2026-09-19 on a
+    // channel still fronting one from 2017, whose payload carries
+    // `isLiveContent: true`, `isUpcoming: true` and NO `isLive`. Clicking it
+    // failed with "This live event will begin in a few moments".
+    //
+    // Absent means NOT live, so `false` is the honest default: measured against
+    // two running broadcasts the same day, a live payload always carries
+    // `isLive: true` outright.
+    let is_upcoming = vd
+        .and_then(|d| d.get("isUpcoming"))
         .and_then(|b| b.as_bool())
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let is_live = !is_upcoming
+        && vd
+            .and_then(|d| d.get("isLive"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
     let start_time = player
         .and_then(|p| {
             p.pointer("/microformat/playerMicroformatRenderer/liveBroadcastDetails/startTimestamp")
@@ -1868,6 +1908,10 @@ async fn stream_live_chat(
             // Join backlog: deliver at once (the frontend coalesces it into a single
             // render) and keep only the newest rows, so joining looks like arriving
             // with context instead of a high-speed replay of the last ~20 seconds.
+            // Its rows are history (the join's context, or what a re-resolve missed),
+            // so they carry `from_backfill` like Twitch's join history does: the list
+            // then draws them without the per-row entrance animation instead of
+            // playing it on thirty rows at once.
             first_batch = false;
             if batch.len() > BACKLOG_KEEP {
                 log::info!(
@@ -1877,7 +1921,7 @@ async fn stream_live_chat(
                 );
             }
             for action in batch.iter().skip(batch.len().saturating_sub(BACKLOG_KEEP)) {
-                process_action(action, channel_key).await;
+                process_action(action, channel_key, true).await;
             }
         } else if !batch.is_empty() {
             // Live: spread the batch across what's LEFT of the poll window, so a fast
@@ -1888,7 +1932,7 @@ async fn stream_live_chat(
                 .as_millis() as u64;
             let gap = (remaining / batch.len() as u64).min(MAX_PACE_GAP_MS);
             for action in &batch {
-                process_action(action, channel_key).await;
+                process_action(action, channel_key, false).await;
                 // Never pace past the window: if dispatch ran long, the rest of the
                 // batch goes out at once so the next poll still leaves on time.
                 if tokio::time::Instant::now() >= deadline {
@@ -1944,9 +1988,10 @@ fn action_keys(action: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-async fn process_action(action: &Value, channel_key: &str) {
+async fn process_action(action: &Value, channel_key: &str, backlog: bool) {
     if let Some(item) = action.pointer("/addChatItemAction/item") {
-        if let Some(msg) = parse_item(item, channel_key) {
+        if let Some(mut msg) = parse_item(item, channel_key) {
+            msg.metadata.from_backfill = backlog;
             publish_chat_message(&msg).await;
         }
         return;
@@ -2795,6 +2840,54 @@ fn color_for(channel_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured 2026-09-19 from `/channel/UCAhaFPP6v3WCfK5Tjao0B7A/live`, which
+    /// still fronts a broadcast scheduled for March 2017 that never began.
+    /// `isLiveContent` is true (it IS a broadcast), `isUpcoming` is true, and
+    /// `isLive` is absent — reading the first as liveness reported this channel
+    /// live in the who's-live list permanently, and clicking it failed with
+    /// "This live event will begin in a few moments".
+    #[test]
+    fn an_abandoned_waiting_room_is_not_live() {
+        let player = serde_json::json!({ "videoDetails": {
+            "videoId": "ABAZa19-3s8",
+            "title": "VIVE LA QUEUE ET LES OURS BLANCS",
+            "author": "Mastu",
+            "isLiveContent": true,
+            "isUpcoming": true,
+        }});
+        let meta = extract_meta(Some(&player), None, "");
+        assert!(!meta.is_live, "an upcoming broadcast has not started");
+        assert_eq!(meta.username.as_deref(), Some("Mastu"));
+    }
+
+    /// The other half of the same measurement, from two broadcasts that really
+    /// were running: a live payload states `isLive` outright. That is what makes
+    /// `false` the safe default for an absent field.
+    #[test]
+    fn a_running_broadcast_is_live() {
+        let player = serde_json::json!({ "videoDetails": {
+            "videoId": "3PFJ9SETS4M",
+            "author": "Lofi Girl",
+            "isLive": true,
+            "isLiveContent": true,
+        }});
+        assert!(extract_meta(Some(&player), None, "").is_live);
+    }
+
+    /// A finished stream keeps `isLiveContent: true` forever, and the browse
+    /// shell a channel serves when nothing is on carries no `videoDetails` at
+    /// all. Neither may be read as live.
+    #[test]
+    fn an_archive_and_a_browse_shell_are_not_live() {
+        let archive = serde_json::json!({ "videoDetails": {
+            "videoId": "1YRBlxS43xY",
+            "author": "Ludwig",
+            "isLiveContent": true,
+        }});
+        assert!(!extract_meta(Some(&archive), None, "").is_live, "an ended stream");
+        assert!(!extract_meta(None, None, "").is_live, "a browse shell");
+    }
 
     #[test]
     fn seen_ids_suppress_a_replayed_backlog() {

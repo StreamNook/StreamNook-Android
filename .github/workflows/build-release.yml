@@ -19,7 +19,7 @@ env:
 jobs:
   merge-to-main:
     # Ports inherit this file on sync merges; only run it in the desktop repo.
-    if: github.repository == 'winters27/StreamNook'
+    if: github.repository == 'StreamNook/StreamNook' || github.repository == 'StreamNook/StreamNook'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -220,6 +220,12 @@ jobs:
   # leaves the Windows (and macOS) release standing.
   build-linux:
     needs: merge-to-main
+    # Linux releases are opt-in: they ship only while the repository variable
+    # LINUX_RELEASE is "true". Unset or anything else, a release is Windows and
+    # macOS only, and the manifest carries no linux-x86_64 entry at all (see the
+    # manifest step), so Linux clients stay on their build and are told "no
+    # update" instead of being offered the old AppImage under a newer version.
+    if: vars.LINUX_RELEASE == 'true'
     runs-on: ubuntu-22.04
     # NOT ubuntu-latest, and this is not stylistic. glibc is forward-compatible
     # only: a binary linked against 24.04's glibc refuses to start on 22.04 with
@@ -421,6 +427,11 @@ jobs:
             find "$appdir" -name "$keep" | grep -q . || { echo "$keep went missing"; exit 1; }
           done
 
+          # The GTK plugin's AppRun hook forces X11 on every Wayland desktop and
+          # lets the host's GIO modules load against our older GLib. The script
+          # explains both and fails the job if the hook no longer matches.
+          bash scripts/linux-appimage-hooks.sh "$appdir"
+
           # Find the packer rather than assuming one path: tauri caches it under
           # ~/.cache/tauri today, but a hardcoded path that moves would abort the
           # whole Linux job on a step that is meant to be a refinement.
@@ -494,10 +505,16 @@ jobs:
           fi
           # The SAME key that signs the Windows and macOS bundles; the client
           # pins one public half as a compile-time const.
-          sudo apt-get install -y --no-install-recommends minisign
+          # The official static binary, pinned, as the Windows job does. apt has no
+          # `minisign` package on ubuntu-22.04 ("Unable to locate package").
+          ms_ver=0.12
+          curl -fsSL -o minisign.tgz "https://github.com/jedisct1/minisign/releases/download/$ms_ver/minisign-$ms_ver-linux.tar.gz"
+          tar xzf minisign.tgz 2>/dev/null
+          ms=./minisign-linux/x86_64/minisign
+          [ -x "$ms" ] || { echo "::error title=minisign missing::$ms not found in minisign-$ms_ver-linux.tar.gz"; exit 1; }
           printf '%s' "$UPDATE_SIGNING_KEY" > ./update.key
           trap 'rm -f ./update.key' EXIT
-          minisign -S -s ./update.key -m "$bundle" -x "$bundle.minisig"
+          "$ms" -S -s ./update.key -m "$bundle" -x "$bundle.minisig"
           echo "SIGNATURE<<EOF" >> "$GITHUB_OUTPUT"
           cat "$bundle.minisig" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
@@ -970,16 +987,24 @@ jobs:
           # than nothing, and finalize-* overwrites them minutes later. A client
           # already on that version simply sees no update, which is correct.
           #
-          # linux-x86_64 is in this list from the day the Linux job landed, not
-          # added later after the same gap bit Linux users too.
+          # linux-x86_64 joins this list while Linux releases are on, below.
           $prevManifest = $null
           try {
             $prevManifest = Invoke-RestMethod -Uri "https://streamnook.app/api/v1/update" -TimeoutSec 20
           } catch {
             Write-Host "::warning::Could not read the previous manifest ($($_.Exception.Message)); macOS keys will be absent until finalize-macos runs."
           }
+          # Linux is carried forward only while Linux releases are on
+          # (vars.LINUX_RELEASE). With them off no Linux build follows, and a
+          # carried entry would point at the previous AppImage under this
+          # release's version: the client compares only the manifest version, so
+          # it would offer that build as an update and reinstall it on every
+          # check. With no entry it reports "no update", which is the truth.
+          $carryKeys = @("macos-aarch64", "macos-x86_64")
+          if ("${{ vars.LINUX_RELEASE }}" -eq "true") { $carryKeys += "linux-x86_64" }
+          else { Write-Host "Linux releases are off (vars.LINUX_RELEASE); the manifest carries no linux-x86_64 entry" }
           if ($prevManifest -and $prevManifest.platforms) {
-            foreach ($key in @("macos-aarch64", "macos-x86_64", "linux-x86_64")) {
+            foreach ($key in $carryKeys) {
               $prev = $prevManifest.platforms.$key
               if ($prev -and $prev.download_url) {
                 $platforms[$key] = [ordered]@{
@@ -1007,6 +1032,32 @@ jobs:
             platforms     = $platforms
             notes         = (Get-Content ./changelog_section.md -Raw).TrimEnd()
             min_supported = "0.0.0"
+            # Server-controlled client switches, read by src/services/clientConfig.ts.
+            #
+            # This block was MISSING, and the omission was silent and total. The
+            # client reads `client_config.write_via_api` from this manifest to decide
+            # whether privileged writes go to the StreamNook API or straight to
+            # Supabase under the anon key, and this step rebuilds the manifest from
+            # scratch on every release, so any hand-added block was wiped by the next
+            # ship. The flag was therefore NEVER true in production: /api/v1/user/sync
+            # received no traffic and `user_clients.version` had zero rows, which is
+            # exactly the per-platform adoption signal it was built to provide.
+            #
+            # `min_supported_version` mirrors the top-level `min_supported` above,
+            # which the Rust updater reads. Two names for one idea was the other half
+            # of the bug: the client looked for a key nothing ever wrote.
+            #
+            # Kept at false here on purpose. The flag is a kill switch and its whole
+            # point is being flippable WITHOUT a release, so flipping it is an edit to
+            # latest.json in R2, not to this file. What matters is that the key now
+            # EXISTS on every ship, so such an edit survives the next release.
+            # Telemetry does not read it: the heartbeat in
+            # services/telemetry_heartbeat.rs always posts to the API, because
+            # telemetry gated on a flag nobody sets is telemetry that is off.
+            client_config = [ordered]@{
+              write_via_api         = $false
+              min_supported_version = "0.0.0"
+            }
             published_at  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
           }
           $manifest | ConvertTo-Json -Depth 6 | Out-File -FilePath ./latest.json -Encoding utf8 -NoNewline
@@ -1027,166 +1078,40 @@ jobs:
           # For attaching the .minisig to the already-created release.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Notify Discord
-        if: steps.check_release.outputs.RELEASE_EXISTS == 'false' && env.DISCORD_RELEASE_WEBHOOK_URL != ''
-        shell: pwsh
-        env:
-          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
-        run: |
-          $version = "${{ steps.version.outputs.VERSION }}"
-          $bundleName = "${{ steps.bundle.outputs.BUNDLE_NAME }}"
-          $releaseUrl = "https://github.com/winters27/StreamNook/releases/tag/v$version"
-
-          # --- Custom server emote substitution ---
-          # Format: '<:name:snowflake_id>' for static, '<a:name:id>' for animated.
-          # Get IDs by typing \:emote_name: in any Discord channel (Discord echoes the raw form).
-          # With Components v2 every visible line is a Text Display, and custom emotes render in
-          # any Text Display (including the title block), so all of them show. Leave a value
-          # empty to keep the unicode fallback.
-          $emoteMap = @{
-            feature     = '<a:alert:1380653449305391104>'    # animated red exclamation
-            bugfix      = '<a:check:1380653692000407572>'    # animated checkmark
-            maintenance = '<:invoice:1384683220901167104>'   # document
-            logo        = ''                                 # thumbnail already shows the Penrose logo
-            rocket      = '<:bu_tg:1380653917452632064>'     # paper airplane ("shipped")
-          }
-
-          # Use the changelog body produced earlier (without the appended Bundle Components / Installation block)
-          $body = Get-Content ./changelog_section.md -Raw
-
-          # Strip the leading "## [version] - date" header — the version is shown in the title block
-          $body = $body -replace '(?ms)^\s*##\s*\[?\d[\d\.]*\]?.*?\r?\n', ''
-          $body = $body.Trim()
-
-          # The release hero: the first markdown image in the section. Compaction below keeps
-          # only headers and bullet leads, so without this the picture never reached Discord.
-          # It becomes a Media Gallery component under the title (Discord shows the webp,
-          # animated ones included). Must be an absolute https URL; the raw.githubusercontent
-          # link resolves because dev was force-pushed to main before this step ran.
-          $heroUrl = ''
-          if ($body -match '!\[[^\]]*\]\((https://[^)\s]+)\)') { $heroUrl = $Matches[1] }
-
-          # Compact the changelog for Discord. Changelog bullets are written as
-          # "- **Bold lead.** explanation prose"; keep only the bold lead so the
-          # post is a short scannable list. Section headers survive, everything
-          # else (prose paragraphs, blockquotes, code fences, dividers) is dropped.
-          # Full notes remain on the GitHub release, linked below.
-          $compactLines = New-Object System.Collections.Generic.List[string]
-          foreach ($line in ($body -split "`r?`n")) {
-            if ($line -match '^#{2,3}\s') {
-              if ($compactLines.Count -gt 0) { $compactLines.Add('') }
-              $compactLines.Add($line)
-            }
-            elseif ($line -match '^\s*-\s+\*\*(.+?)\*\*') {
-              $compactLines.Add('- ' + $Matches[1].TrimEnd('.', ',', ';', ':'))
-            }
-            elseif ($line -match '^\s*-\s+(\S.*)$') {
-              # Bullet without a bold lead: keep just its first sentence.
-              $first = ($Matches[1] -split '(?<=[.!?])\s+')[0]
-              $compactLines.Add('- ' + $first.TrimEnd('.'))
-            }
-          }
-          $body = ($compactLines -join "`n").Trim()
-
-          # Promote section headers from H3 (### Features) to H2 (## Features) so every
-          # section title renders at the same larger size. Only matches exactly three #.
-          $body = $body -replace '(?m)^###\s+', '## '
-
-          # Replace the changelog section-marker emojis with custom server emotes when configured.
-          # release_manager.ps1 generates sections using ✨ / 🐛 / 🔧 (see Brain/projects/StreamNook.md).
-          # Use ConvertFromUtf32 because 🐛 / 🔧 are above U+FFFF and don't fit in a single [char].
-          $featureMarker     = [char]::ConvertFromUtf32(0x2728)   # ✨
-          $bugfixMarker      = [char]::ConvertFromUtf32(0x1F41B)  # 🐛
-          $maintenanceMarker = [char]::ConvertFromUtf32(0x1F527)  # 🔧
-          if ($emoteMap.feature)     { $body = $body.Replace($featureMarker, $emoteMap.feature) }
-          if ($emoteMap.bugfix)      { $body = $body.Replace($bugfixMarker, $emoteMap.bugfix) }
-          if ($emoteMap.maintenance) { $body = $body.Replace($maintenanceMarker, $emoteMap.maintenance) }
-
-          # Components v2 caps total text at 4000 chars across all text displays. The compacted
-          # changelog is normally well under this; guard anyway and link out if it overflows.
-          $maxLen = 3800
-          if ($body.Length -gt $maxLen) {
-            $body = $body.Substring(0, $maxLen).TrimEnd() + "`n`n[Read the full changelog on GitHub]($releaseUrl)"
-          }
-
-          # Split the compacted body into one block per changelog section (Features, Bug Fixes,
-          # ...) so each gets its own Text Display with a real Separator between them, instead
-          # of leaning on markdown whitespace for the visual break.
-          $sections = New-Object System.Collections.Generic.List[string]
-          $sb = New-Object System.Text.StringBuilder
-          foreach ($line in ($body -split "`r?`n")) {
-            if ($line -match '^#{2,3}\s' -and $sb.Length -gt 0) {
-              $sections.Add($sb.ToString().Trim())
-              $sb = New-Object System.Text.StringBuilder
-            }
-            [void]$sb.AppendLine($line)
-          }
-          if ($sb.Length -gt 0) { $sections.Add($sb.ToString().Trim()) }
-
-          # --- Build the Discord Components v2 payload ---
-          # Component types: 17 Container, 9 Section, 10 Text Display, 11 Thumbnail (accessory),
-          # 14 Separator, 1 Action Row, 2 Button (style 5 = link). The IS_COMPONENTS_V2 message
-          # flag (1<<15 = 32768) is required and disallows content/embeds, so the whole message
-          # is components. Custom server emotes render inside any Text Display.
-          $titleParts = @()
-          if ($emoteMap.rocket) { $titleParts += $emoteMap.rocket }
-          $titleText = "## StreamNook v$version is out"
-          $liveLine = (($titleParts + "**It's live now.**") -join ' ')
-
-          $children = New-Object System.Collections.Generic.List[object]
-
-          # Header block: title + "live" line, with the app icon as a thumbnail accessory.
-          $children.Add(@{
-            type = 9
-            components = @(@{ type = 10; content = "$titleText`n$liveLine" })
-            accessory = @{ type = 11; media = @{ url = "https://raw.githubusercontent.com/winters27/StreamNook/main/src-tauri/icons/icon.png" } }
-          })
-          if ($heroUrl) {
-            # Type 12 Media Gallery: one item, full width of the container.
-            $children.Add(@{ type = 12; items = @(@{ media = @{ url = $heroUrl } }) })
-          }
-          $children.Add(@{ type = 14; divider = $true; spacing = 2 })
-
-          # One Text Display per changelog section, thin divider between each.
-          for ($i = 0; $i -lt $sections.Count; $i++) {
-            $children.Add(@{ type = 10; content = $sections[$i] })
-            if ($i -lt $sections.Count - 1) {
-              $children.Add(@{ type = 14; divider = $true; spacing = 1 })
-            }
-          }
-
-          $children.Add(@{ type = 14; divider = $true; spacing = 2 })
-          # Link button to the release, plus a small footer line (v2 has no embed footer).
-          $children.Add(@{
-            type = 1
-            components = @(@{ type = 2; style = 5; label = 'View release on GitHub'; url = $releaseUrl })
-          })
-          $children.Add(@{ type = 10; content = "-# Download $bundleName from the release page" })
-
-          $payloadObj = @{
-            flags = 32768  # IS_COMPONENTS_V2
-            components = @(@{
-              type = 17
-              accent_color = 9941177  # #97B1B9 StreamNook accent
-              components = $children
-            })
-          }
-          $payload = $payloadObj | ConvertTo-Json -Depth 20 -Compress
-
-          # ?with_components=true is required for a webhook to process a Components v2 payload.
-          $uri = $env:DISCORD_RELEASE_WEBHOOK_URL + '?with_components=true'
-          try {
-            Invoke-RestMethod -Uri $uri -Method Post -ContentType 'application/json' -Body $payload | Out-Null
-            echo "Discord notification sent for v$version"
-          } catch {
-            # Don't fail the workflow if Discord is down — release is already on GitHub.
-            echo "::warning::Discord webhook post failed: $_"
-          }
-
   # Joins the two parallel builds. Runs only after BOTH finish, and only does
   # anything if build-macos actually produced a bundle. Everything here used to
   # live at the end of the Windows job, which is what forced Windows to wait for
   # macOS; moving it out is the whole point of the split.
+  # Warns when the macOS half of a release never landed.
+  #
+  # `finalize-macos` below is SKIPPED when build-macos produced no outputs, and a
+  # skipped job is green in the run summary, so a release could ship with the
+  # previous version's macOS entries standing and nothing said so. Every Mac then
+  # stayed on the old build for the whole cycle, traced only by one log line on
+  # the user's own machine. This job exists purely to make that visible.
+  macos-status:
+    needs: [build, build-macos]
+    if: >-
+      ${{ !cancelled()
+          && needs.build.result == 'success'
+          && needs.build.outputs.RELEASE_EXISTS == 'false'
+          && needs.build-macos.outputs.BUNDLE_NAME == '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say that macOS did not ship
+        run: |
+          echo "::warning title=macOS was not published::v${{ needs.build.outputs.VERSION }} shipped WITHOUT a macOS build (build-macos result: ${{ needs.build-macos.result }}). The manifest still carries the PREVIOUS macOS entries, so Macs are offered the older build and will not see this release. Re-run the macOS job, or ship the next release once it is fixed."
+          {
+            echo "### macOS was not published"
+            echo ""
+            echo "\`v${{ needs.build.outputs.VERSION }}\` shipped without a macOS build."
+            echo "build-macos result: \`${{ needs.build-macos.result }}\`"
+            echo ""
+            echo "Windows users have the update. Macs are still offered the previous"
+            echo "release, which is the intended safe state, but they will not get this"
+            echo "version until a macOS bundle is published."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   finalize-macos:
     needs: [build, build-macos]
     if: >-
@@ -1280,6 +1205,7 @@ jobs:
     needs: [build, build-linux]
     if: >-
       ${{ !cancelled()
+          && vars.LINUX_RELEASE == 'true'
           && needs.build.result == 'success'
           && needs.build.outputs.RELEASE_EXISTS == 'false'
           && needs.build-linux.outputs.BUNDLE_NAME == '' }}

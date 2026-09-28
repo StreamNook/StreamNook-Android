@@ -1,3 +1,99 @@
+## [8.8.0] - 2026-09-28
+
+![Every emote, one Tab](https://raw.githubusercontent.com/StreamNook/StreamNook/main/.github/assets/release-8.8.0-emotes-and-drops.webp)
+
+### ✨ Features
+- Tab in chat can open a list of every emote you can use, with where each one comes from. It narrows as you type and matches the middle of names too, so "love" finds a channel emote like vulpLove. A button at the top of the list switches Tab to the carousel, and one on the carousel switches it back. Typing a colon and two letters opens the same list.
+- Stream cards, the sidebar and the hover card show when a channel shares its chat with other channels, with their faces. Channels streaming together show their faces and "Together" in place of the old "+2", and one click still opens everyone in MultiNook.
+- More drops show up in the Drops center: drops that take several days, subscription rewards, and mystery rewards like the Pokémon balls. Each shows Twitch's own progress, such as the day you're on and your minutes today, and a mystery reward gets an Open button. A drop that counts in several categories finds live channels in all of them.
+- A "Claim automatically" switch sits in your drops inventory. Turn it off and finished drops wait for you to claim them.
+- In combined chat you can leave one of a streamer's linked channels out of their feed without unlinking it or switching that platform off everywhere.
+- You can build and preview an OBS overlay without signing in. Signing in is only needed for the OBS link, and your overlay is still there afterwards.
+
+### 🐛 Bug Fixes
+- Badges sit in the order Twitch shows them: role first, then subscription, then what someone earned in the channel, then global badges. That holds in chat, VOD chat replay and profile cards.
+- Messages you send keep your subscriber badge and your other channel badges.
+- A channel points redemption shows the redeemer's channel badges and name colour, the same as their chat messages.
+- On sub, gift and cheer cards, the 7TV badge lines up with the badges next to it instead of sitting lower.
+- 7TV personal emotes show for more chatters, and messages sent before someone's personal emotes loaded switch over once they arrive.
+- FrankerFaceZ badges show in their colours, and bots flagged by FrankerFaceZ wear Twitch's Chat Bot badge.
+- Hovering a StreamNook member badge names it once ("StreamNook Member", not "StreamNook StreamNook Member").
+- Hiding someone from their profile card clears the messages they already sent, not only the ones after, in that channel or everywhere depending on which you picked. Turning on "Hide known bots" clears theirs the same way.
+- Hiding someone from a popped-out profile card no longer unhides everyone else you had hidden, and the card's buttons show whether that person is already hidden.
+- Opening Global Cosmetics no longer blanks the badge grid and loads it all over again a moment after it appears.
+- Placing a prediction no longer counts your bet twice in the points shown.
+- The channel points summary lists a channel once, even when a chest claim and watch points arrive together.
+- Clicking a platform in the chat header no longer switches it off for every streamer, and platforms that got switched off that way are back on. When a streamer turns up on both Kick and YouTube, both suggestions show, and they wait behind the + in the chat header instead of opening over chat.
+- Polls, predictions and the pinned message no longer cover the chat header when a hype train makes it taller, and a pinned message sits under a live poll so you can read both.
+
+### 🔧 Maintenance
+- Your saved sign-ins are now encrypted, with the key kept in Windows Credential Manager or the macOS Keychain. Existing sign-ins move over the first time you open this version. If the keyring can't be reached, a note under Accounts says so.
+- Plugins can build full settings pages that match the rest of Settings.
+- The chat header and the Home navigation strip are restyled, with the selected tab set into the glass as a darker pill.
+
+### ⚡ Performance
+- StreamNook reuses its network connections instead of opening new ones for most requests, so streams, sign-ins, badges and panels start faster.
+- Emoji images are saved on disk and fetched once, and an emoji the server doesn't have isn't asked for again.
+- Stream titles convert emoji codes for a whole page at once, and settings are read once at startup instead of twice.
+- The Drops center loads campaigns and your inventory at the same time.
+
+## [8.7.1] - 2026-09-24
+
+### 🐛 Bug Fixes
+- Low-latency channels play about half a second closer to live again, level with twitch.tv. The live-edge slider now goes down to 1 second.
+- Scrolling up in combined chat pauses it properly, so messages stop sliding up while you read.
+- Combined chat no longer gets flooded with a burst of old YouTube messages, and a batch of catch-up messages no longer plays the entrance animation all at once.
+- A pinned message no longer covers the combined chat bar or the "same streamer?" question under it.
+- Clicking a settings search result takes you to that setting and highlights it. The command palette now opens the right section instead of the top of the tab.
+
+### 🔧 Maintenance
+- Chat settings are reorganized. Pinned messages, names and badges, and mentions and replies have their own sections, the YouTube settings sit together, and every emote option is under Emotes.
+- Linux builds publish again.
+
+## [8.7.0] - 2026-09-24
+
+## 🎉 New: TikTok LIVE, one chat for multistreamers, and Linux
+> TikTok LIVE joins Twitch, Kick and YouTube: watch it, see when the creators you
+> follow go live, and chat as your account. Link a streamer's channels across
+> platforms and their chats merge into the one you are watching. StreamNook also
+> ships for Linux now, as an AppImage that updates itself.
+
+---
+
+### ✨ Features
+- **TikTok LIVE.** Watch a TikTok LIVE on its own or in the MultiNook grid, browse a Top live feed, and sign in to open age-restricted rooms. Signed in, the creators you follow appear in Following and the sidebar when they go live, with go-live alerts, and you can chat as your account.
+- **One chat for a streamer on several platforms.** Link a streamer's Twitch, Kick and YouTube channels, and a bar under the chat header merges their other platforms into the feed you are watching. Replies go back to the platform the message came from.
+- **Following and Discover across every platform.** Channels you follow anywhere share one list, and Discover shows who is live on the other platforms, with their categories.
+- **See who a channel is streaming with.** When streamers share a stream on Twitch, the group and its combined viewer count show on the stream, and one click opens all of them in MultiNook.
+- **VOD chapters and seek previews.** A VOD's category changes show as chapters on the seek bar and in a chapter list, and hovering the bar previews that moment. The broadcast timeline scrubs more finely too.
+- **StreamNook member profiles.** Clicking a StreamNook member's name opens their full profile: atmosphere, frame, relics, stats, accolades and every badge they own, next to the usual Twitch details and actions. Hovering the name decodes their member number.
+- **Chat, styled your way.** New options for event rows (with custom wording and per-platform filters), badges, how messages arrive, emoji style, emote extras, replies and links. You can also hide commands and ring first-time chatters, and name colors stay readable on any background.
+- **Linux.** StreamNook now builds for Linux as an AppImage, and it installs its own updates.
+- **Design your OBS overlay on the web.** The overlay builder in Settings is the same one at streamnook.app/overlays, and both edit the same overlays.
+- Your Twitch badge standing shows without a Drops sign-in, with an estimate of the subs and hours it takes to earn the badges you are missing.
+- Release notes moved from Settings into the changelog popup, and the title bar checks for updates every half hour.
+- Snippets are part of your settings now, so a backup carries them.
+- Streams that arrive framed, like TikTok co-host views, zoom to the picture they actually carry.
+
+### 🐛 Bug Fixes
+- Your chat messages show the moment you send them, and your replies are recognized as yours.
+- Sub notices show Twitch's gift art, and chat defaults to Twitch's own size: 14px text with 4px spacing.
+- Sorting badges by Newest, Oldest, Available or Coming soon follows the real dates.
+- Saving a setting in one window no longer undoes a change another window just saved.
+- Whispers that arrive while StreamNook sits in the tray are kept.
+- A keyword reminder fires once per message instead of once per open window.
+- A profile card keeps showing every 7TV cosmetic someone owns after its first open.
+- Clearing the cache no longer leaves broken images in MultiChat windows.
+- Channel badges such as broadcaster and subscriber no longer count among someone's own badges.
+- 7TV renews its sign-in before it expires, and the plugin marketplace says why it is empty instead of blaming the network.
+
+### ⚡ Performance
+- Spell checking, 7TV cosmetics lookups, image caching, hype train updates and the activity feed history now run once in the app's core instead of in every window, so MultiChat windows use less memory.
+- Profile cards open about a third faster and fill in as each part arrives.
+
+### 🔧 Maintenance
+- The app reports its version periodically instead of only at sign-in. Settings > Support lists what it sends.
+
 ## [8.6.4] - 2026-09-18
 
 ## 🎉 New: a fresh look

@@ -5,7 +5,8 @@ use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use crate::rt::AppHandle;
+use tauri::Emitter;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
@@ -680,6 +681,7 @@ impl EventSubService {
                         raid_event.viewers
                     );
                     let _ = app_handle.emit("eventsub://raid", &raid_event);
+                    crate::services::watch_session::on_raid(app_handle, &raid_event);
                 }
             }
             "stream.offline" => {
@@ -689,6 +691,11 @@ impl EventSubService {
                 {
                     debug!("Stream offline: {}", offline_event.broadcaster_user_name);
                     let _ = app_handle.emit("eventsub://offline", &offline_event);
+                    crate::services::watch_session::on_offline(
+                        app_handle,
+                        &offline_event.broadcaster_user_id,
+                        &offline_event.broadcaster_user_login,
+                    );
                 }
             }
             "stream.online" => {
@@ -698,6 +705,7 @@ impl EventSubService {
                 {
                     debug!("Stream online: {}", online_event.broadcaster_user_name);
                     let _ = app_handle.emit("eventsub://online", &online_event);
+                    crate::services::watch_session::on_online(app_handle, &online_event);
                 }
             }
             "channel.update" => {
@@ -710,6 +718,7 @@ impl EventSubService {
                         update_event.title, update_event.category_name
                     );
                     let _ = app_handle.emit("eventsub://channel-update", &update_event);
+                    crate::services::watch_session::on_channel_update(app_handle, &update_event);
                 }
             }
             "channel.moderate" => {

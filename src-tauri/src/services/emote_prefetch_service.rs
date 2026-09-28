@@ -20,13 +20,15 @@ use log::{debug, warn};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use crate::rt::AppHandle;
+use tauri::Emitter;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
 use crate::services::emote_service::{
     seventv_circuit_open, Emote, EmoteProvider, EmoteService, EmoteSet,
 };
+use crate::services::asset_cache_queue::{announce_entries, AssetKind};
 use crate::services::twitch_service::TwitchService;
 use crate::services::universal_cache_service::{
     download_file_to_disk, get_cached_files_list, save_cached_items_batch, CacheType,
@@ -191,17 +193,23 @@ impl EmotePrefetchService {
 /// its canonical url. Mirrors `emoteCacheKey` / `sevenTvTierUrl` in
 /// services/emoteService.ts.
 fn emote_cache_target(emote: &Emote, tier: &str) -> (String, String) {
+    let key = emote_cache_key(&emote.provider, &emote.id, tier);
     match emote.provider {
-        EmoteProvider::SevenTV => (
-            format!("{}@{}", emote.id, tier),
-            format!("https://cdn.7tv.app/emote/{}/{}.avif", emote.id, tier),
-        ),
-        // Provider-namespaced so a Twitch and an FFZ emote that share a numeric
-        // id can't collide. Must match emoteCacheKey() in services/emoteService.ts.
-        EmoteProvider::Twitch => (format!("twitch-{}", emote.id), emote.url.clone()),
-        EmoteProvider::BTTV => (format!("bttv-{}", emote.id), emote.url.clone()),
-        EmoteProvider::FFZ => (format!("ffz-{}", emote.id), emote.url.clone()),
-        EmoteProvider::Kick => (format!("kick-{}", emote.id), emote.url.clone()),
+        EmoteProvider::SevenTV => (key, format!("https://cdn.7tv.app/emote/{}/{}.avif", emote.id, tier)),
+        _ => (key, emote.url.clone()),
+    }
+}
+
+/// The disk-cache id of one emote. 7TV files are per size tier; the others are
+/// provider-namespaced so a Twitch and an FFZ emote that share a numeric id
+/// can't collide. Must match emoteCacheKey() in services/emoteService.ts.
+pub(crate) fn emote_cache_key(provider: &EmoteProvider, id: &str, tier: &str) -> String {
+    match provider {
+        EmoteProvider::SevenTV => format!("{}@{}", id, tier),
+        EmoteProvider::Twitch => format!("twitch-{}", id),
+        EmoteProvider::BTTV => format!("bttv-{}", id),
+        EmoteProvider::FFZ => format!("ffz-{}", id),
+        EmoteProvider::Kick => format!("kick-{}", id),
     }
 }
 
@@ -444,6 +452,7 @@ async fn run_downloads(
 
         if buffer.len() >= MANIFEST_FLUSH_EVERY {
             let batch = std::mem::take(&mut buffer);
+            announce_entries(&app_handle, AssetKind::Emote, &batch);
             let _ = save_cached_items_batch(batch).await;
         }
 
@@ -470,6 +479,7 @@ async fn run_downloads(
 
     // Persist whatever is left.
     if !buffer.is_empty() {
+        announce_entries(&app_handle, AssetKind::Emote, &buffer);
         let _ = save_cached_items_batch(buffer).await;
     }
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TwitchStream {
     pub id: String,
     pub user_id: String,
@@ -15,8 +15,6 @@ pub struct TwitchStream {
     pub started_at: String,
     #[serde(default)]
     pub broadcaster_type: Option<String>,
-    #[serde(default)]
-    pub has_shared_chat: Option<bool>,
     #[serde(default)]
     pub profile_image_url: Option<String>,
     #[serde(default)]

@@ -1,4 +1,4 @@
-import type { ProviderId } from './providers';
+import type { ProviderCategory, ProviderId } from './providers';
 
 export interface AudioBoostSettings {
   enabled: boolean;
@@ -50,7 +50,9 @@ export interface VideoPlayerSettings {
   audio_boost?: AudioBoostSettings;
   song_id?: SongIdSettings;
   experimental_low_latency?: boolean;
+  /** Live-edge gap in displayed seconds; null or absent = automatic per delivery path. */
   ll_target_latency?: number | null;
+  /** Set once the low-latency engine has been switched on by default for this install. */
   low_latency_engine_defaulted?: boolean;
   /** Ad-free live playback. Android only; the desktop app resolves through its
    *  plugin seam and ignores both of these. */
@@ -137,6 +139,7 @@ export interface DropsSettings {
   auto_reserve_on_watch?: boolean; // Automatically reserve token when starting a stream (default: true)
   priority_channels?: PriorityChannel[]; // Channels to prioritize for channel points automation
   prefer_favorites?: boolean; // Collect your live favorited channels instead of the priority list (default: false)
+  prefer_missing_badges?: boolean; // Work first on campaigns that award a badge you're missing (default: true)
   // Recovery settings
   recovery_settings?: RecoverySettings;
 }
@@ -160,6 +163,8 @@ export interface CurrentDropInfo {
   required_minutes: number;
   current_minutes: number;
   game_name: string;
+  /** Extra progress wording, e.g. "Day 2 of 3 · 12/20 min today" for multi-day drops. */
+  detail?: string;
 }
 
 export interface DropsDeviceCodeInfo {
@@ -583,10 +588,16 @@ export interface ChatInputSettings {
   // still sends + clears like normal.
   quick_send?: boolean;
   // Emote tab completion in the chat input. Tab cycles forward through
-  // matching emotes/chatters, Shift+Tab cycles back.
+  // matching emotes/chatters, Shift+Tab cycles back. Match mode is read by Rust
+  // too (emote_match.rs).
   emote_tab_complete_enabled?: boolean;
   emote_tab_complete_match_mode?: 'starts_with' | 'includes';
   emote_tab_complete_include_chatters?: boolean;
+  // What Tab opens: the inline carousel (complete in place, Tab again cycles;
+  // the default) or the emote list (narrows as you type). Never both.
+  emote_tab_style?: 'carousel' | 'list';
+  // Typing ":" plus two letters opens the emote list. Defaults to on.
+  emote_colon_search_enabled?: boolean;
   // Underline misspelled words in the composer and offer corrections on
   // right-click. Replaces the webview's own spell check, which flags every
   // emote name and every login because it has never seen Twitch chat.
@@ -649,6 +660,13 @@ export interface LiveNotificationSettings {
   show_favorite_drops_notifications?: boolean; // Notify on startup when favorited categories have new drops
   show_channel_points_notifications?: boolean;
   show_badge_notifications?: boolean;
+  // Gift subs you RECEIVE. Polled from Twitch's own notification feed, which
+  // is the only source for them: EventSub's gift subscription authorizes as
+  // the broadcaster, and the push socket's sub-gift topic is channel-scoped.
+  show_gift_sub_notifications?: boolean;
+  // Rewards Twitch names for your account, off the same feed: a badge you
+  // earned, a drop reward waiting to be claimed.
+  show_twitch_reward_notifications?: boolean;
   // Notification method toggles (Dynamic Island vs Toast)
   use_dynamic_island?: boolean;
   use_toast?: boolean;
@@ -1034,6 +1052,13 @@ export interface Settings {
   reminders?: RemindersSettings;
   chat_input?: ChatInputSettings;
   chat_render?: ChatRenderSettings;
+  // Cross-platform chat merging. `channel_links` is BACKEND-owned (the link
+  // service writes it and a settings patch can never override it), so never patch it
+  // through updateSettings — go through the channel-link commands.
+  channel_links?: ChannelLinkGroup[];
+  chat_blend?: ChatBlendSettings;
+  /** The command palette's snippets (models/settings.rs SnippetSettings). */
+  snippets?: SnippetSettings;
   cosmetics?: CosmeticsSettings;
   live_notifications?: LiveNotificationSettings;
   last_seen_version?: string;
@@ -1047,6 +1072,7 @@ export interface Settings {
   compact_view?: CompactViewSettings; // Compact view preset settings
   custom_themes?: CustomTheme[]; // User-created custom themes
   glass_transparency?: number; // Global glassiness, 0-100 (100 = full frosted glass, 0 = solid panels). Default 100.
+  glass_blur?: boolean; // Backdrop blur behind glass. Rust supplies the default (on everywhere); the toggle is the escape hatch for a weak GPU.
   oled_accent?: string; // Accent hex (#rrggbb) for the OLED theme, which lets you pick any accent. Default DEFAULT_OLED_ACCENT.
   multi_nook_slots?: MultiNookSlot[]; // Persisted multi-nook grid configurations
   multi_nook_chat_hidden?: boolean; // Whether the chat panel is globally hidden in MultiNook
@@ -1153,6 +1179,65 @@ export interface ProviderFollow {
   avatar?: string;
 }
 
+/** One platform's half of a streamer who broadcasts in more than one place.
+ *  Mirrors LinkMember on the Rust side, which owns the writing. */
+export interface LinkMember {
+  provider: ProviderId;
+  /** Login / slug / UC id — whatever that platform's own live check accepts,
+   *  never a YouTube video id. Verbatim case: YouTube ids are case-sensitive,
+   *  so this is passed straight to acquireChannel, never rebuilt from a key. */
+  channel: string;
+  display_name?: string;
+  avatar?: string;
+}
+
+/** The channels one streamer broadcasts on. Addressed by ANY member, so the
+ *  same link resolves whether the viewer arrives from Twitch or from Kick. */
+export interface ChannelLinkGroup {
+  id: string;
+  members: LinkMember[];
+  /** `provider:channel` entries the user said are NOT this streamer. */
+  dismissed?: string[];
+  /** `provider:channel` members kept linked but left out of this streamer's
+   *  combined feed (the chat header's platform marks). */
+  hidden?: string[];
+}
+
+/** Merging other platforms' chat into the normal chat panel. Mirrors
+ *  ChatBlendSettings on the Rust side. */
+/** A snippet the user wrote. Ids start `custom.`. */
+export interface CustomSnippetSetting {
+  id: string;
+  title: string;
+  category: string;
+  content: string;
+  keywords?: string;
+}
+
+export interface SnippetSettings {
+  custom: CustomSnippetSetting[];
+  /** Starred snippet ids, built-in or custom. */
+  favorites: string[];
+  /** Snippet id -> lowercase shortcut. */
+  aliases: Record<string, string>;
+}
+
+export interface ChatBlendSettings {
+  // Master switch. Off means nothing connects and nothing probes. Default off.
+  enabled?: boolean;
+  // Which platforms may join a merged feed, keyed by provider id (see
+  // CHAT_PROVIDERS). Absent means allowed; only an explicit false excludes.
+  platforms?: Partial<Record<ProviderId, boolean>>;
+  // Offer a link when a channel looks like it exists on Kick or YouTube.
+  // Default on.
+  suggest_links?: boolean;
+  // Mark rows from a platform other than the one being watched. Default on.
+  show_platform_badge?: boolean;
+  // Set once Rust has reset the global platform switches the chat header's
+  // marks used to write. Backend bookkeeping; the page never sets it.
+  header_marks_scoped?: boolean;
+}
+
 /** A title plus its choices, remembered so the composer can offer it again. */
 export interface RecentPollEntry {
   title: string;
@@ -1211,11 +1296,69 @@ export interface ModLogEvent {
   source?: 'eventsub' | 'irc';
 }
 
-export interface ReleaseNotes {
+/** Mirrors `services::changelog::SectionKind`: which glyph a section gets. */
+export type ChangelogSectionKind =
+  | 'fixes'
+  | 'performance'
+  | 'maintenance'
+  | 'removed'
+  | 'plugins'
+  | 'interface'
+  | 'changes'
+  | 'features'
+  | 'other';
+
+export interface ChangelogItem {
+  title: string;
+  desc: string;
+  /** A bullet with no bold title: the whole line is the change. */
+  plain: boolean;
+}
+
+/** Mirrors `services::changelog::NoteNode`, parsed in Rust. */
+export type ChangelogNode =
+  | { t: 'hero'; title: string; desc: string }
+  | { t: 'image'; url: string; alt: string }
+  | { t: 'note'; desc: string }
+  | {
+      t: 'section';
+      label: string | null;
+      kind: ChangelogSectionKind;
+      intro: string[];
+      items: ChangelogItem[];
+    };
+
+export interface ChangelogRelease {
+  /** Without a leading "v". */
   version: string;
-  name: string;
-  body: string;
-  published_at: string;
+  published_at: string | null;
+  prerelease: boolean;
+  notes: ChangelogNode[];
+}
+
+/** What `get_changelog` returns, newest release first. */
+export interface Changelog {
+  releases: ChangelogRelease[];
+}
+
+/** Mirrors `services::changelog::ChangeTopic`, for an Android change's icon. */
+export type AndroidChangeTopic =
+  | 'audio'
+  | 'power'
+  | 'playback'
+  | 'profile'
+  | 'link'
+  | 'chat'
+  | 'notifications'
+  | 'fix'
+  | 'build'
+  | 'other';
+
+/** What `get_android_changelog` returns while a release is published. */
+export interface AndroidRelease {
+  version: string;
+  published_at: string | null;
+  changes: { title: string; body: string; topic: AndroidChangeTopic }[];
 }
 
 /** Channel points as the Rust channel-state service reports them. */
@@ -1225,6 +1368,34 @@ export interface ChannelPoints {
   name: string | null;
   icon_url: string | null;
   available_claim_id: string | null;
+}
+
+/** One channel in a Twitch collaboration, as Rust reports it. */
+export interface Collaborator {
+  user_id: string;
+  login: string;
+  display_name: string;
+  avatar_url: string | null;
+  /** This channel's own viewers. Rust leaves members who are not live out. */
+  viewer_count: number;
+  is_leader: boolean;
+  /** The watched channel itself. */
+  is_self: boolean;
+}
+
+/** Twitch's Shared Viewership: the watched channel first, then the rest by
+ *  their own viewer count. Always at least two members. */
+export interface Collaboration {
+  /** Unique viewers across every member. */
+  shared_viewers: number;
+  members: Collaborator[];
+}
+
+/** Twitch's Shared Chat outside a Shared Viewership group (Rust
+ *  `shared_chat::SharedChat`): live channels only, the channel first, then by
+ *  their own viewers; `is_leader` marks the session's host. At least two. */
+export interface SharedChat {
+  members: Collaborator[];
 }
 
 /** Per-channel chat state owned by Rust (src-tauri/src/services/channel_state.rs). */
@@ -1237,13 +1408,16 @@ export interface ChannelState {
   points_at: number | null;
   pinned: unknown[];
   pinned_at: number | null;
+  collab: Collaboration | null;
+  collab_at: number | null;
 }
 
 /** One changed section, the payload of the `channel-state` event. */
 export type ChannelStateUpdate =
   | { section: 'viewers'; login: string; viewer_count: number | null; at: number }
   | { section: 'points'; login: string; points: ChannelPoints | null; at: number }
-  | { section: 'pinned'; login: string; pinned: unknown[]; at: number };
+  | { section: 'pinned'; login: string; pinned: unknown[]; at: number }
+  | { section: 'collab'; login: string; collab: Collaboration | null; at: number };
 
 /** One channel's bulk hype-train status, as Rust reports it. */
 export interface HypeTrainBulkStatus {
@@ -1267,6 +1441,13 @@ export interface HomeSnapshot {
   recommended_at: number | null;
   hype_trains: HypeTrainBulkStatus[];
   hype_at: number | null;
+  /** Twitch channel id -> its Shared Viewership group, only for channels in one. */
+  collaborations?: Record<string, Collaboration>;
+  collab_at?: number | null;
+  /** Twitch channel id -> its Shared Chat session, only for channels in one
+   *  and not in a Shared Viewership group. */
+  shared_chats?: Record<string, SharedChat>;
+  shared_chat_at?: number | null;
   watch_streaks: Record<string, number>;
   streaks_at: number | null;
   drops_campaigns: DropCampaign[];
@@ -1274,6 +1455,29 @@ export interface HomeSnapshot {
   drops_at: number | null;
   continue_watching: ContinueWatchingItem[];
   continue_watching_at: number | null;
+  /** Home's Discover tab on the unified view, finished in Rust
+   *  (src-tauri/src/services/unified_discover.rs): Twitch's picks and every
+   *  other platform's directory as one ranked list, without the channels the
+   *  Following tab or the Favourites section already show. Render it as-is. */
+  unified_discover: TwitchStream[];
+  unified_discover_at: number | null;
+  /** Your channels across every platform, finished in Rust
+   *  (src-tauri/src/services/unified_following.rs). Surfaces only pick the
+   *  platform whose rows they show. */
+  following: FollowingLists;
+  following_at: number | null;
+  /** The unified Categories tab's "On other platforms" row, built in Rust from
+   *  each platform's cached categories. */
+  other_categories: ProviderCategory[];
+  other_categories_at: number | null;
+}
+
+/** Live favourites, the other live follows (ranked by viewers across every
+ *  platform) and the offline roster, each across every platform. */
+export interface FollowingLists {
+  favorites: TwitchStream[];
+  live: TwitchStream[];
+  offline: TwitchStream[];
 }
 
 /** One card in Home's Continue Watching row. Rust builds these from the local
@@ -1303,9 +1507,17 @@ export type HomeSnapshotUpdate =
   | { section: 'offline'; channels: TwitchStream[]; last_broadcasts: Record<string, string | null>; at: number }
   | { section: 'recommended'; streams: TwitchStream[]; cursor: string | null; at: number }
   | { section: 'hype_trains'; statuses: HypeTrainBulkStatus[]; at: number }
+  | { section: 'collaborations'; collabs: Record<string, Collaboration>; at: number }
+  | { section: 'shared_chats'; chats: Record<string, SharedChat>; at: number }
   | { section: 'watch_streaks'; streaks: Record<string, number>; at: number }
   | { section: 'drops'; campaigns: DropCampaign[]; active_game_names: string[]; at: number }
-  | { section: 'continue_watching'; items: ContinueWatchingItem[]; at: number };
+  | { section: 'continue_watching'; items: ContinueWatchingItem[]; at: number }
+  | { section: 'unified_discover'; streams: TwitchStream[]; at: number }
+  /** The Sidebar's second section, built in Rust for `scope` ('all' or one
+   *  provider id): ranked, minus what its Favourites and Followed show. */
+  | { section: 'sidebar_discover'; scope: string; streams: TwitchStream[]; at: number }
+  | { section: 'following'; favorites: TwitchStream[]; live: TwitchStream[]; offline: TwitchStream[]; at: number }
+  | { section: 'other_categories'; categories: ProviderCategory[]; at: number };
 
 /**
  * A live stream row. The name is historical: rows may now come from any
@@ -1326,7 +1538,6 @@ export interface TwitchStream {
   thumbnail_url: string;
   started_at: string;
   broadcaster_type?: string;
-  has_shared_chat?: boolean;
   profile_image_url?: string;
   is_live?: boolean;
   // Free-form stream tags (e.g. "English", "Speedrun"); used by the category tag filter.
@@ -1421,6 +1632,10 @@ export interface VodStartInfo {
    *  when none are known: on a `recording` VOD that means Twitch has not
    *  determined them yet, NOT that there are none. */
   muted_segments?: MutedRange[];
+  /** Category changes over the broadcast. Absent when Twitch reports none. */
+  chapters?: VodChapter[];
+  /** Seek-preview sprite sheets. Finished VODs only. */
+  storyboard?: VodStoryboard;
 }
 
 /** An audio range Twitch muted on a VOD, in seconds from the VOD start.
@@ -1428,6 +1643,35 @@ export interface VodStartInfo {
 export interface MutedRange {
   start_secs: number;
   end_secs: number;
+}
+
+/** A category the broadcast ran under, in seconds from the VOD start. Sorted,
+ *  non-overlapping, merged and clamped in Rust (services/vod_chapters.rs). */
+export interface VodChapter {
+  start_secs: number;
+  end_secs: number;
+  title: string;
+  game_id?: string;
+  /** Box art at the size the chapter list draws, already resolved. */
+  box_art_url?: string;
+}
+
+export interface VodStoryboardVariant {
+  quality: string;
+  width: number;
+  height: number;
+  rows: number;
+  cols: number;
+  count: number;
+  interval_secs: number;
+  images: string[];
+}
+
+/** Seek-preview sprite sheets of a finished VOD (services/vod_storyboard.rs).
+ *  `images` are relative to `base_url`. */
+export interface VodStoryboard {
+  base_url: string;
+  variants: VodStoryboardVariant[];
 }
 
 /** Rust's answer to "can this live broadcast be rewound": Twitch keeps a
@@ -1537,6 +1781,20 @@ export interface UnifiedGame {
   active: boolean;                  // Currently automation this game
   has_claimable: boolean;              // Has drops ready to claim
   all_drops_claimed: boolean;          // All available drops have been claimed (game complete)
+  release_ms: number;                  // Newest active campaign's start (epoch ms)
+}
+
+/** The Drops page model, built in Rust (services/drops_overview.rs). */
+export interface DropsOverview {
+  games: UnifiedGame[];
+  inventory_items: InventoryItem[];
+  completed_drops: CompletedDrop[];
+  statistics: DropsStatistics | null;
+  progress: DropProgress[];
+  /** Lowercased badge titles this account has earned. */
+  earned_badge_titles: string[];
+  /** Earned plus Twitch's global catalog, lowercased. */
+  known_badge_titles: string[];
 }
 
 // Drops inventory types
@@ -1558,6 +1816,23 @@ export interface DropProgress {
   drop_instance_id?: string; // Required for claiming drops - compound ID from Twitch
   drop_name?: string; // Cached drop name from backend events
   drop_image?: string; // Cached drop image from backend events
+  /** Twitch's own progress detail for multi-day and subscription drops. */
+  twitch_progress?: TwitchProgress | null;
+}
+
+/** Progress Twitch reports beyond plain minutes (Rust `TwitchProgress`). */
+export interface TwitchProgress {
+  days_done: number;
+  /** Minutes in the current day window; 0 once that window has lapsed. */
+  minutes_today: number;
+  window_expires_at: string | null;
+  /** Minutes rose in the last few minutes: this is being earned now. */
+  accruing: boolean;
+  subs_done: number;
+  /** Earned and waiting to be claimed (Twitch's `CLAIMABLE`); for a draw, waiting to be opened. */
+  ready_to_claim: boolean;
+  /** What the viewer got or holds: for a random draw, the one that came out. */
+  earned?: DropBenefit | null;
 }
 
 export interface TimeBasedDrop {
@@ -1569,6 +1844,14 @@ export interface TimeBasedDrop {
   /** Whether this drop can be auto-collected. Drops with required_minutes_watched = 0 
    * are event-based, badge-based, or require special actions and cannot be auto-collected */
   is_collectible?: boolean;
+  /** Subscriptions (or gifted subs) the reward needs; 0 = none. */
+  required_subs?: number;
+  /** Separate days the watch time repeats on; 0 or 1 = once. `required_minutes_watched` is the total. */
+  required_days?: number;
+  /** The reward is one drawn at random from this many. */
+  random_of?: number | null;
+  /** A draw with one reward left unheld: what it will give (Twitch never repeats one). */
+  next_reward?: DropBenefit | null;
 }
 
 export interface AllowedChannel {
@@ -1590,6 +1873,13 @@ export interface DropCampaign {
   allowed_channels: AllowedChannel[];
   is_acl_based: boolean;
   account_link?: string; // URL to connect game account for drops
+  details_url?: string;
+  /** Each tier carries its own progress (multi-day and container drops), not one shared watch-time count. */
+  separate_progress?: boolean;
+  /** `game_id` is a real category; false when it only groups a cross-category campaign. */
+  has_category?: boolean;
+  /** Every category a stream can be live in to credit this drop; empty means `game_id` alone. */
+  category_ids?: string[];
 }
 
 export type CampaignStatus = 'Active' | 'Upcoming' | 'Expired';
@@ -1699,14 +1989,58 @@ export interface DropsStatistics {
 }
 
 // Dynamic Island Notification Types
-export type NotificationType = 'live' | 'whisper' | 'system' | 'update' | 'drops' | 'channel_points' | 'badge';
+export type NotificationType = 'live' | 'whisper' | 'system' | 'update' | 'drops' | 'channel_points' | 'badge' | 'gift_sub' | 'twitch_reward' | 'membership_gift';
 
 export interface DynamicIslandNotification {
   id: string;
   type: NotificationType;
   timestamp: number;
   read: boolean;
-  data: LiveNotificationData | WhisperNotificationData | SystemNotificationData | UpdateNotificationData | DropsNotificationData | ChannelPointsNotificationData | BadgeNotificationData;
+  data: LiveNotificationData | WhisperNotificationData | SystemNotificationData | UpdateNotificationData | DropsNotificationData | ChannelPointsNotificationData | BadgeNotificationData | GiftSubNotificationData | TwitchRewardNotificationData | MembershipGiftNotificationData;
+}
+
+/** One run of a gift-sub sentence. Twitch sends the body as markdown with
+ *  `**bold**` around the gifter, tier and channel; Rust splits it so the row
+ *  renders spans instead of re-parsing a string per render. */
+export interface GiftSubBodySpan {
+  text: string;
+  bold: boolean;
+}
+
+/** Somebody gave this member a StreamNook membership.
+ *
+ *  There is deliberately no gifter here. The name lives on `comp_memberships.
+ *  granted_by`, which the app cannot read (RLS is on with no policies), so the
+ *  row must not imply one. */
+export interface MembershipGiftNotificationData {
+  grantedAt: string;
+  /** A permanent grant rather than a fixed term. */
+  permanent: boolean;
+}
+
+/** A reward Twitch named for your account (badge earned, drop reward), off
+ *  its own notification feed. Rust classifies and bold-parses it. */
+export interface TwitchRewardNotificationData {
+  kind: 'badge' | 'drop';
+  /** Twitch's sentence with the markdown removed. */
+  body_plain: string;
+  body_spans: GiftSubBodySpan[];
+  /** The reward's own art. */
+  thumbnail_url: string;
+  action_url?: string;
+}
+
+export interface GiftSubNotificationData {
+  /** Twitch's sentence with the markdown removed, for native OS notifications
+   *  and anywhere spans cannot be rendered. */
+  body_plain: string;
+  body_spans: GiftSubBodySpan[];
+  /** Avatar of whoever the row is about. Twitch always populates this. */
+  thumbnail_url: string;
+  /** Present when the action URL was a plain channel link, so clicking opens
+   *  the stream rather than a browser. */
+  channel_login?: string;
+  action_url?: string;
 }
 
 export interface LiveNotificationData {
@@ -1783,9 +2117,12 @@ export interface BadgeNotificationData {
   badge_description?: string;
   status: 'new' | 'available' | 'coming_soon';
   date_info?: string; // e.g., "Dec 1-12" or "Available now"
-  // Relay campaign facts, kept so the stored row can re-derive its status at
-  // render time instead of freezing the one that was true when it arrived.
   enrichment?: Record<string, unknown>;
+  // The earn window Rust resolved when the badge arrived (same shape as
+  // services/badgeStanding WindowRun), kept so the stored row reads its status
+  // against the clock at render time instead of freezing the one that was true
+  // when it arrived. Absent on rows stored before it existed.
+  window?: { start_ms: number | null; end_ms: number | null }[] | null;
 }
 
 // Whisper Types
@@ -1810,6 +2147,41 @@ export interface WhisperConversation {
   messages: Whisper[];
   last_message_timestamp: number;
   unread_count: number;
+}
+
+/** Account facts from IVR (Rust services/ivr.rs). */
+export interface IvrUserSummary {
+  followers: number | null;
+  created_at: string | null;
+  is_affiliate: boolean;
+  is_partner: boolean;
+  is_staff: boolean;
+}
+
+/** A user's subscription standing in one channel, from IVR. */
+export interface IvrSubageSummary {
+  /** "paid", "gift", "prime", ...; null when not subscribed now. */
+  active_sub_type: string | null;
+  cumulative_months: number | null;
+  /** Cumulative, else the current period's months, else the streak. */
+  lifetime_months: number;
+}
+
+/** One conversation's change, recorded by Rust (services/whisper_inbox.rs):
+ *  move `replaced_key` to `key` if set, take `meta`, append `message`. */
+export interface WhisperUpdate {
+  owner_id: string;
+  key: string;
+  replaced_key: string | null;
+  meta: {
+    user_id: string;
+    user_login: string;
+    user_name: string;
+    profile_image_url: string | null;
+    last_message_timestamp: number;
+    unread_count: number;
+  };
+  message: Whisper | null;
 }
 
 // Hype Train Types

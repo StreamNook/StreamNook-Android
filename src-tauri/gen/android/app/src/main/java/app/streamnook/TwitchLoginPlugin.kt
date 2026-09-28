@@ -89,6 +89,13 @@ class ExpireCookiesArgs {
     var urls: Array<String> = emptyArray()
 }
 
+@InvokeArg
+class FileHandoffArgs {
+    lateinit var path: String
+    lateinit var name: String
+    lateinit var mime: String
+}
+
 /** A hidden re-mint either completes on its own quickly or it will not at all. */
 private const val HIDDEN_WATCH_TIMEOUT_MS = 30 * 1000L
 
@@ -167,8 +174,12 @@ class TwitchLoginPlugin(private val activity: Activity) : Plugin(activity) {
                 return@runOnUiThread
             }
             if (overlay != null && hiddenMode) {
+                // No cancel event here. The page listens for one to end a
+                // sign-in, and the visible sign-in taking over has ALREADY
+                // registered its listener, so a cancel ended it before it
+                // began. The re-mint being replaced hears the new sign-in's
+                // token (same key) or runs out its own short deadline.
                 dismiss()
-                (activity as? MainActivity)?.notifyLoginCancelled()
             }
             hiddenMode = args.hidden
             // A redirect left from an abandoned attempt carries a stale state
@@ -454,6 +465,89 @@ class TwitchLoginPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(ret)
     }
 
+    // ── File handoff ────────────────────────────────────────────────────────
+    // The only app-local plugin, so the two file steps only Android can do live
+    // here too. Rust builds the file and decides; these just hand it over.
+
+    /**
+     * Copy a file into the public Downloads collection. MediaStore needs no
+     * storage permission from Android 10; below that it would, so the answer is
+     * "unsupported" and the caller offers the share sheet instead.
+     */
+    @Command
+    fun saveToDownloads(invoke: Invoke) {
+        val args = invoke.parseArgs(FileHandoffArgs::class.java)
+        val ret = JSObject()
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.Q) {
+            ret.put("status", "unsupported")
+            invoke.resolve(ret)
+            return
+        }
+        val resolver = activity.contentResolver
+        val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+        var uri: Uri? = null
+        try {
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.Downloads.DISPLAY_NAME, args.name)
+                put(android.provider.MediaStore.Downloads.MIME_TYPE, args.mime)
+                put(android.provider.MediaStore.Downloads.IS_PENDING, 1)
+            }
+            uri = resolver.insert(collection, values) ?: throw java.io.IOException("Downloads refused the file")
+            resolver.openOutputStream(uri)?.use { out ->
+                java.io.File(args.path).inputStream().use { it.copyTo(out) }
+            } ?: throw java.io.IOException("could not open the Downloads file")
+            values.clear()
+            values.put(android.provider.MediaStore.Downloads.IS_PENDING, 0)
+            resolver.update(uri, values, null, null)
+            ret.put("status", "saved")
+            invoke.resolve(ret)
+        } catch (e: Exception) {
+            // A half-written pending row would linger invisibly; drop it.
+            uri?.let { runCatching { resolver.delete(it, null, null) } }
+            invoke.reject(e.message ?: "could not save to Downloads")
+        }
+    }
+
+    /**
+     * Offer a file to the share sheet. FileProvider only serves the cache dir
+     * (res/xml/file_paths.xml), so a file anywhere else is copied in first.
+     */
+    @Command
+    fun shareFile(invoke: Invoke) {
+        val args = invoke.parseArgs(FileHandoffArgs::class.java)
+        try {
+            val cache = activity.cacheDir.canonicalFile
+            var file = java.io.File(args.path).canonicalFile
+            if (!file.path.startsWith(cache.path + java.io.File.separator)) {
+                val copy = java.io.File(java.io.File(cache, "shared"), args.name)
+                copy.parentFile?.mkdirs()
+                file.copyTo(copy, overwrite = true)
+                file = copy
+            }
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                activity, "${activity.packageName}.fileprovider", file
+            )
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = args.mime
+                putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                // The read grant rides the ClipData; without it the chooser's
+                // preview and some targets cannot open the file.
+                clipData = android.content.ClipData.newRawUri(args.name, uri)
+                addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            activity.runOnUiThread {
+                try {
+                    activity.startActivity(android.content.Intent.createChooser(send, null))
+                    invoke.resolve()
+                } catch (e: Exception) {
+                    invoke.reject(e.message ?: "no app can receive the file")
+                }
+            }
+        } catch (e: Exception) {
+            invoke.reject(e.message ?: "could not share the file")
+        }
+    }
+
     /** Whether the overlay is on screen. Rust polls it to notice a close.
      *  Read directly (the field is @Volatile) rather than hopping to the UI
      *  thread, so a busy UI thread never stalls the Rust poller. */
@@ -673,7 +767,16 @@ class TwitchLoginPlugin(private val activity: Activity) : Plugin(activity) {
                 // that owns the key, so a null here is the ordinary case for
                 // most of the sign-in rather than a failure.
                 val value = decodeJsString(raw)
-                if (value != null && value.length > MIN_TOKEN_LEN) {
+                if (value != null && value.length > MIN_TOKEN_LEN && isExpiredJwt(value)) {
+                    // The key's origin keeps its storage between sessions, so the
+                    // token from last month is sitting there when the flow lands
+                    // back on it, until the page writes the new one. Taking it
+                    // closed the sign-in in under a second and handed the app an
+                    // expired session: the Sign in button looked like it did
+                    // nothing, and the silent monthly re-mint never re-minted.
+                    android.util.Log.i("SNLogin", "ignoring an expired $key; waiting for the new one")
+                    storageWatchHandler.postDelayed(tick, STORAGE_POLL_MS)
+                } else if (value != null && value.length > MIN_TOKEN_LEN) {
                     android.util.Log.i("SNLogin", "captured $key (${value.length} chars)")
                     stopStorageWatch()
                     (activity as? MainActivity)?.notifyLoginStorage(key, value)
@@ -686,6 +789,26 @@ class TwitchLoginPlugin(private val activity: Activity) : Plugin(activity) {
         storageWatchKey = key
         storageWatchTick = tick
         storageWatchHandler.postDelayed(tick, STORAGE_POLL_MS)
+    }
+
+    /** True for a JWT whose `exp` is past (or within a minute of it). Anything
+     *  that is not a readable JWT is not judged here. */
+    private fun isExpiredJwt(value: String): Boolean {
+        val parts = value.split('.')
+        if (parts.size != 3) return false
+        return try {
+            val payload = String(
+                android.util.Base64.decode(
+                    parts[1],
+                    android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
+                ),
+                Charsets.UTF_8,
+            )
+            val exp = JSONObject(payload).optLong("exp", 0L)
+            exp > 0L && exp * 1000L <= System.currentTimeMillis() + 60_000L
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun stopStorageWatch() {

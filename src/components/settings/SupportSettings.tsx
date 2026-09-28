@@ -4,6 +4,7 @@ import { DiscordGlyph } from '../ui/DiscordGlyph';
 import streamnookLogo from '../../assets/streamnook-logo.png';
 import { SettingsSection, SettingsRow } from './_primitives';
 import { useAppStore } from '../../stores/AppStore';
+import { IS_MOBILE } from '../../utils/platform';
 
 import { Logger } from '../../utils/logger';
 
@@ -229,6 +230,7 @@ const SupportSettings = () => {
             </div>
 
             <DiagnosticLoggingSection />
+            <DataRecordedSection />
         </div>
     );
 };
@@ -245,6 +247,19 @@ const SupportSettings = () => {
  * Lives on Support because that is where a person goes when something is wrong,
  * and it is the page a maintainer will point them at.
  */
+/** Phone only: Rust zips the logs and hands them to Downloads or the share sheet. */
+async function exportLogs(to: 'downloads' | 'share') {
+    const toast = useAppStore.getState().addToast;
+    try {
+        const result = await invoke<string>('export_logs', { to });
+        if (result === 'saved') toast('Saved to your Downloads folder.', 'success');
+        else if (result === 'empty') toast('Nothing has been logged yet.', 'info');
+    } catch (e) {
+        Logger.warn('[Support] export logs failed:', e);
+        toast('Could not get the logs. Try again.', 'error');
+    }
+}
+
 const DiagnosticLoggingSection = () => {
     const { settings, updateSettings } = useAppStore();
     // Absent means ON, matching how AppStore reads it (`!== false`), so an
@@ -259,8 +274,8 @@ const DiagnosticLoggingSection = () => {
         >
             <SettingsRow
                 title="Keep a detailed log for bug reports"
-                description="Records connection, playback, and chat activity to streamnook.log on this PC so a problem can be traced after the fact."
-                help="Leave it on if you might report a bug; with it off the log holds almost nothing worth sending. The file stays on your PC until you choose to share it."
+                description="Records connection, playback, and chat activity to streamnook.log on this device so a problem can be traced after the fact."
+                help="Leave it on if you might report a bug; with it off the log holds almost nothing worth sending. The file stays on your device until you choose to share it."
                 control={
                     <Toggle
                         enabled={enabled}
@@ -268,24 +283,80 @@ const DiagnosticLoggingSection = () => {
                     />
                 }
             />
-            <SettingsRow
-                title="Find the log file"
-                description="Opens the folder that holds streamnook.log so you can attach it to a bug report."
-                control={
-                    <button
-                        onClick={() => {
-                            void invoke('open_logs_folder').catch((e) =>
-                                Logger.warn('[Support] open logs folder failed:', e),
-                            );
-                        }}
-                        className="px-3 py-1.5 rounded-md text-sm text-textPrimary bg-white/[0.06] hover:bg-white/[0.1] transition-colors"
-                    >
-                        Open logs folder
-                    </button>
-                }
-            />
+            {IS_MOBILE ? (
+                // The phone keeps its logs in the app's private folder, which a
+                // file manager cannot open without root, so they are shared.
+                <SettingsRow
+                    title="Get the log file"
+                    description="Saves your logs as one zip in Downloads, or sends it straight to an app, so you can attach it to a bug report."
+                    control={
+                        <div className="flex gap-2">
+                            <button
+                                onClick={() => void exportLogs('downloads')}
+                                className="px-3 py-1.5 rounded-md text-sm text-textPrimary bg-white/[0.1] hover:bg-white/[0.14] transition-colors"
+                            >
+                                Save to Downloads
+                            </button>
+                            <button
+                                onClick={() => void exportLogs('share')}
+                                className="px-3 py-1.5 rounded-md text-sm text-textPrimary bg-white/[0.06] hover:bg-white/[0.1] transition-colors"
+                            >
+                                Share
+                            </button>
+                        </div>
+                    }
+                />
+            ) : (
+                <SettingsRow
+                    title="Find the log file"
+                    description="Opens the folder that holds streamnook.log so you can attach it to a bug report."
+                    control={
+                        <button
+                            onClick={() => {
+                                void invoke('open_logs_folder').catch((e) =>
+                                    Logger.warn('[Support] open logs folder failed:', e),
+                                );
+                            }}
+                            className="px-3 py-1.5 rounded-md text-sm text-textPrimary bg-white/[0.06] hover:bg-white/[0.1] transition-colors"
+                        >
+                            Open logs folder
+                        </button>
+                    }
+                />
+            )}
         </SettingsSection>
     );
 };
+
+/**
+ * What the signed-in account records, stated plainly.
+ *
+ * Informational rows, no controls: this describes what already happens rather
+ * than offering a switch, and a toggle that does not exist server-side would be
+ * worse than saying nothing. The wording is deliberately specific about the
+ * behavioural half, because "we collect some diagnostics" would be true of the
+ * version line and misleading about the watch and emote counts.
+ */
+const DataRecordedSection = () => (
+    <SettingsSection
+        label="What your account records"
+        description="Signed in, StreamNook keeps a few counts against your account. Chat messages and anything you type are not among them."
+    >
+        <SettingsRow
+            title="Channels and emotes"
+            description="Counts which channels you watch and which emotes you use, which is what fills in your profile stats and unlocks accolades."
+            help="Stored as running totals per channel and per emote, not as a history of when you watched. Signed out, nothing is counted."
+        />
+        <SettingsRow
+            title="Version and platform"
+            description="Records which build you are on, your operating system, and whether your updater is working."
+            help="This is how a broken update path becomes visible. Without it a client that quietly stopped updating looks identical to one that is already current."
+        />
+        <SettingsRow
+            title="Linked accounts"
+            description="Records which other platforms you have connected, so they survive a reinstall."
+        />
+    </SettingsSection>
+);
 
 export default SupportSettings;

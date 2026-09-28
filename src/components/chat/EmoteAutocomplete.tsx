@@ -1,13 +1,17 @@
 import React, { useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
+import { List } from 'lucide-react';
 import { EmoteTabCandidate } from '../../utils/chatInputWord';
 import { Tooltip } from '../ui/Tooltip';
-import { inlineEmoteTier, sevenTvTierUrl } from '../../services/emoteService';
+import EmoteThumb from './EmoteThumb';
+import EmoteProviderLogo from './EmoteProviderLogo';
 
 interface EmoteAutocompleteProps {
   current: EmoteTabCandidate;
   backwards: EmoteTabCandidate[];
   forwards: EmoteTabCandidate[];
+  /** Make Tab open the emote list instead, from right here. */
+  onSwitchToList?: () => void;
 }
 
 const Caret: React.FC<{ direction: 'left' | 'right' }> = ({ direction }) => (
@@ -26,7 +30,7 @@ const Caret: React.FC<{ direction: 'left' | 'right' }> = ({ direction }) => (
   </svg>
 );
 
-const EmoteThumb: React.FC<{ tok: EmoteTabCandidate; size: number }> = ({ tok, size }) => {
+const CandidateThumb: React.FC<{ tok: EmoteTabCandidate; size: number }> = ({ tok, size }) => {
   const emote = tok.emote;
   if (!emote) {
     return (
@@ -38,39 +42,11 @@ const EmoteThumb: React.FC<{ tok: EmoteTabCandidate; size: number }> = ({ tok, s
       </div>
     );
   }
-  // Disk-first for 7TV (emote.localUrl is the cached file at the per-DPI tier),
-  // CDN at that tier on a miss.
-  const tier = inlineEmoteTier();
-  const src = emote.provider === '7tv'
-    ? (emote.localUrl || sevenTvTierUrl(emote.id, tier))
-    : (emote.localUrl || emote.url);
   return (
     <Tooltip content={emote.name}>
-    <img
-      src={src}
-      alt={emote.name}
-      loading="lazy"
-      draggable={false}
-      style={{ maxHeight: size, maxWidth: size }}
-      className="object-contain"
-      onError={(e) => {
-        const t = e.currentTarget;
-        if (emote.provider === '7tv') {
-          // A stale disk file or a missing size/format walks the avif then webp
-          // ladder so the thumb is never blank.
-          const ladder = [`${tier}.avif`, '2x.avif', '1x.avif', '2x.webp', '1x.webp']
-            .map((s) => `https://cdn.7tv.app/emote/${emote.id}/${s}`);
-          let step = Number(t.dataset.fb || '0');
-          while (step < ladder.length && ladder[step] === t.src) step++;
-          if (step < ladder.length) {
-            t.dataset.fb = String(step + 1);
-            t.src = ladder[step];
-          }
-          return;
-        }
-        if (emote.localUrl && t.src !== emote.url) t.src = emote.url;
-      }}
-    />
+      <span className="inline-flex">
+        <EmoteThumb emote={emote} size={size} />
+      </span>
     </Tooltip>
   );
 };
@@ -81,7 +57,7 @@ const EmoteThumb: React.FC<{ tok: EmoteTabCandidate; size: number }> = ({ tok, s
  * what was inserted into the textarea on this Tab press, so the carousel is
  * purely a preview of what comes next.
  */
-const EmoteAutocomplete: React.FC<EmoteAutocompleteProps> = ({ current, backwards, forwards }) => {
+const EmoteAutocomplete: React.FC<EmoteAutocompleteProps> = ({ current, backwards, forwards, onSwitchToList }) => {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -105,7 +81,7 @@ const EmoteAutocomplete: React.FC<EmoteAutocompleteProps> = ({ current, backward
           {backwards.length > 0 && <Caret direction="left" />}
           {backwards.map((tok) => (
             <div key={`b-${tok.name}`} className="px-2 py-1.5 rounded-md flex items-center justify-center">
-              <EmoteThumb tok={tok} size={40} />
+              <CandidateThumb tok={tok} size={40} />
             </div>
           ))}
         </div>
@@ -113,13 +89,13 @@ const EmoteAutocomplete: React.FC<EmoteAutocompleteProps> = ({ current, backward
         <div
           className="px-3 py-1.5 rounded-md flex items-center justify-center bg-white/10 border border-white/15 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.05)]"
         >
-          <EmoteThumb tok={current} size={52} />
+          <CandidateThumb tok={current} size={52} />
         </div>
 
         <div className="flex items-center gap-1.5 flex-1 min-w-0 opacity-70">
           {forwards.map((tok) => (
             <div key={`f-${tok.name}`} className="px-2 py-1.5 rounded-md flex items-center justify-center">
-              <EmoteThumb tok={tok} size={40} />
+              <CandidateThumb tok={tok} size={40} />
             </div>
           ))}
           {forwards.length > 0 && <Caret direction="right" />}
@@ -130,17 +106,35 @@ const EmoteAutocomplete: React.FC<EmoteAutocompleteProps> = ({ current, backward
         <span className="text-[12px] font-semibold text-white/85 truncate pr-2">
           {current.name}
           {current.emote && (
-            <span className="ml-1.5 text-[9px] uppercase tracking-wider text-white/40">
-              {current.emote.provider}
+            <span className="ml-2 inline-flex items-center gap-1 align-middle px-1.5 py-0.5 rounded bg-white/[0.05] text-[10px] font-normal leading-none text-white/55">
+              <EmoteProviderLogo provider={current.emote.provider} tinted className="w-3 h-3" />
+              {current.sourceDetail ?? current.emote.provider}
             </span>
           )}
           {current.chatter && (
             <span className="ml-1.5 text-[9px] uppercase tracking-wider text-white/40">user</span>
           )}
         </span>
-        <span className="flex items-center gap-1 opacity-60">
-          <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-[9px] font-mono text-white tracking-widest border border-white/10 leading-none">TAB</kbd>
-          <span className="text-[10px] text-white">cycle</span>
+        <span className="shrink-0 flex items-center gap-2">
+          <span className="flex items-center gap-1 opacity-60">
+            <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-[9px] font-mono text-white tracking-widest border border-white/10 leading-none">TAB</kbd>
+            <span className="text-[10px] text-white">cycle</span>
+          </span>
+          {onSwitchToList && (
+            <button
+              type="button"
+              title="Make Tab open the emote list instead"
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-[11px] leading-none text-white/60 hover:text-textPrimary hover:bg-white/[0.07] transition-colors"
+              // mousedown, not click: the textarea keeps focus and its caret.
+              onMouseDown={(e) => {
+                e.preventDefault();
+                onSwitchToList();
+              }}
+            >
+              <List className="w-3.5 h-3.5" />
+              List
+            </button>
+          )}
         </span>
       </div>
     </motion.div>

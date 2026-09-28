@@ -45,6 +45,7 @@ import { useMessageRepeatStore, type RepeatParticipant } from './messageRepeatSt
 import { normalizeForRepeat, isPrivilegedChatter } from '../utils/messageRepeat';
 import { tokenizeLocalBody } from '../utils/localMessageTokens';
 import type { SongMatch } from '../utils/songId';
+import type { BackendChatMessage } from '../services/twitchChat';
 
 // Hard caps borrowed from the prior single-channel hook. Keeping them as
 // per-channel limits means a 5-channel MultiChat caps memory at 5x the
@@ -604,6 +605,11 @@ function bumpRevisionFor(channelKeys: string[]) {
   });
 }
 
+/** Every open channel's counter, for a change that touched every slice. */
+function bumpAllChannels() {
+  bumpRevisionFor([...useChatConnectionStore.getState().channels.keys()]);
+}
+
 /**
  * Lazily-loaded per-message engines, resolved once and then called synchronously.
  *
@@ -614,11 +620,8 @@ function bumpRevisionFor(channelKeys: string[]) {
  * split); every message after that takes the synchronous branch.
  */
 type NukeEngine = typeof import('../utils/nukeEngine');
-type ReminderEngine = typeof import('../utils/reminderEngine');
 let nukeEngineMod: NukeEngine | null = null;
 let nukeEnginePromise: Promise<NukeEngine> | null = null;
-let reminderEngineMod: ReminderEngine | null = null;
-let reminderEnginePromise: Promise<ReminderEngine> | null = null;
 
 function withNukeEngine(fn: (mod: NukeEngine) => void): void {
   if (nukeEngineMod) { fn(nukeEngineMod); return; }
@@ -626,11 +629,6 @@ function withNukeEngine(fn: (mod: NukeEngine) => void): void {
   void nukeEnginePromise.then((mod) => { nukeEngineMod = mod; fn(mod); });
 }
 
-function withReminderEngine(fn: (mod: ReminderEngine) => void): void {
-  if (reminderEngineMod) { fn(reminderEngineMod); return; }
-  reminderEnginePromise ??= import('../utils/reminderEngine');
-  void reminderEnginePromise.then((mod) => { reminderEngineMod = mod; fn(mod); });
-}
 
 // --- Coalesced render flush ---------------------------------------------------
 //
@@ -794,6 +792,54 @@ function queueMessage(channelKey: string, msg: any): void {
   scheduleFlush();
 }
 
+/**
+ * Drop the rows of users a settings save just hid. Rust stops their next
+ * messages at ingest and names them here (a `HIDE_USERS` bridge frame), so the
+ * rows already on screen go at once instead of scrolling away later.
+ * `channelKey` is the filter's composite key (`twitch:xqc`), resolved through
+ * the slice codec; null means every channel.
+ */
+function dropHiddenUsersRows(channelKey: string | null, logins: string[]): void {
+  const names = new Set(logins.map((n) => n.toLowerCase()));
+  if (names.size === 0) return;
+  const store = useChatConnectionStore.getState();
+  const targets = channelKey
+    ? (() => {
+        const { provider, channel } = parseKey(channelKey);
+        return [sliceLookupKey(provider, channel)];
+      })()
+    : [...store.channels.keys()];
+  const isHidden = (m: unknown): boolean => {
+    if (typeof m === 'string') {
+      const login = /^(?:@[^ ]* )?:([^!\s]+)!/.exec(m)?.[1];
+      const display = /(?:^@|;)display-name=([^;\s]*)/.exec(m)?.[1];
+      return (!!login && names.has(login.toLowerCase())) || (!!display && names.has(display.toLowerCase()));
+    }
+    const row = m as { username?: string; display_name?: string } | null;
+    return (
+      (!!row?.username && names.has(row.username.toLowerCase())) ||
+      (!!row?.display_name && names.has(row.display_name.toLowerCase()))
+    );
+  };
+  const touched: string[] = [];
+  for (const key of targets) {
+    const slice = store.channels.get(key);
+    if (!slice) continue;
+    const kept = slice.messages.filter((m) => !isHidden(m));
+    if (kept.length !== slice.messages.length) {
+      slice.messages = kept;
+      touched.push(slice.channel);
+    }
+    const pending = pendingByChannel.get(slice.channel);
+    if (pending) {
+      for (let i = pending.length - 1; i >= 0; i--) {
+        if (isHidden(pending[i])) pending.splice(i, 1);
+      }
+    }
+  }
+  if (touched.length) bumpRevisionFor(touched);
+}
+
 function getSlice(channel: string): ChannelSlice | undefined {
   return useChatConnectionStore.getState().channels.get(channel.toLowerCase());
 }
@@ -930,7 +976,11 @@ function removeSlice(channel: string) {
 // compositing. Out-of-range values fall back to the default rather than
 // crashing.
 const BUFFER_CEILING = IS_MOBILE ? 300 : 1000;
-function getActiveHistoryMax(): number {
+/** How many rows one channel keeps. Exported because a merged feed has to cap
+ *  the COMBINED array against the same number rather than let it grow to
+ *  sources x cap: the message list has no JS windowing, so three sources at a
+ *  raised cap would mount thousands of rows. */
+export function getActiveHistoryMax(): number {
   const setting = useAppStore.getState().settings.chat_render?.message_buffer_cap;
   if (typeof setting !== 'number' || !Number.isFinite(setting)) return CHAT_HISTORY_MAX;
   return Math.max(50, Math.min(BUFFER_CEILING, Math.round(setting)));
@@ -1084,16 +1134,59 @@ function pushMessage(slice: ChannelSlice, msg: any) {
  * already carry authoritative server badges.
  */
 function repaintOwnBadges(slice: ChannelSlice, badges: string): boolean {
+  return repaintOwnRows(slice, (m) => {
+    const current = m.badges.map((b) => `${b.name}/${b.version}`).join(',');
+    return current === badges ? null : { ...m, badges: badgesFromTag(badges) };
+  });
+}
+
+/**
+ * Retroactively repaint the PRIMARY account's own optimistic messages with the
+ * real chat color from USERSTATE. Same rationale as repaintOwnBadges: Twitch
+ * doesn't echo your own PRIVMSG back over your own read connection, so an own
+ * message's color is frozen at build time. If it was built before USERSTATE
+ * landed (or with the default fallback), this rewrites it the moment the real
+ * color arrives so the username never stays a wrong color.
+ */
+function repaintOwnColor(slice: ChannelSlice, color: string): boolean {
+  return repaintOwnRows(slice, (m) => (m.color === color ? null : { ...m, color }));
+}
+
+/** Our own not-yet-confirmed row, built by Rust at send time. */
+function isOwnOptimistic(m: unknown): m is BackendChatMessage {
+  return typeof m === 'object' && m !== null && (m as BackendChatMessage).own_optimistic === true;
+}
+
+/** Still carrying its provisional id (Helix has not answered yet). */
+function isUnstampedOwn(m: unknown): m is BackendChatMessage {
+  return isOwnOptimistic(m) && m.id.startsWith('local-');
+}
+
+function badgesFromTag(tag: string): BackendChatMessage['badges'] {
+  return tag
+    .split(',')
+    .filter(Boolean)
+    .map((b) => {
+      const [name, version = ''] = b.split('/');
+      return { name, version };
+    });
+}
+
+/** Replace the primary account's own rows that `repaint` changes. Only rows this
+ *  window built are touched: anything received carries the server's own values. */
+function repaintOwnRows(
+  slice: ChannelSlice,
+  repaint: (m: BackendChatMessage) => BackendChatMessage | null,
+): boolean {
   if (!currentUserId) return false;
-  const ownTag = `user-id=${currentUserId}`;
   let next: any[] | null = null;
   for (let i = 0; i < slice.messages.length; i++) {
     const m = slice.messages[i];
-    if (typeof m !== 'string' || !m.includes(ownTag)) continue;
-    const current = m.match(/(?:^|;)badges=([^;]*)/)?.[1] ?? '';
-    if (current === badges) continue;
+    if (!isOwnOptimistic(m) || m.user_id !== currentUserId) continue;
+    const painted = repaint(m);
+    if (!painted) continue;
     next ??= slice.messages.slice();
-    next[i] = m.replace(/(^|;)badges=[^;]*/, (_full, sep) => `${sep}badges=${badges}`);
+    next[i] = painted;
   }
   if (!next) return false;
   slice.messages = next;
@@ -1101,42 +1194,58 @@ function repaintOwnBadges(slice: ChannelSlice, badges: string): boolean {
 }
 
 /**
- * Retroactively repaint the PRIMARY account's own optimistic messages with the
- * real chat color from USERSTATE. Same rationale as repaintOwnBadges: Twitch
- * doesn't echo your own PRIVMSG back over your own read connection, so an own
- * message's `color=` tag is frozen at build time. If it was built before
- * USERSTATE landed (or with the default fallback), this rewrites it the moment
- * the real color arrives so the username never stays a wrong color.
+ * A chatter's 7TV personal set arrived after some of their messages did, so
+ * those rows show the emotes as plain words. Rust names the rows; each one's
+ * segments go back to Rust to have the set applied (the parser's own exact-word
+ * rule, so the page holds no copy of it) and the row is swapped in place.
  */
-function repaintOwnColor(slice: ChannelSlice, color: string): boolean {
-  if (!currentUserId) return false;
-  const ownTag = `user-id=${currentUserId}`;
-  let next: any[] | null = null;
-  for (let i = 0; i < slice.messages.length; i++) {
-    const m = slice.messages[i];
-    if (typeof m !== 'string' || !m.includes(ownTag)) continue;
-    const current = m.match(/(?:^|;)color=([^;]*)/)?.[1] ?? '';
-    if (current === color) continue;
-    next ??= slice.messages.slice();
-    next[i] = m.replace(/(^|;)color=[^;]*/, (_full, sep) => `${sep}color=${color}`);
-  }
-  if (!next) return false;
-  slice.messages = next;
-  return true;
+async function repaintPersonalEmotes(channel: string, userId: string, messageIds: unknown[]): Promise<void> {
+  const key = channel.toLowerCase();
+  const slice = getSlice(key);
+  if (!slice || !userId) return;
+  const wanted = new Set(messageIds.map(String));
+  const rows = slice.messages.filter(
+    (m): m is BackendChatMessage =>
+      typeof m === 'object' && m !== null && wanted.has(m.id) && m.user_id === userId && Array.isArray(m.segments),
+  );
+  if (rows.length === 0) return;
+  const painted = await Promise.all(
+    rows.map((m) =>
+      invoke<BackendChatMessage['segments'] | null>('apply_personal_emotes', { userId, segments: m.segments })
+        .then((segments) => (segments ? ([m.id, segments] as const) : null))
+        .catch(() => null),
+    ),
+  );
+  const byId = new Map(painted.filter((p): p is NonNullable<typeof p> => p !== null));
+  if (byId.size === 0) return;
+  withSlice(key, (s) => {
+    let next: ChannelSlice['messages'] | null = null;
+    for (let i = 0; i < s.messages.length; i++) {
+      const m = s.messages[i];
+      const segments = typeof m === 'object' && m !== null ? byId.get(m.id) : undefined;
+      if (!segments) continue;
+      next ??= s.messages.slice();
+      next[i] = { ...m, segments };
+    }
+    if (next) s.messages = next;
+  });
 }
 
 function setAllChannelsConnected(connected: boolean) {
   for (const slice of useChatConnectionStore.getState().channels.values()) {
     slice.isConnected = connected;
   }
-  bumpRevision();
+  // Every slice changed, and a pane subscribes to its own channel's counter,
+  // so a global-only bump left the connection state stale until the next
+  // message in each room.
+  bumpAllChannels();
 }
 
 function setAllChannelsError(error: string | null) {
   for (const slice of useChatConnectionStore.getState().channels.values()) {
     slice.error = error;
   }
-  bumpRevision();
+  bumpAllChannels();
 }
 
 // Extract the lowercase channel from an IRC line by locating the ` #` segment.
@@ -1346,6 +1455,7 @@ async function reconnectAllInner() {
   const state = useChatConnectionStore.getState();
   const channels = Array.from(state.channels.keys());
   if (channels.length === 0) return;
+  clearAllChannelRetries();
 
   intentionalDisconnect = true;
   if (ws) {
@@ -1386,18 +1496,29 @@ async function reconnectAllInner() {
     if (!socketIsOpen()) {
       throw new Error('[ChatStore] reconnect finished without an open socket');
     }
-    for (const ch of channels.slice(1)) {
-      const provider = state.channels.get(ch)?.provider ?? 'twitch';
-      try {
-        if (provider === 'twitch') {
-          await invoke('join_chat_channel', { channel: ch });
-        } else {
-          await invoke('provider_chat_connect', { provider, channel: parseKey(ch).channel });
-        }
-      } catch (err) {
-        Logger.error(`[ChatStore] Failed to re-join ${ch} during reconnect:`, err);
+    // The rest at once, each on its own: one platform failing or slow must not
+    // hold the others back. Twitch channels share one IRC connection, so when
+    // the first channel was not Twitch, the first Twitch one (re)starts it and
+    // the others join after it.
+    const rest = channels.slice(1).filter((ch) => state.channels.has(ch));
+    const providerOf = (ch: string) => state.channels.get(ch)?.provider ?? 'twitch';
+    const twitch = rest.filter((ch) => providerOf(ch) === 'twitch');
+    const others = rest.filter((ch) => providerOf(ch) !== 'twitch');
+    const firstIsTwitch = firstSlice.provider === 'twitch';
+    const rejoinTwitch = async () => {
+      if (twitch.length === 0) return;
+      let joiners = twitch;
+      if (!firstIsTwitch) {
+        const [head, ...tail] = twitch;
+        await connectChannel(head, 'twitch', head, 'start');
+        joiners = tail;
       }
-    }
+      await Promise.all(joiners.map((ch) => connectChannel(ch, 'twitch', ch, 'join')));
+    };
+    await Promise.all([
+      rejoinTwitch(),
+      ...others.map((ch) => connectChannel(ch, providerOf(ch), parseKey(ch).channel, 'start')),
+    ]);
   } catch (err) {
     Logger.error('[ChatStore] Reconnect failed:', err);
     setAllChannelsError('Reconnection failed');
@@ -1522,16 +1643,27 @@ async function connectBridgeInner(
     Logger.debug(`[ChatStore] Invoking bridge connect for ${channel} (${provider})`);
     chatConnectStartedAt = performance.now();
     chatFirstFrameLogged = false;
-    const port = await withTimeout(
-      provider === 'twitch'
-        ? invoke<number>('start_chat', { channel, reattach })
-        : invoke<number>('provider_chat_connect', {
-            provider,
-            channel: bareChannel ?? channel,
-          }),
-      BRIDGE_CONNECT_TIMEOUT_MS,
-      provider === 'twitch' ? 'start_chat' : 'provider_chat_connect',
-    );
+    // Twitch's start_chat brings the bridge up along with its IRC connection,
+    // and stays first so a cold start still orders the claims it resets. Any
+    // other platform, and a Twitch start that failed, takes the socket from
+    // Rust alone: every other channel in the window chats over it whatever
+    // this one channel's connect does, and this channel connects after it.
+    let firstFailure: unknown = null;
+    let port: number;
+    if (provider === 'twitch') {
+      try {
+        port = await withTimeout(
+          invoke<number>('start_chat', { channel, reattach }),
+          BRIDGE_CONNECT_TIMEOUT_MS,
+          'start_chat',
+        );
+      } catch (err) {
+        firstFailure = err;
+        port = await withTimeout(invoke<number>('chat_bridge_port'), BRIDGE_CONNECT_TIMEOUT_MS, 'chat_bridge_port');
+      }
+    } else {
+      port = await withTimeout(invoke<number>('chat_bridge_port'), BRIDGE_CONNECT_TIMEOUT_MS, 'chat_bridge_port');
+    }
     Logger.info(`[ChatPerf] bridge connect took ${Math.round(performance.now() - chatConnectStartedAt)}ms`);
     useChatConnectionStore.setState({ wsPort: port });
 
@@ -1605,10 +1737,106 @@ async function connectBridgeInner(
     setAllChannelsConnected(true);
     startHealthCheck();
 
-    // After first-channel connect, pre-load recent messages (Twitch-only: the
-    // badge cache + history backfill don't apply to other providers).
-    if (provider === 'twitch') void preloadChannel(channel, channelId);
+    if (provider === 'twitch') {
+      // After first-channel connect, pre-load recent messages (Twitch-only: the
+      // badge cache + history backfill don't apply to other providers).
+      if (firstFailure === null) void preloadChannel(channel, channelId);
+      else channelConnectFailed(channel, 'twitch', channel, firstFailure);
+    } else {
+      // Not awaited: the socket is up, and whoever waits on this connect is
+      // waiting for the socket, not for one platform's answer.
+      void connectChannel(channel, provider, bareChannel ?? channel, 'start');
+    }
   }
+}
+
+// A channel whose own connect failed retries alone, on its own clock, while the
+// window's socket and every other channel carry on. Without this the only
+// retry was a reconnect of the whole window, and only ever for its first
+// channel.
+const CHANNEL_RETRY_BASE_MS = 30_000;
+const CHANNEL_RETRY_MAX_MS = 300_000;
+const channelRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const channelRetryAttempts = new Map<string, number>();
+
+function clearChannelRetry(key: string) {
+  const timer = channelRetryTimers.get(key);
+  if (timer) clearTimeout(timer);
+  channelRetryTimers.delete(key);
+  channelRetryAttempts.delete(key);
+}
+
+function clearAllChannelRetries() {
+  for (const timer of channelRetryTimers.values()) clearTimeout(timer);
+  channelRetryTimers.clear();
+  channelRetryAttempts.clear();
+}
+
+/** Mark one channel's connect as failed and schedule its own retry. */
+function channelConnectFailed(key: string, provider: ProviderId, bareChannel: string, err: unknown) {
+  Logger.error(`[ChatStore] ${provider} connect failed for ${key}:`, err);
+  withSlice(key, (s) => {
+    s.isConnected = false;
+    s.error = String(err);
+  });
+  const existing = channelRetryTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const attempt = (channelRetryAttempts.get(key) ?? 0) + 1;
+  channelRetryAttempts.set(key, attempt);
+  const delay = Math.min(CHANNEL_RETRY_BASE_MS * 2 ** (attempt - 1), CHANNEL_RETRY_MAX_MS);
+  channelRetryTimers.set(
+    key,
+    setTimeout(() => {
+      channelRetryTimers.delete(key);
+      // Released since, or the socket is being rebuilt: the reconnect claims
+      // every channel itself.
+      if (!useChatConnectionStore.getState().channels.has(key) || !socketIsOpen()) return;
+      void connectChannel(key, provider, bareChannel, 'start').then((ok) => {
+        const slice = useChatConnectionStore.getState().channels.get(key);
+        if (ok && provider === 'twitch' && slice) void preloadChannel(key, slice.channelId);
+      });
+    }, delay),
+  );
+}
+
+/**
+ * Connect one channel's platform on this window's open socket. Its failure is
+ * its own: only its pane shows it, and it retries alone. For Twitch, `start`
+ * (re)starts the IRC connection when it is down and joins onto it when it is
+ * up; `join` needs it up.
+ */
+async function connectChannel(
+  key: string,
+  provider: ProviderId,
+  bareChannel: string,
+  twitch: 'start' | 'join',
+): Promise<boolean> {
+  try {
+    if (provider === 'twitch') {
+      await withTimeout(
+        twitch === 'start'
+          ? invoke('start_chat', { channel: key, reattach: true })
+          : invoke('join_chat_channel', { channel: key }),
+        BRIDGE_CONNECT_TIMEOUT_MS,
+        twitch === 'start' ? 'start_chat' : 'join_chat_channel',
+      );
+    } else {
+      await withTimeout(
+        invoke('provider_chat_connect', { provider, channel: bareChannel }),
+        BRIDGE_CONNECT_TIMEOUT_MS,
+        'provider_chat_connect',
+      );
+    }
+  } catch (err) {
+    channelConnectFailed(key, provider, bareChannel, err);
+    return false;
+  }
+  channelRetryAttempts.delete(key);
+  withSlice(key, (s) => {
+    s.isConnected = true;
+    s.error = null;
+  });
+  return true;
 }
 
 // Populate the Twitch badge metadata cache for a given channel. Without this,
@@ -1924,6 +2152,14 @@ function handleWsMessage(raw: string) {
   if (raw.startsWith('{')) {
     try {
       const parsed = JSON.parse(raw);
+      if (parsed.type === 'HIDE_USERS' && Array.isArray(parsed.logins)) {
+        dropHiddenUsersRows((parsed.channel_key as string | null | undefined) ?? null, parsed.logins);
+        return;
+      }
+      if (parsed.type === 'PERSONAL_EMOTES' && Array.isArray(parsed.message_ids)) {
+        void repaintPersonalEmotes(String(parsed.channel ?? ''), String(parsed.user_id ?? ''), parsed.message_ids);
+        return;
+      }
       if (parsed.type === 'CLEARMSG' && parsed.target_msg_id) {
         const ch = (parsed.channel as string | undefined)?.toLowerCase();
         const modSettings = useAppStore.getState().settings.moderation;
@@ -2003,7 +2239,7 @@ function handleWsMessage(raw: string) {
             const msgUserId =
               typeof msg !== 'string'
                 ? msg.user_id
-                : msg.match?.(/user-id=([^;]+)/)?.[1];
+                : msg.match?.(/(?:^@|;)user-id=([^;]+)/)?.[1];
             const msgId =
               typeof msg !== 'string' ? msg.id : msg.match?.(/(?:^|;)id=([^;]+)/)?.[1];
             if (msgUserId === parsed.target_user_id && msgId) affected.add(msgId);
@@ -2061,7 +2297,7 @@ function handleWsMessage(raw: string) {
                 const msgUserId =
                   typeof msg !== 'string'
                     ? msg.user_id
-                    : msg.match?.(/user-id=([^;]+)/)?.[1];
+                    : msg.match?.(/(?:^@|;)user-id=([^;]+)/)?.[1];
                 if (msgUserId !== parsed.target_user_id) continue;
                 removedCount += 1;
                 if (typeof msg !== 'string') {
@@ -2271,9 +2507,8 @@ function handleNotice(parsed: any) {
     for (const slice of useChatConnectionStore.getState().channels.values()) {
       for (let i = slice.messages.length - 1; i >= 0; i--) {
         const m = slice.messages[i];
-        if (typeof m !== 'string' || !m.includes('id=local-')) continue;
-        const tsMatch = m.match(/tmi-sent-ts=(\d+)/);
-        const ts = tsMatch ? parseInt(tsMatch[1], 10) : 0;
+        if (!isUnstampedOwn(m)) continue;
+        const ts = Number(m.timestamp) || 0;
         if (ts >= cutoff) {
           removeMessageAt(slice, i);
           break;
@@ -2310,7 +2545,7 @@ function handleNotice(parsed: any) {
       });
       slice.seenMessageIds.add(sysMsgId);
       slice.error = parsed.message;
-      bumpRevision();
+      bumpRevisionFor([slice.channel]);
       // Auto-clear the surfaced error after 3s
       setTimeout(() => {
         withSlice(slice.channel, (s) => {
@@ -2337,8 +2572,10 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
   // never matches a fresh incoming message.
   if (slice.pendingUpgradeIds.has(messageId)) {
     slice.pendingUpgradeIds.delete(messageId);
-    const idMatchIdx = slice.messages.findIndex(
-      (m) => typeof m === 'string' && m.match(/(?:^|;)id=([^;]+)/)?.[1] === messageId,
+    const idMatchIdx = slice.messages.findIndex((m) =>
+      typeof m === 'string'
+        ? m.match(/(?:^@|;)id=([^;]+)/)?.[1] === messageId
+        : isOwnOptimistic(m) && m.id === messageId,
     );
     if (idMatchIdx !== -1) {
       replaceMessageAt(slice, idMatchIdx, parsed);
@@ -2366,11 +2603,9 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
     // Whitespace-tolerant on both sides: the server never echoes trailing
     // whitespace, and callers other than sendChannelMessage may still hand
     // us an untrimmed optimistic line.
-    const optimisticIdx = slice.messages.findIndex((m) => {
-      if (typeof m !== 'string' || !m.includes('id=local-')) return false;
-      const contentMatch = m.match(/PRIVMSG #\w+ :(.+)$/);
-      return contentMatch ? sameSentContent(contentMatch[1], parsed.content) : false;
-    });
+    const optimisticIdx = slice.messages.findIndex(
+      (m) => isUnstampedOwn(m) && sameSentContent(m.content, parsed.content),
+    );
     if (optimisticIdx !== -1) {
       replaceMessageAt(slice, optimisticIdx, parsed);
       slice.seenMessageIds.add(messageId);
@@ -2402,7 +2637,7 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
       }
       const n = parseInt(t['msg-param-mass-gift-count'] ?? '', 10);
       useGiftBombStore.getState().noteAnnouncement(origin, Number.isFinite(n) ? n : undefined);
-      if (foldBufferedGiftChildren(slice, origin) > 0) bumpRevision();
+      if (foldBufferedGiftChildren(slice, origin) > 0) bumpRevisionFor([slice.channel]);
     } else if (origin && isGiftBombChild(mt) && announcedGiftBombOrigins.has(origin)) {
       const rid = t['msg-param-recipient-id'] || '';
       if (rid) {
@@ -2532,10 +2767,7 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
       void mod.checkActiveNukesForMessage(slice.channel, parsed);
     });
 
-    // No-op unless a keyword reminder is scoped to this channel.
-    withReminderEngine((mod) => {
-      mod.checkRemindersForMessage(slice.channel, parsed);
-    });
+    // Keyword reminders are matched in Rust (services/reminder_service.rs).
   }
 
   // Mirror non-chat channel events (subs, gifts, ... and future follows/raids/
@@ -2695,15 +2927,17 @@ function handleRawIrcString(raw: string) {
 
   const idMatch = raw.match(/(?:^|;)id=([^;]+)/);
   const messageId = idMatch?.[1];
-  const userIdMatch = raw.match(/user-id=([^;]+)/);
+  const userIdMatch = raw.match(/(?:^@|;)user-id=([^;]+)/);
   const userId = userIdMatch?.[1];
 
   // Deterministic own-message upgrade (Helix-stamped real id awaiting its echo):
   // replace the stamped optimistic string in place with the full server line.
   if (messageId && slice.pendingUpgradeIds.has(messageId) && !slice.seenMessageIds.has(messageId)) {
     slice.pendingUpgradeIds.delete(messageId);
-    const idMatchIdx = slice.messages.findIndex(
-      (m) => typeof m === 'string' && m.match(/(?:^|;)id=([^;]+)/)?.[1] === messageId,
+    const idMatchIdx = slice.messages.findIndex((m) =>
+      typeof m === 'string'
+        ? m.match(/(?:^@|;)id=([^;]+)/)?.[1] === messageId
+        : isOwnOptimistic(m) && m.id === messageId,
     );
     if (idMatchIdx !== -1) {
       replaceMessageAt(slice, idMatchIdx, raw);
@@ -2725,11 +2959,12 @@ function handleRawIrcString(raw: string) {
     // Whitespace-tolerant, same reason as the structured path above.
     const serverContent = contentMatch?.[1];
     if (serverContent) {
-      const optimisticIdx = slice.messages.findIndex((m) => {
-        if (typeof m !== 'string' || !m.includes('id=local-')) return false;
-        const localMatch = m.match(/PRIVMSG #\w+ :(.+)$/);
-        return localMatch ? sameSentContent(localMatch[1], serverContent) : false;
-      });
+      const withoutMention = serverContent.replace(/^@\S+\s+/, '');
+      const optimisticIdx = slice.messages.findIndex(
+        (m) =>
+          isUnstampedOwn(m) &&
+          (sameSentContent(m.content, serverContent) || sameSentContent(m.content, withoutMention)),
+      );
       if (optimisticIdx !== -1) {
         replaceMessageAt(slice, optimisticIdx, raw);
         if (messageId) slice.seenMessageIds.add(messageId);
@@ -2779,6 +3014,18 @@ export async function acquireChannel(
   const existing = state.channels.get(key);
 
   if (existing) {
+    const held = pendingReleases.get(key);
+    if (held) {
+      // Taken back inside the release grace: the live connection, the buffer and
+      // its dedupe set are all still here, so nothing reconnects and no backlog
+      // replays. Logged because it means a consumer let go and re-took the same
+      // channel within seconds, which is churn worth knowing about.
+      clearTimeout(held.timer);
+      pendingReleases.delete(key);
+      Logger.warn(
+        `[ChatStore] ${key} re-acquired ${Date.now() - held.at}ms after its last release; kept the live connection`,
+      );
+    }
     existing.refCount += 1;
     if (channelId && !existing.channelId) {
       existing.channelId = channelId;
@@ -2847,9 +3094,7 @@ export async function acquireChannel(
       bumpRevision();
       void preloadChannel(key, channelId);
     } catch (err) {
-      Logger.error(`[ChatStore] twitch join/start failed for ${key}:`, err);
-      slice.error = String(err);
-      bumpRevision();
+      channelConnectFailed(key, 'twitch', key, err);
     }
   } else {
     // Non-Twitch source on the already-open bridge: connect its adapter (no
@@ -2860,9 +3105,7 @@ export async function acquireChannel(
       slice.isConnected = true;
       bumpRevision();
     } catch (err) {
-      Logger.error(`[ChatStore] provider_chat_connect failed for ${key}:`, err);
-      slice.error = String(err);
-      bumpRevision();
+      channelConnectFailed(key, provider, channel, err);
     }
   }
 }
@@ -2887,6 +3130,36 @@ export async function releaseChannel(
     bumpRevision();
     return;
   }
+  if (provider !== 'twitch') {
+    // Hold the last release of a non-Twitch source for a grace period. Tearing
+    // it down at once and re-taking it a moment later (a consumer that re-renders
+    // through an empty channel list, a remount) rebuilt the slice and the Rust
+    // connection from nothing, and YouTube answers every fresh connection with
+    // its recent-chat backlog: dozens of rows landing at once as if new, and the
+    // old rows leaving the combined feed under the reader. Twitch is excluded:
+    // its history is a deliberate backfill the store dedupes, and callers rely
+    // on its PART being immediate.
+    if (!pendingReleases.has(key)) {
+      const timer = setTimeout(() => {
+        pendingReleases.delete(key);
+        const current = useChatConnectionStore.getState().channels.get(key);
+        if (!current || current.refCount > 0) return;
+        void finishRelease(key, channel, provider);
+      }, RELEASE_GRACE_MS);
+      pendingReleases.set(key, { timer, at: Date.now() });
+    }
+    bumpRevision();
+    return;
+  }
+  await finishRelease(key, channel, provider);
+}
+
+/** How long the last release of a non-Twitch source waits before it tears down. */
+const RELEASE_GRACE_MS = 15_000;
+/** Non-Twitch channels whose last consumer let go, still inside the grace. */
+const pendingReleases = new Map<string, { timer: ReturnType<typeof setTimeout>; at: number }>();
+
+async function finishRelease(key: string, channel: string, provider: ProviderId): Promise<void> {
   // Last consumer for this channel — drop the slice and PART the channel on
   // the IRC side so messages stop flowing in for it. Critically, we do NOT
   // call `stop_chat` here even when this window's channel set goes empty —
@@ -2894,6 +3167,7 @@ export async function releaseChannel(
   // sibling MultiChat popouts) may still be using it. Tearing down here
   // would kill chat for every other consumer in the process.
   removeSlice(key);
+  clearChannelRetry(key);
   // Free per-channel state the slice didn't own: the pending flush queue and the
   // resolved emote set (1 to 3 MB of metadata that otherwise stayed pinned for
   // the whole session after the last consumer left). emoteSubscribers is left to
@@ -2930,6 +3204,7 @@ export async function releaseChannel(
     reconnectForcePending = false;
     backendReconnecting = false;
     clearHealthCheck();
+    clearAllChannelRetries();
     clearPendingLostRow();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
@@ -2952,7 +3227,27 @@ export async function releaseChannel(
   }
 }
 
-/** Send a message to `channel`. Constructs the optimistic IRC string with
+/** The row being replied to, as the fields a reply carries. Falls back to the
+ *  parent's id alone when the row has scrolled out of this window. */
+function replyParentFor(slice: ChannelSlice, parentId: string) {
+  const parent = slice.messages.find((m) =>
+    typeof m === 'string' ? m.match(/(?:^@|;)id=([^;]+)/)?.[1] === parentId : (m as any)?.id === parentId,
+  );
+  if (!parent) return { id: parentId };
+  if (typeof parent === 'string') {
+    return {
+      id: parentId,
+      display_name: parent.match(/(?:^@|;)display-name=([^;]*)/)?.[1] ?? '',
+      login: parent.match(/:(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG/)?.[1] ?? '',
+      user_id: parent.match(/(?:^@|;)user-id=([^;]+)/)?.[1] ?? '',
+      body: parent.match(/PRIVMSG #\w+ :(.+)$/)?.[1] ?? '',
+    };
+  }
+  const p = parent as BackendChatMessage;
+  return { id: parentId, display_name: p.display_name || '', login: p.username || '', user_id: p.user_id || '', body: p.content || '' };
+}
+
+/** Send a message to `channel`. The row shown for it is built by Rust with
  *  channel-correct room-id and badge metadata. */
 export async function sendChannelMessage(
   channel: string,
@@ -2993,65 +3288,40 @@ export async function sendChannelMessage(
   }
 
   const tempId = `local-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  const timestamp = Date.now();
   // For the primary, prefer the real USERSTATE color (live, refreshes on /color)
   // over the build-time default so the username doesn't flash a wrong color until
-  // the IRC echo lands. A secondary carries its own resolved color.
+  // USERSTATE repaints it. A secondary carries its own resolved color.
   const color =
     (sendingAsSecondary
       ? senderAccount!.color
       : userInfo.color || slice.userColorFromIrc) || '#9147FF';
   // USERSTATE-cached badges win because they're tenure-correct for this channel;
   // caller-provided badges are the fallback while USERSTATE hasn't landed. A
-  // secondary isn't the IRC-connected user, so it has no cached badges; the real
-  // echo repaints them via the id-match path.
+  // secondary isn't the IRC-connected user, so it has no cached badges; its echo
+  // repaints them via the id-match path.
   const badges = sendingAsSecondary ? '' : slice.userBadgesFromIrc || userInfo.badges || '';
-  const roomIdTag = slice.channelId ?? '';
 
-  let replyTags = '';
-  if (replyParentMsgId) {
-    const parent = slice.messages.find((m) => {
-      if (typeof m === 'string') return m.includes(`id=${replyParentMsgId}`);
-      return m && typeof m === 'object' && (m as any).id === replyParentMsgId;
-    });
-    if (parent) {
-      let parentDisplayName = '';
-      let parentUsername = '';
-      let parentUserId = '';
-      let parentMsgBody = '';
-      if (typeof parent === 'string') {
-        parentDisplayName = parent.match(/display-name=([^;]+)/)?.[1] ?? '';
-        parentUsername =
-          parent.match(/:(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG/)?.[1] ?? '';
-        parentUserId = parent.match(/user-id=([^;]+)/)?.[1] ?? '';
-        parentMsgBody = parent.match(/PRIVMSG #\w+ :(.+)$/)?.[1] ?? '';
-      } else {
-        const p = parent as any;
-        parentDisplayName = p.display_name || '';
-        parentUsername = p.username || '';
-        parentUserId = p.user_id || '';
-        parentMsgBody = p.content || '';
-      }
-      const escaped = parentMsgBody
-        .replace(/\\/g, '\\\\')
-        .replace(/;/g, '\\:')
-        .replace(/ /g, '\\s')
-        .replace(/\r/g, '\\r')
-        .replace(/\n/g, '\\n');
-      replyTags = `reply-parent-msg-id=${replyParentMsgId};reply-parent-user-id=${parentUserId};reply-parent-user-login=${parentUsername};reply-parent-display-name=${parentDisplayName};reply-parent-msg-body=${escaped};`;
-    } else {
-      replyTags = `reply-parent-msg-id=${replyParentMsgId};`;
-    }
-  }
-
-  const optimistic = `@badge-info=;badges=${badges};color=${color};display-name=${senderDisplayName};emotes=;first-msg=0;flags=;id=${tempId};mod=0;${replyTags}returning-chatter=0;room-id=${roomIdTag};subscriber=0;tmi-sent-ts=${timestamp};turbo=0;user-id=${senderUserId};user-type= :${senderUsername}!${senderUsername}@${senderUsername}.tmi.twitch.tv PRIVMSG #${key} :${text}`;
-
-  slice.seenMessageIds.add(tempId);
-  pushMessage(slice, optimistic);
-  bumpRevision();
-
-  try {
-    const result = await invoke<{
+  // The row is built in Rust by the same parser as received messages (segments,
+  // emotes, reply info), so it renders exactly as the rest of chat. Requested
+  // alongside the send rather than before it: the send must not wait on it.
+  const built = invoke<BackendChatMessage | null>('build_own_chat_message', {
+    message: {
+      channel: key,
+      text,
+      local_id: tempId,
+      sender_id: senderUserId,
+      sender_login: senderUsername,
+      sender_display_name: senderDisplayName,
+      color,
+      badges,
+      room_id: slice.channelId ?? '',
+      reply_to: replyParentMsgId ? replyParentFor(slice, replyParentMsgId) : null,
+    },
+  }).catch((err) => {
+    Logger.warn('[ChatStore] could not build the sent row:', err);
+    return null;
+  });
+  const sending = invoke<{
       message_id: string | null;
       is_sent: boolean;
       drop_reason: string | null;
@@ -3063,6 +3333,22 @@ export async function sendChannelMessage(
       senderId: senderUserId || null,
       senderAccountId: sendingAsSecondary ? senderUserId : null,
     });
+  // Awaited below; this only stops a fast failure reporting as unhandled while
+  // the row is still being built.
+  sending.catch(() => {});
+
+  const row = await built;
+  if (row) {
+    slice.seenMessageIds.add(tempId);
+    pushMessage(slice, { ...row, own_optimistic: true });
+    // The CHANNEL's counter, not just the global one: a pane re-renders on its
+    // own channel's revision, and Twitch never echoes your own message back, so
+    // a global-only bump left your message invisible until someone else spoke.
+    bumpRevisionFor([key]);
+  }
+
+  try {
+    const result = await sending;
 
     // Twitch accepted the request but dropped the message (AutoMod, etc.).
     // Pull the optimistic copy and tell the user why.
@@ -3072,7 +3358,7 @@ export async function sendChannelMessage(
         return (m as any)?.id !== tempId;
       });
       slice.seenMessageIds.delete(tempId);
-      bumpRevision();
+      bumpRevisionFor([key]);
       if (result.drop_reason) {
         injectSystemMessage(key, `Your message was not sent: ${result.drop_reason}`);
       }
@@ -3086,11 +3372,9 @@ export async function sendChannelMessage(
     // appendStructuredMessage / handleRawIrcString.
     if (result && result.message_id) {
       const realId = result.message_id;
-      const idx = slice.messages.findIndex(
-        (m) => typeof m === 'string' && m.includes(`id=${tempId}`),
-      );
+      const idx = slice.messages.findIndex((m) => isOwnOptimistic(m) && m.id === tempId);
       if (idx !== -1) {
-        replaceMessageAt(slice, idx, (slice.messages[idx] as string).replace(`id=${tempId}`, `id=${realId}`));
+        replaceMessageAt(slice, idx, { ...(slice.messages[idx] as BackendChatMessage), id: realId });
         slice.seenMessageIds.delete(tempId);
         // Arm the echo-upgrade fast path for this id. Defensive cap: a stamped
         // row whose echo never arrives costs one stale entry, never growth.
@@ -3099,7 +3383,7 @@ export async function sendChannelMessage(
           const oldest = slice.pendingUpgradeIds.values().next().value;
           if (oldest !== undefined) slice.pendingUpgradeIds.delete(oldest);
         }
-        bumpRevision();
+        bumpRevisionFor([key]);
       }
     }
   } catch (err) {
@@ -3109,7 +3393,7 @@ export async function sendChannelMessage(
       return (m as any)?.id !== tempId;
     });
     slice.seenMessageIds.delete(tempId);
-    bumpRevision();
+    bumpRevisionFor([key]);
     throw err;
   }
 }
@@ -3177,6 +3461,10 @@ export function injectRedemptionMessage(
     color?: string;
     redemptionId?: string;
     pointsIconUrl?: string | null;
+    rewardImageUrl?: string;
+    rewardBackground?: string;
+    /** `name/version,...` in chat order, from Rust's chat history. */
+    badges?: string;
   },
 ): void {
   // A stable id from Twitch's redemption id (when present) makes this idempotent:
@@ -3199,7 +3487,12 @@ export function injectRedemptionMessage(
     'display-name': name,
     // Triggers the redemption highlight + label in ChatMessage.
     'custom-reward-id': r.rewardId || 'sn-redemption',
+    // Marks the row as a redemption for the stream overlay renderer, which draws
+    // it as a Channel points event (the hosted overlay builds the same tags).
+    'sn-reward-title': r.rewardTitle,
   };
+  if (r.rewardImageUrl) tags['sn-reward-image'] = r.rewardImageUrl;
+  if (r.rewardBackground) tags['sn-reward-bg'] = r.rewardBackground;
   if (r.cost && r.cost > 0) tags['sn-reward-cost'] = String(r.cost);
   if (r.pointsIconUrl) tags['sn-points-icon'] = r.pointsIconUrl;
   withSlice(channel, (slice) => {
@@ -3209,7 +3502,13 @@ export function injectRedemptionMessage(
       username: login,
       display_name: name,
       color: r.color || '#9147ff',
-      badges: [],
+      badges: (r.badges ?? '')
+        .split(',')
+        .filter(Boolean)
+        .map((b) => {
+          const [name, version = ''] = b.split('/');
+          return { name, version };
+        }),
       content: body,
       segments: tokenizeLocalBody(body, getChannelEmotes(channel)),
       is_action: false,
@@ -3393,8 +3692,14 @@ export function useChannelChat(channel: string | null | undefined): ChannelChatS
   // avoid Map.get returning new references on every render. The revision is
   // also handed back as `renderToken` (see ChannelChatSnapshot) so memoized
   // consumers have a change signal that in-place message mutations can't hide.
+  // No key means the caller is showing something this store does not own (a VOD
+  // replay, or a merged feed that subscribes to its own sources). Falling back to
+  // the GLOBAL revision there subscribed it to every channel in the app — every
+  // MultiNook tile and MultiChat pane — so an unrelated flush re-rendered the
+  // message list. That is the one hot path the incremental-merge work exists to
+  // keep quiet. A constant subscribes to nothing.
   const renderToken = useChatConnectionStore((state) =>
-    key ? state.revisionByChannel[key] ?? 0 : state.revision,
+    key ? state.revisionByChannel[key] ?? 0 : 0,
   );
   if (!key) return EMPTY_SNAPSHOT;
   const slice = useChatConnectionStore.getState().channels.get(key);

@@ -1,17 +1,17 @@
 // Floating glass pill tab bar: detached from the bottom edge, riding above the
-// gesture inset. The same object as desktop Home's floating strip: a dark
-// glass capsule over the grid, with the selected tab a lit capsule that glides
-// between tabs. The You tab becomes your avatar once signed in.
+// gesture inset. The same object as desktop Home's floating strip: the whole
+// bar wears the glaze, and the selected tab is a darker pill set into it that
+// glides between tabs. The You tab becomes your avatar once signed in.
 import React from 'react';
 import { motion } from 'framer-motion';
-import { Compass, Gift, Heart, UserCircle } from 'phosphor-react';
+import { Compass, Heart, Package, UserCircle } from 'phosphor-react';
 import { useAppStore } from '../stores/AppStore';
 import { useMobileNavStore, type MobileTab } from './navStore';
 
 const TABS: { id: MobileTab; label: string; Icon: typeof Heart }[] = [
   { id: 'following', label: 'Following', Icon: Heart },
   { id: 'browse', label: 'Browse', Icon: Compass },
-  { id: 'rewards', label: 'Rewards', Icon: Gift },
+  { id: 'rewards', label: 'Rewards', Icon: Package },
   { id: 'you', label: 'You', Icon: UserCircle },
 ];
 
@@ -26,10 +26,10 @@ export const MobileTabBar: React.FC<{
 
   return (
     <nav
-      // glass-panel--dark exists for exactly this contrast problem (chrome over
-      // a bright thumbnail grid), and the shared classes ride the Glassiness
-      // slider, which the old hand-rolled blur ignored.
-      className="fixed z-30 mx-auto max-w-[520px] glass-panel glass-panel--dark !rounded-full px-1.5"
+      // The dock glaze: clear glass with a light blur and a thin black film,
+      // tuned on a phone over a bright thumbnail grid. It still rides the
+      // Glassiness slider.
+      className="fixed z-30 mx-auto max-w-[520px] chrome-glaze chrome-glaze--dock px-1.5"
       style={{
         visibility: hidden ? 'hidden' : undefined,
         // Capped width. Stretched across a tablet or an unfolded Fold the tabs
@@ -48,20 +48,24 @@ export const MobileTabBar: React.FC<{
             <button
               key={id}
               onClick={() => setTab(id)}
+              // Unselected icons are the theme's text colour, not muted: over
+              // bright thumbnails a muted icon disappears. The selected one takes
+              // the theme accent inside the dark pill.
               className={`sn-touch flex-1 flex items-center justify-center transition-colors ${
-                active ? 'text-textPrimary' : 'text-textMuted'
+                active ? 'text-accent' : 'text-textPrimary'
               }`}
               aria-current={active ? 'page' : undefined}
               aria-label={label}
             >
-              {/* The lit capsule hugs the glyph, not the whole tab column, and
+              {/* The selected pill hugs the glyph, not the whole tab column,
+                  leaves the same strip of glass above and below it, and
                   glides between tabs on one shared layoutId, the way the
                   desktop strip's highlight does. */}
-              <span className="relative flex items-center justify-center w-14 h-10">
+              <span className="relative flex items-center justify-center w-[62px] h-11">
                 {active && (
                   <motion.span
                     layoutId="mobileTabHighlight"
-                    className="absolute inset-0 chrome-glaze chrome-glaze--flat chrome-glaze--control"
+                    className="absolute inset-0 glaze-selected"
                     transition={{ type: 'spring', stiffness: 350, damping: 30 }}
                   />
                 )}
@@ -76,7 +80,7 @@ export const MobileTabBar: React.FC<{
                       }`}
                     />
                   ) : (
-                    <Icon size={24} weight={active ? 'fill' : 'regular'} />
+                    <Icon size={25} weight={active ? 'fill' : 'regular'} />
                   )}
                 </span>
               </span>

@@ -29,6 +29,15 @@ const MINT_BUNDLE: &str = include_str!("../../potoken/mint.bundle.js");
 /// still being youtube.com.
 const MINT_PAGE: &str = "https://www.youtube.com/embed/";
 
+/// The store every page here opens in. Elsewhere they run in the main window's
+/// store, which holds no YouTube account. On macOS a webview without its own
+/// store shares the default one, where the YouTube sign-in lives too, so
+/// without this the pages would run signed in there (see
+/// `platform::webview_store`).
+fn own_store() -> [u8; 16] {
+    crate::platform::webview_store::own_store("youtube-potoken")
+}
+
 /// Tokens outlive a single request comfortably. Re-minting costs a webview and
 /// several network round trips, so cache well inside the real lifetime rather
 /// than paying that per segment fetch.
@@ -104,7 +113,8 @@ pub async fn mint(content_binding: &str) -> Result<Vec<u8>> {
 }
 
 async fn mint_uncached(content_binding: &str) -> Result<Vec<u8>> {
-    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    use crate::rt::WebviewWindowBuilder;
+    use tauri::WebviewUrl;
 
     let app = crate::services::providers::app_handle()
         .ok_or_else(|| anyhow!("no app handle; cannot open the minting window"))?;
@@ -118,6 +128,7 @@ async fn mint_uncached(content_binding: &str) -> Result<Vec<u8>> {
         .title("YouTube playback")
         .inner_size(480.0, 320.0)
         .visible(false)
+        .data_store_identifier(own_store())
         .initialization_script(MINT_BUNDLE)
         .build()
         .map_err(|e| anyhow!("could not open the minting window: {}", e))?;
@@ -395,7 +406,8 @@ pub async fn close_resolver() {
 }
 
 async fn resolve_uncached(video_id: &str, min_height: u32) -> Result<ResolvedStreams> {
-    use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+    use crate::rt::WebviewWindowBuilder;
+    use tauri::{Manager, WebviewUrl};
 
     let app = crate::services::providers::app_handle()
         .ok_or_else(|| anyhow!("no app handle; cannot open the resolver window"))?;
@@ -463,6 +475,7 @@ async fn resolve_uncached(video_id: &str, min_height: u32) -> Result<ResolvedStr
             .title("YouTube playback")
             .inner_size(480.0, 320.0)
             .visible(false)
+            .data_store_identifier(own_store())
             .initialization_script(MINT_BUNDLE)
             .build()
             .map_err(|e| anyhow!("could not open the resolver window: {}", e))?,
