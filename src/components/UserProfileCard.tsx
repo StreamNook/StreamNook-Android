@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } from 'react';
-import { MessageCircle, UserPlus, UserMinus, Loader2, ChevronDown, ChevronUp, Pencil, X, Gift, Share2, Check, EyeOff, History } from 'lucide-react';
+import { MessageCircle, UserPlus, UserMinus, Loader2, ChevronDown, ChevronUp, Pencil, X, Gift, Share2, Link2, Check, EyeOff, History } from 'lucide-react';
 import { filterChannelKey, isHiddenInScope } from '../utils/chatFilters';
-import { buildShareUrl } from '../utils/shareLink';
+import { buildShareUrl, buildProfileUrl } from '../utils/shareLink';
 import { providerLabel, type ProviderId } from '../types/providers';
 import { motion, AnimatePresence, useScroll, useTransform, useReducedMotion, useMotionValue, animate } from 'framer-motion';
 import { setUserNickname, setUserColor } from '../utils/userChatOverrides';
@@ -11,6 +11,7 @@ import { useAppStore } from '../stores/AppStore';
 import { streamProvider } from '../utils/streamProvider';
 import { openBadgesOnStreamNookInMain, openBadgesWithBadgeInMain, openBadgesWithTargetInMain } from '../utils/openBadgesInMain';
 import { computePaintStyle, getBadgeImageUrls, getBadgeFallbackUrls, pickPaintLayerImage, queueCosmeticForCaching } from '../services/seventvService';
+import { withBttvPro } from '../services/bttvProBadge';
 import { useNameColorAdjust } from '../hooks/useNameColor';
 import { FallbackImage } from './FallbackImage';
 import { formatIVRDate, formatSubTenure } from '../utils/ivrFormat';
@@ -35,11 +36,12 @@ import {
   getCosmeticsVersion,
   subscribeCosmeticsVersion,
 } from '../services/supabaseService';
-import { resolveCosmeticAsset } from './cosmeticAssets';
+import { resolveCosmeticAsset, DEFAULT_COSMETIC_SLUG } from './cosmeticAssets';
 import { SLOT_FOR_TYPE, type CosmeticType } from '../services/cosmetics/types';
 import { useMemberProfile, type MemberProfilePreview } from './profile/memberProfile';
 import { MemberProfileBackdrop } from './profile/MemberProfileBackdrop';
 import { MemberProfileHero } from './profile/MemberProfileHero';
+import { ProfileFrame, useProfileFrameUrl } from './profile/ProfileFrame';
 import { MemberProfileSections } from './profile/MemberProfileSections';
 import { PaintChip, SevenTvProfileButton } from './profile/IdentityChips';
 import { StreamNookBadge } from './StreamNookBadge';
@@ -388,7 +390,6 @@ interface NicknameEditorProps {
 // StreamNookBadge renders this as its fallback when a member has no cosmetic
 // explicitly equipped, so the inactive-thumbnail list must exclude it to avoid
 // rendering the same Member badge twice.
-const DEFAULT_COSMETIC_SLUG = 'streamnook-default';
 
 /** The in-app card's width, and a StreamNook member's wider card. Must match
  *  the `w-[440px]` / `w-[760px]` on the card root and the popout window sizes
@@ -415,15 +416,16 @@ function normalizeHex(input: string | null | undefined): string {
 // "Other" pile so each badge keeps its provenance, mirroring the Attainables
 // "Chat Clients" gallery. Any provider not listed here falls through to a
 // catch-all "Other" group, so a new Rust-side provider can't silently vanish.
+// In the fixed provider order chat draws badges in (Rust's THIRD_PARTY_ORDER).
 const THIRD_PARTY_PROVIDER_GROUPS: { key: string; label: string }[] = [
   { key: 'ffz', label: 'FrankerFaceZ' },
   { key: 'bttv', label: 'BetterTTV' },
   { key: 'chatterino', label: 'Chatterino' },
+  { key: 'homies', label: 'Homies' },
+  { key: 'moltorino', label: 'Moltorino' },
   { key: 'chatsen', label: 'Chatsen' },
   { key: 'chatty', label: 'Chatty' },
   { key: 'dankchat', label: 'DankChat' },
-  { key: 'homies', label: 'Homies' },
-  { key: 'moltorino', label: 'Moltorino' },
 ];
 const providerGroupKey = (provider: unknown): string =>
   typeof provider === 'string' ? provider.toLowerCase() : '';
@@ -878,6 +880,9 @@ const UserProfileCard = ({
   // number (MemberReveal); clicking it opens this.
   const isMemberCard = isStreamNookMember && !!cardMemberId;
   const memberView = useMemberProfile(isMemberCard ? cardMemberId : null, profilePreview, !!profilePreview);
+  // An equipped frame is the member card's border (see ProfileFrame).
+  const frameUrl = useProfileFrameUrl(isMemberCard ? cardMemberId : null);
+  const framed = isMemberCard && !!frameUrl;
   // The <StreamNookBadge> slot below always renders the member's PRIMARY mark:
   // their active cosmetic when it has art (bundled or cloud-served, the same
   // resolution StreamNookBadge uses), otherwise the default "StreamNook Member"
@@ -967,6 +972,8 @@ const UserProfileCard = ({
   const [followLoading, setFollowLoading] = useState(false);
   // Share confirmation (copies streamnook.app/w/<login>).
   const [shareCopied, setShareCopied] = useState(false);
+  // Profile-link confirmation (copies streamnook.app/u/<login>, members only).
+  const [profileLinkCopied, setProfileLinkCopied] = useState(false);
 
   // Get channel context
   const getChannelContext = useCallback(() => {
@@ -1471,21 +1478,21 @@ const UserProfileCard = ({
     // BTTV Pro loyalty badge (resolved over the BTTV socket, not the cached
     // contributor feed). Tagged provider 'BTTV' so it lands in the BetterTTV
     // group via THIRD_PARTY_PROVIDER_GROUPS, alongside any contributor badge.
-    if (bttvProBadge?.url) {
-      thirdPartyBadges.push({
-        id: 'bttv-pro',
-        src: bttvProBadge.url,
-        srcSet: undefined,
-        title: 'BTTV Pro',
-        provider: 'BTTV',
-      });
-    }
+    const thirdPartyWithPro = bttvProBadge?.url
+      ? withBttvPro(thirdPartyBadges, {
+          id: 'bttv-pro',
+          src: bttvProBadge.url,
+          srcSet: undefined,
+          title: 'BTTV Pro',
+          provider: 'BTTV',
+        })
+      : thirdPartyBadges;
 
     return {
       twitchBadges,
       seventvBadges,
-      thirdPartyBadges,
-      totalBadgeCount: twitchBadges.length + seventvBadges.length + thirdPartyBadges.length
+      thirdPartyBadges: thirdPartyWithPro,
+      totalBadgeCount: twitchBadges.length + seventvBadges.length + thirdPartyWithPro.length
     };
   }, [cachedProfile, profileData, bttvProBadge, earlySeventv, wornCosmetics, messageBadges]);
 
@@ -1501,17 +1508,10 @@ const UserProfileCard = ({
   }, [userId]);
   const visibleThirdPartyBadges = useMemo(() => {
     if (!identityLoadout?.customized) return thirdPartyBadges;
-    // Render in the member's CHOSEN order (their stored loadout key order) so the
-    // profile card matches chat exactly. Chat resolves these through the server's
-    // resolveLoadout, which preserves the saved `badges` array order; filtering
-    // the provider-ordered thirdPartyBadges list (the previous approach) kept the
-    // same set but a different order, which is the drift between chat and profile.
-    const byKey = new Map<string, (typeof thirdPartyBadges)[number]>(
-      thirdPartyBadges.map((b) => [`${b.provider}:${b.id}`, b]),
-    );
-    return identityLoadout.badges
-      .map((k) => byKey.get(k))
-      .filter((b): b is NonNullable<typeof b> => b != null);
+    // A loadout picks WHICH badges show, never where they sit: the list keeps
+    // the fixed provider order Rust builds it in, the same order chat draws.
+    const chosen = new Set(identityLoadout.badges);
+    return thirdPartyBadges.filter((b) => chosen.has(`${b.provider}:${b.id}`));
   }, [thirdPartyBadges, identityLoadout?.customized, identityLoadout?.badges]);
   // Count what's actually shown (curation can hide some third-party badges) so
   // the "Badges N" header doesn't overcount hidden ones.
@@ -1688,6 +1688,22 @@ const UserProfileCard = ({
       >
         {shareCopied ? <Check size={14} className="text-success" /> : <Share2 size={14} className="text-accent" />}
         {shareCopied ? 'Copied' : 'Share'}
+      </button>
+      {/* The member's public profile page on the web. */}
+      <button
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(buildProfileUrl(login));
+            setProfileLinkCopied(true);
+            window.setTimeout(() => setProfileLinkCopied(false), 1400);
+          } catch (err) {
+            Logger.error('[UserProfileCard] Failed to copy profile link:', err);
+          }
+        }}
+        className={`${memberActionBtn} ${profileLinkCopied ? 'text-success' : ''}`}
+      >
+        {profileLinkCopied ? <Check size={14} className="text-success" /> : <Link2 size={14} className="text-accent" />}
+        {profileLinkCopied ? 'Copied' : 'Profile link'}
       </button>
     </div>
   );
@@ -1927,10 +1943,11 @@ const UserProfileCard = ({
       )}
       <div
         ref={cardRef}
-        className={`${isStandaloneWindow ? 'w-full h-full' : `fixed z-50 ${isMemberCard ? 'w-[760px]' : 'w-[440px]'} max-h-[88vh]`} sn-light-off user-profile-card backdrop-blur-xl shadow-2xl border border-borderSubtle rounded-lg overflow-hidden flex flex-col`}
+        className={`${isStandaloneWindow ? 'relative w-full h-full' : `fixed z-50 ${isMemberCard ? 'w-[760px]' : 'w-[440px]'} max-h-[88vh]`} sn-light-off user-profile-card backdrop-blur-xl shadow-2xl ${framed ? '' : 'border border-borderSubtle rounded-lg'} overflow-hidden flex flex-col`}
         style={isStandaloneWindow ? { backgroundColor: 'rgba(0, 0, 0, 0.75)' } : cardStyle}
         onMouseDown={isStandaloneWindow ? undefined : handleMouseDown}
       >
+        {framed && <ProfileFrame url={frameUrl} />}
         {isMemberCard && <MemberProfileBackdrop view={memberView} />}
         {isMemberCard && cardMemberId ? (
           <div className="relative z-10 profile-card-header cursor-grab active:cursor-grabbing flex-shrink-0">

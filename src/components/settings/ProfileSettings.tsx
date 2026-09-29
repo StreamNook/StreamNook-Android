@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useSyncExternalStore, useMemo, type CSSPro
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useAppStore } from '../../stores/AppStore';
-import { refreshAtmosphere } from '../../stores/chatUserStore';
+import { refreshAtmosphere, setOwnThemeHiddenInChat } from '../../stores/chatUserStore';
 import { AtmosphereBackground } from '../AtmosphereBackground';
 import { isDevAtmosphere } from '../../services/devAtmospheres';
 import { MajorCologneChrome } from '../MajorCologneChrome';
@@ -44,6 +44,8 @@ import {
   setProfileTheme,
   patchProfileSnapshotTheme,
   setHiddenSections,
+  setChatAtmosphere,
+  setIncludeTwitchRecap,
   getAccolades,
 } from '../../services/supabaseService';
 import type { CosmeticCatalogEntry } from '../../services/supabaseService';
@@ -65,11 +67,18 @@ import {
   type CaptureMode,
 } from '../../utils/shareProfile';
 import { clearCosmeticsMemoryCache, invalidateUserCosmetics, getCosmeticsWithFallback, applyLocalCosmeticSelection } from '../../services/cosmeticsCache';
-import { buildBttvProBadge, resolveBttvProUrl } from '../../services/bttvProBadge';
+import { buildBttvProBadge, resolveBttvProUrl, withBttvPro } from '../../services/bttvProBadge';
 import { invoke } from '@tauri-apps/api/core';
 import { Logger } from '../../utils/logger';
 import LinkedAccountsSection from './LinkedAccountsSection';
 import ProfileOverview from './ProfileOverview';
+import { features } from '../../features';
+import {
+  isStatHidden,
+  PROFILE_VISIBILITY_GROUPS,
+  toggleStat,
+  type ProfileStatKey,
+} from '../../services/profileVisibility';
 
 export interface ChatIdentityCache {
   badges: ChatIdentityBadge[];
@@ -102,18 +111,6 @@ const extractTwitchBadgeImageId = (imageUrl: string): string | null => {
   return m ? m[1] : null;
 };
 
-// Public-profile sections the member can hide from other viewers. Most keys
-// match ProfileOverview's `sectionHidden`; `views` is honored by the overlay's
-// hero (the profile-view counter), not a ProfileOverview section. Subs/spend are
-// never persisted, so they're not toggleable here.
-const VISIBILITY_SECTIONS: Array<{ key: string; label: string }> = [
-  { key: 'roast', label: 'Hours watched' },
-  { key: 'twitch', label: 'Your Twitch (age, followers, type)' },
-  { key: 'lifetime', label: 'Lifetime stats' },
-  { key: 'emotes', label: 'Top emotes' },
-  { key: 'accolades', label: 'Accolades' },
-  { key: 'views', label: 'Profile views' },
-];
 
 // Selection indicator for the loadout pickers — a flat checkmark chip in the
 // item's top-right corner (replaces the old status dot). `accent` for Twitch /
@@ -224,6 +221,10 @@ const ProfileSettings = () => {
   useEffect(() => { getPreviewEmotes().then(setPreviewEmotes).catch(() => {}); }, []);
   // Sections the member has hidden from their public profile.
   const [hiddenSecs, setHiddenSecs] = useState<string[]>(() => seededProfile?.hiddenSections ?? []);
+  // Whether our atmosphere also paints behind our chat messages.
+  const [chatAtmosphere, setChatAtmosphereState] = useState(true);
+  // Whether our Twitch Recap hours count toward the hours on our profile.
+  const [includeRecap, setIncludeRecap] = useState(true);
   const [loadoutLoaded, setLoadoutLoaded] = useState(false);
   const [subscribed, setSubscribed] = useState(false);
   // Accolades the member has earned (persisted in user_accolades). Used to
@@ -419,6 +420,8 @@ const ProfileSettings = () => {
         if (mountedRef.current) {
           setProfileThemeState(p.profileTheme);
           setHiddenSecs(p.hiddenSections);
+          setChatAtmosphereState(p.chatAtmosphere);
+          setIncludeRecap(p.includeTwitchRecap);
         }
       })
       .catch(() => {});
@@ -476,9 +479,33 @@ const ProfileSettings = () => {
     })();
   };
 
-  const toggleSectionVisibility = (key: string) => {
+  const toggleChatAtmosphere = () => {
     if (!currentUser?.user_id) return;
-    const next = hiddenSecs.includes(key) ? hiddenSecs.filter((k) => k !== key) : [...hiddenSecs, key];
+    const userId = currentUser.user_id;
+    const next = !chatAtmosphere;
+    setChatAtmosphereState(next);
+    // Repaint our own rows now rather than waiting for the realtime echo.
+    setOwnThemeHiddenInChat(userId, !next);
+    void setChatAtmosphere(userId, next).then((ok) => {
+      if (ok) return;
+      setOwnThemeHiddenInChat(userId, next);
+      if (mountedRef.current) setChatAtmosphereState(!next);
+    });
+  };
+
+  const toggleIncludeRecap = () => {
+    const next = !includeRecap;
+    setIncludeRecap(next);
+    void setIncludeTwitchRecap(next).then((ok) => {
+      if (!ok && mountedRef.current) setIncludeRecap(!next);
+    });
+  };
+
+  // One switch per stat; the saved list also keeps older apps hiding what's
+  // hidden (see services/profileVisibility).
+  const toggleStatVisibility = (key: ProfileStatKey) => {
+    if (!currentUser?.user_id) return;
+    const next = toggleStat(hiddenSecs, key);
     setHiddenSecs(next);
     void setHiddenSections(currentUser.user_id, next);
     updateProfilePreview({ hiddenSections: next }); // live-update an open preview
@@ -915,22 +942,15 @@ const ProfileSettings = () => {
   const tpKey = (b: { provider: string; id: string }) => `${b.provider}:${b.id}`;
   const isThirdPartyShown = (b: { provider: string; id: string }) =>
     loadout.badges.includes(tpKey(b));
-  // Render the shown badges in the member's CHOSEN order (their stored loadout
-  // key order) so this preview matches chat + the profile card, which both honor
-  // that order. Filtering thirdPartyBadges directly kept provider/fetch order and
-  // is what made the preview disagree with chat.
   // The full toggleable set = the server-resolved third-party badges PLUS your
-  // own BTTV Pro (resolved client-side; absent for non-Pro users). Drives both
-  // the preview ordering here and the picker grid below.
+  // own BTTV Pro (resolved client-side; absent for non-Pro users), in the fixed
+  // provider order chat draws. It drives both the preview here and the picker
+  // grid below. Choosing a badge decides whether it shows, never where it sits,
+  // so the preview simply filters this list.
   const allThirdParty: any[] = selfBttvProBadge
-    ? [...thirdPartyBadges, selfBttvProBadge]
+    ? withBttvPro(thirdPartyBadges as any[], selfBttvProBadge)
     : thirdPartyBadges;
-  const shownThirdPartyByKey = new Map<string, any>(
-    allThirdParty.map((b) => [tpKey(b as any), b]),
-  );
-  const shownThirdParty = loadout.badges
-    .map((k) => shownThirdPartyByKey.get(k))
-    .filter((b): b is NonNullable<typeof b> => b != null);
+  const shownThirdParty = allThirdParty.filter((b) => isThirdPartyShown(b));
   const toggleThirdParty = (b: { provider: string; id: string }) => {
     if (!currentUser?.user_id) return;
     const key = tpKey(b);
@@ -1035,7 +1055,10 @@ const ProfileSettings = () => {
   const previewAtm = getAtmosphere(activePreviewId);
   // Frosted readability block behind the text for busy washes (e.g. Midnight),
   // mirroring ChatMessage so the text stays legible over the image in the preview.
-  const previewFrost = !!previewAtm?.chatFrost;
+  // The chat preview shows what chat will show, so it drops the wash when the
+  // member keeps their atmosphere out of chat.
+  const chatPreviewAtm = chatAtmosphere ? previewAtm : null;
+  const previewFrost = !!chatPreviewAtm?.chatFrost;
   const previewLocked = previewAtm ? !atmUnlocked(previewAtm) : activePreviewId === 'paint' ? !canPaint : false;
   // Name the RIGHT tier on the lock pill: an Atmosphere needs Subscriber, but a
   // 7TV paint only needs Supporter. Telling a paint previewer to "subscribe"
@@ -1162,12 +1185,10 @@ const ProfileSettings = () => {
 
         <div className="relative flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-2 flex-wrap">
-            {/* Canonical badge order (see utils/badgeOrder): StreamNook leads, then
-                Twitch global, then 7TV, then third-party. The card has no channel
-                context, so the channel-contextual tier (sub/poll) never shows here. */}
-            {streamNookUserNumber !== null && currentUser?.user_id && (
-              <StreamNookBadge userId={currentUser.user_id} side="bottom" />
-            )}
+            {/* Canonical badge order (see utils/badgeOrder): Twitch global, then
+                7TV, then third-party, then StreamNook last, next to the name. The
+                card has no channel context, so the channel-contextual tier
+                (sub/poll) never shows here. */}
             {selectedGlobalBadge && (
               <Tooltip content={`Twitch: ${selectedGlobalBadge.title}`} side="top">
                 <img src={selectedGlobalBadge.image_url} alt={selectedGlobalBadge.title} className="w-6 h-6" />
@@ -1193,6 +1214,9 @@ const ProfileSettings = () => {
                 <img src={badge.image4x || badge.imageUrl} alt={badge.title} className="w-6 h-6" />
               </Tooltip>
             ))}
+            {streamNookUserNumber !== null && currentUser?.user_id && (
+              <StreamNookBadge userId={currentUser.user_id} side="bottom" />
+            )}
             <h3
               className="text-3xl font-bold"
               style={seventvPaint ? computePaintStyle(seventvPaint as any, '#9146FF') : { color: 'var(--text-primary)' }}
@@ -1518,7 +1542,7 @@ const ProfileSettings = () => {
           className="relative isolate w-full max-w-[402px] overflow-hidden rounded-lg border border-white/[0.06]"
           style={{ paddingLeft: 18, paddingRight: 18, paddingTop: 7, paddingBottom: 7, minHeight: 60 }}
         >
-          {previewAtm && <AtmosphereBackground atm={previewAtm} variant="chat" />}
+          {chatPreviewAtm && <AtmosphereBackground atm={chatPreviewAtm} variant="chat" />}
           {/* Inline flow (not flex) so a long message wraps to the LEFT edge on the
               next line like a real chat row, instead of indenting under the name or
               stretching into one super-wide line. Busy washes (chatFrost, e.g.
@@ -1526,7 +1550,7 @@ const ProfileSettings = () => {
           <div
             className={`relative text-sm leading-relaxed ${
               previewFrost
-                ? 'inline-block max-w-full rounded-md bg-[rgba(5,6,13,0.22)] px-1.5 py-0.5 backdrop-blur-[4px]'
+                ? `inline-block max-w-full rounded-md px-1.5 py-0.5 ${features.richAtmospheres ? 'atm-frost' : 'atm-frost atm-frost--flat'}`
                 : ''
             }`}
           >
@@ -1762,19 +1786,58 @@ const ProfileSettings = () => {
             );
           })()}
         </div>
+        {/* Only meaningful while an atmosphere (or the Cologne look) is worn. */}
+        {getAtmosphere(profileTheme) && (
+          <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.06] px-1 pt-3">
+            <div className="min-w-0">
+              <div className="text-sm text-textPrimary">Show in my chat messages</div>
+              <div className="text-[12px] leading-relaxed text-textSecondary">
+                Turn this off to keep your atmosphere on your profile and hover card only.
+              </div>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={chatAtmosphere}
+              onClick={toggleChatAtmosphere}
+              className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors ${
+                chatAtmosphere ? 'bg-accent' : 'bg-white/[0.12]'
+              }`}
+              aria-label={`${chatAtmosphere ? 'Hide' : 'Show'} your atmosphere in chat`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  chatAtmosphere ? 'translate-x-[18px]' : 'translate-x-0.5'
+                }`}
+              />
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Profile visibility: per-section hide/unhide for the PUBLIC profile (what
-          other StreamNook users see in the overlay). Self view always shows all. */}
+      {/* Profile visibility: one switch per stat for the PUBLIC profile (what
+          other StreamNook users see, in the app and on streamnook.app). Self
+          view always shows all. */}
       <div className="settings-card p-4">
         <h4 className="text-sm font-semibold text-textPrimary">Profile visibility</h4>
         <p className="mt-0.5 text-[12px] leading-relaxed text-textSecondary">
-          Choose what shows on your public profile (what other StreamNook users see when they open
-          it). Your subscriptions and spend are always private.
+          Choose what shows on your public profile, here and on streamnook.app. Your channel points,
+          drops, subscriptions and spend are always private.
         </p>
         <div className="mt-3 space-y-0.5">
-          {VISIBILITY_SECTIONS.map((s) => {
-            const visible = !hiddenSecs.includes(s.key);
+          {PROFILE_VISIBILITY_GROUPS.flatMap((g) => [
+            ...(g.items.length > 1
+              ? [
+                  <p
+                    key={`${g.label}-head`}
+                    className="px-1 pb-0.5 pt-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-textMuted first:pt-0"
+                  >
+                    {g.label}
+                  </p>,
+                ]
+              : []),
+            ...g.items.map((s) => {
+            const visible = !isStatHidden(hiddenSecs, s.key);
             return (
               <div key={s.key} className="flex items-center justify-between gap-3 px-1 py-1.5">
                 <span className="text-sm text-textPrimary">{s.label}</span>
@@ -1782,7 +1845,7 @@ const ProfileSettings = () => {
                   type="button"
                   role="switch"
                   aria-checked={visible}
-                  onClick={() => toggleSectionVisibility(s.key)}
+                  onClick={() => toggleStatVisibility(s.key)}
                   className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors ${
                     visible ? 'bg-accent' : 'bg-white/[0.12]'
                   }`}
@@ -1796,7 +1859,32 @@ const ProfileSettings = () => {
                 </button>
               </div>
             );
-          })}
+            }),
+          ])}
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.06] px-1 pt-3">
+          <div className="min-w-0">
+            <div className="text-sm text-textPrimary">Add my Twitch Recap hours</div>
+            <div className="text-[12px] leading-relaxed text-textSecondary">
+              Counts the hours Twitch Recap recorded before you joined StreamNook toward your hours watched.
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={includeRecap}
+            onClick={toggleIncludeRecap}
+            className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors ${
+              includeRecap ? 'bg-accent' : 'bg-white/[0.12]'
+            }`}
+            aria-label={`${includeRecap ? 'Remove' : 'Add'} your Twitch Recap hours`}
+          >
+            <span
+              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                includeRecap ? 'translate-x-[18px]' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
         </div>
       </div>
 

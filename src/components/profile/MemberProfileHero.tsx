@@ -1,16 +1,16 @@
-// The member's hero band: their frame, avatar, painted name, worn badges,
+// The member's hero band: their avatar, painted name, worn badges,
 // applied atmosphere, view count, and rank. Doubles as a drag handle.
 
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import { X, User, Eye } from 'lucide-react';
 import { motion } from 'framer-motion';
-import { ProfileFrame } from './ProfileFrame';
 import { StreamNookBadge, getTier } from '../StreamNookBadge';
 import { getBadgeImageUrls, getBadgeFallbackUrls } from '../../services/seventvService';
 import { FallbackImage } from '../FallbackImage';
 import { Tooltip } from '../ui/Tooltip';
 import { AtmosphereChip, PaintChip, SevenTvProfileButton } from './IdentityChips';
 import type { MemberProfileView } from './memberProfile';
+import { isStatHidden } from '../../services/profileVisibility';
 
 export function MemberProfileHero({
   userId,
@@ -75,8 +75,6 @@ export function MemberProfileHero({
       <div className="pointer-events-none absolute inset-x-0 top-0 z-[2] h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[2] h-px bg-gradient-to-r from-transparent via-white/[0.12] to-transparent" />
 
-      {/* The member's equipped Frame, bordering the hero band. */}
-      <ProfileFrame userId={userId} />
       {/* Identity — seated and vertically centered in the hero. */}
       <div className="relative z-10 flex items-center gap-3 p-4">
         <div className="flex min-w-0 flex-1 items-center gap-3.5">
@@ -176,7 +174,7 @@ export function MemberProfileHero({
               {/* Profile views — a subtle public counter. Hideable via the
                   'views' visibility toggle (honored here so the live preview
                   reflects what others see). */}
-              {profileViews != null && !effectiveHiddenSections.includes('views') && (
+              {profileViews != null && !isStatHidden(effectiveHiddenSections, 'views') && (
                 <Tooltip content="Profile views" side="bottom">
                   <span className="flex items-center gap-1 text-[11px] leading-none text-textMuted">
                     <Eye size={13} className="opacity-80" />
