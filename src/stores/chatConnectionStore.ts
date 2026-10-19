@@ -18,6 +18,8 @@
 // upstream callers using mixed case still resolve correctly via `.toLowerCase()`
 // at the API boundary.
 
+import type { CheerCheck } from '../services/bitsService';
+import { useCheerPromptStore } from './cheerPromptStore';
 import { sameSentContent } from '../utils/sentContent';
 import { isWindowHidden, onWindowVisibility } from '../utils/windowVisibility';
 import { IS_MOBILE } from '../utils/platform';
@@ -43,8 +45,8 @@ import { useGiftBombStore, type GiftRecipient } from './giftBombStore';
 import { giftBombOriginOf, isGiftBombAnnouncement, isGiftBombChild } from '../utils/giftBombCollapse';
 import { useMessageRepeatStore, type RepeatParticipant } from './messageRepeatStore';
 import { normalizeForRepeat, isPrivilegedChatter } from '../utils/messageRepeat';
-import { tokenizeLocalBody } from '../utils/localMessageTokens';
 import type { SongMatch } from '../utils/songId';
+import type { SeventvEmoteChange } from '../components/overlay/overlayConfig';
 import type { BackendChatMessage } from '../services/twitchChat';
 
 // Hard caps borrowed from the prior single-channel hook. Keeping them as
@@ -61,6 +63,22 @@ const WS_OPEN_RETRY_ATTEMPTS = 5;
 const HEALTH_CHECK_INTERVAL_MS = 30_000;
 const STALE_WARNING_MS = 2 * 60_000;
 const STALE_RECONNECT_MS = 3 * 60_000;
+
+/**
+ * How long the connection has gone without any sign of life: neither a chat
+ * frame nor the backend's heartbeat. Rust sends that heartbeat every thirty
+ * seconds while its IRC reads are alive and stops it once they are not, so a
+ * quiet room keeps answering here and only a dead connection goes silent.
+ */
+export function connectionSilentMs(now: number, lastFrameAt: number, lastHeartbeatAt: number): number {
+  return now - Math.max(lastFrameAt, lastHeartbeatAt);
+}
+
+/** Whether to raise the stale warning, which the phones' watchdog rebuilds on. */
+export function staleWarningDue(now: number, lastFrameAt: number, lastHeartbeatAt: number): boolean {
+  const silent = connectionSilentMs(now, lastFrameAt, lastHeartbeatAt);
+  return silent > STALE_WARNING_MS && silent <= STALE_RECONNECT_MS;
+}
 
 // --- Public types -----------------------------------------------------------
 
@@ -81,6 +99,64 @@ export interface RoomState {
   subsOnly: boolean;
   emoteOnly: boolean;
   r9k: boolean;
+  /** The active modes in words, written by Rust (services/room_modes.rs) and
+   *  shipped whole on the ROOMSTATE frame. Null until a frame carries them. */
+  modes: RoomModeView | null;
+}
+
+export type RoomModeKind = 'subs_only' | 'emote_only' | 'followers_only' | 'slow' | 'unique';
+
+/** One active room mode, worded by Rust. */
+export interface RoomMode {
+  kind: RoomModeKind;
+  /** "Followers-only chat (10 minutes)" */
+  label: string;
+  /** "Followers-only (10m)" */
+  compact: string;
+  /** "Followers 10m" */
+  short: string;
+  /** One sentence on what the mode does. */
+  detail: string;
+  /** false: this mode does not hold you back. null: not known. */
+  applies_to_you: boolean | null;
+}
+
+/** Mirrors Rust `room_modes::RoomModeView`. */
+export interface RoomModeView {
+  modes: RoomMode[];
+  /** The chip style's words: the most limiting mode, in a word or two. */
+  chip: string | null;
+  /** Every mode spares you: the chip is drawn a shade quieter. */
+  exempt: boolean;
+  /** The prompt style: replaces "Send a message" while a mode may hold you back. */
+  prompt: string | null;
+  prompt_short: string | null;
+  /** "You can chat as a moderator" when every mode spares you. */
+  standing: string | null;
+  /** The slow-mode wait that applies to you; 0 when none does. */
+  slow_seconds: number;
+  /** The mode that certainly keeps you from sending (your badges or your
+   *  follow prove it), or null. Never set on a guess. */
+  blocked?: RoomModeKind | null;
+  /** What a disabled message box says while `blocked` is set. */
+  reason?: string | null;
+  /** A moderator's warning you have not acknowledged (Rust chat_warning.rs):
+   *  the box stays locked behind its Acknowledge button. */
+  warning?: ChatWarningView | null;
+}
+
+/** Mirrors Rust `chat_warning::WarningView`. */
+export interface ChatWarningView {
+  /** "A moderator warned you". */
+  title: string;
+  /** The reason in quotes and what to do. */
+  detail: string;
+  /** "Acknowledge". */
+  action: string;
+  /** The locked field's placeholder. */
+  prompt: string;
+  /** A word or two for a narrow box. */
+  short: string;
 }
 
 export const EMPTY_ROOM_STATE: RoomState = {
@@ -89,6 +165,7 @@ export const EMPTY_ROOM_STATE: RoomState = {
   subsOnly: false,
   emoteOnly: false,
   r9k: false,
+  modes: null,
 };
 
 export interface SendUserInfo {
@@ -123,6 +200,19 @@ interface ChannelSlice {
   /** Currently pinned message (provider-driven; e.g. Kick's pin event). */
   pinnedMessage: any | null;
   refCount: number;
+  /** How many of `refCount` are background holds (a MultiNook tile, the chat
+   *  pin, a MultiChat tab): kept joined, shown nowhere by that holder. */
+  backgroundRefs: number;
+  /** Held back at the bridge (see `reviewHold`): Rust keeps its frames and
+   *  replays them when it is shown. */
+  heldBack: boolean;
+  /** Mentions that arrived while held back, counted by Rust's tick. Kept apart
+   *  from `liveMentionCount` because the backlog counts those same rows again
+   *  when it replays; `PARK_END` clears this in the flush that counts them. */
+  heldMentions: number;
+  /** Rows that arrived while held back, counted by the same tick; cleared by
+   *  `PARK_END`. Nonzero means "new messages you have not seen". */
+  heldRows: number;
   isPausedForBuffer: boolean;
   /** Rows above the cap still allowed after a resume; set by setChannelPaused,
    *  released RESUME_DECAY_PER_FLUSH per flush by flushPending. */
@@ -134,6 +224,10 @@ interface ChannelSlice {
    *  trimmed. Historical backfill (prepended, not live) is intentionally
    *  excluded — only `pushMessage` bumps it. */
   liveMessageCount: number;
+  /** Monotonic count of live rows the Rust rule engine stamped as mentioning
+   *  or replying to the signed-in user. Never decremented or reset, so a
+   *  "last seen" baseline stays valid after the rows themselves are trimmed. */
+  liveMentionCount: number;
   // Internals (not surfaced via the per-channel hook):
   seenMessageIds: Set<string>;
   /** Real Helix ids stamped onto our own optimistic rows, still awaiting their
@@ -195,6 +289,9 @@ let ws: WebSocket | null = null;
 // socket stayed null forever). Concurrent callers await this promise and then
 // verify the socket really opened.
 let wsConnectPromise: Promise<void> | null = null;
+// The channel that connect claims in Rust: a caller that rides it for another
+// channel still has to claim its own.
+let wsConnectChannel: string | null = null;
 
 // Bumped whenever the last channel is released. A connect captures this on entry
 // and discards its socket if the value moved, because a connect can easily
@@ -239,6 +336,8 @@ let reconnectAttempts = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let healthCheckTimer: ReturnType<typeof setInterval> | null = null;
 let lastMessageTime = Date.now();
+/** When the backend's last HEARTBEAT arrived (0 = none on this socket yet). */
+let lastHeartbeatTime = 0;
 let intentionalDisconnect = false;
 let currentUserId: string | null = null;
 // True between a backend IRC_RECONNECTING and the next IRC_CONNECTED; gates
@@ -610,24 +709,6 @@ function bumpAllChannels() {
   bumpRevisionFor([...useChatConnectionStore.getState().channels.keys()]);
 }
 
-/**
- * Lazily-loaded per-message engines, resolved once and then called synchronously.
- *
- * These were `import()`ed inside the per-message path, so every single chat
- * message allocated two promises and queued two microtask hops even when no nuke
- * or reminder was armed. The module registry caches the module, but not the
- * promise/closure churn. First use still loads asynchronously (so the chunk stays
- * split); every message after that takes the synchronous branch.
- */
-type NukeEngine = typeof import('../utils/nukeEngine');
-let nukeEngineMod: NukeEngine | null = null;
-let nukeEnginePromise: Promise<NukeEngine> | null = null;
-
-function withNukeEngine(fn: (mod: NukeEngine) => void): void {
-  if (nukeEngineMod) { fn(nukeEngineMod); return; }
-  nukeEnginePromise ??= import('../utils/nukeEngine');
-  void nukeEnginePromise.then((mod) => { nukeEngineMod = mod; fn(mod); });
-}
 
 
 // --- Coalesced render flush ---------------------------------------------------
@@ -753,6 +834,7 @@ function flushPending(): void {
     // evict recent subs/redemptions/raids from the shared buffer. liveMessageCount
     // still counts every message (drives the accurate "N new since paused" badge).
     slice.liveMessageCount += queued.length;
+    slice.liveMentionCount += countMentionsOfMe(queued);
     // Copy-on-write (see the helpers above pushMessage): the array identity
     // changes with its content, so consumers can memoize on it.
     slice.messages = trimWithEventRetention(slice.messages.concat(queued), limit, slice.liveMessageCount);
@@ -912,9 +994,14 @@ function emptySlice(
     clearedUserContexts: new Map(),
     pinnedMessage: null,
     refCount: 0,
+    backgroundRefs: 0,
+    heldBack: false,
+    heldMentions: 0,
+    heldRows: 0,
     isPausedForBuffer: false,
     resumeOverflow: 0,
     liveMessageCount: 0,
+    liveMentionCount: 0,
     seenMessageIds: new Set(),
     pendingUpgradeIds: new Set(),
     userBadgesFromIrc: null,
@@ -1098,6 +1185,7 @@ function releaseHistoryHold(slice: ChannelSlice): boolean {
   slice.historyHold = null;
   if (hold.held.length === 0) return false;
   slice.liveMessageCount += hold.held.length;
+  slice.liveMentionCount += countMentionsOfMe(hold.held);
   slice.messages = trimWithEventRetention(
     slice.messages.concat(hold.held),
     liveAppendLimit(slice, getActiveHistoryMax()),
@@ -1114,7 +1202,24 @@ function pushMessage(slice: ChannelSlice, msg: any) {
   // Monotonic — counts the append regardless of any trim below. Drives the
   // accurate "N new since paused" badge.
   slice.liveMessageCount++;
+  if (isMentionOfMe(msg)) slice.liveMentionCount++;
   slice.messages = trimWithEventRetention(slice.messages.concat([msg]), limit, slice.liveMessageCount);
+}
+
+/** Rust's verdict (`ChatRules::evaluate`) read off the row. Rows Rust never
+ *  evaluated (own optimistic sends, raw-string fallbacks) count as no. */
+function isMentionOfMe(msg: unknown): boolean {
+  const md =
+    msg && typeof msg === 'object'
+      ? (msg as { metadata?: { is_mentioned?: boolean; is_reply_to_me?: boolean } }).metadata
+      : null;
+  return !!md && (md.is_mentioned === true || md.is_reply_to_me === true);
+}
+
+function countMentionsOfMe(rows: readonly unknown[]): number {
+  let n = 0;
+  for (const m of rows) if (isMentionOfMe(m)) n++;
+  return n;
 }
 
 /**
@@ -1231,6 +1336,83 @@ async function repaintPersonalEmotes(channel: string, userId: string, messageIds
   });
 }
 
+type RowSegments = NonNullable<BackendChatMessage['segments']>;
+
+/** One backlog row Rust parsed again once its channel's emote table landed. */
+interface HistorySegmentsRow {
+  id: string;
+  segments: RowSegments;
+  parent_segments?: RowSegments | null;
+  /** A Shared Chat partner row's badges, once its room's badge art landed. */
+  badges?: BackendChatMessage['badges'];
+}
+
+/** Re-stamps that arrived before their backlog merged (the merge also waits
+ *  on the channel's badge cache), applied when it does. */
+const pendingHistorySegments = new Map<string, { at: number; rows: Map<string, HistorySegmentsRow> }>();
+const PENDING_HISTORY_SEGMENTS_MS = 60_000;
+
+function withHistorySegments(m: BackendChatMessage, row: HistorySegmentsRow): BackendChatMessage {
+  const replyInfo = m.metadata?.reply_info;
+  return {
+    ...m,
+    segments: row.segments,
+    ...(Array.isArray(row.badges) ? { badges: row.badges } : {}),
+    ...(m.metadata && replyInfo && row.parent_segments
+      ? { metadata: { ...m.metadata, reply_info: { ...replyInfo, parent_segments: row.parent_segments } } }
+      : {}),
+  };
+}
+
+/**
+ * A first visit's backlog is parsed before the channel's emote table exists,
+ * so its 7TV/BTTV/FFZ emotes show as words. Rust parses the same lines again
+ * once the table lands and names the rows that changed (`HISTORY_SEGMENTS`);
+ * each is swapped in place. Rows this window has not merged yet wait for the
+ * backlog.
+ */
+function applyHistorySegments(channel: string, rows: unknown[]): void {
+  const key = channel.toLowerCase();
+  if (!key) return;
+  const byId = new Map<string, HistorySegmentsRow>();
+  for (const r of rows) {
+    const row = r as HistorySegmentsRow | null;
+    if (row && typeof row.id === 'string' && Array.isArray(row.segments)) byId.set(row.id, row);
+  }
+  if (byId.size === 0) return;
+  if (getSlice(key)) {
+    withSlice(key, (s) => {
+      let next: ChannelSlice['messages'] | null = null;
+      for (let i = 0; i < s.messages.length; i++) {
+        const m = s.messages[i];
+        if (typeof m !== 'object' || m === null) continue;
+        const row = byId.get((m as BackendChatMessage).id);
+        if (!row) continue;
+        next ??= s.messages.slice();
+        next[i] = withHistorySegments(m as BackendChatMessage, row);
+        byId.delete(row.id);
+      }
+      if (next) s.messages = next;
+    });
+  }
+  if (byId.size === 0) return;
+  const now = Date.now();
+  for (const [k, v] of pendingHistorySegments) {
+    if (now - v.at > PENDING_HISTORY_SEGMENTS_MS) pendingHistorySegments.delete(k);
+  }
+  const held = pendingHistorySegments.get(key)?.rows ?? new Map<string, HistorySegmentsRow>();
+  for (const [id, row] of byId) held.set(id, row);
+  pendingHistorySegments.set(key, { at: now, rows: held });
+}
+
+/** The re-stamps waiting for `key`'s backlog, taken once. */
+function takePendingHistorySegments(key: string): Map<string, HistorySegmentsRow> | null {
+  const held = pendingHistorySegments.get(key);
+  if (!held) return null;
+  pendingHistorySegments.delete(key);
+  return Date.now() - held.at <= PENDING_HISTORY_SEGMENTS_MS ? held.rows : null;
+}
+
 function setAllChannelsConnected(connected: boolean) {
   for (const slice of useChatConnectionStore.getState().channels.values()) {
     slice.isConnected = connected;
@@ -1319,13 +1501,16 @@ function startHealthCheck() {
       scheduleReconnect(0);
       return;
     }
-    const elapsed = Date.now() - lastMessageTime;
-    if (elapsed > STALE_WARNING_MS && elapsed <= STALE_RECONNECT_MS) {
-      Logger.warn(
-        `[ChatStore] No frames for ${Math.floor(elapsed / 1000)}s — connection may be stale`,
-      );
-      setAllChannelsError(`Connection may be stale — no data for ${Math.floor(elapsed / 1000)}s`);
-    } else if (elapsed > STALE_RECONNECT_MS) {
+    const now = Date.now();
+    const elapsed = now - lastMessageTime;
+    if (staleWarningDue(now, lastMessageTime, lastHeartbeatTime)) {
+      const silent = Math.floor(connectionSilentMs(now, lastMessageTime, lastHeartbeatTime) / 1000);
+      Logger.warn(`[ChatStore] No frames or heartbeats for ${silent}s, connection may be stale`);
+      setAllChannelsError(`Connection may be stale, no data for ${silent}s`);
+    }
+    // The re-JOIN probe below reads frames alone: a socket the heartbeat still
+    // reaches can be deaf to its channels, and only a channel frame proves a JOIN.
+    if (elapsed > STALE_RECONNECT_MS) {
       Logger.debug('[ChatStore] No frames for 3+ minutes — checking stream / reconnecting');
       lastMessageTime = Date.now();
 
@@ -1542,6 +1727,45 @@ export async function reconnectAllChannels(): Promise<void> {
 }
 
 /**
+ * Rebuild the Twitch chat connection without letting go of any room (the
+ * phones). Rust stops the Twitch side and brings it back with every room this
+ * window holds (`rebuild_chat`, services/chat_recovery.rs), then this window's
+ * socket attaches to the new bridge. Every slice keeps its rows on screen, and
+ * each room's history load fills only what the outage missed.
+ *
+ * Answers whether Rust ran a cycle. It declines one already running, an
+ * automatic one within a minute of the last, or a window holding no Twitch room.
+ */
+export async function rebuildTwitchChat(reason: string, force = false): Promise<boolean> {
+  const twitchSlices = () =>
+    Array.from(useChatConnectionStore.getState().channels.values()).filter((s) => s.provider === 'twitch');
+  if (twitchSlices().length === 0) return false;
+  let port: number | null = null;
+  try {
+    port = (await invoke<number | null>('rebuild_chat', { force, reason })) ?? null;
+  } catch (err) {
+    Logger.warn('[ChatStore] rebuild_chat failed:', err);
+    return false;
+  }
+  if (port === null) return false;
+  // Rust closed the old socket when it took the bridge down, and that close
+  // scheduled a reconnect of its own. This one replaces it.
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempts = 0;
+  await reconnectAll(true);
+  // The reconnect reloads history for the window's first channel only; the
+  // other rooms fill their gap here. Rows already shown are skipped.
+  const first = useChatConnectionStore.getState().channels.keys().next().value;
+  for (const slice of twitchSlices()) {
+    if (slice.channel !== first) void preloadChannel(slice.channel, slice.channelId);
+  }
+  return true;
+}
+
+/**
  * Hard-refresh a single channel's chat — the chat-side analog of restarting the
  * stream. Wipes the visible message buffer + dedup/moderation state, busts and
  * re-fetches the channel's emote set, then forces the shared IRC bridge to tear
@@ -1615,19 +1839,32 @@ async function connectBridgeForFirstChannel(
   // Bounded so a pathological chain of connects cannot spin here.
   for (let waited = 0; wsConnectPromise && waited < 3; waited += 1) {
     const inflight = wsConnectPromise;
+    const inflightChannel = wsConnectChannel;
     try {
       await inflight;
     } catch {
       // Whoever started that attempt reports its own failure.
     }
-    if (socketIsOpen()) return;
+    if (socketIsOpen()) {
+      // The socket is that connect's, and so is the one claim it made in Rust.
+      // This channel is another one, or the same one released in between (a
+      // remount, or closing a window's only chat and opening it again), whose
+      // release reached Rust after that claim and PARTed it. Rust JOINs only
+      // what some window claims, so claim this channel here; a repeat claim is
+      // a no-op.
+      const ok = await connectChannel(channel, provider, bareChannel ?? channel, 'start');
+      if (ok && provider === 'twitch' && inflightChannel !== channel) void preloadChannel(channel, channelId);
+      return;
+    }
   }
   const attempt = connectBridgeInner(channel, channelId, reattach, provider, bareChannel);
   wsConnectPromise = attempt;
+  wsConnectChannel = channel;
   try {
     await attempt;
   } finally {
     wsConnectPromise = null;
+    wsConnectChannel = null;
   }
 }
 
@@ -1703,8 +1940,10 @@ async function connectBridgeInner(
     ws = socket;
     reconnectAttempts = 0;
     lastMessageTime = Date.now();
+    lastHeartbeatTime = 0;
 
     socket.onmessage = (event) => handleWsMessage(event.data);
+    sendRouteSnapshot();
     socket.onerror = (err) => {
       Logger.error('[ChatStore] WS error:', err);
       setAllChannelsError('Connection error');
@@ -1916,6 +2155,8 @@ async function preloadChannel(
         if (eid) existingIds.add(eid);
       }
       const filtered: any[] = [];
+      // Emote re-stamps Rust sent before this backlog got here.
+      const restamped = takePendingHistorySegments(key);
       // Structured backfill rows arrive through Rust's parse path, where the
       // rule engine already dropped hidden users, bots and ignored phrases.
       for (const msg of source) {
@@ -1925,7 +2166,8 @@ async function preloadChannel(
           if (slice.seenMessageIds.has(id) || existingIds.has(id)) continue;
           slice.seenMessageIds.add(id);
         }
-        filtered.push(msg);
+        const row = id && typeof msg !== 'string' ? restamped?.get(id) : undefined;
+        filtered.push(row ? withHistorySegments(msg, row) : msg);
       }
 
       // Initial load prepends (history belongs above the live stream that
@@ -1978,8 +2220,11 @@ function handleWsMessage(raw: string) {
   // lastMessageTime: the backend heartbeat only proves the socket reads
   // SOMETHING (its own PONGs included), so letting it reset the stale timer
   // blinded the watchdog to a connection that was TCP-alive but delivering no
-  // channel traffic. It still clears the stale-warning banner.
+  // channel traffic. It still proves the backend's IRC reads are alive, which
+  // is what the stale warning asks (Rust stops sending it once they are not),
+  // and it clears that warning.
   if (raw === 'HEARTBEAT') {
+    lastHeartbeatTime = Date.now();
     setAllChannelsError(null);
     return;
   }
@@ -2046,6 +2291,38 @@ function handleWsMessage(raw: string) {
         setAllChannelsError('Reconnecting to chat...');
       }, LOST_ROW_GRACE_MS);
     }
+    return;
+  }
+  // A held-back channel's mentions and rows, once a second while either moved:
+  // tab badges and "new messages" marks keep counting.
+  if (raw.startsWith('PARKED_TICK:')) {
+    const m = /^PARKED_TICK:(\d+):(\d+):(.+)$/.exec(raw);
+    if (m) {
+      withSlice(m[3], (slice) => {
+        slice.heldMentions += Number(m[1]);
+        slice.heldRows += Number(m[2]);
+      });
+    }
+    return;
+  }
+  // The backlog has arrived: count it in place of the held tally, in one step
+  // so the badge never dips or counts a row twice.
+  if (raw.startsWith('PARK_END:')) {
+    const slice = getSlice(raw.slice('PARK_END:'.length));
+    if (slice) {
+      runFlush();
+      slice.heldMentions = 0;
+      slice.heldRows = 0;
+      bumpRevisionFor([slice.channel]);
+    }
+    return;
+  }
+  // More arrived while it was held back than Rust kept: drop the older rows so
+  // the backlog that follows never sits under a hole.
+  if (raw.startsWith('PARK_GAP:')) {
+    withSlice(raw.slice('PARK_GAP:'.length), (slice) => {
+      slice.messages = [];
+    });
     return;
   }
   if (raw.startsWith('RECONNECTING:')) {
@@ -2158,6 +2435,10 @@ function handleWsMessage(raw: string) {
       }
       if (parsed.type === 'PERSONAL_EMOTES' && Array.isArray(parsed.message_ids)) {
         void repaintPersonalEmotes(String(parsed.channel ?? ''), String(parsed.user_id ?? ''), parsed.message_ids);
+        return;
+      }
+      if (parsed.type === 'HISTORY_SEGMENTS' && Array.isArray(parsed.rows)) {
+        applyHistorySegments(String(parsed.channel ?? ''), parsed.rows);
         return;
       }
       if (parsed.type === 'CLEARMSG' && parsed.target_msg_id) {
@@ -2362,6 +2643,8 @@ function handleWsMessage(raw: string) {
             subsOnly: parsed.subs_only ?? slice.roomState.subsOnly,
             emoteOnly: parsed.emote_only ?? slice.roomState.emoteOnly,
             r9k: parsed.r9k ?? slice.roomState.r9k,
+            // Whole, never merged: Rust words the merged room every time.
+            modes: parsed.modes !== undefined ? (parsed.modes as RoomModeView | null) : slice.roomState.modes,
           };
         };
         if (ch) {
@@ -2440,8 +2723,22 @@ function handleWsMessage(raw: string) {
   handleRawIrcString(raw);
 }
 
+/** The msg-id of a NOTICE frame Rust writes into a room itself
+ *  (`slash_dispatch::LOCAL_NOTICE_ID`). */
+const LOCAL_NOTICE_ID = 'streamnook_notice';
+
 function handleNotice(parsed: any) {
   const msgId = parsed.msg_id as string | undefined;
+  // A line StreamNook writes into one room itself (a slash command's later
+  // result, a reminder that could not post): shown in that room only.
+  if (msgId === LOCAL_NOTICE_ID) {
+    const channel = typeof parsed.channel === 'string' ? parsed.channel : '';
+    if (channel && parsed.message) {
+      const key = channel.includes(':') ? channel : channel.toLowerCase();
+      injectSystemMessage(key, String(parsed.message), undefined, systemSourceFor(key));
+    }
+    return;
+  }
   const modActionMap: Record<string, string> = {
     host_on: 'host',
     host_off: 'unhost',
@@ -2755,20 +3052,8 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
     queueMessage(slice.channel, parsed);
   }
 
-  // Side effects run on every real chat message, including copies that repeat
-  // collapse folded out of the view. A copypasta wave is exactly what /nuke
-  // targets, so hiding copies from the engine would leave it actioning only the
-  // first one; a keyword reminder should fire on a folded message too.
-  // Gift-bomb children and TikTok likes are events, not chat, so they stay out.
-  if (slice.channel && !giftBombChildSuppressed && parsed.metadata?.msg_type !== 'tiktok_like') {
-    // No-op if no nukes are armed for this channel. Fire-and-forget; nuke
-    // action errors are logged inside the engine.
-    withNukeEngine((mod) => {
-      void mod.checkActiveNukesForMessage(slice.channel, parsed);
-    });
-
-    // Keyword reminders are matched in Rust (services/reminder_service.rs).
-  }
+  // A running /nuke window and keyword reminders see every recorded message
+  // in Rust (services/nuke.rs, services/reminder_service.rs).
 
   // Mirror non-chat channel events (subs, gifts, ... and future follows/raids/
   // hosts) into the MultiChat activity panel. Only synthesized event messages
@@ -2867,10 +3152,10 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
       );
     }
 
-    // Channel-point redemptions that posted to chat (Twitch only): a highlighted
-    // message or a reward that required text. On channels you only watch these
-    // are the ONLY visible redemptions (the rest need broadcaster auth), and
-    // Twitch sends just the reward id (no name) so custom rewards stay generic.
+    // Channel-point redemptions in chat (Twitch only): a highlighted message, a
+    // reward that required text, and the row Rust builds for a no-input reward
+    // from the channel points feed. Only that row names its reward
+    // (`sn-reward-title`); Twitch's own messages carry just the reward id.
     if (pk.provider === 'twitch') {
       const isHighlight = tags['msg-id'] === 'highlighted-message';
       if (isHighlight || tags['custom-reward-id']) {
@@ -2884,7 +3169,7 @@ function appendStructuredMessage(slice: ChannelSlice, parsed: any) {
               displayName: parsed.display_name || parsed.username,
               userId: parsed.user_id,
               color: parsed.color,
-              systemText: isHighlight ? 'highlighted message' : undefined,
+              systemText: isHighlight ? 'highlighted message' : tags['sn-reward-title'] || undefined,
             },
           }),
         );
@@ -2995,6 +3280,104 @@ function handleRawIrcString(raw: string) {
   }
 }
 
+// --- What this window receives -----------------------------------------------
+//
+// The bridge sends a window only the channels it holds (src-tauri
+// services/chat_bridge_route.rs). The window says which over its own socket:
+// the full list when the socket opens, then each change. A channel held only by
+// background holders and shown by nothing is held back: Rust keeps its frames in
+// order (up to this slice's own buffer size) and sends a count each second, and
+// the moment anything shows it again the frames arrive in one go, so switching
+// to it is as immediate as before while it costs this page nothing meanwhile.
+
+/** How many mounted views are showing each channel (by slice key). */
+const sliceViewers = new Map<string, number>();
+
+function sendRoute(line: string): void {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(line);
+    } catch {
+      // A closing socket; the next open sends the whole route again.
+    }
+  }
+}
+
+function holdCap(slice: ChannelSlice): number {
+  return currentBufferLimit(slice, getActiveHistoryMax());
+}
+
+/** Hold the channel back, or bring it back, to match who holds and shows it. */
+function reviewHold(key: string): void {
+  const slice = getSlice(key);
+  if (!slice) return;
+  const hold =
+    slice.refCount > 0 && slice.backgroundRefs >= slice.refCount && (sliceViewers.get(key) ?? 0) === 0;
+  if (hold === slice.heldBack) return;
+  slice.heldBack = hold;
+  sendRoute(hold ? `PARK:${holdCap(slice)}:${key}` : `UNPARK:${key}`);
+  scheduleParkedEmoteRelease(key, hold);
+}
+
+/** A chat held back this long gives up its emote set. */
+const PARKED_EMOTE_RELEASE_MS = 3 * 60_000;
+const parkedEmoteTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
+ * A hidden chat's rows already carry Rust's emote stamps, so its 1-3 MB emote
+ * set only serves a picker nobody can open. Held back long enough, the set is
+ * dropped; showing the chat again fetches it from Rust's cache. Without this
+ * every chat ever looked at kept its set until it was closed, which made the
+ * chat dock (no cap on docked chats) linear in memory. The cache lives in this
+ * page, so the page decides when it goes.
+ */
+function scheduleParkedEmoteRelease(key: string, held: boolean): void {
+  const pending = parkedEmoteTimers.get(key);
+  if (pending) {
+    clearTimeout(pending);
+    parkedEmoteTimers.delete(key);
+  }
+  if (!held) return;
+  parkedEmoteTimers.set(
+    key,
+    setTimeout(() => {
+      parkedEmoteTimers.delete(key);
+      const slice = getSlice(key);
+      if (!slice?.heldBack || (emoteSubscribers.get(key)?.size ?? 0) > 0) return;
+      emoteCache.delete(key);
+    }, PARKED_EMOTE_RELEASE_MS),
+  );
+}
+
+/** The whole route, for a socket that just opened. */
+function sendRouteSnapshot(): void {
+  const { channels } = useChatConnectionStore.getState();
+  sendRoute(`SUBS:${Array.from(channels.keys()).join('\t')}`);
+  for (const slice of channels.values()) {
+    if (slice.heldBack) sendRoute(`PARK:${holdCap(slice)}:${slice.channel}`);
+  }
+}
+
+/** Mark these channels as on screen while the calling view is mounted. */
+export function useSliceViewers(keys: readonly string[]): void {
+  const joined = keys.map((k) => k.toLowerCase()).sort().join('\n');
+  useEffect(() => {
+    const list = joined ? joined.split('\n') : [];
+    for (const k of list) {
+      sliceViewers.set(k, (sliceViewers.get(k) ?? 0) + 1);
+      reviewHold(k);
+    }
+    return () => {
+      for (const k of list) {
+        const n = (sliceViewers.get(k) ?? 1) - 1;
+        if (n > 0) sliceViewers.set(k, n);
+        else sliceViewers.delete(k);
+        reviewHold(k);
+      }
+    };
+  }, [joined]);
+}
+
 // --- Public API -------------------------------------------------------------
 
 /** Acquire a chat connection for `channel`. Idempotent — if the channel is
@@ -3003,6 +3386,9 @@ export async function acquireChannel(
   channel: string,
   channelId: string | null,
   provider: ProviderId = 'twitch',
+  /** A background hold: keep the channel joined without showing it (see
+   *  `reviewHold`). Release it with the same flag. */
+  opts?: { background?: boolean },
 ): Promise<void> {
   // Twitch keeps bare-login keys (byte-identical to before); non-Twitch sources
   // get a "provider:channel" composite key. MultiChat only.
@@ -3027,16 +3413,19 @@ export async function acquireChannel(
       );
     }
     existing.refCount += 1;
+    if (opts?.background) existing.backgroundRefs += 1;
+    reviewHold(key);
     if (channelId && !existing.channelId) {
       existing.channelId = channelId;
-      // MultiChat opens panes before the channel's broadcaster_id has resolved
-      // (the stream-info poll runs after first render). That means the initial
-      // acquireChannel call comes through with channelId=null, preloadChannel
-      // bails, and the badge metadata cache never gets populated for this
-      // channel. When the real channelId arrives a moment later and the caller
-      // re-acquires to refresh it, kick off the badge init we deferred so
-      // Twitch channel badges (subscriber/bits/etc.) start resolving.
-      if (provider === 'twitch') void initializeBadgesForChannel(channelId);
+      // The slice was opened without an id: MultiChat panes before their
+      // stream info resolves, the chat dock's held channel before its live
+      // row arrives, the blended feed's companion chats. That first open
+      // skipped the badge init AND the recent-history backfill, so when the
+      // main chat then opened the same channel with its id it landed here and
+      // a quiet channel sat on "Waiting for messages" with no history. Now
+      // that the id is known, run the whole preload; it skips rows the slice
+      // already holds, so a backfill that did run is never doubled.
+      if (provider === 'twitch') void preloadChannel(key, channelId);
     }
     bumpRevision();
     Logger.debug(`[ChatStore] +1 ref on ${key} (now ${existing.refCount})`);
@@ -3045,7 +3434,10 @@ export async function acquireChannel(
 
   const slice = emptySlice(key, channelId, provider);
   slice.refCount = 1;
+  if (opts?.background) slice.backgroundRefs = 1;
   setSlice(key, slice);
+  sendRoute(`SUB:${key}`);
+  reviewHold(key);
 
   // Twitch: start the Rust backfill now, alongside the connect/join below,
   // and hold the first live rows until it lands (or HISTORY_HOLD_MS) so the
@@ -3116,6 +3508,7 @@ export async function acquireChannel(
 export async function releaseChannel(
   channel: string,
   provider: ProviderId = 'twitch',
+  opts?: { background?: boolean },
 ): Promise<void> {
   // Same fold as acquire. Before this, a mixed-case YouTube id missed here and hit
   // the early return below, so the channel was never PARTed and its slice never
@@ -3125,8 +3518,10 @@ export async function releaseChannel(
   const slice = useChatConnectionStore.getState().channels.get(key);
   if (!slice) return;
   slice.refCount -= 1;
+  if (opts?.background && slice.backgroundRefs > 0) slice.backgroundRefs -= 1;
   Logger.debug(`[ChatStore] -1 ref on ${key} (now ${slice.refCount})`);
   if (slice.refCount > 0) {
+    reviewHold(key);
     bumpRevision();
     return;
   }
@@ -3167,6 +3562,7 @@ async function finishRelease(key: string, channel: string, provider: ProviderId)
   // sibling MultiChat popouts) may still be using it. Tearing down here
   // would kill chat for every other consumer in the process.
   removeSlice(key);
+  sendRoute(`UNSUB:${key}`);
   clearChannelRetry(key);
   // Free per-channel state the slice didn't own: the pending flush queue and the
   // resolved emote set (1 to 3 MB of metadata that otherwise stayed pinned for
@@ -3247,15 +3643,29 @@ function replyParentFor(slice: ChannelSlice, parentId: string) {
   return { id: parentId, display_name: p.display_name || '', login: p.username || '', user_id: p.user_id || '', body: p.content || '' };
 }
 
+/** What Twitch made of a send. `pin_error` is set only when a pin was asked
+ *  for and failed after the message went out. */
+export interface SendChannelOutcome {
+  message_id: string | null;
+  is_sent: boolean;
+  drop_reason: string | null;
+  pin_error?: string;
+  /** The message cheers, so Rust held it for the cheer card instead. */
+  cheer?: CheerCheck;
+}
+
 /** Send a message to `channel`. The row shown for it is built by Rust with
- *  channel-correct room-id and badge metadata. */
+ *  channel-correct room-id and badge metadata. `pinAfterSend` has Rust pin the
+ *  message once Twitch accepts it (`/pin <text>`). Resolves with the outcome,
+ *  or null when nothing was sent (empty text, chat not connected). */
 export async function sendChannelMessage(
   channel: string,
   rawText: string,
   userInfo: SendUserInfo,
   replyParentMsgId?: string,
   senderAccount?: SendAsAccount | null,
-): Promise<void> {
+  options?: { pinAfterSend?: boolean },
+): Promise<SendChannelOutcome | null> {
   // Trailing whitespace never survives the round trip: Twitch's echo comes
   // back without it (and the Rust parser trim_end()s the payload), while the
   // emote picker always leaves "name " in the compose box. An optimistic row
@@ -3266,10 +3676,10 @@ export async function sendChannelMessage(
   // will echo. (The duplicate-bypass suffix ends in U+E0000, which is not
   // whitespace, so it is untouched.)
   const text = rawText.trimEnd();
-  if (!text.trim()) return;
+  if (!text.trim()) return null;
   const key = channel.toLowerCase();
   const slice = useChatConnectionStore.getState().channels.get(key);
-  if (!slice || !slice.isConnected) return;
+  if (!slice || !slice.isConnected) return null;
 
   // currentUserId tracks the PRIMARY (the IRC-connected reader), regardless of
   // which account we're sending as.
@@ -3321,17 +3731,14 @@ export async function sendChannelMessage(
     Logger.warn('[ChatStore] could not build the sent row:', err);
     return null;
   });
-  const sending = invoke<{
-      message_id: string | null;
-      is_sent: boolean;
-      drop_reason: string | null;
-    }>('send_chat_message', {
+  const sending = invoke<SendChannelOutcome>('send_chat_message', {
       message: text,
       replyParentMsgId: replyParentMsgId || null,
       targetChannel: key,
       broadcasterId: slice.channelId || null,
       senderId: senderUserId || null,
       senderAccountId: sendingAsSecondary ? senderUserId : null,
+      pinAfterSend: options?.pinAfterSend ? true : null,
     });
   // Awaited below; this only stops a fast failure reporting as unhandled while
   // the row is still being built.
@@ -3359,10 +3766,15 @@ export async function sendChannelMessage(
       });
       slice.seenMessageIds.delete(tempId);
       bumpRevisionFor([key]);
-      if (result.drop_reason) {
+      // The phone's composer says it beside the kept draft, with Retry and
+      // Discard, so a row here would say it twice.
+      if (result.drop_reason && !IS_MOBILE) {
         injectSystemMessage(key, `Your message was not sent: ${result.drop_reason}`);
       }
-      return;
+      // Held, not dropped: the chat box showing this channel asks before any
+      // bits are spent.
+      if (result.cheer) useCheerPromptStore.getState().hold(result.cheer);
+      return result;
     }
 
     // Helix returns the authoritative message id. Stamp it onto the optimistic
@@ -3374,7 +3786,11 @@ export async function sendChannelMessage(
       const realId = result.message_id;
       const idx = slice.messages.findIndex((m) => isOwnOptimistic(m) && m.id === tempId);
       if (idx !== -1) {
-        replaceMessageAt(slice, idx, { ...(slice.messages[idx] as BackendChatMessage), id: realId });
+        const own = slice.messages[idx] as BackendChatMessage;
+        // The id lives in the row's tags too, and that copy is the one reply,
+        // delete and pin read (parseMessage builds tags from them). Stamping
+        // only `id` left replies to your own message pointing at the local id.
+        replaceMessageAt(slice, idx, { ...own, id: realId, tags: { ...own.tags, id: realId } });
         slice.seenMessageIds.delete(tempId);
         // Arm the echo-upgrade fast path for this id. Defensive cap: a stamped
         // row whose echo never arrives costs one stale entry, never growth.
@@ -3386,6 +3802,7 @@ export async function sendChannelMessage(
         bumpRevisionFor([key]);
       }
     }
+    return result ?? null;
   } catch (err) {
     Logger.error('[ChatStore] send_chat_message failed:', err);
     slice.messages = slice.messages.filter((m) => {
@@ -3416,6 +3833,9 @@ export function injectSystemMessage(
   // unchanged; a provider pane passes its own so the row doesn't sign itself
   // "Twitch" on a Kick or YouTube channel.
   source?: { label: string; color: string },
+  // A 7TV emote set change, carried whole so a stream overlay can draw it as
+  // a 7TV event instead of reading this row's text.
+  seventvEmoteChange?: SeventvEmoteChange,
 ): void {
   const sysMsgId = `sys-cmd-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   withSlice(channel, (slice) => {
@@ -3435,90 +3855,13 @@ export function injectSystemMessage(
       is_mentioned: false,
       is_from_shared_chat: false,
       songCard,
+      ...(seventvEmoteChange ? { seventvEmoteChange } : {}),
       tags: new Map([
         ['user-id', 'tw-system'],
         ['id', sysMsgId],
       ]),
     });
     slice.seenMessageIds.add(sysMsgId);
-  });
-}
-
-/** Inject a no-input channel-points redemption as a chat row. Reuses the native
- *  highlight-message render path (via the `custom-reward-id` tag) so it reads as
- *  a redemption, with the redeemer as the author and the reward name as the body.
- *  No-ops when the channel's chat isn't open. Message-style rewards post their
- *  own PRIVMSG, so callers should only pass the no-input ones. */
-export function injectRedemptionMessage(
-  channel: string,
-  r: {
-    userLogin: string;
-    userName: string;
-    userId?: string;
-    rewardId: string;
-    rewardTitle: string;
-    cost?: number;
-    color?: string;
-    redemptionId?: string;
-    pointsIconUrl?: string | null;
-    rewardImageUrl?: string;
-    rewardBackground?: string;
-    /** `name/version,...` in chat order, from Rust's chat history. */
-    badges?: string;
-  },
-): void {
-  // A stable id from Twitch's redemption id (when present) makes this idempotent:
-  // the same redemption seen by two open chat views collapses to one row.
-  const id = r.redemptionId
-    ? `redeem-${r.redemptionId}`
-    : `redeem-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-  const login = r.userLogin || r.userName;
-  const name = r.userName || r.userLogin || login;
-  // Body is just the reward name; the cost renders as the channel-points glyph +
-  // amount in ChatMessage (via the sn-reward-cost / sn-points-icon tags), not as
-  // a plain "(N)" appended to the text.
-  const body = r.rewardTitle;
-  // Plain-object tags (NOT a Map): parseMessage rebuilds tags with
-  // `Object.entries(raw.tags)`, which is empty for a Map — that silently dropped
-  // custom-reward-id, so redemptions lost their decoration and rendered plain.
-  const tags: Record<string, string> = {
-    'user-id': r.userId || '',
-    id,
-    'display-name': name,
-    // Triggers the redemption highlight + label in ChatMessage.
-    'custom-reward-id': r.rewardId || 'sn-redemption',
-    // Marks the row as a redemption for the stream overlay renderer, which draws
-    // it as a Channel points event (the hosted overlay builds the same tags).
-    'sn-reward-title': r.rewardTitle,
-  };
-  if (r.rewardImageUrl) tags['sn-reward-image'] = r.rewardImageUrl;
-  if (r.rewardBackground) tags['sn-reward-bg'] = r.rewardBackground;
-  if (r.cost && r.cost > 0) tags['sn-reward-cost'] = String(r.cost);
-  if (r.pointsIconUrl) tags['sn-points-icon'] = r.pointsIconUrl;
-  withSlice(channel, (slice) => {
-    if (slice.seenMessageIds.has(id)) return;
-    pushMessage(slice, {
-      id,
-      username: login,
-      display_name: name,
-      color: r.color || '#9147ff',
-      badges: (r.badges ?? '')
-        .split(',')
-        .filter(Boolean)
-        .map((b) => {
-          const [name, version = ''] = b.split('/');
-          return { name, version };
-        }),
-      content: body,
-      segments: tokenizeLocalBody(body, getChannelEmotes(channel)),
-      is_action: false,
-      is_first_message: false,
-      is_mentioned: false,
-      is_from_shared_chat: false,
-      user_id: r.userId || '',
-      tags,
-    });
-    slice.seenMessageIds.add(id);
   });
 }
 
@@ -3590,51 +3933,72 @@ export function useChannelMessageCount(channel: string | null | undefined): numb
   return slice ? slice.messages.length : 0;
 }
 
-/** True when this message mentions `login` (case-insensitive). Handles both
- *  the parsed-object form (Rust ChatMessage with optional `is_mentioned` set
- *  by the segment parser) and the raw IRC-string fallback (regex-scan the
- *  PRIVMSG body for `@login`). Used by the unread-mention counter, which only
- *  surfaces unread badges for @ mentions of the signed-in user. */
-function messageMentionsLogin(msg: unknown, login: string): boolean {
-  if (!msg || !login) return false;
-  if (typeof msg === 'object') {
-    const obj = msg as { is_mentioned?: boolean; content?: string };
-    if (obj.is_mentioned) return true;
-    if (typeof obj.content === 'string') {
-      return obj.content.toLowerCase().includes(`@${login}`);
-    }
-    return false;
-  }
-  if (typeof msg === 'string') {
-    const idx = msg.indexOf(' PRIVMSG ');
-    if (idx === -1) return false;
-    const colon = msg.indexOf(' :', idx);
-    if (colon === -1) return false;
-    return msg.slice(colon + 2).toLowerCase().includes(`@${login}`);
-  }
-  return false;
+/** React hook returning the monotonic count of live messages in a channel that
+ *  mention or reply to the signed-in user. Used by the MultiChat popout's tab
+ *  strip to drive @-mention unread indicators: comparing this count against a
+ *  per-tab "last seen" snapshot reveals new mentions that arrived while the tab
+ *  wasn't visible. Rerenders only when the count changes, not per message. */
+export function useChannelMentionCount(
+  provider: ProviderId,
+  channel: string | null | undefined,
+): number {
+  const key = channel ? sliceLookupKey(provider, channel) : null;
+  return useChatConnectionStore((state) => {
+    const slice = key ? state.channels.get(key) : undefined;
+    return slice ? slice.liveMentionCount + slice.heldMentions : 0;
+  });
 }
 
-/** React hook returning the count of messages mentioning the supplied login
- *  in a channel. Used by the MultiChat popout's tab strip to drive @-mention
- *  unread indicators — comparing this count against a per-tab "last seen"
- *  snapshot reveals new mentions that arrived while the tab wasn't visible.
- *  Pass `null` for `login` (e.g. unauthenticated) and the count stays at 0. */
-export function useChannelMentionCount(
-  channel: string | null | undefined,
-  login: string | null | undefined,
-): number {
-  const key = channel ? channel.toLowerCase() : null;
-  useChatConnectionStore((state) => (key ? state.revisionByChannel[key] ?? 0 : state.revision));
-  if (!channel || !login) return 0;
-  const slice = useChatConnectionStore.getState().channels.get(channel.toLowerCase());
-  if (!slice) return 0;
-  const target = login.toLowerCase();
-  let count = 0;
-  for (const msg of slice.messages) {
-    if (messageMentionsLogin(msg, target)) count++;
-  }
-  return count;
+/** What happened in a held-back (hidden) channel since it was last shown:
+ *  0 nothing, 1 new messages, 2 a mention. Both clear when it is shown. Read
+ *  from Rust's parked tick, so a hidden chat costs the page nothing per row. */
+export type HeldActivity = 0 | 1 | 2;
+export function useChannelHeldActivity(provider: ProviderId, channel: string | null | undefined): HeldActivity {
+  const key = channel ? sliceLookupKey(provider, channel) : null;
+  return useChatConnectionStore((state) => {
+    const slice = key ? state.channels.get(key) : undefined;
+    if (!slice?.heldBack) return 0;
+    return slice.heldMentions > 0 ? 2 : slice.heldRows > 0 ? 1 : 0;
+  });
+}
+
+/** A hidden chat a summary looks at; `light` counts its new messages too. */
+export interface HeldEntry {
+  provider: ProviderId;
+  channel: string;
+  light: boolean;
+}
+
+/** Mentions collected across these hidden chats since each was last shown. */
+export function useHeldMentionTotal(entries: readonly HeldEntry[]): number {
+  return useChatConnectionStore((state) => {
+    let n = 0;
+    for (const e of entries) {
+      const slice = state.channels.get(sliceLookupKey(e.provider, e.channel));
+      if (slice?.heldBack) n += slice.heldMentions;
+    }
+    return n;
+  });
+}
+
+/** Whether any of these hidden chats that mark new messages has some. */
+export function useAnyHeldNew(entries: readonly HeldEntry[]): boolean {
+  return useChatConnectionStore((state) =>
+    entries.some((e) => {
+      if (!e.light) return false;
+      const slice = state.channels.get(sliceLookupKey(e.provider, e.channel));
+      return !!slice?.heldBack && slice.heldRows > 0;
+    }),
+  );
+}
+
+/** The mentions a held-back channel collected since it was last shown. */
+export function useChannelHeldMentions(provider: ProviderId, channel: string | null | undefined): number {
+  const key = channel ? sliceLookupKey(provider, channel) : null;
+  return useChatConnectionStore((state) => {
+    const slice = key ? state.channels.get(key) : undefined;
+    return slice?.heldBack ? slice.heldMentions : 0;
+  });
 }
 
 /** React hook returning the shared per-channel emote set. Multiple components
@@ -3686,6 +4050,8 @@ export function useChannelChatMeta(channel: string | null | undefined) {
   );
 }
 
+const NO_KEYS: readonly string[] = [];
+
 export function useChannelChat(channel: string | null | undefined): ChannelChatSnapshot {
   const key = channel ? channel.toLowerCase() : null;
   // Subscribe to revision to drive updates; read the slice imperatively to
@@ -3701,6 +4067,8 @@ export function useChannelChat(channel: string | null | undefined): ChannelChatS
   const renderToken = useChatConnectionStore((state) =>
     key ? state.revisionByChannel[key] ?? 0 : 0,
   );
+  // On screen: never held back at the bridge while this view is mounted.
+  useSliceViewers(key ? [key] : NO_KEYS);
   if (!key) return EMPTY_SNAPSHOT;
   const slice = useChatConnectionStore.getState().channels.get(key);
   if (!slice) return EMPTY_SNAPSHOT;

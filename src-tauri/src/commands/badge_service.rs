@@ -1,4 +1,6 @@
-use crate::services::badge_service::{BadgeService, ThirdPartyGalleryBadge, UserBadgesResponse};
+use crate::services::badge_service::{
+    BadgeDetail, BadgeService, SelectedTwitchBadge, ThirdPartyGalleryBadge, UserBadgesResponse,
+};
 use crate::services::twitch_service::TwitchService;
 use log::debug;
 use std::sync::Arc;
@@ -25,8 +27,34 @@ pub async fn initialize_badge_service() {
     debug!("[BadgeService] Service initialized and pre-warmed");
 }
 
+/// The third-party badges a chatter wears, without waiting on the service
+/// (see `BadgeService::worn_third_party_now`); empty before it is ready.
+pub fn third_party_worn_now(user_id: &str) -> Vec<crate::services::badge_service::UserBadge> {
+    let Ok(guard) = BADGE_SERVICE.try_read() else { return Vec::new() };
+    guard.as_ref().map(|s| s.worn_third_party_now(user_id)).unwrap_or_default()
+}
+
 pub async fn get_service() -> Result<Arc<RwLock<Option<BadgeService>>>, String> {
     Ok(BADGE_SERVICE.clone())
+}
+
+/// The global badge a Twitch user selected, the one chat shows for them in
+/// every channel; `None` when they wear none. Profile cards show this.
+#[tauri::command]
+pub async fn get_selected_twitch_badge(user_id: String) -> Result<Option<SelectedTwitchBadge>, String> {
+    let service_lock = get_service().await?;
+    {
+        let service_guard = service_lock.read().await;
+        if service_guard.is_none() {
+            drop(service_guard);
+            initialize_badge_service().await;
+        }
+    }
+    let service_guard = service_lock.read().await;
+    let service = service_guard
+        .as_ref()
+        .ok_or_else(|| "Badge service failed to initialize".to_string())?;
+    service.selected_badge(&user_id).await
 }
 
 /// Get user badges for a specific channel (for normal chat - display badges only)
@@ -273,6 +301,36 @@ pub async fn get_all_third_party_badges(
         .await)
 }
 
+/// What the badge spotlight shows for a clicked third-party badge (FFZ,
+/// BetterTTV, Chatterino, Homies, Moltorino, Chatsen, Chatty, DankChat):
+/// provider name and site, and whatever the in-memory feeds know about the
+/// badge (title, art, description, holder count, whether the viewer holds
+/// it). Accepts any of the badge id spaces (`ffz-3`, `ffz:ffz-3`, `3`); a
+/// badge the feeds do not list still answers with the provider's details.
+#[tauri::command]
+pub async fn get_badge_detail(
+    provider: String,
+    id: String,
+    title: Option<String>,
+    viewer_user_id: Option<String>,
+) -> Result<BadgeDetail, String> {
+    let service_lock = get_service().await?;
+    {
+        let service_guard = service_lock.read().await;
+        if service_guard.is_none() {
+            drop(service_guard);
+            initialize_badge_service().await;
+        }
+    }
+    let service_guard = service_lock.read().await;
+    let service = service_guard
+        .as_ref()
+        .ok_or_else(|| "Badge service failed to initialize".to_string())?;
+    service
+        .get_badge_detail(&provider, &id, title.as_deref(), viewer_user_id.as_deref())
+        .await
+}
+
 /// Resolve a single user's BetterTTV Pro loyalty badge (the per-user badge a Pro
 /// subscriber enables). This is separate from the contributor badge feed above:
 /// BTTV only exposes Pro badges over its live-update WebSocket, so this does an
@@ -287,13 +345,14 @@ pub async fn get_bttv_pro_badge(
     Ok(crate::services::bttv_pro_service::resolve_bttv_pro_badge(&user_id).await)
 }
 
-/// Every distinct BetterTTV Pro loyalty badge image URL StreamNook has resolved
-/// so far, across all users (persisted). The BetterTTV gallery tab renders one
-/// tile per URL so discovered loyalty tiers are visible to everyone, not just
-/// the account that owns them.
+/// Every distinct BetterTTV Pro loyalty badge design StreamNook knows: the ones
+/// this install resolved (persisted), then the shared list streamnook.app
+/// builds from every profile lookup. The BetterTTV gallery tab renders one tile
+/// per URL so discovered loyalty tiers are visible to everyone, not just the
+/// account that owns them.
 #[tauri::command]
 pub async fn get_discovered_bttv_pro_badges() -> Result<Vec<String>, String> {
-    Ok(crate::services::bttv_pro_service::get_discovered_bttv_pro_badges())
+    Ok(crate::services::bttv_pro_service::all_known_bttv_pro_badges().await)
 }
 
 /// The primary account's badge standing: what it owns, every badge's earn
@@ -308,6 +367,20 @@ pub async fn get_badge_standing(
     Ok(crate::services::badge_standing::get_standing(&app_handle, force.unwrap_or(false)).await)
 }
 
+/// The phones' badge wall (services/badge_wall.rs): the global catalogue with
+/// owned badges marked, each tile's status and sheet copy, in `sort`
+/// (`newest`, `available`, `soon`, `usage`, `oldest`), and the missing strip.
+/// `force` re-reads the account's collection in the background.
+#[tauri::command]
+pub async fn get_badge_wall(
+    app_handle: crate::rt::AppHandle,
+    sort: Option<String>,
+    force: Option<bool>,
+) -> Result<crate::services::badge_wall::BadgeWall, String> {
+    let sort = crate::services::badge_wall::Sort::parse(sort.as_deref().unwrap_or("newest"));
+    Ok(crate::services::badge_wall::get(&app_handle, sort, force.unwrap_or(false)).await)
+}
+
 /// One badge's earn window, for a surface that shows a single badge.
 #[tauri::command]
 pub async fn get_badge_window(
@@ -315,6 +388,90 @@ pub async fn get_badge_window(
     version: String,
 ) -> Result<Option<Vec<crate::services::badge_window::WindowRun>>, String> {
     Ok(crate::services::badge_standing::window_for(&set_id, &version).await)
+}
+
+/// The live Drops campaign that awards a badge, when one is running, so a
+/// badge page can offer the channels it is earned on. None when no campaign
+/// matches or the Drops list cannot be read (Drops not signed in).
+#[tauri::command]
+pub async fn get_badge_drop_campaign(
+    state: tauri::State<'_, crate::models::settings::AppState>,
+    set_id: String,
+    version: String,
+) -> Result<Option<crate::models::drops::DropCampaign>, String> {
+    Ok(live_badge_campaign(&state, &set_id, &version).await.map(|(c, _)| c))
+}
+
+/// How one badge is earned and where: what to do, for how long, on which
+/// channels and in which category, plus a sentence saying all of it. The
+/// viewer's live Drops list answers first; the relay's campaign requirement
+/// covers anyone not signed in to Drops.
+#[tauri::command]
+pub async fn get_badge_earn_guide(
+    state: tauri::State<'_, crate::models::settings::AppState>,
+    set_id: String,
+    version: String,
+) -> Result<crate::services::badge_earn::EarnGuide, String> {
+    use crate::services::universal_cache_service::{get_cached_item, CacheType};
+
+    let live = live_badge_campaign(&state, &set_id, &version)
+        .await
+        .and_then(|(c, title)| crate::services::badge_earn::campaign_requirement(&c, title.as_deref()));
+    let meta = get_cached_item(CacheType::Badge, &format!("metadata:{set_id}-v{version}"))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| {
+            serde_json::from_value::<crate::commands::badge_metadata::BadgeMetadataCached>(c.data).ok()
+        });
+    Ok(crate::services::badge_earn::earn_guide(
+        meta.as_ref().and_then(|m| m.enrichment.as_ref()),
+        meta.as_ref().and_then(|m| m.more_info.as_deref()),
+        live,
+    ))
+}
+
+/// The live Drops campaign awarding a badge, with the badge's title.
+async fn live_badge_campaign(
+    state: &crate::models::settings::AppState,
+    set_id: &str,
+    version: &str,
+) -> Option<(crate::models::drops::DropCampaign, Option<String>)> {
+    let title = crate::commands::badges::get_cached_global_badges()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|catalog| {
+            catalog
+                .data
+                .into_iter()
+                .find(|s| s.set_id == set_id)?
+                .versions
+                .into_iter()
+                .find(|v| v.id == version)
+                .map(|v| v.title)
+        });
+    // The cached list at any age first: a fresh fetch resets the live progress
+    // map, which a badge page has no business doing.
+    let mut campaigns = {
+        let drops = state.drops_service.lock().await;
+        match drops.cached_campaigns_snapshot().await {
+            Some(c) => c,
+            None => match drops.get_all_active_campaigns_cached().await {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!("[Badges] No Drops list for {set_id}: {e}");
+                    return None;
+                }
+            },
+        }
+    };
+    let now = chrono::Utc::now();
+    campaigns.retain(|c| c.end_at > now);
+    let campaign =
+        crate::services::drops_overview::campaign_for_badge(&campaigns, set_id, title.as_deref())
+            .cloned()?;
+    Some((campaign, title))
 }
 
 /// Whether a badge's earn window is open right now. Prefers the enrichment's
@@ -368,6 +525,67 @@ async fn apply_drop(
     );
 }
 
+/// Store a drop's earn window again when the feed has already recorded the
+/// drop but the cache never kept the window. Android's notification worker
+/// used to record drops as seen while its window writes never reached disk,
+/// and an unchanged re-push is otherwise skipped, so those badges stayed
+/// windowless (never Available, never in the missing strip) for good. Only the
+/// enrichment is written: no gallery merge, no toast. True when it wrote one.
+pub(crate) async fn heal_enrichment(
+    badge: &crate::services::badge_polling_service::BadgeNotification,
+) -> bool {
+    let Some(enrichment) = &badge.enrichment else {
+        return false;
+    };
+    let key = format!("metadata:{}-v{}", badge.badge_set_id, badge.badge_version);
+    // The same enrichment, not just any: a lost write could also be an update
+    // (the relay adding a window to a drop it first sent without one), leaving
+    // the older copy in place.
+    let kept = || {
+        matches!(
+            crate::services::universal_cache_service::peek_cached_entry(&key),
+            Ok(Some(entry)) if entry.metadata.source == crate::commands::badge_metadata::ENRICHMENT_SOURCE
+                && entry.data.get("enrichment") == Some(enrichment)
+        )
+    };
+    if kept() {
+        return false;
+    }
+    crate::commands::badge_metadata::store_enrichment_metadata(
+        &badge.badge_set_id,
+        &badge.badge_version,
+        enrichment,
+    )
+    .await;
+    // An enrichment with nothing in it is skipped by the store; reporting it
+    // as healed would rebuild open surfaces on every frame for nothing.
+    kept()
+}
+
+/// Merge back into the gallery any drop the feed recorded whose gallery entry
+/// was lost the same way as its window (see `heal_enrichment`): a badge absent
+/// from the gallery has no tile and can never reach the missing strip. Reads
+/// the gallery once for the whole batch. True when it merged one.
+async fn heal_gallery(badges: &[crate::services::badge_polling_service::BadgeNotification]) -> bool {
+    let Ok(Some(gallery)) = crate::commands::badges::get_cached_global_badges().await else {
+        return false;
+    };
+    let present: std::collections::HashSet<(&str, &str)> = gallery
+        .data
+        .iter()
+        .flat_map(|s| s.versions.iter().map(move |v| (s.set_id.as_str(), v.id.as_str())))
+        .collect();
+    let mut merged = false;
+    for badge in badges {
+        if !present.contains(&(badge.badge_set_id.as_str(), badge.badge_version.as_str())) {
+            merged |= crate::commands::badges::merge_pushed_badge_into_global_cache(badge)
+                .await
+                .unwrap_or(false);
+        }
+    }
+    merged
+}
+
 /// Ingest a batch of drops from the real-time feed (the badge WebSocket, or its
 /// `latest.json` poll fallback).
 ///
@@ -398,7 +616,7 @@ pub async fn ingest_badge_drops(
 
     let _ = crate::commands::badges::prune_invalid_global_badges().await;
 
-    let mut stored_any = false;
+    let mut stored_any = if seeding { false } else { heal_gallery(&badges).await };
     for badge in &badges {
         let feed_id = badge.feed_id();
         let hash = badge.content_hash();
@@ -411,6 +629,7 @@ pub async fn ingest_badge_drops(
         };
 
         if !action.stores() {
+            stored_any |= heal_enrichment(badge).await;
             continue;
         }
 

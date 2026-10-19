@@ -7,14 +7,14 @@
 //! credits drop progress but not channel points, while the legacy spade
 //! track endpoint still credits channel points but not drops. Reporting on
 //! one path only silently stops the other kind of crediting. This is the
-//! piece that makes channel points accrue and drop progress advance for the
-//! on-screen stream. It never reports more than one channel, never reports
+//! piece that makes channel points accrue for the on-screen stream; drop
+//! progress also needs that stream's segments requested for the viewer,
+//! which `drop_playback` does alongside it. It never reports more than one channel, never reports
 //! an off-screen channel, and never claims anything.
 //!
-//! The target follows the active-channel chokepoints the frontend already
-//! drives (stream start, channel hot-swap, stream stop), which also track
-//! the focused chat in the multi-stream grid, so grid viewing reports the
-//! focused tile only. Playback state is optimistic on a new target (streams
+//! The target follows the active-channel chokepoints (stream start and stop,
+//! and MultiNook's focused tile through `watch_session::set_grid_focus`), so
+//! grid viewing reports the focused tile only. Playback state is optimistic on a new target (streams
 //! autoplay) and corrected by the player's playing and pause events.
 
 use anyhow::{anyhow, Result};
@@ -23,11 +23,11 @@ use base64::Engine;
 use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use reqwest::Client;
 use serde_json::json;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -62,6 +62,21 @@ pub struct WatchHeartbeatService {
     /// as a different account re-derives the id instead of serving a stale one.
     cached_user_id: RwLock<Option<(String, String)>>,
     loop_started: AtomicBool,
+    /// The last result of each report, so a release log says it once per change.
+    drops_outcome: AtomicU8,
+    points_outcome: AtomicU8,
+}
+
+/// A report's outcome, for the once-per-change log.
+const OUTCOME_UNKNOWN: u8 = 0;
+const OUTCOME_OK: u8 = 1;
+const OUTCOME_REFUSED: u8 = 2;
+const OUTCOME_FAILED: u8 = 3;
+const OUTCOME_SKIPPED: u8 = 4;
+
+/// True when `outcome` differs from the last one stored in `slot`.
+fn changed(slot: &AtomicU8, outcome: u8) -> bool {
+    slot.swap(outcome, Ordering::Relaxed) != outcome
 }
 
 impl WatchHeartbeatService {
@@ -72,6 +87,8 @@ impl WatchHeartbeatService {
             playing: AtomicBool::new(false),
             cached_user_id: RwLock::new(None),
             loop_started: AtomicBool::new(false),
+            drops_outcome: AtomicU8::new(OUTCOME_UNKNOWN),
+            points_outcome: AtomicU8::new(OUTCOME_UNKNOWN),
         }
     }
 
@@ -81,6 +98,12 @@ impl WatchHeartbeatService {
         if self.loop_started.swap(true, Ordering::SeqCst) {
             return;
         }
+        // Drop minutes also need the stream's segments requested for this
+        // viewer; that traffic follows the same target and playing flag.
+        tauri::async_runtime::spawn(crate::services::drop_playback::run(
+            self.client.clone(),
+            self.clone(),
+        ));
         let service = self.clone();
         tauri::async_runtime::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -129,6 +152,14 @@ impl WatchHeartbeatService {
         self.playing.store(playing, Ordering::SeqCst);
     }
 
+    /// The channel on screen while it plays, which segment traffic follows.
+    async fn playing_login(&self) -> Option<String> {
+        if !self.playing.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.target.read().await.as_ref().map(|t| t.login.clone())
+    }
+
     async fn tick(&self) {
         if !self.playing.load(Ordering::SeqCst) {
             return;
@@ -140,6 +171,9 @@ impl WatchHeartbeatService {
         // No drops credential means no spade surface to report on; watching
         // simply earns nothing, the same as not being logged in on the web.
         let Ok(token) = DropsAuthService::get_token().await else {
+            if changed(&self.drops_outcome, OUTCOME_SKIPPED) {
+                info!("[Heartbeat] not reporting {}: no drops sign-in", target.login);
+            }
             return;
         };
 
@@ -184,34 +218,48 @@ impl WatchHeartbeatService {
             return;
         };
 
+        // Each result is logged at info once per change, so a release build
+        // shows when reporting starts, stops being accepted, or fails.
         match self
             .send_minute_watched(&target, &broadcast_id, &token)
             .await
         {
-            Ok(true) => debug!(
-                "[Heartbeat] minute-watched credited for {} ({})",
-                target.login, target.channel_id
-            ),
-            Ok(false) => debug!(
-                "[Heartbeat] minute-watched not credited for {}",
-                target.login
-            ),
-            Err(e) => warn!("[Heartbeat] send failed for {}: {e}", target.login),
+            Ok(true) => {
+                if changed(&self.drops_outcome, OUTCOME_OK) {
+                    info!("[Heartbeat] drops minute-watched accepted for {} ({})", target.login, target.channel_id);
+                }
+            }
+            Ok(false) => {
+                if changed(&self.drops_outcome, OUTCOME_REFUSED) {
+                    info!("[Heartbeat] drops minute-watched not accepted for {}", target.login);
+                }
+            }
+            Err(e) => {
+                if changed(&self.drops_outcome, OUTCOME_FAILED) {
+                    warn!("[Heartbeat] send failed for {}: {e}", target.login);
+                }
+            }
         }
 
         match self
             .send_minute_watched_legacy(&target, &broadcast_id, &token)
             .await
         {
-            Ok(true) => debug!(
-                "[Heartbeat] points minute-watched accepted for {} ({})",
-                target.login, target.channel_id
-            ),
-            Ok(false) => debug!(
-                "[Heartbeat] points minute-watched rejected for {}",
-                target.login
-            ),
-            Err(e) => warn!("[Heartbeat] points send failed for {}: {e}", target.login),
+            Ok(true) => {
+                if changed(&self.points_outcome, OUTCOME_OK) {
+                    info!("[Heartbeat] points minute-watched accepted for {} ({})", target.login, target.channel_id);
+                }
+            }
+            Ok(false) => {
+                if changed(&self.points_outcome, OUTCOME_REFUSED) {
+                    info!("[Heartbeat] points minute-watched rejected for {}", target.login);
+                }
+            }
+            Err(e) => {
+                if changed(&self.points_outcome, OUTCOME_FAILED) {
+                    warn!("[Heartbeat] points send failed for {}: {e}", target.login);
+                }
+            }
         }
     }
 
@@ -418,5 +466,11 @@ impl WatchHeartbeatService {
         })
         .await?;
         Ok(response.status().as_u16() == 204)
+    }
+}
+
+impl crate::services::drop_playback::Follow for WatchHeartbeatService {
+    async fn following(&self) -> Option<String> {
+        self.playing_login().await
     }
 }

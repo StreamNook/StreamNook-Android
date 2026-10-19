@@ -28,8 +28,21 @@ export interface EmoteMatchRow {
   matchLen?: number;
   /** Section heading while browsing with nothing typed. */
   group?: string;
+  /** Set on a chatter row (Rust's provider `user`), which follows the emotes
+   *  in a cycle answer: the chatter's login. */
+  chatterLogin?: string;
   isZeroWidth?: boolean;
   modifierFlags?: number;
+  emoteType?: string;
+  /** Who made it, where the provider's set says (the menu's hover credit). */
+  ownerName?: string;
+  /** The emote's own name when the set shows it under an alias. */
+  originalName?: string;
+  animated?: boolean;
+  width?: number;
+  favorite?: boolean;
+  /** An FFZ subscriber effect this account cannot use (picker mode only). */
+  locked?: boolean;
 }
 
 export interface EmoteMatchResult {
@@ -38,6 +51,8 @@ export interface EmoteMatchResult {
   total: number;
   /** False while the channel's emotes are still loading. */
   ready: boolean;
+  /** Matches per provider before the cap (`twitch`, `7tv`, `bttv`, ...). */
+  counts: Partial<Record<EmoteMatchRow['provider'], number>>;
 }
 
 export interface EmoteMatchChannel {
@@ -53,7 +68,7 @@ interface WireRow {
   insert_text?: string;
   url: string;
   local_path?: string;
-  provider: EmoteMatchRow['provider'];
+  provider: EmoteMatchRow['provider'] | 'user';
   source_label: string;
   source_detail: string;
   match_at?: number;
@@ -61,19 +76,29 @@ interface WireRow {
   group?: string;
   is_zero_width?: boolean;
   modifier_flags?: number;
+  emote_type?: string;
+  owner_name?: string;
+  original_name?: string;
+  animated?: boolean;
+  width?: number;
+  favorite?: boolean;
+  locked?: boolean;
+  login?: string;
 }
 
-const EMPTY: EmoteMatchResult = { rows: [], total: 0, ready: false };
+const EMPTY: EmoteMatchResult = { rows: [], total: 0, ready: false, counts: {} };
 
 export async function matchEmotes(
   target: EmoteMatchChannel,
   query: string,
   profile: EmoteMatchProfile,
-  options: { twitchFirst?: boolean; limit?: number } = {},
+  /** `picker`: the emote menu's search, which also lists FFZ subscriber
+   *  effects this account cannot send (marked `locked`). */
+  options: { twitchFirst?: boolean; limit?: number; picker?: boolean } = {},
 ): Promise<EmoteMatchResult> {
   if (!target.channel) return EMPTY;
   try {
-    const res = await invoke<{ rows: WireRow[]; total: number; ready: boolean }>('match_emote_tokens', {
+    const res = await invoke<{ rows: WireRow[]; total: number; ready: boolean; counts?: EmoteMatchResult['counts'] }>('match_emote_tokens', {
       provider: target.provider,
       channel: target.channel,
       channelId: target.channelId || null,
@@ -82,17 +107,19 @@ export async function matchEmotes(
       order: options.twitchFirst ? 'twitch_first' : 'default',
       tier: inlineEmoteTier(),
       limit: options.limit ?? null,
+      picker: options.picker ?? null,
     });
     return {
       total: res.total,
       ready: res.ready,
+      counts: res.counts ?? {},
       rows: res.rows.map((r) => ({
         id: r.id,
         name: r.name,
         insertText: r.insert_text,
         url: r.url,
         localUrl: r.local_path ? convertFileSrc(r.local_path) : undefined,
-        provider: r.provider,
+        provider: r.provider === 'user' ? 'twitch' : r.provider,
         sourceLabel: r.source_label,
         sourceDetail: r.source_detail,
         matchAt: r.match_at,
@@ -100,6 +127,14 @@ export async function matchEmotes(
         group: r.group,
         isZeroWidth: r.is_zero_width,
         modifierFlags: r.modifier_flags,
+        emoteType: r.emote_type,
+        ownerName: r.owner_name,
+        originalName: r.original_name,
+        animated: r.animated,
+        width: r.width,
+        favorite: r.favorite,
+        locked: r.locked,
+        chatterLogin: r.provider === 'user' ? (r.login ?? r.name.replace(/^@/, '')) : undefined,
       })),
     };
   } catch {
@@ -107,24 +142,62 @@ export async function matchEmotes(
   }
 }
 
-/** Rows as Tab-cycle candidates, in the order Rust ranked them. */
+/** The viewer's personal 7TV emote that shows instead of a channel emote of
+ *  the same name in their own messages. */
+export interface PersonalOverride {
+  name: string;
+  id: string;
+  url: string;
+}
+
+/** Channel emote names the viewer's personal set replaces, keyed by name.
+ *  Twitch only (personal emotes are a Twitch feature); empty until Rust knows
+ *  both sets. */
+export async function personalEmoteOverrides(
+  channel: string,
+  channelId?: string | null,
+): Promise<Map<string, PersonalOverride>> {
+  try {
+    const list = await invoke<PersonalOverride[]>('personal_emote_overrides', {
+      channel,
+      channelId: channelId || null,
+    });
+    return new Map(list.map((o) => [o.name, o]));
+  } catch {
+    return new Map();
+  }
+}
+
+/** Rows as Tab-cycle candidates, in the order Rust ranked them. Chatter rows
+ *  (provider `user`, after the emotes) insert what Rust chose: the login when
+ *  a display name is localized. */
 export function rowsToTabCandidates(rows: EmoteMatchRow[]): EmoteTabCandidate[] {
-  return rows.map((r, i) => ({
-    name: r.name,
-    insertText: r.insertText,
-    priority: i,
-    emote: {
-      id: r.id,
+  return rows.map((r, i): EmoteTabCandidate => {
+    if (r.chatterLogin !== undefined) {
+      return {
+        name: r.name,
+        insertText: r.insertText,
+        priority: i,
+        chatter: { username: r.chatterLogin, displayName: r.name.replace(/^@/, '') },
+      };
+    }
+    return {
       name: r.name,
-      url: r.url,
-      localUrl: r.localUrl,
-      provider: r.provider,
-      isZeroWidth: r.isZeroWidth,
-      modifierFlags: r.modifierFlags,
-    },
-    sourceLabel: r.sourceLabel,
-    sourceDetail: r.sourceDetail,
-  }));
+      insertText: r.insertText,
+      priority: i,
+      emote: {
+        id: r.id,
+        name: r.name,
+        url: r.url,
+        localUrl: r.localUrl,
+        provider: r.provider,
+        isZeroWidth: r.isZeroWidth,
+        modifierFlags: r.modifierFlags,
+      },
+      sourceLabel: r.sourceLabel,
+      sourceDetail: r.sourceDetail,
+    };
+  });
 }
 
 /**

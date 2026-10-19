@@ -39,6 +39,15 @@ const RESOLVE_CONCURRENCY: usize = 4;
 /// it is read as it arrives, so it never counts as unread.
 static ACTIVE: Mutex<Option<String>> = Mutex::new(None);
 
+/// Who whispered last since the app started, for `/r`: (login, display
+/// name, user id).
+static LAST_FROM: Mutex<Option<(String, String, String)>> = Mutex::new(None);
+
+/// The sender of the newest whisper received, for `/r`.
+pub fn last_from() -> Option<(String, String, String)> {
+    LAST_FROM.lock().ok().and_then(|l| l.clone())
+}
+
 type Conversations = HashMap<String, StoredConversation>;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -246,6 +255,12 @@ fn update_for(
 /// Persist a whisper the socket just received and tell the windows. Runs off
 /// the socket's read loop, so a slow avatar lookup never delays keepalives.
 pub async fn record_incoming(app: AppHandle, owner_id: String, ev: WhisperEvent, received_ms: i64) {
+    if !ev.from_user_login.is_empty() {
+        if let Ok(mut last) = LAST_FROM.lock() {
+            let name = if ev.from_user_name.is_empty() { ev.from_user_login.clone() } else { ev.from_user_name.clone() };
+            *last = Some((ev.from_user_login.clone(), name, ev.from_user_id.clone()));
+        }
+    }
     let lookup = WhisperStorageService::update_conversations(&app, &owner_id, |convs| {
         (needs_avatar(convs, &ev), false)
     });
@@ -365,6 +380,40 @@ pub async fn send(
         (update_for(convs, &owner, target.key, None, Some(message)), true)
     })?
     .ok_or_else(|| "Conversation vanished while sending".to_string())
+}
+
+/// Send a whisper typed into a Windows notification and tell every window, as
+/// the Whispers panel's own send would. A notification can start the app, so
+/// this waits a little for the Twitch sign-in to load.
+pub async fn reply_from_notification(
+    app: &AppHandle,
+    user_id: &str,
+    login: &str,
+    name: &str,
+    avatar: Option<String>,
+    text: String,
+) -> Result<(), String> {
+    let mut me = None;
+    for _ in 0..20 {
+        if let Ok(user) = TwitchService::get_user_info().await {
+            me = Some(user);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let me = me.ok_or_else(|| "You are not signed in to Twitch.".to_string())?;
+    let key = WhisperStorageService::update_conversations(app, &me.id, |convs| (find_key(convs, user_id, login), false))?
+        .unwrap_or_else(|| user_id.to_string());
+    let target = SendTarget {
+        key,
+        user_id: user_id.to_string(),
+        user_login: login.to_string(),
+        user_name: name.to_string(),
+        profile_image_url: avatar,
+    };
+    let update = send(app, &me.id, target, text).await?;
+    let _ = app.emit(UPDATED_EVENT, &update);
+    Ok(())
 }
 
 // ---- Imports --------------------------------------------------------------

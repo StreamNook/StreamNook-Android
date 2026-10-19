@@ -8,6 +8,34 @@
  *   "Kappa| HeyGuys"      -> [0, 5]   ("Kappa")
  *   "abc def gh|ij klm"   -> [8, 12]  ("ghij")
  */
+/**
+ * Put `insert` in place of the selection `start..end` (a bare caret when they
+ * match), spaced from its neighbours: a space before it unless the text
+ * before already ends in whitespace (or is empty), and one after unless the
+ * text after already starts with a space. Returns the new text and the caret
+ * just past the inserted word and its trailing space. Out-of-range positions
+ * are clamped, so a stale selection can never cut the text.
+ *
+ *   ("hi|", "Kappa")         -> "hi Kappa |"
+ *   ("|there", "Kappa")      -> "Kappa |there"
+ *   ("a | b", "Kappa")       -> "a Kappa | b"
+ */
+export function insertAtCaret(
+  value: string,
+  start: number,
+  end: number,
+  insert: string,
+): { text: string; caret: number } {
+  const at = Math.max(0, Math.min(start, value.length));
+  const to = Math.max(at, Math.min(end, value.length));
+  const before = value.slice(0, at);
+  const after = value.slice(to);
+  const lead = before && !/\s$/.test(before) ? ' ' : '';
+  const trail = after.startsWith(' ') ? '' : ' ';
+  const head = before + lead + insert + trail;
+  return { text: head + after, caret: head.length };
+}
+
 export function getWordRange(text: string, position: number): [number, number] {
   let start = 0;
   let end = text.length;
@@ -54,45 +82,6 @@ export interface EmoteTabCandidate {
   };
   /** Set for chatter completions; the value is prefixed with @ if user typed @-prefix */
   chatter?: { username: string; displayName: string };
-}
-
-/** The most candidates one Tab cycle walks through. */
-export const TAB_CYCLE_LIMIT = 50;
-
-/**
- * Chatter names after the emote matches, as the Tab cycle offers them. The
- * emotes arrive ranked from Rust; chatters always follow them. A `:` query is
- * emote-only, and an `@` query completes to `@name`.
- */
-export function withChatterCandidates(
-  emotes: EmoteTabCandidate[],
-  word: string,
-  users: ReadonlyArray<{ username: string; displayName?: string }>,
-  mode: EmoteTabMatchMode,
-): EmoteTabCandidate[] {
-  const out = emotes.slice(0, TAB_CYCLE_LIMIT);
-  if (word.startsWith(':') || out.length >= TAB_CYCLE_LIMIT) return out;
-  const isAt = word.startsWith('@');
-  const q = (isAt ? word.slice(1) : word).toLowerCase();
-  if (!q) return out;
-  const test = (s: string) => {
-    const t = s.toLowerCase();
-    return mode === 'starts_with' ? t.startsWith(q) : t.includes(q);
-  };
-  const seen = new Set(out.map((c) => c.name.toLowerCase()));
-  for (const u of users) {
-    const dn = u.displayName || u.username;
-    if (seen.has(dn.toLowerCase())) continue;
-    if (!test(dn) && !test(u.username)) continue;
-    seen.add(dn.toLowerCase());
-    out.push({
-      name: (isAt ? '@' : '') + dn,
-      priority: TAB_CYCLE_LIMIT,
-      chatter: { username: u.username, displayName: dn },
-    });
-    if (out.length >= TAB_CYCLE_LIMIT) break;
-  }
-  return out;
 }
 
 /**

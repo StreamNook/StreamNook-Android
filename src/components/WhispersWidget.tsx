@@ -13,7 +13,10 @@ import { warmSpellcheck } from '../utils/spellcheck';
 import type { WhisperConversation, Whisper, WhisperUpdate, UserInfo } from '../types';
 
 import { Logger } from '../utils/logger';
+import { SevenTvAvatar } from './SevenTvAvatar';
 import { playNotificationSound as playGatedNotificationSound } from '../utils/notificationSound';
+import { isImeComposing } from '../utils/imeComposing';
+import { useOutsidePress } from '../hooks/useOutsidePress';
 interface WhispersWidgetProps {
     isOpen: boolean;
     onClose: () => void;
@@ -181,6 +184,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
     const fileInputRef = useRef<HTMLInputElement>(null);
     const sortMenuRef = useRef<HTMLDivElement>(null);
     const emojiPickerRef = useRef<HTMLDivElement>(null);
+    const emojiButtonRef = useRef<HTMLButtonElement>(null);
     const sendingRef = useRef(false);
 
     const { currentUser, settings, setProfileModalUser } = useAppStore();
@@ -305,18 +309,8 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
     };
 
     // Close menus when clicking outside
-    useEffect(() => {
-        const handleClickOutside = (event: MouseEvent) => {
-            if (sortMenuRef.current && !sortMenuRef.current.contains(event.target as Node)) {
-                setShowSortMenu(false);
-            }
-            if (emojiPickerRef.current && !emojiPickerRef.current.contains(event.target as Node)) {
-                setShowEmojiPicker(false);
-            }
-        };
-        document.addEventListener('mousedown', handleClickOutside);
-        return () => document.removeEventListener('mousedown', handleClickOutside);
-    }, []);
+    const markInsideSortMenu = useOutsidePress(showSortMenu, [sortMenuRef], () => setShowSortMenu(false));
+    const markInsideEmojiPicker = useOutsidePress(showEmojiPicker, [emojiPickerRef, emojiButtonRef], () => setShowEmojiPicker(false));
 
     // Play notification sound. Shared gate, so a whisper that also raises a
     // notification-center entry pings once rather than twice.
@@ -554,7 +548,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
     };
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
+        if (e.key === 'Enter' && !e.shiftKey && !isImeComposing(e)) {
             e.preventDefault();
             handleSend();
         }
@@ -732,7 +726,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
 
                     {/* Sort Options */}
                     <div className="px-4 py-2 border-b border-borderSubtle">
-                        <div className="relative" ref={sortMenuRef}>
+                        <div className="relative" ref={sortMenuRef} onPointerDownCapture={markInsideSortMenu}>
                             <button
                                 onClick={() => setShowSortMenu(!showSortMenu)}
                                 className="flex items-center gap-2 text-xs text-textSecondary hover:text-textPrimary transition-colors"
@@ -783,7 +777,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
                                 >
                                     <div className="relative flex-shrink-0">
                                         {conv.profile_image_url ? (
-                                            <img src={conv.profile_image_url} alt={conv.user_name} className="w-11 h-11 rounded-full object-cover border border-white/5" />
+                                            <SevenTvAvatar cosmeticsId={conv.user_id} px={44} motion="hover" src={conv.profile_image_url} alt={conv.user_name} className="w-11 h-11 rounded-full object-cover border border-white/5" />
                                         ) : (
                                             <div className="w-11 h-11 rounded-full bg-accent/10 border border-accent/20 flex items-center justify-center">
                                                 <MessageCircle size={18} className="text-accent" />
@@ -854,7 +848,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
                                             type="text"
                                             value={searchQuery}
                                             onChange={(e) => setSearchQuery(e.target.value)}
-                                            onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
+                                            onKeyDown={(e) => e.key === 'Enter' && !isImeComposing(e) && handleSearch()}
                                             placeholder="Search for a user..."
                                             className="w-full glass-input rounded-lg pl-10 pr-4 py-2.5 text-sm transition-colors"
                                         />
@@ -870,7 +864,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
                                         {searchResults.map((user) => (
                                             <button key={user.id} onClick={() => startConversation(user)} className="w-full flex items-center gap-3 p-3 glass-panel hover:bg-glass-hover rounded-lg transition-colors border-transparent">
                                                 {user.profile_image_url ? (
-                                                    <img src={user.profile_image_url} alt={user.display_name} className="w-11 h-11 rounded-full object-cover border border-white/5" />
+                                                    <SevenTvAvatar cosmeticsId={user.id} px={44} motion="hover" src={user.profile_image_url} alt={user.display_name} className="w-11 h-11 rounded-full object-cover border border-white/5" />
                                                 ) : (
                                                     <div className="w-11 h-11 rounded-full bg-accent/10 border border-accent/20 flex items-center justify-center">
                                                         <MessageCircle size={18} className="text-accent" />
@@ -901,7 +895,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
                                     className="flex items-center gap-3 flex-1 text-left group hover:bg-surface-hover p-1.5 -ml-1.5 rounded-lg transition-colors"
                                 >
                                     {currentConversation.profile_image_url ? (
-                                        <img src={currentConversation.profile_image_url} alt={currentConversation.user_name} className="w-10 h-10 rounded-full object-cover border border-white/5 group-hover:border-accent/40 transition-colors" />
+                                        <SevenTvAvatar cosmeticsId={currentConversation.user_id} px={40} motion="animate" src={currentConversation.profile_image_url} alt={currentConversation.user_name} className="w-10 h-10 rounded-full object-cover border border-white/5 group-hover:border-accent/40 transition-colors" />
                                     ) : (
                                         <div className="w-10 h-10 rounded-full bg-accent/10 border border-accent/20 flex items-center justify-center group-hover:border-accent/40 transition-colors">
                                             <MessageCircle size={16} className="text-accent" />
@@ -947,10 +941,10 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
                             )}
 
                             {/* Input Area */}
-                            <div className="shrink-0 p-4 relative bg-surface-hover/20 backdrop-blur-md border-t border-borderSubtle">
+                            <div className="shrink-0 p-4 relative bg-glass-hover/20 backdrop-blur-md border-t border-borderSubtle">
                                 {/* Emoji Picker */}
                                 {showEmojiPicker && (
-                                    <div ref={emojiPickerRef} className="absolute bottom-full left-4 right-4 mb-2 glass-panel shadow-xl overflow-hidden" style={{ height: '320px' }}>
+                                    <div ref={emojiPickerRef} onPointerDownCapture={markInsideEmojiPicker} className="absolute bottom-full left-4 right-4 mb-2 glass-panel shadow-xl overflow-hidden" style={{ height: '320px' }}>
                                         <div className="p-3 border-b border-borderSubtle">
                                             <input
                                                 type="text"
@@ -989,7 +983,7 @@ const WhispersWidget = ({ isOpen, onClose }: WhispersWidgetProps) => {
                                 )}
 
                                 <div className="flex items-end gap-2">
-                                    <button onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`p-2.5 rounded-xl transition-colors flex-shrink-0 ${showEmojiPicker ? 'text-accent bg-accent/10 border border-transparent shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-accent)_35%,transparent)]' : 'text-textSecondary hover:text-accent hover:bg-surface-hover border border-transparent'}`}>
+                                    <button ref={emojiButtonRef} onClick={() => setShowEmojiPicker(!showEmojiPicker)} className={`p-2.5 rounded-xl transition-colors flex-shrink-0 ${showEmojiPicker ? 'text-accent bg-accent/10 border border-transparent shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--color-accent)_35%,transparent)]' : 'text-textSecondary hover:text-accent hover:bg-surface-hover border border-transparent'}`}>
                                         <Smile size={20} />
                                     </button>
                                     {/* Wrapper so the spell-check underlay can sit

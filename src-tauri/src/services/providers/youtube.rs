@@ -238,11 +238,15 @@ impl ChatProvider for YouTubeProvider {
                     dec_bridge_users();
                 }
             }
+            drop(conns);
+            // Nothing reads this channel's 7TV set now, so its live feed goes too.
+            crate::services::seventv_eventapi::unsubscribe_channel_on(&id_lc, "youtube").await;
         }
         Ok(())
     }
 
     async fn release_window(&self, window: &str) {
+        let mut dropped: Vec<String> = Vec::new();
         let mut conns = self.conns.lock().await;
         conns.retain(|id_lc, conn| {
             if !conn.consumers.remove(window) || !conn.consumers.is_empty() {
@@ -255,8 +259,16 @@ impl ChatProvider for YouTubeProvider {
                 dec_bridge_users();
                 log::debug!("[youtube] released '{}' with window '{}'", id_lc, window);
             }
+            dropped.push(id_lc.clone());
             false
         });
+        // Outside the retain closure, which is synchronous.
+        drop(conns);
+        for id_lc in dropped {
+            crate::services::seventv_eventapi::unsubscribe_channel_on(&id_lc, "youtube").await;
+            // The send cooldown cached as ROOMSTATE belongs to this connection.
+            crate::services::irc_service::remove_provider_room_state(&key::make_key("youtube", &id_lc)).await;
+        }
     }
 
     async fn send(&self, channel: &str, text: &str, _reply_to: Option<&str>) -> Result<SendOutcome> {
@@ -269,50 +281,72 @@ impl ChatProvider for YouTubeProvider {
             return Ok(drop("Connect your YouTube account to send"));
         }
         let Some(meta) = channel_meta(channel) else {
-            return Ok(drop("YouTube channel isn't resolved yet — try again in a moment"));
+            return Ok(drop("YouTube chat is still connecting. Try again in a moment"));
         };
-        let (Some(channel_id), Some(video_id), Some(api_key)) = (
+        let (Some(channel_id), Some(video_id), Some(_)) = (
             meta.user_id.as_deref(),
             meta.video_id.as_deref(),
             meta.api_key.as_deref(),
         ) else {
             return Ok(drop("YouTube channel isn't fully resolved yet"));
         };
-        let params = send_message_params(channel_id, video_id);
-        let body = json!({ "richMessage": { "textSegments": [{ "text": text }] }, "params": params });
-        match post_innertube_authed("send_message", api_key, &meta, body).await {
+        match super::youtube_send::send_text(&meta, channel_id, video_id, text).await {
             Ok(v) => {
-                // The send response can say WE were timed out instead of accepting.
-                if let Some(us) = v.get("timeoutDurationUsec").and_then(|x| x.as_str()) {
-                    let secs = us.parse::<i64>().unwrap_or(0) / 1_000_000;
-                    return Ok(drop(&format!("You're in timeout for {}s", secs)));
-                }
+                let channel_key = key::make_key("youtube", channel);
+                let (item, message_id, cooldown_secs) =
+                    match super::youtube_send::classify_send_response(&v) {
+                        super::youtube_send::SendResponse::Accepted {
+                            item,
+                            message_id,
+                            cooldown_secs,
+                        } => (item, message_id, cooldown_secs),
+                        // No posted row in the answer: it counts as sent (the
+                        // composer stays clear) and the viewer hears about it
+                        // only if the row never reaches chat.
+                        super::youtube_send::SendResponse::Unconfirmed { cooldown_secs } => {
+                            log::info!("[YouTube] send answered without its posted row; watching chat for it");
+                            watch_unconfirmed_send(&channel_key, text);
+                            (None, None, cooldown_secs)
+                        }
+                        super::youtube_send::SendResponse::Refused(reason) => {
+                            log::warn!("[YouTube] send answered 200 without posting: {}", reason);
+                            return Ok(drop(&reason));
+                        }
+                    };
                 // The response carries the FULL rendered message (author, id, runs).
                 // Publish it immediately so our own line shows at once instead of
                 // waiting for the next read poll (~5s); the read loop's later echo of
                 // the same id is deduped by the store's seenMessageIds.
-                let item = v.pointer("/actions/0/addChatItemAction/item");
-                let message_id = item
-                    .and_then(|i| i.pointer("/liveChatTextMessageRenderer/id"))
-                    .and_then(|x| x.as_str())
-                    .map(String::from);
                 if let Some(item) = item {
-                    let channel_key = key::make_key("youtube", channel);
                     if let Some(msg) = parse_item(item, &channel_key) {
                         publish_chat_message(&msg).await;
                     }
                 }
+                // The cooldown YouTube attached to the posted message drives the
+                // composer's existing slow-mode countdown, through the same partial
+                // ROOMSTATE frame the other providers use (only `slow` is set, so
+                // nothing else in the room state is touched). A 1 s cooldown is
+                // YouTube's ordinary per-viewer pacing, not slow mode, and would put
+                // a "Slow mode · 1s" label on every chat after the first send.
+                let slow = if cooldown_secs > 1 { cooldown_secs } else { 0 };
+                let rs = json!({
+                    "type": "ROOMSTATE",
+                    "provider": "youtube",
+                    "channel": channel_key,
+                    "slow": slow,
+                })
+                .to_string();
+                crate::services::irc_service::cache_provider_room_state(&channel_key, rs.clone()).await;
+                publish_frame(rs).await;
                 Ok(SendOutcome {
                     message_id,
                     is_sent: true,
                     drop_reason: None,
                 })
             }
-            Err(e) => {
-                log::warn!("[YouTube] send failed: {}", e);
-                let detail: String = e.to_string().chars().take(160).collect();
-                Ok(drop(&format!("YouTube send failed: {}", detail)))
-            }
+            // `send_text` has already logged YouTube's full answer; the viewer gets
+            // the short reason only.
+            Err(reason) => Ok(drop(&reason)),
         }
     }
 
@@ -323,6 +357,35 @@ impl ChatProvider for YouTubeProvider {
             SendCapability::NeedsLogin
         }
     }
+}
+
+/// Watch chat for a message YouTube took without returning its posted row. If
+/// the row has not arrived after `ECHO_WAIT`, the open chat offers the text
+/// back (`provider-send-unconfirmed`), since it may not have posted.
+fn watch_unconfirmed_send(channel_key: &str, text: &str) {
+    use super::youtube_send::{echo_seen, expect_echo, ECHO_WAIT, SEND_UNCONFIRMED_EVENT};
+
+    let id = expect_echo(channel_key, text, youtube_auth_service::account_channel_id());
+    let channel_key = channel_key.to_string();
+    let text = text.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(ECHO_WAIT).await;
+        if echo_seen(id) {
+            return;
+        }
+        log::warn!(
+            "[YouTube] send: no chat row confirmed a sent message in {} within {}s",
+            channel_key,
+            ECHO_WAIT.as_secs()
+        );
+        if let Some(app) = super::app_handle() {
+            use tauri::Emitter;
+            let payload = json!({ "provider": "youtube", "channel": channel_key, "text": text });
+            if let Err(e) = app.emit(SEND_UNCONFIRMED_EVENT, payload) {
+                log::debug!("[YouTube] unconfirmed-send emit failed: {e}");
+            }
+        }
+    });
 }
 
 // --- Outgoing send / moderation (authenticated InnerTube, webview-session) ---
@@ -432,8 +495,13 @@ pub async fn unban_user(channel: &str, target_channel_id: &str) -> Result<()> {
 // moderation actions ONLY to someone who can moderate. So we POST a recent message's
 // context-menu params and check whether the response carries moderate endpoints.
 
-// Latest seen context-menu params per channel (any recent message works to probe).
-static CONTEXT_PARAMS: OnceLock<std::sync::Mutex<HashMap<String, String>>> = OnceLock::new();
+// Latest seen context-menu params per channel, with the message author's channel
+// id. Any recent message works to probe EXCEPT our own: YouTube offers everyone a
+// direct-endpoint Delete on their own message, which reads exactly like a
+// moderator's Remove, so probing our own message made every viewer who had
+// chatted a "moderator".
+static CONTEXT_PARAMS: OnceLock<std::sync::Mutex<HashMap<String, (String, String)>>> =
+    OnceLock::new();
 // Cached probe result per channel, so the gate doesn't re-probe every render.
 static CAN_MOD: OnceLock<std::sync::Mutex<HashMap<String, bool>>> = OnceLock::new();
 
@@ -447,13 +515,23 @@ static CAN_MOD: OnceLock<std::sync::Mutex<HashMap<String, bool>>> = OnceLock::ne
 static CAN_MOD_FAILED_AT: OnceLock<std::sync::Mutex<HashMap<String, Instant>>> = OnceLock::new();
 const CAN_MOD_RETRY_AFTER: Duration = Duration::from_secs(60);
 
-fn store_context_params(channel_key: &str, params: &str) {
+/// Whether `author_id` is the signed-in account's own channel. Unknown (identity
+/// not read yet) is not ours; `can_moderate` re-checks once it is known.
+fn is_own_author(author_id: &str) -> bool {
+    !author_id.is_empty()
+        && youtube_auth_service::account_channel_id().is_some_and(|own| own == author_id)
+}
+
+fn store_context_params(channel_key: &str, params: &str, author_id: &str) {
+    if is_own_author(author_id) {
+        return;
+    }
     let slug = key::parse_key(channel_key).channel;
     if let Ok(mut m) = CONTEXT_PARAMS
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
     {
-        m.insert(slug, params.to_string());
+        m.insert(slug, (params.to_string(), author_id.to_string()));
     }
 }
 
@@ -490,7 +568,7 @@ pub async fn can_moderate(channel: &str) -> bool {
     let Some(api_key) = meta.api_key.clone() else {
         return false;
     };
-    let Some(params) = CONTEXT_PARAMS
+    let Some((params, author_id)) = CONTEXT_PARAMS
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .ok()
@@ -498,6 +576,9 @@ pub async fn can_moderate(channel: &str) -> bool {
     else {
         return false; // no message seen yet — can't probe
     };
+    if is_own_author(&author_id) {
+        return false; // stored before our identity was known; wait for someone else's message
+    }
     let is_mod = match post_innertube_authed(
         "get_item_context_menu",
         &api_key,
@@ -657,7 +738,7 @@ fn chat_token(chat_id: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn send_message_params(channel_id: &str, video_id: &str) -> String {
+pub(crate) fn send_message_params(channel_id: &str, video_id: &str) -> String {
     pb::b2(&pb::cat(&[
         pb::ld(1, &cv_token(channel_id, video_id)),
         pb::vt(2, 2),
@@ -1992,6 +2073,8 @@ async fn process_action(action: &Value, channel_key: &str, backlog: bool) {
     if let Some(item) = action.pointer("/addChatItemAction/item") {
         if let Some(mut msg) = parse_item(item, channel_key) {
             msg.metadata.from_backfill = backlog;
+            // Confirms a send whose answer came back without its posted row.
+            super::youtube_send::note_chat_row(channel_key, &msg.user_id, &msg.content);
             publish_chat_message(&msg).await;
         }
         return;
@@ -2353,6 +2436,9 @@ fn parse_membership(r: &Value, channel_key: &str) -> ChatMessage {
         .or_else(|| milestone.clone())
         .unwrap_or_else(|| "New member".to_string());
     let (segments, plain) = parse_runs(r.get("message"));
+    // A milestone's own comment is a chat line like any other: the channel's
+    // 7TV emotes apply to it too.
+    let segments = bake_seventv(segments, channel_key);
     let display = r
         .pointer("/authorName/simpleText")
         .and_then(|x| x.as_str())
@@ -2447,7 +2533,7 @@ fn base_message(
         .pointer("/contextMenuEndpoint/liveChatItemContextMenuEndpoint/params")
         .and_then(|x| x.as_str())
     {
-        store_context_params(channel_key, p);
+        store_context_params(channel_key, p, &user_id);
     }
 
     let mut tags = HashMap::new();
@@ -2527,11 +2613,14 @@ fn bake_seventv(segments: Vec<MessageSegment>, channel_key: &str) -> Vec<Message
             out.push(seg);
             continue;
         };
-        // Split on spaces, keeping them, so the message reads exactly as sent.
+        // Split on any whitespace (YouTube runs carry newlines and no-break
+        // spaces as well as spaces), keeping it, so the message reads exactly
+        // as sent and a word beside a line break still matches.
         let mut buf = String::new();
-        for (i, word) in content.split(' ').enumerate() {
-            if i > 0 {
-                buf.push(' ');
+        for (is_space, word) in whitespace_runs(content) {
+            if is_space {
+                buf.push_str(word);
+                continue;
             }
             match youtube_emotes::lookup(&identifier, word) {
                 Some(e) => {
@@ -2555,6 +2644,30 @@ fn bake_seventv(segments: Vec<MessageSegment>, channel_key: &str) -> Vec<Message
         if !buf.is_empty() {
             out.push(MessageSegment::Text { content: buf });
         }
+    }
+    out
+}
+
+/// `text` cut into alternating runs of whitespace and non-whitespace, in order,
+/// each tagged with whether it is whitespace. Joined back they are `text`.
+fn whitespace_runs(text: &str) -> Vec<(bool, &str)> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut current: Option<bool> = None;
+    for (i, c) in text.char_indices() {
+        let space = c.is_whitespace();
+        match current {
+            Some(kind) if kind == space => {}
+            Some(kind) => {
+                out.push((kind, &text[start..i]));
+                start = i;
+                current = Some(space);
+            }
+            None => current = Some(space),
+        }
+    }
+    if let Some(kind) = current {
+        out.push((kind, &text[start..]));
     }
     out
 }
@@ -2840,6 +2953,18 @@ fn color_for(channel_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whitespace_runs_keep_every_kind_of_space() {
+        let runs = whitespace_runs("KEKW\nok\u{a0}\u{a0}LUL ");
+        assert_eq!(
+            runs,
+            vec![(false, "KEKW"), (true, "\n"), (false, "ok"), (true, "\u{a0}\u{a0}"), (false, "LUL"), (true, " ")]
+        );
+        let joined: String = runs.iter().map(|(_, s)| *s).collect();
+        assert_eq!(joined, "KEKW\nok\u{a0}\u{a0}LUL ");
+        assert!(whitespace_runs("").is_empty());
+    }
+
 
     /// Captured 2026-09-19 from `/channel/UCAhaFPP6v3WCfK5Tjao0B7A/live`, which
     /// still fronts a broadcast scheduled for March 2017 that never began.

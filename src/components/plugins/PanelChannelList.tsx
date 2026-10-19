@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Users, Plus, X, Loader2 } from 'lucide-react';
 import { useAppStore } from '../../stores/AppStore';
 import { PanelChannel } from '../../types/plugins';
 import { Logger } from '../../utils/logger';
+import { SevenTvAvatar } from '../SevenTvAvatar';
 
 interface ChannelResult {
   id?: string;
@@ -38,6 +40,9 @@ const PanelChannelList = ({
   const [open, setOpen] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const boxRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuStyle, setMenuStyle] = useState<CSSProperties>({});
+  const menuOpen = open && input.trim() !== '';
 
   useEffect(() => {
     if (followedStreams.length === 0) loadFollowedStreams();
@@ -45,11 +50,52 @@ const PanelChannelList = ({
 
   useEffect(() => {
     const onClickOutside = (e: MouseEvent) => {
-      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (boxRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
     };
     document.addEventListener('mousedown', onClickOutside);
     return () => document.removeEventListener('mousedown', onClickOutside);
   }, []);
+
+  // The results menu is portalled to <body> with fixed coordinates: the row
+  // this field sits in lives inside a settings card that clips its overflow,
+  // so an in-place dropdown was cut off at the card's bottom edge. It opens
+  // upward when the window has more room above the field than below it.
+  useLayoutEffect(() => {
+    if (!menuOpen) return;
+    const reposition = () => {
+      const el = boxRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const below = window.innerHeight - r.bottom - 16;
+      const above = r.top - 16;
+      const up = below < 224 && above > below;
+      setMenuStyle({
+        position: 'fixed',
+        left: Math.round(r.left),
+        width: Math.round(r.width),
+        zIndex: 9999,
+        maxHeight: Math.max(120, Math.min(280, up ? above : below)),
+        ...(up
+          ? { bottom: Math.round(window.innerHeight - r.top + 8) }
+          : { top: Math.round(r.bottom + 8) }),
+      });
+    };
+    reposition();
+    // Follow the field as the page scrolls; a scroll inside the menu itself
+    // leaves it where it is.
+    const onScroll = (e: Event) => {
+      if (menuRef.current?.contains(e.target as Node)) return;
+      reposition();
+    };
+    window.addEventListener('resize', reposition);
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      window.removeEventListener('resize', reposition);
+      window.removeEventListener('scroll', onScroll, true);
+    };
+  }, [menuOpen]);
 
   useEffect(() => {
     if (!input.trim()) {
@@ -130,12 +176,12 @@ const PanelChannelList = ({
             <Loader2 size={15} className="animate-spin text-accent" />
           </div>
         )}
-        {open && input.trim() && (
-          <div className="glass-panel absolute left-0 right-0 z-50 mt-2 overflow-hidden">
+        {menuOpen && createPortal(
+          <div ref={menuRef} style={menuStyle} className="glass-panel flex flex-col overflow-hidden">
             {searching && results.length === 0 ? (
               <div className="p-3 text-center text-[12px] italic text-textSecondary">Searching...</div>
             ) : results.length > 0 ? (
-              <div className="max-h-56 overflow-y-auto">
+              <div className="min-h-0 flex-1 overflow-y-auto custom-scrollbar">
                 {results.map((r) => {
                   const login = r.user_login || r.broadcaster_login || '';
                   const name = r.user_name || r.display_name || login;
@@ -148,7 +194,13 @@ const PanelChannelList = ({
                       className="group flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors hover:bg-white/[0.06]"
                     >
                       {avatar ? (
-                        <img src={avatar} alt={name} className="h-8 w-8 rounded-full object-cover" />
+                        <SevenTvAvatar
+                          cosmeticsId={r.user_id || r.id}
+                          px={32}
+                          src={avatar}
+                          alt={name}
+                          className="h-8 w-8 rounded-full object-cover"
+                        />
                       ) : (
                         <div className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10">
                           <Users size={14} className="text-textSecondary" />
@@ -169,7 +221,8 @@ const PanelChannelList = ({
             ) : (
               <div className="p-3 text-center text-[12px] italic text-textSecondary">No channels found.</div>
             )}
-          </div>
+          </div>,
+          document.body,
         )}
       </div>
     </div>
@@ -203,11 +256,17 @@ const Row = ({
   }, [channel.channel_id, avatar]);
   return (
     <div className="group flex items-center gap-3 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-      <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded bg-white/5 font-mono text-[11px] text-textSecondary">
+      <span className="flex h-5 min-w-5 flex-shrink-0 items-center justify-center rounded bg-white/5 px-1 font-mono text-[11px] text-textSecondary">
         {index + 1}
       </span>
       {avatar ? (
-        <img src={avatar} alt={channel.display_name} className="h-7 w-7 flex-shrink-0 rounded-full object-cover" />
+        <SevenTvAvatar
+          cosmeticsId={channel.channel_id}
+          px={28}
+          src={avatar}
+          alt={channel.display_name}
+          className="h-7 w-7 flex-shrink-0 rounded-full object-cover"
+        />
       ) : (
         <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full bg-white/10">
           <Users size={13} className="text-textSecondary" />

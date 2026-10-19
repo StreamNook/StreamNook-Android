@@ -17,7 +17,14 @@ import {
   clampOverlayStyle,
   renderEventTemplate,
   DEFAULT_LINK_COLOR,
+  twitchBadgeCategory,
+  isCustomFontFamily,
+  localFontFaceCss,
+  overlayFontStack,
+  primaryFontFamily,
+  touchLocalFontAliases,
   type OverlayStyle,
+  type SeventvEmoteChange,
   type EventCategory,
   type EventTemplateContext,
 } from './overlayConfig';
@@ -27,7 +34,7 @@ import { AtmosphereChatWash } from './AtmosphereChatWash';
 import { convertMoneyInText, loadRates, ratesReady } from './currency';
 import { giftBombOriginOf, isGiftBombAnnouncement, isGiftBombChild } from '../../utils/giftBombCollapse';
 import { adjustNameColor } from '../../utils/nameColor';
-import { overlayBackdropIsDark, zeroWidthLayout } from './overlayLayout';
+import { gifLineIndex, messageLineClamp, overlayBackdropIsDark, zeroWidthLayout } from './overlayLayout';
 
 // The StreamNook identity badge on the overlay is just the member's equipped
 // cosmetic image (the app's rich hover card doesn't belong on a broadcast). The
@@ -126,6 +133,8 @@ interface FallbackImgProps {
   loading?: 'lazy' | 'eager';
   referrerPolicy?: HTMLAttributeReferrerPolicy;
   fallback?: ReactNode;
+  /** Marks a chat GIF, for the Max lines measurement (useGifLine). */
+  'data-overlay-gif'?: string;
 }
 const FallbackImg = ({ fallback = null, ...props }: FallbackImgProps) => {
   const [failed, setFailed] = useState(false);
@@ -133,21 +142,70 @@ const FallbackImg = ({ fallback = null, ...props }: FallbackImgProps) => {
   return <img {...props} onError={() => setFailed(true)} />;
 };
 
-// A Twitch chat GIF (GIPHY-backed, Tier 2/3 subscribers). Always drawn at the
-// gigantified size; the message renderer places it by the giant placement
-// setting. The URL is used exactly as Twitch sent it, and a failed load shows
-// the description Twitch put in the message text.
-const GifImg = ({ segment, emoteScale }: { segment: Extract<MessageSegment, { type: 'gif' }>; emoteScale: number }) => (
+// A Twitch chat GIF (GIPHY-backed, Tier 2/3 subscribers). Drawn at the
+// gigantified size, inline where it was typed, so a GIF message reads like a
+// text message: the GIF starts right after the name. Its TOP sits on the top of
+// the name's line (text-top), so the name stays on the first line and the GIF
+// hangs below it; middle alignment would push the name down to the GIF's
+// centre. The extra height stays inside this row's own line box. The URL is used
+// exactly as Twitch sent it, and a failed load shows the description Twitch put
+// in the message text. The GIF size setting scales it on top of Emote size.
+const GifImg = ({ segment, emoteScale, gifScale }: { segment: Extract<MessageSegment, { type: 'gif' }>; emoteScale: number; gifScale: number }) => (
   <FallbackImg
     src={segment.gif_url}
     alt={segment.content}
     loading="lazy"
     referrerPolicy="no-referrer"
-    className="inline-block w-auto align-middle"
-    style={{ height: `calc(8em * ${emoteScale})`, maxWidth: `calc(24em * ${emoteScale})`, margin: '0 0.125rem', borderRadius: '0.35em', verticalAlign: 'middle' }}
+    data-overlay-gif=""
+    className="inline-block w-auto"
+    style={{ height: `calc(8em * ${emoteScale} * ${gifScale})`, maxWidth: `min(100%, calc(24em * ${emoteScale} * ${gifScale}))`, margin: '0 0.125rem', borderRadius: '0.35em', verticalAlign: 'text-top', objectFit: 'contain' }}
     fallback={<span>{segment.content}</span>}
   />
 );
+
+// Max lines on a row with a GIF. A GIF too wide for what is left of the name's
+// line wraps below it, and a plain line cap would cut that whole line away, so
+// the row measures which line its (last) GIF starts on and the cap always
+// reaches it (messageLineClamp). Read with the clamp lifted: past the cap a
+// clamped block need not lay out, or report, the lines it hides. Re-read when
+// the row or a GIF changes size: a GIF that loads, a narrower overlay.
+const measureGifLine = (line: HTMLElement): number => {
+  const gifs = line.querySelectorAll<HTMLElement>('img[data-overlay-gif]');
+  const gif = gifs[gifs.length - 1];
+  if (!gif || typeof document.createRange !== 'function') return 0;
+  const saved = { display: line.style.display, clamp: line.style.webkitLineClamp };
+  line.style.display = 'block';
+  line.style.webkitLineClamp = 'none';
+  try {
+    const range = document.createRange();
+    range.setStart(line, 0);
+    range.setEndBefore(gif);
+    return gifLineIndex(Array.from(range.getClientRects()), gif.getBoundingClientRect().top);
+  } finally {
+    line.style.display = saved.display;
+    line.style.webkitLineClamp = saved.clamp;
+  }
+};
+
+const useGifLine = (active: boolean, message: OverlayMessage, style: OverlayStyle) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const [gifLine, setGifLine] = useState(0);
+  useLayoutEffect(() => {
+    const line = ref.current;
+    if (!active || !line) return;
+    const measure = () => {
+      const next = measureGifLine(line);
+      setGifLine((prev) => (prev === next ? prev : next));
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(line);
+    line.querySelectorAll('img[data-overlay-gif]').forEach((gif) => ro.observe(gif));
+    return () => ro.disconnect();
+  }, [active, message, style]);
+  return [ref, active ? gifLine : 0] as const;
+};
 
 const badgeUrl = (b: OverlayMessage['badges'][number]): string | undefined =>
   b.image_url_4x || b.image_url_2x || b.image_url_1x;
@@ -255,6 +313,69 @@ const PointsGlyph = ({ size = '0.9em' }: { size?: string }) => (
     <path fillRule="evenodd" d="M1 12C1 5.925 5.925 1 12 1s11 4.925 11 11-4.925 11-11 11S1 18.075 1 12Zm11 9a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z" clipRule="evenodd" />
   </svg>
 );
+
+// 7TV's brand blue and its wordmark (SevenTV/Extension public/logo.svg), for the
+// emote set rows.
+const SEVENTV_BLUE = '#29b6f6';
+const SevenTvMark = () => (
+  <svg viewBox="0 0 109.6 80.9" fill={SEVENTV_BLUE} aria-hidden="true" style={{ height: '0.8em', width: 'auto' }}>
+    <path d="M84.1,22.2l5-8.7,2.7-4.6L86.8.2V0H60.1l5,8.7,5,8.7,2.8,4.8H84.1" />
+    <path d="M29,80.6l5-8.7,5-8.7,5-8.7,5-8.7,5-8.7,5-8.7L62.7,22l-5-8.7-5-8.7L49.9.1H7.7l-5,8.7L0,13.4l5,8.7v.2h32l-5,8.7-5,8.7-5,8.7-5,8.7-5,8.7L8.5,72l5,8.7v.2H29" />
+    <path d="M70.8,80.6H86.1l5-8.7,5-8.7,5-8.7,5-8.7,3.5-6-5-8.7v-.2H89.2l-5,8.7-5,8.7-.7,1.3-5-8.7-5-8.7-.7-1.3-5,8.7-5,8.7L55,53.1l5,8.7,5,8.7,5,8.7.8,1.4" />
+  </svg>
+);
+
+// The card every event row sits in, in the streamer's event style: 'plain' a
+// tinted bar in the accent colour, 'outline' a ring (optionally filled and
+// animated), 'streamnook' the app's wash for the event (`washClass`).
+const eventFrame = (
+  style: OverlayStyle,
+  accent: string,
+  washClass: string | undefined,
+): { className: string | undefined; css: CSSProperties } => {
+  const isStreamNook = style.eventStyle === 'streamnook';
+  const isOutline = style.eventStyle === 'outline';
+  const animType =
+    style.eventAnimation === 'sheen' || style.eventAnimation === 'pulse' || style.eventAnimation === 'chase'
+      ? style.eventAnimation
+      : null;
+  const outlineAnimClass =
+    isOutline && animType ? `sn-ft-anim-ring sn-ft-t-${animType}${style.eventAnimateRepeat === true ? ' sn-ft-loop' : ''}` : undefined;
+  const ring = (style.eventOutlineColor || '').trim() || accent;
+  return {
+    className: isStreamNook ? washClass : outlineAnimClass,
+    css: {
+      flex: 1, minWidth: 0, display: 'flex', alignItems: 'flex-start', gap: '0.5em',
+      // Em, not px: the whole renderer is drawn at ss× and scaled back down, so a
+      // raw px padding here came out half-size on the hosted overlay while the
+      // builder preview (ss=1) showed it full — the two never matched.
+      padding: '0.2em 0.55em', borderRadius: '0.4em',
+      ...(isStreamNook
+        ? { border: '1px solid rgba(255,255,255,0.08)' }
+        : isOutline
+          ? {
+              // The first-time chatter ring treatment, tinted with the accent (or
+              // the streamer's one fixed eventOutlineColor). Em-sized real border
+              // (see the first-time ring note: px strokes go sub-pixel under
+              // supersampling), opt-in fill clipped to the padding box, opt-in
+              // border animation (eventAnimation).
+              position: 'relative',
+              borderRadius: '0.5em',
+              border: `0.09em solid color-mix(in srgb, ${ring} 60%, transparent)`,
+              ...(style.eventFill === true
+                ? { backgroundColor: `color-mix(in srgb, ${ring} 8%, transparent)`, backgroundClip: 'padding-box' as const }
+                : null),
+            }
+          : { borderLeft: `2px solid ${accent}`, background: `linear-gradient(90deg, color-mix(in srgb, ${accent} 20%, transparent), transparent)` }),
+    },
+  };
+};
+
+const SEVENTV_CHANGE_LABEL: Record<SeventvEmoteChange['action'], string> = {
+  added: 'Added Emote',
+  removed: 'Removed Emote',
+  renamed: 'Renamed Emote',
+};
 
 // Twitch's own animated gem for the tier, matching the in-app cheer card.
 const cheerGemUrl = (bits: number): string => {
@@ -388,10 +509,9 @@ const OverlaySegment = ({ segment, style, emoteScale, giant = false }: { segment
   }
   if (segment.type === 'gif') {
     // Off renders the description Twitch sent, the way personal emotes off
-    // renders the word typed. On, the GIF draws at the gigantified size; the
-    // message renderer decides whether it sits inline or on its own line below.
+    // renders the word typed. On, the GIF draws at the gigantified size, inline.
     if (style.showGifs === false) return <span>{segment.content}</span>;
-    return <GifImg segment={segment} emoteScale={scale} />;
+    return <GifImg segment={segment} emoteScale={scale} gifScale={style.gifScale ?? 1} />;
   }
   if (segment.type === 'link') {
     // 'plain' inherits the body color from the container, so a link reads as
@@ -638,6 +758,13 @@ const eventTemplateContext = (
 
 const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; style: OverlayStyle; expiring?: boolean }) => {
   const provider = (message.provider ?? 'twitch') as ProviderId;
+  // Max lines on a GIF row measures the GIF's line (useGifLine); up here,
+  // ahead of the event rows' early return, as hooks have to be.
+  const gifRowClamped =
+    messageLineClamp(style.maxMessageLines) >= 1 &&
+    style.showGifs !== false &&
+    (message.segments ?? []).some((s) => s.type === 'gif');
+  const [lineRef, gifLine] = useGifLine(gifRowClamped, message, style);
   const rawColor = message.color || '#9147ff';
   const color =
     style.readableNameColors === false ? rawColor : adjustNameColor(rawColor, 'hsl_loop', overlayBackdropIsDark(style));
@@ -654,22 +781,35 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
   // Native platform badges obey showBadges. Everything else — StreamNook member
   // badge, 7TV, FFZ, Chatterino, and the rest — obeys the showThirdPartyBadges
   // master AND a per-provider allowlist, each toggling independently by the
-  // badge's `source` ('streamnook' for the member badge).
+  // badge's `source` ('streamnook' for the member badge). A Homies custom badge
+  // (category 'homies-custom') has its own entry, apart from the Homies roles.
   const hiddenBadgeProviders = style.hiddenBadgeProviders ?? [];
   const badgeSourceHidden = (src?: string) => hiddenBadgeProviders.includes((src || '').toLowerCase());
+  const extraBadgeHidden = (b: { source?: string; category?: string }) =>
+    badgeSourceHidden(b.category === 'homies-custom' ? 'homies-custom' : b.source);
   const nativeBadgesOn = style.showBadges;
   const thirdPartyOn = style.showThirdPartyBadges !== false;
   // YouTube owners have no badge — their name renders in a gold pill instead — so
   // the broadcaster "badge" (the owner signal from the service) is dropped from the
   // rendered set and only used to detect the owner for the pill below.
   const isYtOwner = provider === 'youtube' && (message.badges ?? []).some((b) => b.name === 'broadcaster');
+  // Twitch badges also obey the per-category hide list (predictions, bits, ...),
+  // matched by badge set id. Other platforms reuse names like 'subscriber', so
+  // the categories apply to Twitch rows only.
+  const hiddenTwitchCategories = style.hiddenTwitchBadgeCategories ?? [];
+  const twitchCategoryHidden = (setId: string) => {
+    if (provider !== 'twitch' || hiddenTwitchCategories.length === 0) return false;
+    const category = twitchBadgeCategory(setId);
+    return category != null && hiddenTwitchCategories.includes(category);
+  };
   const nativeBadges = (message.badges ?? [])
     .filter((b) => !(provider === 'youtube' && b.name === 'broadcaster'))
+    .filter((b) => !twitchCategoryHidden(b.name))
     .sort((a, b) => (provider === 'youtube' ? (YT_BADGE_ORDER[a.name] ?? 9) - (YT_BADGE_ORDER[b.name] ?? 9) : 0));
   const showNativeBadges = nativeBadgesOn && nativeBadges.length > 0;
   const showSnBadge = thirdPartyOn && !badgeSourceHidden('streamnook') && message.streamNookUserNumber != null;
   const showSeventvBadge = thirdPartyOn && !!message.seventvBadgeUrl && !badgeSourceHidden('7tv');
-  const visibleExtraBadges = thirdPartyOn ? (message.extraBadges ?? []).filter((b) => !badgeSourceHidden(b.source)) : [];
+  const visibleExtraBadges = thirdPartyOn ? (message.extraBadges ?? []).filter((b) => !extraBadgeHidden(b)) : [];
   const showExtraBadges = visibleExtraBadges.length > 0;
   const anyBadge = showNativeBadges || showSnBadge || showSeventvBadge || showExtraBadges;
   // 'full' draws the context line above the message, 'mention' prefixes the body
@@ -774,7 +914,15 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
         <FallbackImg key="seventv" src={message.seventvBadgeUrl} alt={message.seventvBadgeTitle || '7TV badge'} className="inline-block align-middle" style={{ height: badgeSize, width: badgeSize }} />
       )}
       {showExtraBadges && visibleExtraBadges.map((b, i) => (
-        <FallbackImg key={`tp-${i}`} src={b.url} alt={b.title || 'badge'} className="inline-block align-middle" style={{ height: badgeSize, width: badgeSize }} />
+        // A glyph badge (FFZ:AP) carries its backdrop colour: the rounded
+        // square its own client draws behind it (radius side / 9).
+        <FallbackImg
+          key={`tp-${i}`}
+          src={b.url}
+          alt={b.title || 'badge'}
+          className="inline-block align-middle"
+          style={{ height: badgeSize, width: badgeSize, ...(b.backdrop ? { backgroundColor: b.backdrop, borderRadius: `calc(${badgeSize} / 9)` } : null) }}
+        />
       ))}
       {/* StreamNook identity badge sits rightmost, next to the name, mirroring
           the real chat row (see utils/badgeOrder in the app repo). */}
@@ -813,6 +961,50 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
   // before the name.
   const nameAndBadges = provider === 'youtube' ? (<>{nameNode}{badgesNode}</>) : (<>{badgesNode}{nameNode}</>);
 
+  // A change to the channel's 7TV emote set: the 7TV mark, what happened and who
+  // did it, then the emote with what became of it, in the streamer's event style.
+  const emoteChange = message.seventvEmoteChange;
+  if (emoteChange) {
+    const frame = eventFrame(style, SEVENTV_BLUE, 'sn-ev-seventv');
+    const emoteSeg: MessageSegment | null = emoteChange.emoteUrl
+      ? { type: 'emote', content: emoteChange.name, emote_url: emoteChange.emoteUrl }
+      : null;
+    const strong = (text: string) => <span style={{ fontWeight: 700 }}>{text}</span>;
+    const outcome =
+      emoteChange.action === 'renamed' && emoteChange.oldName
+        ? <>{strong(emoteChange.oldName)} is now {strong(emoteChange.name)}</>
+        : <>{strong(emoteChange.name)} was {emoteChange.action === 'removed' ? 'removed from' : 'added to'} the set</>;
+    return (
+      <div className={`sn-ov-row ${entranceClass}${retractedClass}`} style={{ flexShrink: 0, lineHeight: style.lineHeight, textShadow: textShadowCss(style), display: 'flex', alignItems: 'flex-start', gap: '0.35em' }} data-provider={provider} data-ov-row="" data-ov-7tv={emoteChange.action}>
+        {style.sourceTag !== 'none' && (
+          <span style={{ flexShrink: 0, paddingTop: '0.25em' }}>
+            <SourceTag provider={provider} mode={style.sourceTag} />
+          </span>
+        )}
+        <div className={frame.className} style={frame.css}>
+          <span style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', height: `${style.lineHeight}em` }}>
+            <SevenTvMark />
+          </span>
+          <div style={{ minWidth: 0, color: style.bodyTextColor }}>
+            <div className="min-w-0">
+              <span style={{ fontWeight: 700, color: SEVENTV_BLUE }}>{SEVENTV_CHANGE_LABEL[emoteChange.action]}</span>
+              <span style={{ opacity: 0.75 }}> by </span>
+              {strong(emoteChange.actor)}
+            </div>
+            <div style={{ display: 'flex', gap: '0.5em', marginTop: '0.2em', opacity: emoteChange.action === 'removed' ? 0.85 : 0.95 }}>
+              <span aria-hidden="true" style={{ flexShrink: 0, width: '2px', borderRadius: '1px', background: 'color-mix(in srgb, currentColor 45%, transparent)' }} />
+              <span style={{ minWidth: 0 }}>
+                {emoteSeg && <OverlaySegment segment={emoteSeg} style={style} />}
+                {emoteSeg ? ' ' : null}
+                {outcome}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Event rows (subs, resubs, gifts, raids, announcements): render an icon + the
   // system message like the main app, with the user's message below if present —
   // never a blank normal message.
@@ -827,7 +1019,7 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
   if (systemMessage || asCheerEvent || rewardTitle || (msgType && !!CATEGORY_OF[msgType])) {
     const category: EventCategory = asCheerEvent ? 'cheer' : rewardTitle ? 'redemption' : categoryOf(msgType);
     const rawEventText = asCheerEvent
-      ? `cheered ${cheerBits.toLocaleString()} bits`
+      ? `cheered ${cheerBits.toLocaleString()} ${cheerBits === 1 ? 'bit' : 'bits'}`
       : rewardTitle
         ? `redeemed ${rewardTitle}`
         : systemMessage || eventFallback(category, message.display_name || message.username);
@@ -866,19 +1058,10 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
     const meta = PROVIDERS[provider] ?? PROVIDERS.twitch;
     const isPrime = category === 'subscription' && message.tags?.['msg-param-sub-plan'] === 'Prime';
     const EventIcon = CATEGORY_ICON[category];
-    const isStreamNook = style.eventStyle === 'streamnook';
-    const isOutline = style.eventStyle === 'outline';
-    const evAnimType =
-      style.eventAnimation === 'sheen' || style.eventAnimation === 'pulse' || style.eventAnimation === 'chase'
-        ? style.eventAnimation
-        : null;
-    const outlineAnimClass =
-      isOutline && evAnimType
-        ? `sn-ft-anim-ring sn-ft-t-${evAnimType}${style.eventAnimateRepeat === true ? ' sn-ft-loop' : ''}`
-        : undefined;
     // Charity donations get collapsed into the 'cheer' category for the icon, but
     // in-app they wear the green donation wash — honor that here.
     const gradientClass = msgType === 'charitydonation' ? 'sn-ev-donation' : CATEGORY_GRADIENT[category];
+    const frame = eventFrame(style, meta.color, gradientClass);
     const action = stripLeadingName(text, [message.display_name, message.username]);
     // Subscriptions: collapse Twitch's two sentences ("subscribed at Tier 1." +
     // "They've subscribed for N months!") into ONE — "subscribed at Tier 1 for N
@@ -926,35 +1109,8 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
           </span>
         )}
         <div
-          className={isStreamNook ? gradientClass : outlineAnimClass}
-          style={{
-            flex: 1, minWidth: 0, display: 'flex', alignItems: 'flex-start', gap: '0.5em',
-            // Em, not px: the whole renderer is drawn at ss× and scaled back down, so a
-            // raw px padding here came out half-size on the hosted overlay while the
-            // builder preview (ss=1) showed it full — the two never matched.
-            padding: '0.2em 0.55em', borderRadius: '0.4em',
-            ...(isStreamNook
-              ? { border: '1px solid rgba(255,255,255,0.08)' }
-              : isOutline
-                ? {
-                    // The first-time chatter ring treatment, tinted with the
-                    // source platform's color (or the streamer's one fixed
-                    // eventOutlineColor). Em-sized real border (see the
-                    // first-time ring note: px strokes go sub-pixel under
-                    // supersampling), opt-in fill clipped to the padding box,
-                    // opt-in border animation (eventAnimation).
-                    position: 'relative',
-                    borderRadius: '0.5em',
-                    border: `0.09em solid color-mix(in srgb, ${(style.eventOutlineColor || '').trim() || meta.color} 60%, transparent)`,
-                    ...(style.eventFill === true
-                      ? {
-                          backgroundColor: `color-mix(in srgb, ${(style.eventOutlineColor || '').trim() || meta.color} 8%, transparent)`,
-                          backgroundClip: 'padding-box' as const,
-                        }
-                      : null),
-                  }
-                : { borderLeft: `2px solid ${meta.color}`, background: `linear-gradient(90deg, color-mix(in srgb, ${meta.color} 20%, transparent), transparent)` }),
-          }}
+          className={frame.className}
+          style={frame.css}
         >
           {/* Exactly ONE line tall, so the icon box can never make the card taller than
               its text. A fixed 1.5em box did: at any lineHeight below 1.5 the card grew
@@ -1071,29 +1227,32 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
   // with it rather than leaving them orphaned in the text.
   const zw = zeroWidthLayout(bodySegs, (s) => !(s.type === 'emote' && s.is_personal && style.showPersonalEmotes === false));
 
-  // Twitch chat GIFs share the giant placement: plucked onto the line below
-  // (Left / Center / Right) or left where they were typed (Inline), always at
-  // the giant size. With the GIF toggle off they stay in the flow and
-  // OverlaySegment renders the description Twitch sent instead.
-  const gifIdxs: number[] = style.showGifs === false ? [] : bodySegs.flatMap((s, i) => (s.type === 'gif' ? [i] : []));
-  const gifsPlucked = gifIdxs.length > 0 && giantAlign !== 'inline';
-  const gifInline = gifIdxs.length > 0 && giantAlign === 'inline';
+  // Twitch chat GIFs always stay where they were typed, at the giant size and
+  // top-aligned with the name line (GifImg), so a GIF message reads like a text
+  // message. They never follow the giant Placement: plucked onto a line of
+  // their own, a GIF left a blank gap above it and an indent beside the name.
+  // With the GIF toggle off OverlaySegment renders the description instead.
 
   // Long-message clamp: cap the whole rendered line block at N lines with an
   // ellipsis, so one copypasta can't eat the canvas. The -webkit-box line-clamp
   // works over the mixed inline content (badges, name, emotes) as line boxes.
-  const clampLines = Math.round(style.maxMessageLines ?? 0);
+  // A GIF row is clamped too: the GIF grows the line box it sits in, so the
+  // clamp counts it as one line and hides whole lines after the cap, never part
+  // of the GIF, and a GIF can't carry a long message past the cap. A GIF too
+  // wide for the rest of the name's line wraps below it; its line still counts
+  // as one line of the cap (useGifLine), so the GIF always shows.
+  const clampLines = messageLineClamp(style.maxMessageLines, gifLine);
   // Skipped for an inline giant: the clamp would slice an 8em image mid-emote, and the
   // block placements dodge this by living outside the clamped div entirely.
   const lineClampStyle =
-    clampLines >= 1 && !giantInline && !gifInline
-      ? { display: '-webkit-box', WebkitLineClamp: Math.min(6, clampLines), WebkitBoxOrient: 'vertical' as const, overflow: 'hidden' }
+    clampLines >= 1 && !giantInline
+      ? { display: '-webkit-box', WebkitLineClamp: clampLines, WebkitBoxOrient: 'vertical' as const, overflow: 'hidden' }
       : null;
 
   // Inline flow (NOT flex) so the 7TV paint's background-clip:text renders like
   // the real chat row, and wrapped lines start at the left edge.
   const line = (
-    <div className="min-w-0" style={{ color: style.bodyTextColor, ...lineClampStyle }}>
+    <div ref={lineRef} className="min-w-0" style={{ color: style.bodyTextColor, ...lineClampStyle }}>
       <SourceTag provider={provider} mode={style.sourceTag} />
       {style.showTimestamps && message.metadata?.formatted_timestamp && (
         <span style={{ fontSize: '0.78em', opacity: 0.55, marginRight: '0.45em', verticalAlign: 'middle' }}>
@@ -1120,7 +1279,7 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
           <span style={{ fontWeight: 700, opacity: 0.85 }}>@{stripAt(replyMention.parent_display_name)} </span>
         )}
         {bodySegs.map((seg, i) => {
-          if (zw.skip.has(i) || (i === giantIdx && !giantInline) || (gifsPlucked && seg.type === 'gif')) return null;
+          if (zw.skip.has(i) || (i === giantIdx && !giantInline)) return null;
           const giant = i === giantIdx && giantInline;
           const overlays = zw.attached.get(i);
           return overlays
@@ -1131,9 +1290,8 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
     </div>
   );
 
-  // The plucked gigantified emote, and any chat GIFs, on their own line below
-  // the message line, sharing the giant placement.
-  const giantBlock = (giantIdx >= 0 && !giantInline) || gifsPlucked ? (
+  // The plucked gigantified emote on its own line below the message line.
+  const giantBlock = giantIdx >= 0 && !giantInline ? (
     <div
       style={{
         display: 'flex',
@@ -1143,12 +1301,9 @@ const OverlayRow = ({ message, style, expiring }: { message: OverlayMessage; sty
         marginTop: '0.2em',
       }}
     >
-      {giantIdx >= 0 && !giantInline && (
-        zw.attached.has(giantIdx)
-          ? <StackedEmote segs={[bodySegs[giantIdx], ...zw.attached.get(giantIdx)!.map((o) => bodySegs[o])]} style={style} giant />
-          : <OverlaySegment segment={bodySegs[giantIdx]} style={style} giant />
-      )}
-      {gifsPlucked && gifIdxs.map((i) => <OverlaySegment key={`gif-${i}`} segment={bodySegs[i]} style={style} giant />)}
+      {zw.attached.has(giantIdx)
+        ? <StackedEmote segs={[bodySegs[giantIdx], ...zw.attached.get(giantIdx)!.map((o) => bodySegs[o])]} style={style} giant />
+        : <OverlaySegment segment={bodySegs[giantIdx]} style={style} giant />}
     </div>
   ) : null;
 
@@ -1285,15 +1440,29 @@ const CONTAINER_PAD_Y = 16;
 // only bounds a pathological burst before the measure pass narrows it.
 const MAX_ROWS = 200;
 
-// Generic CSS family keywords that never need a webfont load.
-const GENERIC_FAMILIES = new Set([
-  'system-ui', 'ui-sans-serif', 'ui-monospace', 'ui-serif', 'sans-serif', 'serif',
-  'monospace', 'cursive', 'fantasy', '-apple-system', 'blinkmacsystemfont',
-  'inherit', 'initial', 'unset',
-]);
-// First family in a font-family string, unquoted.
-const primaryFamily = (ff: string): string =>
-  (ff || '').split(',')[0].trim().replace(/^["']|["']$/g, '');
+// Installed fonts get an alias family that finds them by face or PostScript
+// name too (see overlayFontStack in overlayConfig). Its @font-face rules live
+// in one <style> per document.
+const LOCAL_FONT_STYLE_ID = 'sn-ov-localfont';
+const MAX_LOCAL_FONT_ALIASES = 16;
+// Most recently used last. Typing a name in the builder visits many prefixes,
+// so only the recent ones stay declared, and a family in use never gives way.
+let localFontAliases: string[] = [];
+
+/** Declare the alias for a family once per document and mark it recently used. */
+function ensureLocalFontAlias(family: string): void {
+  if (typeof document === 'undefined') return;
+  const declared = localFontAliases.includes(family);
+  localFontAliases = touchLocalFontAliases(localFontAliases, family, MAX_LOCAL_FONT_ALIASES);
+  let el = document.getElementById(LOCAL_FONT_STYLE_ID) as HTMLStyleElement | null;
+  if (declared && el) return;
+  if (!el) {
+    el = document.createElement('style');
+    el.id = LOCAL_FONT_STYLE_ID;
+    document.head.appendChild(el);
+  }
+  el.textContent = localFontAliases.map(localFontFaceCss).join('\n');
+}
 
 /**
  * Renders the overlay chat. Filters by selected sources, orders by direction, and
@@ -1324,16 +1493,18 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
   // API and catalog: unlike fonts.googleapis.com it isn't on browser tracking-
   // prevention lists, so it loads inside the app's WebView2 too (the in-app builder
   // preview), not just in a plain browser. If the name isn't a real font the request
-  // no-ops and the browser falls back to the family stack.
+  // no-ops and the browser falls back to the family stack, where the installed-
+  // font alias (overlayFontStack) picks up a font on the streaming PC.
   useEffect(() => {
     if (typeof document === 'undefined') return;
-    const fam = primaryFamily(style.fontFamily);
-    if (!fam || GENERIC_FAMILIES.has(fam.toLowerCase())) return;
+    const fam = primaryFontFamily(style.fontFamily);
+    if (!isCustomFontFamily(fam)) return;
     // One reusable <link> whose href is swapped, debounced. The builder's font
     // box fires on every keystroke, and the previous per-family id appended a
     // fresh stylesheet (and a wasted request) for every prefix typed, none of
     // which were ever removed.
     const timer = setTimeout(() => {
+      ensureLocalFontAlias(fam);
       const id = 'sn-ov-webfont';
       let link = document.getElementById(id) as HTMLLinkElement | null;
       if (!link) {
@@ -1456,12 +1627,16 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
     const expiring = new Set<string>();
     const list = collapseGiftBombs(messages).filter((m) => {
       if (!seen.has(m.id)) seen.set(m.id, nowMs);
+
       if (ageSec > 0) {
         const elapsed = nowMs - (seen.get(m.id) ?? nowMs);
         if (elapsed > ageSec * 1000 + EXPIRE_FADE_MS) return false;
         if (elapsed > ageSec * 1000) expiring.add(m.id);
       }
       if (!allowed.has((m.provider ?? 'twitch') as ProviderId)) return false;
+      // A 7TV emote set row is the channel's, not a chatter's: only its own
+      // switch (and the age and platform rules above) apply to it.
+      if (m.seventvEmoteChange) return style.seventvEmoteChanges !== false;
       if (style.hideBots && isBotMessage(m)) return false;
       if (isBlockedUser(m)) return false;
       const mt = m.metadata?.msg_type || m.tags?.['msg-id'];
@@ -1508,7 +1683,7 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
     }
     return { ordered: list, expiringIds: expiring };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [messages, sourcesKey, style.hideBots, hiddenKey, hiddenProviderKey, blockedKey, style.hideCommands, cmdFilterKey, phraseKey, ageSec, expireTick]);
+  }, [messages, sourcesKey, style.hideBots, style.seventvEmoteChanges, hiddenKey, hiddenProviderKey, blockedKey, style.hideCommands, cmdFilterKey, phraseKey, ageSec, expireTick]);
 
   const windowMsgs = ordered.slice(-count);
   const rendered = style.direction === 'newTop' ? windowMsgs.slice().reverse() : windowMsgs;
@@ -1628,7 +1803,7 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
       : `linear-gradient(to bottom, transparent 0, #000 ${fadePx}px, #000 100%)`;
 
   const containerStyle: CSSProperties = {
-    fontFamily: style.fontFamily,
+    fontFamily: overlayFontStack(style.fontFamily),
     fontSize: `${fontPx}px`,
     color: style.bodyTextColor,
     // Set once here so both reach messages, event cards, reply context, timestamps and
@@ -1818,6 +1993,12 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
             color-mix(in srgb, #ff9d6b 13%, transparent) 33%,
             color-mix(in srgb, #ffc06b 11%, transparent) 66%,
             color-mix(in srgb, #ffc06b 16%, transparent) 100%); }
+        .sn-ev-seventv { background-color: #0c0c0d; background-size: 100% 100%;
+          background-image: linear-gradient(90deg,
+            color-mix(in srgb, #29b6f6 18%, transparent) 0%,
+            color-mix(in srgb, #4fc3f7 13%, transparent) 33%,
+            color-mix(in srgb, #29b6f6 10%, transparent) 66%,
+            color-mix(in srgb, #29b6f6 16%, transparent) 100%); }
         /* Exact match to globals.css so the shared AtmosphereChatWash animates
            identically on the hosted overlay (the component overrides the 16s/20s
            base to 9s/12s inline, same as in-app chat). */

@@ -32,18 +32,30 @@ import {
   youTubeChannelTitle,
 } from '../../services/channelLookup';
 import { searchPlatforms } from '../../services/platformSearch';
+import { sevenTvIdForStream } from '../../services/sevenTvPictures';
+import { SevenTvAvatar } from '../SevenTvAvatar';
 import type { BlendCompanion, LinkSuggestion } from '../../hooks/useBlendCompanions';
+import { isImeComposing } from '../../utils/imeComposing';
 
 /** The platforms whose chat can be combined, in the order the picker lists them. */
-const COMBINABLE: ProviderId[] = ['kick', 'youtube', 'twitch'];
+const COMBINABLE: ProviderId[] = ['kick', 'youtube', 'tiktok', 'twitch'];
 
-const BAR_BG = { backgroundColor: 'color-mix(in srgb, var(--color-background) 90%, transparent)' };
+const BAR_BG = { backgroundColor: 'color-mix(in srgb, var(--color-background) calc(90% + (1 - var(--glass-strength, 1)) * 10%), transparent)' };
 
 /** What the channel typed into the box turned out to be. */
 type Preview =
   | { state: 'idle' }
   | { state: 'looking' }
-  | { state: 'found'; channel: string; name: string; avatar?: string; live: boolean | null; title: string }
+  | {
+      state: 'found';
+      channel: string;
+      name: string;
+      avatar?: string;
+      /** The channel owner's cosmetics id, for their 7TV picture. */
+      sevenTvId?: string | null;
+      live: boolean | null;
+      title: string;
+    }
   | { state: 'missing' }
   /** Not looked up: a YouTube @handle has no cheap offline lookup, or the
    *  platform could not be reached. Linking still works. */
@@ -57,7 +69,9 @@ async function lookUp(provider: ProviderId, channel: string): Promise<Preview> {
   if (provider === 'youtube') {
     if (!isYouTubeChannelId(channel)) return { state: 'unchecked' };
     const name = await youTubeChannelTitle(channel);
-    return name ? { state: 'found', channel, name, live: null, title: '' } : { state: 'unchecked' };
+    return name
+      ? { state: 'found', channel, name, sevenTvId: sevenTvIdForStream({ provider, user_id: channel }), live: null, title: '' }
+      : { state: 'unchecked' };
   }
   let query = channel;
   if (provider === 'kick' && kickSlugHasTwoSpellings(channel)) {
@@ -85,6 +99,7 @@ async function lookUp(provider: ProviderId, channel: string): Promise<Preview> {
               channel: row.user_login,
               name: row.user_name || row.user_login,
               avatar: row.profile_image_url || undefined,
+              sevenTvId: sevenTvIdForStream({ provider, user_id: row.user_id }),
               live: !!row.is_live,
               title: row.title ?? '',
             }
@@ -140,6 +155,7 @@ function PlatformPicker({
 const PLACEHOLDER: Partial<Record<ProviderId, string>> = {
   kick: 'Kick channel name or link',
   youtube: '@handle or channel link',
+  tiktok: 'TikTok @handle or LIVE link',
   twitch: 'Twitch username or link',
 };
 
@@ -261,7 +277,10 @@ function LinkEditor({
     status = (
       <>
         {preview.avatar ? (
-          <img
+          <SevenTvAvatar
+            cosmeticsId={preview.sevenTvId}
+            px={24}
+            motion="animate"
             src={preview.avatar}
             alt=""
             className="h-6 w-6 shrink-0 rounded-full object-cover"
@@ -348,6 +367,7 @@ function LinkEditor({
               if (lp && options.includes(lp)) setPicked(lp);
             }}
             onKeyDown={(e) => {
+              if (isImeComposing(e)) return;
               if (e.key === 'Enter') void submit();
               if (e.key === 'Escape') onClose();
             }}
@@ -414,7 +434,12 @@ function SuggestionRow({
     <div className="blend-suggest">
       <span className="blend-suggest-face">
         {candidate.avatar ? (
-          <img
+          <SevenTvAvatar
+            // A member names its channel by login on Twitch and Kick, which
+            // 7TV does not key on; a YouTube member's channel is its UC id.
+            cosmeticsId={candidate.provider === 'youtube' ? sevenTvIdForStream({ provider: 'youtube', user_id: candidate.channel }) : null}
+            px={28}
+            motion="animate"
             src={candidate.avatar}
             alt=""
             onError={(e) => {

@@ -1,14 +1,20 @@
+import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../../stores/AppStore';
+import { Logger } from '../../utils/logger';
 // Rendered inside ChatSettings, so this reaches the phone too. Shared panel,
 // so a platform branch here is legitimate.
 import { IS_MOBILE } from '../../utils/platform';
 import { SettingsSection, SettingsRow, SegmentedSelect } from './_primitives';
-import type { HighlightDisplayStyle } from '../../types';
+import { InlineSlider, SubControl, SubControls } from '../plugins/settingsPageKit';
+import type { ChatDesignSettings, HighlightDisplayStyle } from '../../types';
+import { useSettingReset } from './settingReset';
+import { ScrollbarMarksPreview, type PreviewDesign } from './ChatPreview';
+import { FALLBACK_MARK_KINDS, MARK_KIND_OPTIONS } from '../chat/scrollbarMarkLayout';
 
 const STYLE_HINTS: Record<HighlightDisplayStyle, string> = {
   standard: 'Tinted row background plus colored left border.',
-  minimal: 'Colored left border only — no row tint.',
-  none: 'No visual. Sound and title-flash still fire.',
+  minimal: 'Colored left border only, no row tint.',
+  none: 'Nothing drawn. The sound and title flash still play.',
 };
 
 const Toggle = ({ enabled, onChange }: { enabled: boolean; onChange: () => void }) => (
@@ -31,6 +37,35 @@ const HighlightAppearanceSettings = () => {
   const appearance = settings.chat_highlights?.appearance ?? {};
   const displayStyle: HighlightDisplayStyle = appearance.display_style ?? 'standard';
   const opacity = appearance.opacity ?? 20;
+  const resetFor = useSettingReset();
+
+  const design = settings.chat_design;
+  // Rust always sends a full chat_design block; the cast keeps the spread typed.
+  const writeDesign = (patch: Partial<ChatDesignSettings>) =>
+    updateSettings({ ...settings, chat_design: { ...(design as ChatDesignSettings), ...patch } });
+  const marksOn = design?.scrollbar_marks ?? true;
+  const markKinds = design?.scrollbar_mark_kinds ?? [...FALLBACK_MARK_KINDS];
+  // Rust keeps the set in the settings order, so a list toggled back to the
+  // default compares equal to it and the reset arrow goes away.
+  const toggleMarkKind = (kind: string) => {
+    void invoke('edit_settings_list', {
+      path: 'chat_design.scrollbar_mark_kinds',
+      edit: { op: 'toggle', value: kind },
+    }).catch((err) => Logger.warn('[HighlightAppearance] mark kind toggle failed:', err));
+  };
+  const previewDesign: PreviewDesign = {
+    show_dividers: design?.show_dividers ?? true,
+    alternating_backgrounds: design?.alternating_backgrounds ?? false,
+    message_spacing: design?.message_spacing ?? 8,
+    font_size: design?.font_size ?? 14,
+    font_weight: design?.font_weight ?? 400,
+    show_timestamps: design?.show_timestamps ?? false,
+    show_timestamp_seconds: design?.show_timestamp_seconds ?? false,
+    timestamp_format: design?.timestamp_format ?? '12h',
+    username_separator: design?.username_separator ?? (design?.username_colon ? 'colon' : 'none'),
+    username_style: design?.username_style ?? 'plain',
+    username_accent_source: design?.username_accent_source ?? 'user',
+  };
 
   const writeAppearance = (patch: Partial<typeof appearance>) =>
     updateSettings({
@@ -45,11 +80,13 @@ const HighlightAppearanceSettings = () => {
   return (
     <SettingsSection
       label="Highlight Appearance"
-      description="Applies to every highlight type below — phrases, usernames, badges, and built-in events."
+      description="Applies to every highlight type below: phrases, usernames, badges, and events."
     >
       <SettingsRow
-        title="Display style"
+        title="Style"
+        onReset={resetFor(['chat_highlights.appearance.display_style', 'standard'])}
         description={STYLE_HINTS[displayStyle]}
+        help="Opacity is how bright the row tint appears, in the Standard style only. 20% matches the original look."
       >
         <SegmentedSelect<HighlightDisplayStyle>
           value={displayStyle}
@@ -60,26 +97,25 @@ const HighlightAppearanceSettings = () => {
             { value: 'none', label: 'None' },
           ]}
         />
-      </SettingsRow>
-
-      <SettingsRow
-        title={`Tint opacity: ${opacity}%`}
-        description={
-          displayStyle === 'standard'
-            ? 'How bright the row tint appears. 20% matches the previous default.'
-            : 'Disabled in this display style — only the standard variant uses the row tint.'
-        }
-        disabled={displayStyle !== 'standard'}
-      >
-        <input
-          type="range"
-          min="0"
-          max="100"
-          step="5"
-          value={opacity}
-          onChange={(e) => writeAppearance({ opacity: parseInt(e.target.value, 10) })}
-          className="w-full accent-accent cursor-pointer"
-        />
+        {displayStyle === 'standard' && (
+          <SubControls>
+            <SubControl
+              title="Opacity"
+              onReset={resetFor(['chat_highlights.appearance.opacity', 20])}
+              control={
+                <InlineSlider
+                  value={opacity}
+                  min={0}
+                  max={100}
+                  step={5}
+                  label="Highlight tint opacity"
+                  format={(v) => `${v}%`}
+                  onChange={(v) => writeAppearance({ opacity: v })}
+                />
+              }
+            />
+          </SubControls>
+        )}
       </SettingsRow>
 
       {/* Desktop only: there is no window title to flash on Android and nothing
@@ -87,8 +123,10 @@ const HighlightAppearanceSettings = () => {
           system notifications instead (Settings > Notifications). */}
       {!IS_MOBILE && (
         <SettingsRow
-          title="Flash window title when unfocused"
-          description="When a highlight lands while StreamNook is in the background, flash the window title until you tab back. Messages older than 5 seconds (history backfill) are skipped."
+          title="Title flash"
+          onReset={resetFor(['chat_highlights.appearance.flash_title_when_unfocused', false])}
+          description="Flashes the window title when a highlight lands while StreamNook is in the background, until you tab back."
+          help="Chat history loaded when you join a channel never flashes."
           control={
             <Toggle
               enabled={appearance.flash_title_when_unfocused ?? false}
@@ -99,6 +137,54 @@ const HighlightAppearanceSettings = () => {
           }
         />
       )}
+
+      <SettingsRow
+        title="Scrollbar marks"
+        onReset={resetFor('chat_design.scrollbar_marks')}
+        description="Small ticks on the chat scrollbar show where mentions, subs, announcements and pinned messages are, so you can find what you missed while reading back."
+        help="A tick takes its message's highlight color where it has one. A run of one kind, like a gift bomb, joins into one bar, and mentions draw on top of everything else."
+        control={
+          <Toggle
+            enabled={marksOn}
+            onChange={() => writeDesign({ scrollbar_marks: !marksOn })}
+          />
+        }
+      >
+        {marksOn && (
+          <div className="space-y-4">
+            <SubControls>
+              <SubControl
+                title="Kinds"
+                stacked
+                onReset={resetFor('chat_design.scrollbar_mark_kinds')}
+                control={
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {MARK_KIND_OPTIONS.map(({ kind, label }) => {
+                      const on = markKinds.includes(kind);
+                      return (
+                        <button
+                          key={kind}
+                          type="button"
+                          aria-pressed={on}
+                          onClick={() => toggleMarkKind(kind)}
+                          className={`px-2.5 py-1 rounded-full text-[12px] font-medium transition-colors ${
+                            on
+                              ? 'chrome-glaze chrome-glaze--flat chrome-glaze--control text-textPrimary'
+                              : 'glass-button-static text-textMuted'
+                          }`}
+                        >
+                          {label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                }
+              />
+            </SubControls>
+            <ScrollbarMarksPreview design={previewDesign} kinds={markKinds} mentionColor={design?.mention_color} />
+          </div>
+        )}
+      </SettingsRow>
     </SettingsSection>
   );
 };

@@ -742,7 +742,7 @@ pub(crate) mod window {
             // that is about to be replaced, so wait for the page itself.
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(15) {
-                if let Ok(u) = win.url() {
+                if let Some(u) = crate::platform::webview_url::current_url(&win).await {
                     if u.host_str().map(|h| h.ends_with("tiktok.com")).unwrap_or(false) {
                         return Ok(win);
                     }
@@ -785,7 +785,9 @@ pub(crate) mod window {
             let started = Instant::now();
             while started.elapsed() < timeout {
                 tokio::time::sleep(Duration::from_millis(150)).await;
-                let fragment = win.url().ok().and_then(|u| u.fragment().map(|f| f.to_string()));
+                let fragment = crate::platform::webview_url::current_url(&win)
+                    .await
+                    .and_then(|u| u.fragment().map(|f| f.to_string()));
                 if let Some(answer) = read_answer(fragment.as_deref(), id) {
                     self.touch();
                     return answer;
@@ -871,9 +873,8 @@ pub(crate) mod window {
             .map_err(|e| anyhow!("could not open the TikTok page: {e}"))?;
         let result = async {
             let started = Instant::now();
-            while !win
-                .url()
-                .ok()
+            while !crate::platform::webview_url::current_url(&win)
+                .await
                 .and_then(|u| u.host_str().map(|h| h.ends_with("tiktok.com")))
                 .unwrap_or(false)
             {
@@ -895,7 +896,9 @@ pub(crate) mod window {
             let started = Instant::now();
             while started.elapsed() < REQUEST_TIMEOUT {
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                let fragment = win.url().ok().and_then(|u| u.fragment().map(|f| f.to_string()));
+                let fragment = crate::platform::webview_url::current_url(&win)
+                    .await
+                    .and_then(|u| u.fragment().map(|f| f.to_string()));
                 if let Some(answer) = read_answer::<SignAnswer>(fragment.as_deref(), id) {
                     let answer = answer?;
                     if !answer.ok {

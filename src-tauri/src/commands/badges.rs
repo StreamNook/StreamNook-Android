@@ -114,6 +114,7 @@ pub async fn fetch_global_badges() -> Result<HelixBadgesResponse, String> {
                             "[Badges] Using cached badges (age: {} days)",
                             cache_age_days
                         );
+                        note_row_view_badges(None, &cached_data.badges);
                         return Ok(cached_data.badges);
                     } else {
                         debug!(
@@ -156,7 +157,72 @@ pub async fn fetch_global_badges() -> Result<HelixBadgesResponse, String> {
         debug!("[Badges] Cached global badges for 7 days");
     }
 
+    note_row_view_badges(None, &badges);
     Ok(badges)
+}
+
+/// The global badge list read fresh from Twitch whatever the cache's age, for
+/// a deliberate refresh: the cached list is kept up to 7 days, so new drop
+/// badges could stay off a phone's wall for a week. Versions only the cache
+/// has (drops merged from the feed before Twitch lists them) are kept.
+pub async fn refresh_global_badges() -> Result<HelixBadgesResponse, String> {
+    let client_id = env!("TWITCH_APP_CLIENT_ID").to_string();
+    let token = TwitchService::get_token()
+        .await
+        .map_err(|e| format!("Failed to get token: {}", e))?;
+    let _guard = GLOBAL_BADGES_LOCK.lock().await;
+    let cache_key = "global_badges";
+    let previous = match get_cached_item(CacheType::Badge, cache_key).await {
+        Ok(Some(cached)) => serde_json::from_value::<CachedBadgesData>(cached.data).ok(),
+        _ => None,
+    };
+
+    let mut badges = fetch_badges_from_api(client_id, token).await?;
+    if let Some(previous) = previous {
+        for old in previous.badges.data {
+            match badges.data.iter_mut().find(|s| s.set_id == old.set_id) {
+                Some(set) => {
+                    for v in old.versions {
+                        if !set.versions.iter().any(|n| n.id == v.id) {
+                            set.versions.push(v);
+                        }
+                    }
+                }
+                None => badges.data.push(old),
+            }
+        }
+    }
+
+    let cached_data = CachedBadgesData {
+        badges: badges.clone(),
+        cached_at: get_current_timestamp(),
+    };
+    if let Ok(json_value) = serde_json::to_value(&cached_data) {
+        let _ = cache_item(CacheType::Badge, cache_key.to_string(), json_value, "twitch".to_string(), 7).await;
+    }
+    note_row_view_badges(None, &badges);
+    Ok(badges)
+}
+
+/// Hands badge art to the native row view, which stamps it onto rows (the web
+/// renderers resolve it themselves from what these commands return).
+fn note_row_view_badges(room_id: Option<&str>, badges: &HelixBadgesResponse) {
+    crate::services::chat_row_view::note_twitch_badges(
+        room_id,
+        badges.data.iter().flat_map(|set| {
+            set.versions
+                .iter()
+                .map(move |v| (set.set_id.as_str(), v.id.as_str(), v.image_url_2x.as_str(), v.title.as_str()))
+        }),
+    );
+}
+
+/// Seconds since the global badge list was read from Twitch; None with none
+/// cached.
+pub async fn global_badges_age_secs() -> Option<u64> {
+    let cached = get_cached_item(CacheType::Badge, "global_badges").await.ok()??;
+    let data = serde_json::from_value::<CachedBadgesData>(cached.data).ok()?;
+    Some(get_current_timestamp().saturating_sub(data.cached_at))
 }
 
 /// Get cached global badges without fetching from API
@@ -171,6 +237,7 @@ pub async fn get_cached_global_badges() -> Result<Option<HelixBadgesResponse>, S
                     "[Badges] Retrieved {} badge sets from cache",
                     cached_data.badges.data.len()
                 );
+                note_row_view_badges(None, &cached_data.badges);
                 Ok(Some(cached_data.badges))
             }
             Err(e) => {
@@ -601,6 +668,18 @@ pub async fn debug_compare_badge_sources() -> Result<(Vec<String>, Vec<String>, 
 /// Fetch channel-specific Twitch badges using the Helix API
 #[tauri::command]
 pub async fn fetch_channel_badges(channel_id: String) -> Result<HelixBadgesResponse, String> {
+    // The channel's FFZ room (its own moderator / VIP art) is read alongside
+    // Helix while the viewer has the art on. Only a room never read before is
+    // waited on, and only briefly: the chat's history waits on this set. Art
+    // that lands later is announced (`ffz_room_badges::CHANGED_EVENT`) and every
+    // window reads the set again; a stale room refreshes in the background.
+    let role_art = crate::services::ffz_room_badges::enabled();
+    let first_read = if role_art {
+        let unread = !crate::services::ffz_room_badges::has_entry(&channel_id);
+        crate::services::ffz_room_badges::refresh(&channel_id).filter(|_| unread)
+    } else {
+        None
+    };
     let client_id = env!("TWITCH_APP_CLIENT_ID").to_string();
     let token = TwitchService::get_token()
         .await
@@ -627,12 +706,50 @@ pub async fn fetch_channel_badges(channel_id: String) -> Result<HelixBadgesRespo
         ));
     }
 
-    let badges = response
+    let mut badges = response
         .json::<HelixBadgesResponse>()
         .await
         .map_err(|e| format!("Failed to parse channel badges: {}", e))?;
 
+    if let Some(read) = first_read {
+        let _ = tokio::time::timeout(crate::services::ffz_room_badges::FIRST_READ_WAIT, read).await;
+    }
+    crate::services::ffz_room_badges::apply_if_enabled(&channel_id, &mut badges, role_art);
+
+    note_row_view_badges(Some(&channel_id), &badges);
     Ok(badges)
+}
+
+/// A channel's FrankerFaceZ moderator and VIP art at 72 px (Twitch's 4x),
+/// finished the way chat draws it, whatever the viewer's own chat setting.
+/// The stream overlay has its own switch for this art, so its preview asks
+/// here instead of reading the chat's badge set.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct FfzRoomRoleArtDto {
+    pub moderator: Option<String>,
+    pub vip: Option<String>,
+}
+
+impl FfzRoomRoleArtDto {
+    fn from_art(art: &crate::services::ffz_room_badges::RoomRoleArt) -> Self {
+        let x4 = |role: &Option<crate::services::ffz_room_badges::RoleArt>| {
+            role.as_ref().map(|r| r.x4.clone()).filter(|u| !u.is_empty())
+        };
+        Self { moderator: x4(&art.moderator), vip: x4(&art.vip) }
+    }
+}
+
+/// How long the overlay preview waits on a room it has not read yet.
+const ROLE_ART_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[tauri::command]
+pub async fn get_ffz_room_role_art(channel_id: String) -> Result<Option<FfzRoomRoleArtDto>, String> {
+    if let Some(read) = crate::services::ffz_room_badges::refresh(&channel_id) {
+        let _ = tokio::time::timeout(ROLE_ART_READ_WAIT, read).await;
+    }
+    Ok(crate::services::ffz_room_badges::cached(&channel_id)
+        .map(|art| FfzRoomRoleArtDto::from_art(&art))
+        .filter(|dto| dto.moderator.is_some() || dto.vip.is_some()))
 }
 
 /// Get user's badges for a specific channel

@@ -6,7 +6,7 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
 
-import { formatViewerCount, formatUptimeClock } from './streamStats.ts';
+import { formatShortCount, formatViewerCount, formatUptimeClock, pickLiveStartedAt } from './streamStats.ts';
 
 const NOW = Date.parse('2026-08-20T12:00:00.000Z');
 const startedAgo = (ms: number) => new Date(NOW - ms).toISOString();
@@ -47,7 +47,39 @@ test('abbreviates viewer counts at the thousand and million boundaries', () => {
   assert.equal(formatViewerCount(999), '999');
   assert.equal(formatViewerCount(1000), '1.0K');
   assert.equal(formatViewerCount(12300), '12.3K');
-  assert.equal(formatViewerCount(999999), '1000.0K');
+  assert.equal(formatViewerCount(999949), '999.9K');
+  // Rounding up to the next unit takes the next unit's letter.
+  assert.equal(formatViewerCount(999950), '1.0M');
+  assert.equal(formatViewerCount(999999), '1.0M');
   assert.equal(formatViewerCount(1000000), '1.0M');
   assert.equal(formatViewerCount(1234567), '1.2M');
+});
+
+test('the chat header counts from Rust, and never from a recording or a missing start', () => {
+  const rust = '2026-08-20T09:00:00Z';
+  const stream = '2026-08-20T11:59:00Z';
+  // Rust has answered: its start wins, live or under a VOD of a live channel.
+  assert.equal(pickLiveStartedAt(rust, stream, false), rust);
+  assert.equal(pickLiveStartedAt(rust, '', false), rust);
+  assert.equal(pickLiveStartedAt(rust, stream, true), rust);
+  // Before Rust answers (or for Kick and friends): the stream's own start.
+  assert.equal(pickLiveStartedAt(null, stream, false), stream);
+  assert.equal(pickLiveStartedAt(undefined, stream, false), stream);
+  // A MultiNook tile's synthesized stream has no start: show nothing, not now.
+  assert.equal(pickLiveStartedAt(null, '', false), '');
+  // Under a VOD, clip or offline chat the stream's date is the video's.
+  assert.equal(pickLiveStartedAt(null, stream, true), '');
+  assert.equal(pickLiveStartedAt('', stream, true), '');
+});
+
+test('short counts drop a zero tenth and keep any other', () => {
+  assert.equal(formatShortCount(136000), '136K');
+  assert.equal(formatShortCount(136049), '136K');
+  assert.equal(formatShortCount(136400), '136.4K');
+  assert.equal(formatShortCount(1000000), '1M');
+  assert.equal(formatShortCount(999999), '1M');
+  assert.equal(formatShortCount(1600000), '1.6M');
+  assert.equal(formatShortCount(10000), '10K');
+  assert.equal(formatShortCount(999), '999');
+  assert.equal(formatShortCount(0), '0');
 });

@@ -2,19 +2,28 @@ import React, { useMemo, useState, useEffect, useRef, memo, useSyncExternalStore
 import { Gift } from 'lucide-react';
 import { parseBadges } from '../services/twitchBadges';
 import { Tooltip } from './ui/Tooltip';
-import { parseMessage } from '../services/twitchChat';
+import { parseMessage, type MessageSegment } from '../services/twitchChat';
 import { queueEmoteForDisplayCaching, getCachedEmoteUrl, getEmoteLookup, inlineEmoteTier, sevenTvTierUrl, EmoteSet } from '../services/emoteService';
 import { getCachedEmojiUrl, parseEmojisSync } from '../services/emojiService';
 import { calculateHalfPadding } from '../utils/chatLayoutUtils';
-import { computePaintStyle, getBadgeImageUrl, getBadgeFallbackUrls, pickPaintLayerImage, queueCosmeticForCaching } from '../services/seventvService';
+import { mentionHoldBackground } from './chat/mentionHold';
+import { deletedBodyStyle, deletedRowDimmed, DEFAULT_DELETED_STYLE } from './chat/deletedMessage';
+import { ModerationTag } from './chat/ModerationTag';
+import { eventCardClass as eventCardClassFor, eventCardStyle as eventCardStyleFor } from './chat/eventCard';
+import { mentionBoxClass, mentionBoxStyle, mentionLook, mentionTextStyle } from './chat/mentionStyle';
+
+// Emote previews open almost at once: a quick pass over an emote should still
+// show it (the shared tooltip default waits 250 ms).
+const EMOTE_TOOLTIP_DELAY_MS = 60;
+import { computePaintStyle, getBadgeImageUrl, pickPaintLayerImage, queueCosmeticForCaching } from '../services/seventvService';
 import { StyledChatName } from './chat/StyledChatName';
+import { ChatBadgeIcons, type ResolvedTwitchBadge } from './chat/ChatBadgeIcons';
+import { visibleChatterBadges } from '../utils/chatterBadges';
 import { useDragModerationStore } from '../stores/dragModerationStore';
 import { usePinStore } from '../stores/pinStore';
-import { FallbackImage } from './FallbackImage';
 import { getCosmeticsWithFallback } from '../services/cosmeticsCache';
 import type { ThirdPartyBadge as ThirdPartyBadgeType } from '../services/badgeService';
 import { useAppStore } from '../stores/AppStore';
-import { openBadgesWithBadgeInMain } from '../utils/openBadgesInMain';
 import { openExternal } from '../utils/openExternal';
 import { useChatUserStore } from '../stores/chatUserStore';
 import { useShallow } from 'zustand/react/shallow';
@@ -23,11 +32,12 @@ import { useGiftBombRecipients } from '../stores/giftBombStore';
 import { useMessageRepeat } from '../stores/messageRepeatStore';
 import { ChannelPointsIcon } from './ChannelPointsIcon';
 import { useUserColor } from '../services/userColorCache';
-import { queueBadgeForCaching, getCachedBadgeUrl } from '../services/badgeImageCacheService';
 import { memberIdFor } from '../utils/memberIdentity';
 import { isStreamNookUser, getStreamNookUserNumber, subscribeStreamNookRegistryVersion, getStreamNookRegistryVersion } from '../services/supabaseService';
 import { MemberReveal, MEMBER_REVEAL_CARD_CLASS } from './StreamNookBadge';
-import { StreamNookBadge } from './StreamNookBadge';
+import { EmoteCreditLine } from './chat/EmoteCreditLine';
+import { canCredit } from '../services/emoteCredit';
+import { openEmoteCard, useEmoteCardStore } from '../stores/emoteCardStore';
 import { AtmosphereBackground } from './AtmosphereBackground';
 import { MajorCologneChrome } from './MajorCologneChrome';
 import { getAtmosphere } from '../services/atmospheres';
@@ -43,12 +53,12 @@ import type { ProviderId } from '../types/providers';
 import { isHomeRow, rowProvider } from '../utils/chatAuthority';
 import { ProviderLogo } from './ProviderLogo';
 import { getDisplayedName, getColorOverride } from '../utils/userChatOverrides';
+import { overrideKey, rowOverrideKey, rowSenderNames, rowShownName, stripLeadingName, withShownSender } from '../utils/chatterName';
 import { useNameColorAdjust } from '../hooks/useNameColor';
 import { vendorEmojiUrl } from '../services/emojiService';
 import { categoryOf, chatEventTemplateContext } from '../utils/chatEvents';
 import { renderEventTemplate } from './overlay/overlayConfig';
 import { convert as convertMoney, formatMoney, preloadRates, symbolToCode } from '../services/currencyService';
-import { CHANNEL_SPECIFIC_TWITCH_BADGES } from '../utils/badgeOrder';
 import { LinkPreviewCard } from './chat/LinkPreviewCard';
 import { SongCard } from './chat/SongCard';
 import { extractPreviewUrls, prettyUrlLabel } from '../services/linkPreviewService';
@@ -255,6 +265,66 @@ const WideEmoteImg = (
 // Parse plain text into emote/emoji/text segments by name lookup against the
 // loaded emote sets. Serves the local-echo fallback (no Rust segments yet) and
 // the reply preview, which only ever has the parent message as raw text.
+/** Rust's segments as the renderer's. Twitch text is already emoji-tokenized
+ *  in Rust; the other providers (Kick/YouTube/TikTok) emit raw text, so their
+ *  unicode emoji become Apple-emoji image segments here for parity. */
+const fromRustSegments = (segments: MessageSegment[], isProvider: boolean): EmoteSegment[] => {
+  return segments.flatMap((seg): EmoteSegment[] => {
+    if (seg.type === 'emote') {
+      return [{
+        type: 'emote' as const,
+        content: seg.content,
+        emoteId: seg.emote_id,
+        emoteUrl: seg.emote_url,
+        isZeroWidth: seg.is_zero_width,
+        modifierFlags: seg.modifier_flags,
+        isPersonal: seg.is_personal,
+      }];
+    } else if (seg.type === 'emoji') {
+      return [{
+        type: 'emoji' as const,
+        content: seg.content,
+        emojiUrl: seg.emoji_url,
+      }];
+    } else if (seg.type === 'link') {
+      // Links are handled in parseTextWithLinks
+      return [{
+        type: 'text' as const,
+        content: seg.content,
+      }];
+    } else if (seg.type === 'cheermote') {
+      // Cheermote segment with animated GIF and bits amount
+      return [{
+        type: 'cheermote' as const,
+        content: seg.content,
+        cheermoteUrl: seg.cheermote_url,
+        prefix: seg.prefix,
+        bits: seg.bits,
+        tier: seg.tier,
+        color: seg.color,
+      }];
+    } else if (seg.type === 'gif') {
+      return [{
+        type: 'gif' as const,
+        content: seg.content,
+        gifId: seg.gif_id,
+        gifUrl: seg.gif_url,
+      }];
+    } else if (isProvider) {
+      return parseEmojisSync(seg.content).map((es): EmoteSegment =>
+        es.type === 'emoji' && es.emojiUrl
+          ? { type: 'emoji' as const, content: es.content, emojiUrl: es.emojiUrl }
+          : { type: 'text' as const, content: es.content },
+      );
+    } else {
+      return [{
+        type: 'text' as const,
+        content: seg.content,
+      }];
+    }
+  });
+};
+
 const parseTextWithEmoteSets = (text: string, emotes?: EmoteSet | null): EmoteSegment[] => {
   const words = text.split(' ');
   const segments: EmoteSegment[] = [];
@@ -262,8 +332,9 @@ const parseTextWithEmoteSets = (text: string, emotes?: EmoteSet | null): EmoteSe
   words.forEach((word, i) => {
     if (i > 0) segments.push({ type: 'text', content: ' ' });
 
-    // Per-set name index (7tv > bttv > ffz > twitch > kick > youtube,
-    // first-wins - same order the old find() chain searched). Kick/YouTube
+    // Per-set name index (twitch > 7tv > bttv > ffz > kick > youtube,
+    // first-wins: a Twitch emote is never replaced by a same-name
+    // third-party one, as in Rust's parser). Kick/YouTube
     // matter here because a Kick reply preview arrives as plain text with its
     // emote tokens already reduced to names. This runs per word of every reply
     // preview, so the old six-array linear scan was O(words x set size).
@@ -302,52 +373,53 @@ const parseTextWithEmoteSets = (text: string, emotes?: EmoteSet | null): EmoteSe
   return coalesced;
 };
 
-// Global cache for channel names and profile images to prevent re-fetching and flashing
-const channelNameCache = new Map<string, string>();
-const channelProfileImageCache = new Map<string, string>();
-
-/**
- * Get the best URL for a Twitch badge, with reactive caching.
- * - Channel-specific badges (subscriber, bits, etc.) are never cached to avoid cross-channel pollution
- * - Global badges are cached locally for faster loading
- */
-function getTwitchBadgeUrl(badgeKey: string, badgeInfo: { localUrl?: string; url?: string; image_url_4x?: string; image_url_2x?: string; image_url_1x?: string }): string {
-  // If already has a local URL, use it
-  if (badgeInfo.localUrl) {
-    return badgeInfo.localUrl;
-  }
-
-  // Extract set ID from badge key (format: "set/version")
-  const setId = badgeKey.split('/')[0];
-  
-  // Channel-specific badges are never cached - always use remote URL
-  // This prevents cross-channel pollution where one streamer's sub badge appears in another's chat
-  if (CHANNEL_SPECIFIC_TWITCH_BADGES.has(setId)) {
-    return badgeInfo.image_url_4x || badgeInfo.image_url_1x || '';
-  }
-
-  // Global badges can be cached safely
-  const cacheId = `twitch-${badgeKey}`;
-  
-  // Check if we have a cached version
-  const cachedUrl = getCachedBadgeUrl(cacheId);
-  if (cachedUrl) {
-    return cachedUrl;
-  }
-
-  // Not cached - queue for caching and return remote 4x URL
-  const remoteUrl = badgeInfo.image_url_4x;
-  if (remoteUrl) {
-    queueBadgeForCaching(cacheId, remoteUrl);
-  }
-
-  return remoteUrl || badgeInfo.image_url_1x || '';
+/** The partner channel a Shared Chat row came from, as the core serves it
+ *  (`get_shared_chat_source`): its login, face and its own color, floored for
+ *  the theme. */
+interface SharedSource {
+  id: string;
+  login: string;
+  display_name: string;
+  avatar_url?: string;
+  color: string;
 }
 
+// One answer per source room and theme darkness, shared by every row, so a
+// burst of partner rows asks once and none flashes in later than the first.
+const sharedSourceCache = new Map<string, SharedSource | null>();
+const sharedSourceAsks = new Map<string, Promise<SharedSource | null>>();
+const sharedSourceKey = (roomId: string, dark: boolean) => `${roomId}:${dark ? 'd' : 'l'}`;
+const askSharedSource = (roomId: string, dark: boolean): Promise<SharedSource | null> => {
+  const key = sharedSourceKey(roomId, dark);
+  const asked = sharedSourceAsks.get(key);
+  if (asked) return asked;
+  const ask = loadInvoke()
+    .then((invoke) => invoke<SharedSource | null>('get_shared_chat_source', { roomId, dark }))
+    .catch((err) => {
+      Logger.warn('[ChatMessage] Shared chat source unavailable:', err);
+      return null;
+    })
+    .then((found) => {
+      // A miss is not cached, so the next row asks again (the core rate-limits).
+      if (found) sharedSourceCache.set(key, found);
+      sharedSourceAsks.delete(key);
+      return found;
+    });
+  sharedSourceAsks.set(key, ask);
+  return ask;
+};
+
 import { BackendChatMessage } from '../services/twitchChat';
+import { SevenTvAvatar } from './SevenTvAvatar';
+import { isThemeDark } from '../themes';
 
 import { Logger } from '../utils/logger';
-import { kickTimeoutMinutes } from '../utils/kickTimeout';
+import { holdChatRow, moderateWithToast, useModTimeoutSteps, type ModRequest } from '../services/moderation';
+import { CaretDown, Clock, Copy, Prohibit, PushPin, PushPinSlash, Trash, X } from 'phosphor-react';
+import { ModSlider } from './chat/ModSlider';
+import { ModLineButtons } from './chat/ModLineButtons';
+import type { LineButton } from './chat/modLine';
+import { WatchStreakFlame } from './icons/WatchStreakFlame';
 
 interface ChatMessageProps {
   message: string | BackendChatMessage; // Raw IRC message or Backend Message Object
@@ -380,6 +452,14 @@ interface ChatMessageProps {
    *  streamer's other platforms, and `isModerator` / `broadcasterId` describe
    *  this one only. */
   homeProvider?: ProviderId;
+  /** Blended feed: the row's platform logo, drawn at the start of the name
+   *  line on every row type, so it sits beside the name whatever is above it
+   *  (a reply, a redemption header, a timestamp). */
+  sourceMark?: ProviderId;
+  /** Line buttons, resolved once by the list when the viewer moderates this
+   *  channel and has them on; null otherwise. One shared array for every
+   *  row, so it only changes when the setting does. */
+  modLine?: LineButton[] | null;
 }
 
 /**
@@ -476,6 +556,20 @@ const MentionSpan: React.FC<{
   // When the user has turned off paint-on-mentions globally, fall back to the
   // flat color even if the user has a paint set.
   const paintMentionsInBody = useAppStore((s) => s.settings.chat_design?.paint_mentions_in_body) ?? true;
+  const mentionWeight = useAppStore((s) => s.settings.chat_design?.mention_weight);
+  const mentionItalic = useAppStore((s) => s.settings.chat_design?.mention_italic);
+  const mentionShape = useAppStore((s) => s.settings.chat_design?.mention_style);
+  const mentionColor = useAppStore((s) => s.settings.chat_design?.mention_text_color);
+  const look = useMemo(
+    () =>
+      mentionLook({
+        mention_weight: mentionWeight,
+        mention_italic: mentionItalic,
+        mention_style: mentionShape,
+        mention_text_color: mentionColor,
+      }),
+    [mentionWeight, mentionItalic, mentionShape, mentionColor],
+  );
   const nameStyle = useMemo(() => {
     if (userPaint && paintMentionsInBody) {
       return computePaintStyle(userPaint, userColor, paintShadowMode);
@@ -519,17 +613,17 @@ const MentionSpan: React.FC<{
     }
   };
   
-  // No pill fill here: normal-chat mentions are plain colored names. A latent
-  // bg-accent/15 never compiled until the 2026-07-26 token-alpha fix, then
-  // surfaced as an accidental pill and was removed.
+  // Plain coloured names by default; weight, slant, a pill and a fixed colour
+  // are the viewer's choice (chat/mentionStyle). The pill tint sits on the
+  // outer box because a paint draws the text through background-clip.
   return (
     <Tooltip content={`View ${username}'s profile`} side="top">
       <span
-        className="inline-block px-1.5 py-0.5 rounded font-medium cursor-pointer transition-colors"
-        style={nameStyle}
+        className={`${mentionBoxClass(look)} cursor-pointer transition-colors`}
+        style={mentionBoxStyle(look, userColor)}
         onClick={handleClick}
       >
-        @{username}
+        <span style={mentionTextStyle(look, nameStyle)}>@{username}</span>
       </span>
     </Tooltip>
   );
@@ -543,10 +637,22 @@ const chatMessageAreEqual = (prevProps: ChatMessageProps, nextProps: ChatMessage
     // If objects, compare IDs
     if (typeof prevProps.message !== 'string' && typeof nextProps.message !== 'string') {
       if (prevProps.message.id !== nextProps.message.id) return false;
+      // Same row, new segments: a re-stamp from Rust (a backlog parsed before
+      // the channel's emotes landed, a late 7TV personal set). A row object
+      // that is only copied keeps its segments array, so this costs nothing
+      // on the hot path.
+      if (prevProps.message.segments !== nextProps.message.segments) return false;
     } else {
       return false;
     }
   }
+  if (prevProps.sourceMark !== nextProps.sourceMark) return false;
+  // Who may act on the row. Mod status usually lands after the join's history
+  // rows are drawn, and the line buttons show without a hover, so those rows
+  // must repaint when it does. Each changes about once per channel.
+  if (prevProps.isModerator !== nextProps.isModerator) return false;
+  if (prevProps.broadcasterId !== nextProps.broadcasterId) return false;
+  if (prevProps.modLine !== nextProps.modLine) return false;
   // messageIndex is intentionally NOT compared. It is the array position, which
   // shifts by N on every flush once the list sits at its cap (busy channel), so
   // comparing it re-rendered EVERY visible row on EVERY flush — the main-thread
@@ -571,8 +677,8 @@ const chatMessageAreEqual = (prevProps: ChatMessageProps, nextProps: ChatMessage
 // selector returns the same array identity for every non-member chatter (a
 // fresh [] each render would re-render every row on any store change).
 const EMPTY_THIRD_PARTY: ThirdPartyBadgeType[] = [];
-const EMPTY_HIDDEN_PROVIDERS: string[] = [];
-const EMPTY_TWITCH_BADGES: never[] = [];
+// A gift recipient's row shows their 7TV badge only.
+const NO_RECIPIENT_TWITCH_BADGES: ResolvedTwitchBadge[] = [];
 
 // Memoized ChatMessage component to prevent unnecessary re-renders
 // This is critical for preventing animation restarts when new messages arrive
@@ -638,17 +744,16 @@ function UsernameWithCosmetics({
   return (
     <span className="inline-flex items-center align-middle">
       {userBadge && (
-        <span className="inline-flex items-center align-middle gap-1 mr-1">
-          <Tooltip content={userBadge.description || userBadge.name} side="top">
-            <img
-              src={getBadgeImageUrl(userBadge)}
-              alt={userBadge.description || userBadge.name}
-              className="sn-chat-badge inline-block"
-              onError={(e) => {
-                e.currentTarget.style.display = 'none';
-              }}
-            />
-          </Tooltip>
+        <span className="inline-flex items-center align-middle gap-1 mr-1.5">
+          {/* The chat badge renderer: same hover card and spotlight click as
+              the badges on any chat row. */}
+          <ChatBadgeIcons
+            twitchBadges={NO_RECIPIENT_TWITCH_BADGES}
+            seventvBadge={userBadge}
+            thirdPartyBadges={EMPTY_THIRD_PARTY}
+            streamNookMemberId={null}
+            keyPrefix="recipient"
+          />
         </span>
       )}
       <Tooltip content="Click to view profile" side="top">
@@ -675,24 +780,34 @@ function UsernameWithCosmetics({
   );
 }
 
-/** Timeout durations for the hover dock: settings.moderation.timeout_presets
- *  (seconds) or the classic 1s / 10m / 1h / 24h. */
-function formatTimeoutLabel(seconds: number): string {
-  if (seconds % 604800 === 0 && seconds >= 604800) return `${seconds / 604800}w`;
-  if (seconds % 86400 === 0 && seconds >= 86400) return `${seconds / 86400}d`;
-  if (seconds % 3600 === 0 && seconds >= 3600) return `${seconds / 3600}h`;
-  if (seconds % 60 === 0 && seconds >= 60) return `${seconds / 60}m`;
-  return `${seconds}s`;
-}
-const DEFAULT_TIMEOUT_PRESETS = [1, 600, 3600, 86400];
-function presetsFromSetting(raw: number[] | undefined): Array<{ label: string; val: number }> {
-  const list = (raw && raw.length > 0 ? raw : DEFAULT_TIMEOUT_PRESETS)
-    .filter((n) => Number.isFinite(n) && n >= 1 && n <= 1209600)
-    .slice(0, 8);
-  return (list.length > 0 ? list : DEFAULT_TIMEOUT_PRESETS).map((val) => ({ label: formatTimeoutLabel(val), val }));
+/** The hover dock's timeout lengths: the viewer's durations as Rust says this
+ *  platform applies them (the Ban that ends Rust's list has its own button).
+ *  Its own component so only a row whose lengths are open asks for them. */
+function DockTimeoutPresets({ provider, onPick }: { provider: string; onPick: (seconds: number, withReason: boolean) => void }) {
+  const steps = useModTimeoutSteps(provider, true);
+  return (
+    <>
+      {steps?.map((step) =>
+        step.action !== 'timeout' || step.seconds == null ? null : (
+          <button
+            key={step.seconds}
+            aria-label={`Time out for ${step.label}`}
+            className="h-[22px] rounded-md px-1.5 text-[11px] font-semibold leading-none text-white/70 hover:text-warning hover:bg-warning/20 transition-colors"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              if (step.seconds != null) onPick(step.seconds, e.shiftKey);
+            }}
+          >
+            {step.label}
+          </button>
+        ),
+      )}
+    </>
+  );
 }
 
-const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, onReplyClick, isHighlighted = false, moderationContext = null, onEmoteRightClick, onMessageCopy, onUsernameRightClick, onBadgeClick, emotes, isModerator = false, broadcasterId, homeProvider = 'twitch' }: ChatMessageProps) {
+const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, onReplyClick, isHighlighted = false, moderationContext = null, onEmoteRightClick, onMessageCopy, onUsernameRightClick, onBadgeClick, emotes, isModerator = false, broadcasterId, homeProvider = 'twitch', sourceMark, modLine = null }: ChatMessageProps) {
   // Field selectors, NOT a whole-store subscription. This component is mounted
   // once per chat row, so subscribing to the entire store made every row
   // re-render on every unrelated store tick (hours-watched, viewer count, etc.).
@@ -708,11 +823,6 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const chatCustomization = useAppStore((s) => s.settings.chat_customization);
   const chatHighlights = useAppStore((s) => s.settings.chat_highlights);
   const chatEvents = useAppStore((s) => s.settings.chat_events);
-  const timeoutPresetSetting = useAppStore((s) => s.settings.moderation?.timeout_presets);
-  const timeoutPresets = useMemo(
-    () => presetsFromSetting(timeoutPresetSetting),
-    [timeoutPresetSetting],
-  );
   const currentUser = useAppStore((s) => s.currentUser);
   // Whole-message pickup attaches transient window listeners; this ref holds the
   // current teardown so an unmount can run it if the row is removed mid-press
@@ -744,6 +854,19 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
 
     return parseMessage(message, channelId);
   }, [message]);
+
+  // The room an emote's hover card looks its credit up in: the channel's
+  // login, and the origin room for shared chat.
+  const creditRoom = useMemo(
+    () =>
+      typeof message === 'string'
+        ? null
+        : {
+            login: message.channel || null,
+            id: message.tags?.['source-room-id'] || message.tags?.['room-id'] || null,
+          },
+    [message],
+  );
 
   const isAction = parsed.isAction || false;
 
@@ -822,60 +945,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       // Apple-emoji image segments here for parity (also covers the blended feed,
       // which renders these segments directly).
       const isProvider = !!parsed.provider && parsed.provider !== 'twitch';
-      return parsed.segments.flatMap((seg): EmoteSegment[] => {
-        if (seg.type === 'emote') {
-          return [{
-            type: 'emote' as const,
-            content: seg.content,
-            emoteId: seg.emote_id,
-            emoteUrl: seg.emote_url,
-            isZeroWidth: seg.is_zero_width,
-            modifierFlags: seg.modifier_flags,
-            isPersonal: seg.is_personal,
-          }];
-        } else if (seg.type === 'emoji') {
-          return [{
-            type: 'emoji' as const,
-            content: seg.content,
-            emojiUrl: seg.emoji_url,
-          }];
-        } else if (seg.type === 'link') {
-          // Links are handled in parseTextWithLinks
-          return [{
-            type: 'text' as const,
-            content: seg.content,
-          }];
-        } else if (seg.type === 'cheermote') {
-          // Cheermote segment with animated GIF and bits amount
-          return [{
-            type: 'cheermote' as const,
-            content: seg.content,
-            cheermoteUrl: seg.cheermote_url,
-            prefix: seg.prefix,
-            bits: seg.bits,
-            tier: seg.tier,
-            color: seg.color,
-          }];
-        } else if (seg.type === 'gif') {
-          return [{
-            type: 'gif' as const,
-            content: seg.content,
-            gifId: seg.gif_id,
-            gifUrl: seg.gif_url,
-          }];
-        } else if (isProvider) {
-          return parseEmojisSync(seg.content).map((es): EmoteSegment =>
-            es.type === 'emoji' && es.emojiUrl
-              ? { type: 'emoji' as const, content: es.content, emojiUrl: es.emojiUrl }
-              : { type: 'text' as const, content: es.content },
-          );
-        } else {
-          return [{
-            type: 'text' as const,
-            content: seg.content,
-          }];
-        }
-      });
+      return fromRustSegments(parsed.segments, isProvider);
     }
 
     // Fallback for local messages (no segments from Rust yet): parse text by
@@ -883,13 +953,22 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     return parseTextWithEmoteSets(parsed.content, emotes);
   }, [parsed.segments, parsed.content, parsed.provider, emotes]);
 
-  // Reply preview: the parent message only exists as raw tag text, so emotes
-  // in it are resolved by name against the same loaded sets.
+  // Reply preview: Rust tokenizes the quoted parent with the channel and
+  // platform it was said in, as it does the row. A row from before that (no
+  // parent segments) falls back to matching names against the loaded sets,
+  // which are the home channel's, so only for a home row: on another
+  // platform's row (combined chat) they would show the home channel's emote
+  // for a name that channel may mean differently.
+  const replyFromHome = rowProvider(message, homeProvider) === homeProvider;
   const replyPreviewSegments = useMemo<EmoteSegment[] | null>(() => {
+    const quoted = parsed.replyInfo?.parentSegments;
+    if (quoted && quoted.length > 0) {
+      return fromRustSegments(quoted, !!parsed.provider && parsed.provider !== 'twitch');
+    }
     const body = parsed.replyInfo?.parentMsgBody;
     if (!body) return null;
-    return parseTextWithEmoteSets(body, emotes);
-  }, [parsed.replyInfo?.parentMsgBody, emotes]);
+    return parseTextWithEmoteSets(body, replyFromHome ? emotes : null);
+  }, [parsed.replyInfo?.parentSegments, parsed.replyInfo?.parentMsgBody, parsed.provider, emotes, replyFromHome]);
 
   // Extract userId once to prevent re-renders
   const userId = useMemo(() => parsed.tags.get('user-id'), [parsed.tags]);
@@ -952,60 +1031,29 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     );
   };
 
-  const modBan = async (durationSeconds: number | null, reasonOverride?: string) => {
-    // Falls back to the first saved reason, so the common case needs no typing.
-    const saved = useAppStore.getState().settings.moderation?.saved_ban_reasons?.[0]?.trim();
-    const reason = (reasonOverride ?? saved ?? '').trim() || null;
-    await attempt(async () => {
-      const invoke = await loadInvoke();
-      if (parsed.provider === 'kick') {
-        if (!providerUserId || !broadcasterId) return;
-        const durationMinutes =
-          durationSeconds == null ? null : kickTimeoutMinutes(durationSeconds);
-        await invoke('kick_ban_user', {
-          broadcasterUserId: Number(broadcasterId),
-          targetUserId: Number(providerUserId),
-          durationMinutes,
-          reason,
-        });
-      } else if (parsed.provider === 'youtube') {
-        // YouTube: address the chatter by their channel id; a duration = timeout
-        // (YouTube's fixed length), null = permanent hide/ban.
-        if (!providerUserId) return;
-        await invoke('youtube_ban_user', {
-          channel: parsed.channel.replace(/^youtube:/, ''),
-          targetChannelId: providerUserId,
-          durationSeconds,
-        });
-      } else {
-        const targetUserId = parsed.tags.get('user-id');
-        if (!targetUserId) return;
-        await invoke('ban_user', { broadcasterId, targetUserId, duration: durationSeconds, reason });
-      }
-    }, (err) => {
-      Logger.error('[ChatMessage] mod ban/timeout failed:', err);
-    });
-  };
+  // Who a mod action on this row aims at. Rust (`moderate_chatter`) picks the
+  // platform API and its rules; Kick and YouTube rows carry the chatter's id
+  // on `providerUserId`, Twitch rows on the IRC tag.
+  const modTarget = (): Omit<ModRequest, 'action'> => ({
+    provider: parsed.provider ?? 'twitch',
+    broadcasterId,
+    channel: parsed.channel,
+    targetUserId: parsed.provider && parsed.provider !== 'twitch' ? providerUserId : parsed.tags.get('user-id'),
+    targetName: parsed.displayName || parsed.tags.get('display-name') || parsed.username,
+  });
 
-  // Provider-aware delete. Twitch -> Helix `delete_chat_message`; Kick ->
-  // `kick_delete_message` (DELETE /public/v1/chat/{id}).
-  const modDelete = async (messageId: string) => {
-    await attempt(async () => {
-      const invoke = await loadInvoke();
-      if (parsed.provider === 'kick') {
-        await invoke('kick_delete_message', { messageId });
-      } else if (parsed.provider === 'youtube') {
-        await invoke('youtube_delete_message', {
-          channel: parsed.channel.replace(/^youtube:/, ''),
-          messageId,
-        });
-      } else {
-        await invoke('delete_chat_message', { broadcasterId, messageId });
-      }
-    }, (err) => {
-      Logger.error('[ChatMessage] delete failed:', err);
+  // The hover dock's actions say what happened, with Undo for a timeout or
+  // ban, like every other surface. The first saved reason rides along, so the
+  // common case needs no typing.
+  const modBan = (durationSeconds: number | null) =>
+    moderateWithToast({
+      ...modTarget(),
+      action: durationSeconds == null ? { kind: 'ban' } : { kind: 'timeout', seconds: durationSeconds },
+      useSavedReason: true,
     });
-  };
+
+  const modDelete = (messageId: string) =>
+    moderateWithToast({ ...modTarget(), action: { kind: 'delete', messageId } });
 
   // Link preview cards. Allowlisted hosts (YouTube, Twitch, imgur, etc.) auto-
   // expand; every other link is surfaced too but as a click-to-load chip, so an
@@ -1040,28 +1088,21 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // person) and in the IRC mention insertion path (Twitch only resolves real
   // @logins, never nicknames). Render path swaps in the nickname.
   const userOverrides = chatCustomization?.user_overrides;
-  const originalDisplayName = useMemo(
-    () => parsed.tags.get('display-name') || parsed.displayName || parsed.username,
-    [parsed.tags, parsed.displayName, parsed.username],
-  );
+  // The one author name every layout below renders (plain row, sub, watch
+  // streak, raid, cheer, donation): Rust's stamped name, under the viewer's
+  // nickname for this chatter when one is set.
   const effectiveDisplayName = useMemo(
-    () => getDisplayedName(cosmeticsKey ?? userId, originalDisplayName, userOverrides),
-    [cosmeticsKey, userId, originalDisplayName, userOverrides],
+    // Same key the profile card saves under (rowOverrideKey / overrideKey).
+    () => rowShownName(parsed, rowOverrideKey(parsed as never), userOverrides),
+    [parsed, userOverrides],
   );
-  // The author name shown on a normal message. Twitch keeps its exact existing
-  // value (its `username` already holds the cased display name), so Twitch
-  // rendering is unchanged. Non-Twitch providers (Kick) put the lowercase slug
-  // in `username`, so render their cased display name instead.
   const showAtSign = chatDesign?.show_at_sign === true;
   const renderedName = useMemo(
-    () => {
-      const base =
-        parsed.provider && parsed.provider !== 'twitch'
-          ? parsed.tags.get('display-name') || parsed.displayName || parsed.username
-          : parsed.username;
-      return showAtSign && base && !base.startsWith('@') ? `@${base}` : base;
-    },
-    [parsed.provider, parsed.tags, parsed.displayName, parsed.username, showAtSign],
+    () =>
+      showAtSign && effectiveDisplayName && !effectiveDisplayName.startsWith('@')
+        ? `@${effectiveDisplayName}`
+        : effectiveDisplayName,
+    [effectiveDisplayName, showAtSign],
   );
   // Color override layers under the user's 7TV paint when one is selected
   // (the paint computes against this base color), or replaces parsed.color
@@ -1072,7 +1113,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const replyMentionNode =
     replyStyle === 'mention' && parsed.replyInfo ? (
       <span className="font-semibold opacity-85">
-        @{getDisplayedName(parsed.replyInfo.parentUserId, parsed.replyInfo.parentDisplayName, userOverrides)}{' '}
+        @{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}{' '}
       </span>
     ) : null;
   const giantJustify =
@@ -1130,21 +1171,35 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     }),
   );
   const seventvPaint = seventvPaintRaw as SevenTVPaintWithSelection | null | undefined;
-  // Badge controls. Filtered HERE, at the source, so the five badge render
-  // sites below all follow without each knowing why.
-  const badgesOn = chatDesign?.show_badges !== false;
-  const thirdPartyBadgesOn = chatDesign?.show_third_party_badges !== false;
-  const hiddenBadgeProviders = chatDesign?.hidden_badge_providers ?? EMPTY_HIDDEN_PROVIDERS;
-  const badgeSourceHidden = (src?: string) => hiddenBadgeProviders.includes((src || '').toLowerCase());
-  const visibleBadges = badgesOn ? parsed.badges : EMPTY_TWITCH_BADGES;
-  const seventvBadgeAll = seventvBadgeRaw as SevenTVBadgeWithSelection | null | undefined;
-  const seventvBadge = thirdPartyBadgesOn && !badgeSourceHidden('7tv') ? seventvBadgeAll : null;
-  const thirdPartyBadges = useMemo(
-    () => (thirdPartyBadgesOn ? thirdPartyBadgesAll.filter((b) => !badgeSourceHidden(b.provider)) : EMPTY_THIRD_PARTY),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [thirdPartyBadgesAll, thirdPartyBadgesOn, hiddenBadgeProviders],
+  // Badge controls. Filtered HERE, at the source, so every badge render site
+  // below follows without each knowing why. The same helper filters the pinned
+  // message, so a hidden provider is hidden there too.
+  const {
+    twitch: visibleBadges,
+    seventv: seventvBadge,
+    thirdParty: thirdPartyBadges,
+    streamNook: snBadgeOn,
+  } = useMemo(
+    () =>
+      visibleChatterBadges(
+        {
+          show_badges: chatDesign?.show_badges,
+          show_third_party_badges: chatDesign?.show_third_party_badges,
+          hidden_badge_providers: chatDesign?.hidden_badge_providers,
+        },
+        parsed.badges,
+        seventvBadgeRaw as SevenTVBadgeWithSelection | null | undefined,
+        thirdPartyBadgesAll,
+      ),
+    [
+      chatDesign?.show_badges,
+      chatDesign?.show_third_party_badges,
+      chatDesign?.hidden_badge_providers,
+      parsed.badges,
+      seventvBadgeRaw,
+      thirdPartyBadgesAll,
+    ],
   );
-  const snBadgeOn = thirdPartyBadgesOn && !badgeSourceHidden('streamnook');
   const atmosphere = atmosphereId ? getAtmosphere(atmosphereId) : null;
   // Frost behind the text only when the atmosphere declares it needs it (busy
   // washes); subtle ones render the text bare. A backdrop-filter per message row
@@ -1161,6 +1216,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // hovered. Keyboard and drag moderation don't need this DOM (verified:
   // ChatModController invokes commands directly; drags target data-message-id).
   const [hoverArmed, setHoverArmed] = useState(false);
+  // The hover dock's other timeout lengths: open on a click, in place inside
+  // the row's cluster, until a pick, the close button or the pointer leaving
+  // the row.
+  const [timeoutLengthsOpen, setTimeoutLengthsOpen] = useState(false);
   // "Animate emotes: on hover" needs a live hover flag; the other modes never
   // write it, so rows do not re-render on pointer traffic unless asked.
   const animateEmotes = chatDesign?.animate_emotes ?? 'always';
@@ -1214,6 +1273,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       color: hl.color,
       sound_id: (hl.sound_id ?? null) as HighlightMatch['sound_id'],
       cooldown_ms: hl.cooldown_ms,
+      hold: hl.hold === true,
     };
   }, [stamped, parsed.metadata]);
 
@@ -1310,11 +1370,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // drag-to-moderate grab handle, or both. Migrates the old boolean.
   const modActionStyle = chatDesign?.mod_action_style
     ?? (chatDesign?.drag_moderation_enabled === false ? 'buttons' : 'both');
-  // Drag-to-moderate is mod-only — every action bucket is a mod action, so a
-  // non-mod dragging a message just lifts it into an empty void. Gate the whole
-  // pickup gesture (and the text-selection sacrifice it requires) on the current
-  // user's mod status, so non-mods always keep normal chat: select text, copy,
-  // click links. The classic mod buttons are likewise already mod-gated below.
+  // Drag-to-moderate is mod-only: every action tile is a mod action. The
+  // pickup starts only from the handle on the row's left edge, so everyone,
+  // mods included, keeps normal chat on the rest of the row (select text,
+  // drag, scroll, click links, right-click to reply).
   // Authority is home-only. `isModerator` and `broadcasterId` both describe the
   // channel being watched, so offering a mod action on a row from one of the
   // streamer's OTHER platforms would aim this channel's credentials at another
@@ -1326,8 +1385,26 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const rowSourceProvider = rowProvider(message, homeProvider);
   const showPlatformMark =
     rowSourceProvider !== homeProvider && chatBlend?.show_platform_badge !== false;
+  // Blended feed: every row leads its name line with its platform's logo. It
+  // is drawn inside that line, so a reply quote, a redemption header or a
+  // timestamp above the name never pulls it off the name. Centred on the text
+  // the way the badge strip is (see .sn-badge-strip): an image-only
+  // inline-flex box sits on its bottom edge, lifted until its middle meets
+  // the text's.
+  const sourceMarkPx = Math.round((chatDesign?.font_size ?? 14) * 1.2);
+  const sourceMarkEl = sourceMark ? (
+    <span
+      className="mr-1.5 inline-flex flex-shrink-0"
+      style={{ verticalAlign: `calc(0.38em - ${sourceMarkPx / 2}px)` }}
+    >
+      <ProviderLogo provider={sourceMark} size={sourceMarkPx} />
+    </span>
+  ) : null;
   const bodyDragEnabled = canModerateThisRow && (modActionStyle === 'drag' || modActionStyle === 'both');
   const showModButtons = modActionStyle === 'buttons' || modActionStyle === 'both';
+  // This row offers the hover dock. The row says so on itself, so the list
+  // can hold still from the moment the pointer reaches the row.
+  const dockOffered = canModerateThisRow && showModButtons && !!broadcasterId;
   // The inline Pin button is ALWAYS available to moderators so a pin can never go
   // missing. The Pin Action setting only controls whether a Pin tile ALSO shows
   // in the drag-to-moderate gesture (handled in ModerationDragLayer).
@@ -1341,18 +1418,22 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const draggedMessageId = useDragModerationStore((s) => s.dragged?.messageId);
   const isBeingDragged = !!draggedMessageId && draggedMessageId === parsed.tags.get('id');
 
-  // Whole-message pickup: pressing on a non-interactive part of the row and
-  // dragging past a small threshold lifts the chatter into the drag-to-moderate
-  // buckets. Clicks and the things you'd normally click (name/badges/emotes/
-  // links) are left alone; text selection is off in drag mode (use Copy).
+  // Handle pickup: pressing the left-edge handle and dragging past a small
+  // threshold lifts the chatter into the drag-to-moderate tiles. It used to
+  // start anywhere on the row, which took text selection, dragging and
+  // scrolling away from moderators on every message.
   const handleBodyPickup = (e: React.PointerEvent) => {
     if (!bodyDragEnabled || e.button !== 0) return;
-    const target = e.target as HTMLElement;
-    if (target.closest('a, button, img, [data-no-drag]')) return;
+    const row = (e.currentTarget as HTMLElement).parentElement;
+    if (!row) return;
+    e.preventDefault();
     // Non-Twitch providers (Kick, YouTube) have no `user-id` tag; the chatter's id
     // rides on `providerUserId`. Twitch keeps the IRC tag.
     const dragUserId = parsed.provider === 'twitch' ? parsed.tags.get('user-id') : providerUserId;
     if (!dragUserId || !broadcasterId) return;
+    // Hold the list from the press so a fast chat cannot scroll this row away
+    // before the pickup threshold; the list lets go when the button comes up.
+    holdChatRow(row, true);
     const startX = e.clientX;
     const startY = e.clientY;
     const onMove = (me: PointerEvent) => {
@@ -1362,13 +1443,14 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         {
           userId: dragUserId,
           login: parsed.username,
-          displayName: parsed.tags.get('display-name') || parsed.username,
+          displayName: parsed.displayName || parsed.tags.get('display-name') || parsed.username,
           color: effectiveColor,
           messageId: parsed.tags.get('id') || undefined,
           broadcasterId,
           provider: parsed.provider,
           channel: parsed.channel?.replace(/^youtube:/, ''),
           isModerator: canModerateThisRow,
+          canPunish: canActOnChatter,
           moderationState:
             moderationContext?.type === 'ban'
               ? 'ban'
@@ -1445,7 +1527,12 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             ? 'bttv'
             : emoteUrl.includes('frankerfacez')
               ? 'ffz'
-              : undefined;
+              : // Kick's own emotes: the same `kick-<id>` file the emote picker
+                // and Rust's prefetch keep. Without a provider they were cached
+                // again under the bare id, two files for one image.
+                emoteUrl.includes('files.kick.com')
+                ? 'kick'
+                : undefined;
 
       // Giant art URL. Only 7TV cache keys are per-tier; the other providers
       // key by bare id, so caching 4x bytes there would overwrite the
@@ -1512,11 +1599,25 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         },
         referrerPolicy: 'no-referrer',
         onClick: () => {
-          // Left-click a 7TV emote to open the quick spotlight modal, where it
-          // can be added to any channel you edit (or escalated into the full
-          // manager). Non-7TV emotes have no 7TV id, so they do nothing here.
-          if (is7TVEmote && segment.emoteId) {
+          if (!segment.emoteId) return;
+          // A 7TV emote opens the 7TV spotlight where this window has it (main:
+          // add to any channel you edit, creator chip). Everything creditable
+          // elsewhere, and every Twitch / BTTV / FFZ emote, opens the emote
+          // card with its creators. Kick and YouTube emotes have none to show.
+          if (is7TVEmote && useEmoteCardStore.getState().seventvSpotlight) {
             useAppStore.getState().openEmoteSpotlight(segment.emoteId, segment.content);
+            return;
+          }
+          const provider = is7TVEmote ? '7tv' : emoteProvider;
+          if (provider && canCredit(provider)) {
+            openEmoteCard({
+              provider,
+              id: segment.emoteId,
+              name: segment.content ?? '',
+              url: emoteUrl,
+              channelLogin: creditRoom?.login,
+              channelId: creditRoom?.id,
+            });
           }
         },
         onContextMenu: (e) => {
@@ -1573,15 +1674,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       // still surfaces.
       const isCompactTooltip = !!chatDesign?.compact_emote_tooltips;
       // is7TVEmote was computed at the top of this branch (reused here).
-      const providerLabel =
-        is7TVEmote || emoteUrl.includes('7tv') ? '7TV'
-        : emoteUrl.includes('betterttv') ? 'BetterTTV'
-        : emoteUrl.includes('frankerfacez') ? 'FrankerFaceZ'
-        : emoteUrl.includes('jtvnw.net') ? 'Twitch'
-        : 'Emote';
-      const previewUrl = is7TVEmote && segment.emoteId
+      // The 4x preview is disk-cached like chat emotes (the emote prefetch
+      // pulls it for followed channels; a first hover saves it), so a
+      // repeat hover draws a local file instead of waiting on 7TV.
+      const cachedPreviewUrl = is7TVEmote && segment.emoteId
+        ? getCachedEmoteUrl(segment.emoteId, '7tv', '4x')
+        : undefined;
+      const previewUrl = cachedPreviewUrl ?? (is7TVEmote && segment.emoteId
         ? `https://cdn.7tv.app/emote/${segment.emoteId}/4x.avif`
-        : emoteUrl;
+        : emoteUrl);
       // User-configurable hover-preview height. Defaults to 96px (one step up
       // from the original fixed 64px preview). maxWidth scales with it so wide
       // 7TV emotes aren't clipped in the card.
@@ -1596,6 +1697,11 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               className="w-auto object-contain mx-auto drop-shadow-md"
               style={{ height: hoverPreviewSize, maxWidth: hoverPreviewSize * 2 }}
               referrerPolicy="no-referrer"
+              onLoad={() => {
+                if (!cachedPreviewUrl && is7TVEmote && segment.emoteId) {
+                  queueEmoteForDisplayCaching(segment.emoteId, '7tv', previewUrl, '4x');
+                }
+              }}
               onError={(e) => {
                 const t = e.currentTarget;
                 // Some emotes have no working 4x (or a flaky avif), which is why
@@ -1620,7 +1726,14 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             />
             <div className="text-center flex flex-col items-center gap-0.5">
               <span className="font-bold text-[13px] leading-tight">{segment.content}</span>
-              <span className="text-[10px] text-white/60 leading-tight">{providerLabel}</span>
+              {/* Who made it: looked up when this card opens, never per message. */}
+              <EmoteCreditLine
+                provider={emoteProvider ?? ''}
+                id={segment.emoteId}
+                name={segment.content ?? ''}
+                channelLogin={creditRoom?.login}
+                channelId={creditRoom?.id}
+              />
               {segment.modifierFlags != null ? (
                 <span className="text-[9px] font-bold tracking-wider uppercase text-warning mt-0.5 mix-blend-screen drop-shadow-sm">
                   Modifier
@@ -1644,12 +1757,14 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   ))}
                 </span>
               )}
-              <span className="text-[10px] text-white/50 mt-0.5">Right-click to copy</span>
+              <span className="text-[10px] text-white/50 mt-0.5">
+                {canCredit(is7TVEmote ? '7tv' : (emoteProvider ?? '')) ? 'Click for details · Right-click to copy' : 'Right-click to copy'}
+              </span>
             </div>
           </div>
         );
       return (
-        <Tooltip key={key} content={tooltipContent} side="top">
+        <Tooltip key={key} content={tooltipContent} side="top" delay={EMOTE_TOOLTIP_DELAY_MS} requirePointerMove>
           {isOverlay && !inGrid ? (
             // Fallback for standalone zero-width emote (e.g., at the start of a message)
             <span className="inline-block w-0 align-middle pointer-events-none" style={gridStyle}>
@@ -1676,7 +1791,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           ? getCachedEmojiUrl(segment.content, segment.emojiUrl)
           : (vendorEmojiUrl(segment.content, emojiStyle) ?? segment.emojiUrl ?? '');
       return (
-        <Tooltip key={key} content={segment.content} side="top">
+        <Tooltip key={key} content={segment.content} side="top" delay={EMOTE_TOOLTIP_DELAY_MS}>
           <img
             src={emojiSrc}
             alt={segment.content}
@@ -1765,8 +1880,13 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             loading="lazy"
             decoding="async"
             referrerPolicy="no-referrer"
-            className={`inline-block h-20 w-auto max-w-full rounded-md ${inGrid ? '' : 'align-middle'} ${marginClass}`}
-            style={gridStyle}
+            // text-top: the GIF's top sits on the name's line, so the name
+            // stays on the first line instead of dropping to the GIF's middle
+            // (the same placement as the stream overlay). Height is the 5rem
+            // (80px) base times the GIF size setting, which ChatMessageList
+            // carries as --sn-gif-scale (layout_service.rs uses the same base).
+            className={`inline-block w-auto max-w-full rounded-md object-contain ${inGrid ? '' : 'align-text-top'} ${marginClass}`}
+            style={{ ...gridStyle, height: 'calc(5rem * var(--sn-gif-scale, 1))' }}
             onError={(e) => {
               // Asset gone: keep the description Twitch sent instead of a blank.
               e.currentTarget.style.display = 'none';
@@ -1802,6 +1922,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     const isPrefixMod = (s: EmoteSegment) =>
       s.type === 'emote' && ((s.modifierFlags ?? 0) & MOD_PREFIX) !== 0;
     const isSpacer = (s: EmoteSegment) => s.type === 'text' && s.content.trim() === '';
+    // Rust hands a whitespace run over as one spacer holding all of it.
+    // BetterTTV modifiers attach across exactly one space; zero-width overlays
+    // (below) attach across any run, as Chatterino and 7TV stack them.
+    const isSingleSpace = (s: EmoteSegment) => s.type === 'text' && s.content === ' ';
     // A modifier can never be another modifier's target.
     const isTarget = (s: EmoteSegment) =>
       (s.type === 'emote' || s.type === 'emoji') && s.modifierFlags == null;
@@ -1829,13 +1953,13 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
 
       if (pending.length > 0) {
         const last = pending[pending.length - 1];
-        // The run survives exactly one spacer, matching BetterTTV: a doubled
-        // space breaks attachment.
-        if (isSpacer(segment) && !isSpacer(last)) {
+        // The run survives exactly one spacer of one space, matching
+        // BetterTTV: a doubled space breaks attachment.
+        if (isSingleSpace(segment) && !isSpacer(last)) {
           pending.push(segment);
           return;
         }
-        if (isTarget(segment) && isSpacer(last)) {
+        if (isTarget(segment) && isSingleSpace(last)) {
           groupedSegments.push([segment, ...pending.filter(isPrefixMod)]);
           pending = [];
           return;
@@ -2124,6 +2248,13 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // "<reward name> <points glyph> <amount>" instead of a plain "(N)" in the text.
   const redemptionCost = parsed.tags.get('sn-reward-cost');
   const redemptionPointsIcon = parsed.tags.get('sn-points-icon');
+  // A reward that asks for text arrives as a chat message tagged only with its
+  // id; Rust names it from the channel's rewards (irc_service stamp_reward_name).
+  const redeemedTitle = parsed.tags.get('sn-redeemed-title');
+  const redeemedCost = parsed.tags.get('sn-redeemed-cost');
+  // A reward with no text, which Rust builds as its own row (body = the
+  // reward's title): one line, "<name> redeemed <title> <cost>", like Twitch.
+  const isRewardEventRow = !!parsed.tags.get('sn-reward-title');
   const isGigantifiedEmote =
     msgId === 'gigantified-emote-message' || sourceMsgId === 'gigantified-emote-message';
   const isAnimatedMessage =
@@ -2139,7 +2270,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         : isSubModeBypass
           ? 'Sent a Message in Sub-Only Mode'
           : hasCustomReward
-            ? 'Redeemed a channel points reward'
+            ? (redeemedTitle ? `Redeemed ${redeemedTitle}` : 'Redeemed a channel points reward')
             : null;
   const isRedemption = redemptionLabel !== null;
 
@@ -2149,36 +2280,27 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // in which case the row falls through with its cheermotes inline.
   const isBitsCheer = bitsAmount && parseInt(bitsAmount, 10) > 0 && (chatEvents?.cheer_display ?? 'card') !== 'message';
 
-  // How event rows dress: the tinted cards, a ring, or nothing. The glint
-  // classes are the same ones first-time rows use (see globals.css sn-ft-*).
-  const eventStyle = chatEvents?.event_style ?? 'cards';
-  const eventAnim =
-    chatEvents?.event_animation && chatEvents.event_animation !== 'none' ? chatEvents.event_animation : null;
-  const eventCardClass = (gradient: string) => {
-    const base = eventStyle === 'plain' ? '' : eventStyle === 'outline' ? 'sn-event-outline' : gradient;
-    const anim = eventAnim
-      ? ` ${eventStyle === 'outline' ? 'sn-ft-anim-ring' : 'sn-ft-anim-bar'} sn-ft-t-${eventAnim}${chatEvents?.event_animate_repeat ? ' sn-ft-loop' : ''}`
-      : '';
-    return `relative ${base}${anim}`;
-  };
-  const eventCardStyle =
-    eventStyle === 'outline' && chatEvents?.event_outline_color
-      ? ({ '--sn-event-outline': chatEvents.event_outline_color } as React.CSSProperties)
-      : undefined;
+  // How event rows dress (cards, ring or plain, plus the glint).
+  const eventCardClass = (gradient: string) => eventCardClassFor(chatEvents, gradient);
+  const eventCardStyle = eventCardStyleFor(chatEvents);
   // Custom wording for an event category, or null to keep the platform's.
+  // `{username}` is the name the card shows (nickname first), and `{default}`,
+  // Twitch's own sentence, has its leading author name swapped for it: that
+  // sentence names the chatter by raw login on some notices (watch streaks).
   const eventTemplateFor = (category: 'subscription' | 'gift' | 'cheer' | 'milestone' | 'raid'): string | null => {
     const template = chatEvents?.event_templates?.[category];
     if (!template) return null;
+    const platformText = parsed.tags.get('system-msg')?.replace(/\\s/g, ' ');
     return renderEventTemplate(
       template,
       chatEventTemplateContext(parsed.tags, category, {
         username: parsed.username,
-        displayName: parsed.tags.get('display-name') || parsed.displayName || parsed.username,
+        displayName: effectiveDisplayName,
         provider: parsed.provider ?? 'twitch',
         bits: bitsAmount ? parseInt(bitsAmount, 10) : undefined,
         channel: (parsed.channel ?? '').split(':').pop() || undefined,
         time: parsed.metadata?.formatted_timestamp || undefined,
-        defaultText: parsed.tags.get('system-msg')?.replace(/\\s/g, ' ') || undefined,
+        defaultText: platformText ? withShownSender(platformText, parsed, effectiveDisplayName) : undefined,
       }),
     );
   };
@@ -2261,59 +2383,28 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const currentRoomId = parsed.tags.get('room-id');
   const isFromSharedChat = sourceRoomId && currentRoomId && sourceRoomId !== currentRoomId;
 
-  // State to store the fetched channel name - initialize from cache if available
-  // These hooks must be declared before any conditional returns
-  const [fetchedChannelName, setFetchedChannelName] = useState<string | null>(() => {
-    if (sourceRoomId && channelNameCache.has(sourceRoomId)) {
-      return channelNameCache.get(sourceRoomId) || null;
-    }
-    return null;
-  });
-
-  // State to store the channel profile image
-  const [channelProfileImage, setChannelProfileImage] = useState<string | null>(() => {
-    if (sourceRoomId && channelProfileImageCache.has(sourceRoomId)) {
-      return channelProfileImageCache.get(sourceRoomId) || null;
-    }
-    return null;
-  });
-
-  // Fetch source channel name and profile image if this is a shared chat message (only once per sourceRoomId)
+  // The partner channel this row came from, read once per room from the core
+  // (hooks before any conditional return). Read from the shared cache during
+  // render, so a row that mounts after the first never flashes in unmarked;
+  // only a room not known yet asks, and its answer lands here.
+  const sourceDark = isThemeDark();
+  const sourceKey = isFromSharedChat && sourceRoomId ? sharedSourceKey(sourceRoomId, sourceDark) : null;
+  const [askedSource, setAskedSource] = useState<{ key: string; source: SharedSource } | null>(null);
+  const sharedSource = sourceKey
+    ? (sharedSourceCache.get(sourceKey) ?? (askedSource?.key === sourceKey ? askedSource.source : null))
+    : null;
   useEffect(() => {
-    if (!isFromSharedChat || !sourceRoomId) return;
-
-    // Both caches were read by the state initializers (sourceRoomId is fixed
-    // for a row), so a cache hit means there is nothing to fetch.
-    if (channelProfileImageCache.has(sourceRoomId)) return;
-
-    let isMounted = true;
-
-    // Fetch the channel name and profile image
-    loadInvoke().then((invoke) => {
-      invoke<any>('get_user_by_id', { userId: sourceRoomId })
-        .then((user) => {
-          if (!isMounted) return;
-          if (user && user.login) {
-            // Store name in cache
-            channelNameCache.set(sourceRoomId, user.login);
-            setFetchedChannelName(user.login);
-
-            // Store profile image in cache
-            if (user.profile_image_url) {
-              channelProfileImageCache.set(sourceRoomId, user.profile_image_url);
-              setChannelProfileImage(user.profile_image_url);
-            }
-          }
-        })
-        .catch((err) => {
-          Logger.warn('[ChatMessage] Failed to fetch source channel info:', err);
-        });
+    if (!sourceKey || !sourceRoomId || sharedSourceCache.has(sourceKey)) return;
+    let live = true;
+    void askSharedSource(sourceRoomId, sourceDark).then((found) => {
+      if (live && found) setAskedSource({ key: sourceKey, source: found });
     });
-
     return () => {
-      isMounted = false;
+      live = false;
     };
-  }, [isFromSharedChat, sourceRoomId, fetchedChannelName, channelProfileImage]);
+  }, [sourceKey, sourceRoomId, sourceDark]);
+  const fetchedChannelName = sharedSource?.login ?? null;
+  const channelProfileImage = sharedSource?.avatar_url ?? null;
 
   // Handle bits cheers
   if (isBitsCheer) {
@@ -2325,12 +2416,27 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     // Format bits count with commas for readability
     const formattedBits = bitsCount.toLocaleString();
 
+    // The row leads with the cheermote actually used (the one carrying the
+    // most bits), so it comes out of the message below; any others stay
+    // inline. No cheermote segment (an odd payload) falls back to Twitch's
+    // own gem for the amount.
+    const leadIdx = contentWithEmotes.reduce(
+      (best, seg, i) =>
+        seg.type === 'cheermote' && (best < 0 || (seg.bits ?? 0) > (contentWithEmotes[best].bits ?? 0)) ? i : best,
+      -1,
+    );
+    const leadCheermote = leadIdx >= 0 ? contentWithEmotes[leadIdx] : null;
+    const bodySegments = (leadIdx >= 0 ? contentWithEmotes.filter((_, i) => i !== leadIdx) : contentWithEmotes).map(
+      (seg, i) => (i === 0 && seg.type === 'text' ? { ...seg, content: seg.content.trimStart() } : seg),
+    );
+    const bodyHasContent = bodySegments.some((seg) => seg.type !== 'text' || seg.content.trim() !== '');
+
     // Defensive: EventSub shows gigantified messages arrive with cheer:null,
     // but `bits` is a plain IRC tag; if both ever co-occur, the giant must
     // not be silently dropped by this early return.
     const giantPluckCheer =
       isGigantifiedEmote && chatDesign?.giant_emotes !== false
-        ? pluckGiantEmote(contentWithEmotes)
+        ? pluckGiantEmote(bodySegments)
         : null;
 
     // Determine bits tier color based on amount (matching Twitch's color scheme)
@@ -2388,57 +2494,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       if (visibleBadges.length === 0 && !seventvBadge && thirdPartyBadges.length === 0 && !isSN) return null;
 
       return (
-        <span className="inline-flex items-center gap-1 mr-1">
-          {visibleBadges.map((badge, idx) => {
-            // Handle both old format (key/info) and new format (name/version)
-            if (!badge.info) return null;
-            return (
-              <Tooltip key={`bits-badge-${badge.key}-${idx}`} content={badge.info.title} side="top">
-                <img
-                  src={getTwitchBadgeUrl(badge.key, badge.info)}
-                  alt={badge.info.title}
-                  className="sn-chat-badge inline-block cursor-pointer hover:scale-110 transition-transform"
-                  onClick={() => onBadgeClick?.(badge.key, badge.info)}
-                  onError={(e) => {
-                    Logger.warn('[Badge] Failed to load badge:', badge.key, badge.info.image_url_1x);
-                    e.currentTarget.style.display = 'none';
-                  }}
-                />
-              </Tooltip>
-            );
-          })}
-          {seventvBadge && (
-            <Tooltip content={`Click for details: ${seventvBadge.description || seventvBadge.name}`} side="top">
-              <button
-                onClick={() => openBadgesWithBadgeInMain(seventvBadge.id)}
-                // A flex box around a block image: an inline-block button put the
-                // image on its text baseline, which sat it lower than the badges
-                // beside it.
-                className="inline-flex items-center cursor-pointer hover:scale-110 transition-transform"
-              >
-                <FallbackImage
-                  src={getBadgeImageUrl(seventvBadge)}
-                  fallbackUrls={getBadgeFallbackUrls(seventvBadge.id).slice(1)}
-                  alt={seventvBadge.description || seventvBadge.name}
-                  className="sn-chat-badge block"
-                />
-              </button>
-            </Tooltip>
-          )}
-          {thirdPartyBadges.filter(badge => badge && badge.imageUrl).map((badge, idx) => (
-            <Tooltip key={`bits-tp-badge-${badge.id}-${idx}`} content={`${badge.title} (${badge.provider.toUpperCase()})`} side="top">
-              <img
-                // 2x, not imageUrl's 4x; see the default layout's badge row.
-                src={badge.image2x || badge.imageUrl}
-                alt={badge.title}
-                className="sn-chat-badge inline-block"
-                onError={(e) => {
-                  e.currentTarget.style.display = 'none';
-                }}
-              />
-            </Tooltip>
-          ))}
-          {isSN && snBadgeOn && <StreamNookBadge userId={senderUserId} />}
+        <span className="sn-badge-strip mr-1.5">
+          <ChatBadgeIcons
+            twitchBadges={visibleBadges}
+            seventvBadge={seventvBadge}
+            thirdPartyBadges={thirdPartyBadges}
+            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            onBadgeClick={onBadgeClick}
+            keyPrefix="ev0"
+          />
         </span>
       );
     };
@@ -2450,34 +2514,55 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       <div key={messageId} className={`px-3 border-t border-borderSubtle ${eventCardClass('bits-gradient')}`} style={{ ...eventCardStyle, paddingTop: `${eventPadding}px`, paddingBottom: `${eventPadding}px` }}>
         <div className="flex items-center gap-2.5">
           <div className="flex-shrink-0">
-            {/* Twitch's animated bits gem for the tier */}
-            <img
-              src={bitsAnimUrl}
-              alt=""
-              className="w-5 h-5 object-contain"
-              decoding="async"
-              referrerPolicy="no-referrer"
-              onError={(e) => { e.currentTarget.style.display = 'none'; }}
-            />
+            {leadCheermote?.cheermoteUrl ? (
+              // The cheermote they cheered with, at its own tier.
+              <Tooltip content={leadCheermote.content} side="top">
+                <img
+                  src={leadCheermote.cheermoteUrl}
+                  alt={leadCheermote.content}
+                  className="w-7 h-7 object-contain"
+                  decoding="async"
+                  referrerPolicy="no-referrer"
+                  onError={(e) => { e.currentTarget.src = bitsAnimUrl; }}
+                />
+              </Tooltip>
+            ) : (
+              // Twitch's animated bits gem for the tier
+              <img
+                src={bitsAnimUrl}
+                alt=""
+                className="w-7 h-7 object-contain"
+                decoding="async"
+                referrerPolicy="no-referrer"
+                onError={(e) => { e.currentTarget.style.display = 'none'; }}
+              />
+            )}
           </div>
           <div
             className="flex-1 min-w-0 flex flex-col leading-relaxed"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
             <p className="text-white font-semibold leading-relaxed">
+              {sourceMarkEl}
               {renderBadges()}
               {cheerTemplate ? (
                 <span style={{ color: bitsTierColor }} className="font-bold">{cheerTemplate}</span>
               ) : (
                 <>
-                  {renderClickableUsername(parsed.username, parsed.tags.get('display-name') || parsed.username)}
-                  <span style={{ color: bitsTierColor }} className="font-bold"> cheered {formattedBits} bits</span>
+                  {renderClickableUsername(parsed.username, parsed.displayName || parsed.tags.get('display-name') || parsed.username)}
+                  <span className="font-normal text-textSecondary"> cheered </span>
+                  <span
+                    className="inline-flex items-center rounded-full px-1.5 align-[1px] text-[0.86em] font-bold leading-[1.45] tabular-nums"
+                    style={{ color: bitsTierColor, boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${bitsTierColor} 45%, transparent)` }}
+                  >
+                    {formattedBits} {bitsCount === 1 ? 'bit' : 'bits'}
+                  </span>
                 </>
               )}
             </p>
-            {parsed.content && (
-              <p className="text-textSecondary mt-1 leading-relaxed break-words">
-                {giantPluckCheer ? giantPluckCheer.inline : renderContent(contentWithEmotes)}
+            {bodyHasContent && (
+              <p className="text-textSecondary mt-0.5 leading-relaxed break-words">
+                {giantPluckCheer ? giantPluckCheer.inline : renderContent(bodySegments)}
               </p>
             )}
             {giantPluckCheer?.giant && (
@@ -2581,56 +2666,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       if (visibleBadges.length === 0 && !seventvBadge && thirdPartyBadges.length === 0 && !isSN) return null;
 
       return (
-        <span className="inline-flex items-center gap-1 mr-1">
-          {visibleBadges.map((badge, idx) => {
-            if (!badge.info) return null;
-            return (
-              <Tooltip key={`donation-badge-${badge.key}-${idx}`} content={badge.info.title} side="top">
-                <img
-                  src={getTwitchBadgeUrl(badge.key, badge.info)}
-                  alt={badge.info.title}
-                  className="sn-chat-badge inline-block cursor-pointer hover:scale-110 transition-transform"
-                  onClick={() => onBadgeClick?.(badge.key, badge.info)}
-                  onError={(e) => {
-                    Logger.warn('[Badge] Failed to load badge:', badge.key, badge.info.image_url_1x);
-                    e.currentTarget.style.display = 'none';
-                  }}
-                />
-              </Tooltip>
-            );
-          })}
-          {seventvBadge && (
-            <Tooltip content={`Click for details: ${seventvBadge.description || seventvBadge.name}`} side="top">
-              <button
-                onClick={() => openBadgesWithBadgeInMain(seventvBadge.id)}
-                // A flex box around a block image: an inline-block button put the
-                // image on its text baseline, which sat it lower than the badges
-                // beside it.
-                className="inline-flex items-center cursor-pointer hover:scale-110 transition-transform"
-              >
-                <FallbackImage
-                  src={getBadgeImageUrl(seventvBadge)}
-                  fallbackUrls={getBadgeFallbackUrls(seventvBadge.id).slice(1)}
-                  alt={seventvBadge.description || seventvBadge.name}
-                  className="sn-chat-badge block"
-                />
-              </button>
-            </Tooltip>
-          )}
-          {thirdPartyBadges.filter(badge => badge && badge.imageUrl).map((badge, idx) => (
-            <Tooltip key={`donation-tp-badge-${badge.id}-${idx}`} content={`${badge.title} (${badge.provider.toUpperCase()})`} side="top">
-              <img
-                // 2x, not imageUrl's 4x; see the default layout's badge row.
-                src={badge.image2x || badge.imageUrl}
-                alt={badge.title}
-                className="sn-chat-badge inline-block"
-                onError={(e) => {
-                  e.currentTarget.style.display = 'none';
-                }}
-              />
-            </Tooltip>
-          ))}
-          {isSN && snBadgeOn && <StreamNookBadge userId={senderUserId} />}
+        <span className="sn-badge-strip mr-1.5">
+          <ChatBadgeIcons
+            twitchBadges={visibleBadges}
+            seventvBadge={seventvBadge}
+            thirdPartyBadges={thirdPartyBadges}
+            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            onBadgeClick={onBadgeClick}
+            keyPrefix="ev1"
+          />
         </span>
       );
     };
@@ -2689,8 +2733,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
             <p className="text-white font-semibold leading-relaxed">
+              {sourceMarkEl}
               {renderBadges()}
-              {renderClickableUsername(parsed.username, parsed.tags.get('display-name') || parsed.username)}
+              {renderClickableUsername(parsed.username, parsed.displayName || parsed.tags.get('display-name') || parsed.username)}
               {isSuperChat ? (
                 <span className="text-success font-bold">
                   {formattedAmount
@@ -2729,7 +2774,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     // Get watch streak details
     const streakValue = parsed.tags.get('msg-param-value'); // Number of consecutive streams
     const channelPointsReward = parsed.tags.get('msg-param-copoReward'); // Channel points earned
-    const displayName = parsed.tags.get('display-name') || parsed.username;
+    const displayName = parsed.displayName || parsed.tags.get('display-name') || parsed.username;
 
     // Helper function to render username as clickable
     const renderClickableUsername = (username: string, displayNameProp?: string) => {
@@ -2767,56 +2812,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       if (visibleBadges.length === 0 && !seventvBadge && thirdPartyBadges.length === 0 && !isSN) return null;
 
       return (
-        <span className="inline-flex items-center gap-1 mr-1">
-          {visibleBadges.map((badge, idx) => {
-            if (!badge.info) return null;
-            return (
-              <Tooltip key={`watchstreak-badge-${badge.key}-${idx}`} content={badge.info.title} side="top">
-                <img
-                  src={getTwitchBadgeUrl(badge.key, badge.info)}
-                  alt={badge.info.title}
-                  className="sn-chat-badge inline-block cursor-pointer hover:scale-110 transition-transform"
-                  onClick={() => onBadgeClick?.(badge.key, badge.info)}
-                  onError={(e) => {
-                    Logger.warn('[Badge] Failed to load badge:', badge.key, badge.info.image_url_1x);
-                    e.currentTarget.style.display = 'none';
-                  }}
-                />
-              </Tooltip>
-            );
-          })}
-          {seventvBadge && (
-            <Tooltip content={`Click for details: ${seventvBadge.description || seventvBadge.name}`} side="top">
-              <button
-                onClick={() => openBadgesWithBadgeInMain(seventvBadge.id)}
-                // A flex box around a block image: an inline-block button put the
-                // image on its text baseline, which sat it lower than the badges
-                // beside it.
-                className="inline-flex items-center cursor-pointer hover:scale-110 transition-transform"
-              >
-                <FallbackImage
-                  src={getBadgeImageUrl(seventvBadge)}
-                  fallbackUrls={getBadgeFallbackUrls(seventvBadge.id).slice(1)}
-                  alt={seventvBadge.description || seventvBadge.name}
-                  className="sn-chat-badge block"
-                />
-              </button>
-            </Tooltip>
-          )}
-          {thirdPartyBadges.filter(badge => badge && badge.imageUrl).map((badge, idx) => (
-            <Tooltip key={`watchstreak-tp-badge-${badge.id}-${idx}`} content={`${badge.title} (${badge.provider.toUpperCase()})`} side="top">
-              <img
-                // 2x, not imageUrl's 4x; see the default layout's badge row.
-                src={badge.image2x || badge.imageUrl}
-                alt={badge.title}
-                className="sn-chat-badge inline-block"
-                onError={(e) => {
-                  e.currentTarget.style.display = 'none';
-                }}
-              />
-            </Tooltip>
-          ))}
-          {isSN && snBadgeOn && <StreamNookBadge userId={senderUserId} />}
+        <span className="sn-badge-strip mr-0.5">
+          <ChatBadgeIcons
+            twitchBadges={visibleBadges}
+            seventvBadge={seventvBadge}
+            thirdPartyBadges={thirdPartyBadges}
+            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            onBadgeClick={onBadgeClick}
+            keyPrefix="ev2"
+          />
         </span>
       );
     };
@@ -2828,16 +2832,14 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       <div key={messageId} className={`px-3 border-t border-borderSubtle ${eventCardClass('watchstreak-gradient')}`} style={{ ...eventCardStyle, paddingTop: `${eventPadding}px`, paddingBottom: `${eventPadding}px` }}>
         <div className="flex items-center gap-2.5">
           <div className="flex-shrink-0">
-            {/* Fire/Watch Streak icon from Twitch */}
-            <svg className="w-5 h-5 text-highlight-orange" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M11 4.5 9 2 4.8 6.9A7.48 7.48 0 0 0 3 11.77C3 15.2 5.8 18 9.23 18h1.65A6.12 6.12 0 0 0 17 11.88c0-1.86-.65-3.66-1.84-5.1L12 3l-1 1.5ZM6.32 8.2 9 5l2 2.5L12 6l1.62 2.07A5.96 5.96 0 0 1 15 11.88c0 2.08-1.55 3.8-3.56 4.08.36-.47.56-1.05.56-1.66 0-.52-.18-1.02-.5-1.43L10 11l-1.5 1.87c-.32.4-.5.91-.5 1.43 0 .6.2 1.18.54 1.64A4.23 4.23 0 0 1 5 11.77c0-1.31.47-2.58 1.32-3.57Z" clipRule="evenodd" />
-            </svg>
+            <WatchStreakFlame size={20} className="text-highlight-orange" />
           </div>
           <div
             className="flex-1 min-w-0 flex flex-col"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
             <p className="text-white font-semibold leading-relaxed flex items-center flex-wrap gap-1">
+              {sourceMarkEl}
               {renderBadges()}
               {renderClickableUsername(parsed.username, displayName)}
               {channelPointsReward && (
@@ -2852,7 +2854,14 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               )}
             </p>
             <p className="text-textSecondary mt-0.5 leading-relaxed break-words">
-              {eventTemplateFor('milestone') ?? `Watched ${streakValue} consecutive streams and sparked a watch streak!`}
+              {/* The header already names the chatter, so custom wording that
+                  opens with the name (`{username} ...`, `{default}`) drops it here. */}
+              {(() => {
+                const custom = eventTemplateFor('milestone');
+                return custom
+                  ? stripLeadingName(custom, [effectiveDisplayName, ...rowSenderNames(parsed)])
+                  : `Watched ${streakValue} consecutive streams and sparked a watch streak!`;
+              })()}
             </p>
             {parsed.content && (
               <p className="text-textPrimary mt-1 leading-relaxed break-words">
@@ -2888,56 +2897,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       if (visibleBadges.length === 0 && !seventvBadge && thirdPartyBadges.length === 0 && !isSN) return null;
 
       return (
-        <span className="inline-flex items-center align-middle gap-1 mr-1">
-          {visibleBadges.map((badge, idx) => {
-            if (!badge.info) return null;
-            return (
-              <Tooltip key={`sub-badge-${badge.key}-${idx}`} content={badge.info.title} side="top">
-                <img
-                  src={getTwitchBadgeUrl(badge.key, badge.info)}
-                  alt={badge.info.title}
-                  className="sn-chat-badge inline-block cursor-pointer hover:scale-110 transition-transform"
-                  onClick={() => onBadgeClick?.(badge.key, badge.info)}
-                  onError={(e) => {
-                    Logger.warn('[Badge] Failed to load badge:', badge.key, badge.info.image_url_1x);
-                    e.currentTarget.style.display = 'none';
-                  }}
-                />
-              </Tooltip>
-            );
-          })}
-          {seventvBadge && (
-            <Tooltip content={`Click for details: ${seventvBadge.description || seventvBadge.name}`} side="top">
-              <button
-                onClick={() => openBadgesWithBadgeInMain(seventvBadge.id)}
-                // A flex box around a block image: an inline-block button put the
-                // image on its text baseline, which sat it lower than the badges
-                // beside it.
-                className="inline-flex items-center cursor-pointer hover:scale-110 transition-transform"
-              >
-                <FallbackImage
-                  src={getBadgeImageUrl(seventvBadge)}
-                  fallbackUrls={getBadgeFallbackUrls(seventvBadge.id).slice(1)}
-                  alt={seventvBadge.description || seventvBadge.name}
-                  className="sn-chat-badge block"
-                />
-              </button>
-            </Tooltip>
-          )}
-          {thirdPartyBadges.filter(badge => badge && badge.imageUrl).map((badge, idx) => (
-            <Tooltip key={`sub-tp-badge-${badge.id}-${idx}`} content={`${badge.title} (${badge.provider.toUpperCase()})`} side="top">
-              <img
-                // 2x, not imageUrl's 4x; see the default layout's badge row.
-                src={badge.image2x || badge.imageUrl}
-                alt={badge.title}
-                className="sn-chat-badge inline-block"
-                onError={(e) => {
-                  e.currentTarget.style.display = 'none';
-                }}
-              />
-            </Tooltip>
-          ))}
-          {isSN && snBadgeOn && <StreamNookBadge userId={senderUserId} />}
+        <span className="sn-badge-strip mr-1.5">
+          <ChatBadgeIcons
+            twitchBadges={visibleBadges}
+            seventvBadge={seventvBadge}
+            thirdPartyBadges={thirdPartyBadges}
+            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            onBadgeClick={onBadgeClick}
+            keyPrefix="ev3"
+          />
         </span>
       );
     };
@@ -2946,18 +2914,26 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     const parseSystemMessageWithClickableNames = (message: string) => {
       if (!message) return null;
 
-      // Pattern to match usernames in the system message
-      // This will match the subscriber's name and recipient names
-      const usernamePattern = /\b([A-Za-z0-9_]{3,25})\b/g;
-      const parts: (string | JSX.Element)[] = [];
-      let lastIndex = 0;
-      let match;
-      let keyIndex = 0;
-
       // Get recipient info from tags
       const recipientUserId = parsed.tags.get('msg-param-recipient-id');
       const recipientUserName = parsed.tags.get('msg-param-recipient-user-name');
       const recipientDisplayName = msgParamRecipientDisplayName;
+
+      // The notice names the sender and recipient by display name, which can
+      // be localized (any script), or by login. Match exactly those names: an
+      // ASCII-word scan never finds a localized one, so it stayed plain text.
+      // The shown name too: custom wording writes it in place of the platform's.
+      const senderNames = [effectiveDisplayName, ...rowSenderNames(parsed)].filter((n): n is string => !!n);
+      const recipientNames = [recipientDisplayName, recipientUserName].filter((n): n is string => !!n);
+      const alternatives = [...senderNames, ...recipientNames]
+        .sort((x, y) => y.length - x.length)
+        .map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      if (alternatives.length === 0) return message;
+      const usernamePattern = new RegExp(`(?<![\\p{L}\\p{N}_])(${alternatives.join('|')})(?![\\p{L}\\p{N}_])`, 'giu');
+      const parts: (string | JSX.Element)[] = [];
+      let lastIndex = 0;
+      let match;
+      let keyIndex = 0;
 
       while ((match = usernamePattern.exec(message)) !== null) {
         const matchedName = match[1];
@@ -2968,9 +2944,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         }
 
         // Check if this is the subscriber's username or recipient's username
-        const isSubscriber = matchedName.toLowerCase() === parsed.username.toLowerCase();
+        const matchedLower = matchedName.toLowerCase();
+        const isSubscriber = senderNames.some((n) => n.toLowerCase() === matchedLower);
         const isRecipient = recipientUserName &&
-          matchedName.toLowerCase() === recipientUserName.toLowerCase();
+          recipientNames.some((n) => n.toLowerCase() === matchedLower);
 
         if (isSubscriber) {
           // Gifter with their badges and cosmetics
@@ -2990,7 +2967,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                       onUsernameClick(
                         userId,
                         parsed.username,
-                        parsed.tags.get('display-name') || parsed.username,
+                        parsed.displayName || parsed.tags.get('display-name') || parsed.username,
                         parsed.color,
                         parsed.badges,
                         e
@@ -3110,6 +3087,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
             <p className="text-white font-semibold leading-relaxed">
+              {sourceMarkEl}
               {parseSystemMessageWithClickableNames(displayMessage)}
             </p>
             {(subMsgId === 'submysterygift' || subMsgId === 'anonsubmysterygift') && giftRecipients.length > 0 && (
@@ -3147,6 +3125,87 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     );
   }
 
+  // Raids arrive as a USERNOTICE with no body, so the plain row would show the
+  // raider's name and nothing else. The card says who raided and with how many.
+  if (msgId === 'raid' || sourceMsgId === 'raid') {
+    const messageId = parsed.tags.get('id') || `raid-${parsed.username}-${parsed.tags.get('tmi-sent-ts') ?? ''}`;
+    const displayName = parsed.displayName || parsed.tags.get('display-name') || parsed.username;
+    const raidViewers = parseInt(parsed.tags.get('msg-param-viewerCount') || '', 10);
+    const raidTemplate = eventTemplateFor('raid');
+
+    const renderBadges = () => {
+      const senderUserId = senderMemberId;
+      const isSN = isSNSender;
+
+      if (visibleBadges.length === 0 && !seventvBadge && thirdPartyBadges.length === 0 && !isSN) return null;
+
+      return (
+        <span className="sn-badge-strip mr-1.5">
+          <ChatBadgeIcons
+            twitchBadges={visibleBadges}
+            seventvBadge={seventvBadge}
+            thirdPartyBadges={thirdPartyBadges}
+            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            onBadgeClick={onBadgeClick}
+            keyPrefix="ev4"
+          />
+        </span>
+      );
+    };
+
+    const eventPadding = calculateHalfPadding(chatDesign?.message_spacing ?? 8);
+
+    return (
+      <div key={messageId} className={`px-3 border-t border-borderSubtle ${eventCardClass('raid-gradient')}`} style={{ ...eventCardStyle, paddingTop: `${eventPadding}px`, paddingBottom: `${eventPadding}px` }}>
+        <div className="flex items-center gap-2.5">
+          <div className="flex-shrink-0">
+            <svg className="w-5 h-5 text-highlight-red" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+              <path d="M7 6a3 3 0 1 1 6 0 3 3 0 0 1-6 0ZM3.5 8.5a2 2 0 1 1 4 0 2 2 0 0 1-4 0ZM12.5 8.5a2 2 0 1 1 4 0 2 2 0 0 1-4 0ZM5 15a5 5 0 0 1 10 0v2H5v-2ZM1 16a3.5 3.5 0 0 1 3.6-3.5A6.5 6.5 0 0 0 3.5 15v2H1v-1ZM19 16a3.5 3.5 0 0 0-3.6-3.5 6.5 6.5 0 0 1 1.1 2.5v2H19v-1Z" />
+            </svg>
+          </div>
+          <div
+            className="flex-1 min-w-0 flex flex-col leading-relaxed"
+            style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
+          >
+            <p className="text-white font-semibold leading-relaxed">
+              {sourceMarkEl}
+              {raidTemplate ? (
+                <span className="text-highlight-red font-bold">{raidTemplate}</span>
+              ) : (
+                <>
+                  {renderBadges()}
+                  <Tooltip content="Click to view profile" side="top">
+                    <span
+                      className="font-bold cursor-pointer hover:underline"
+                      style={usernameStyle}
+                      onClick={(e) => {
+                        if (clickUserId && onUsernameClick) {
+                          onUsernameClick(clickUserId, parsed.username, displayName, parsed.color, parsed.badges, e, clickProvider);
+                        }
+                      }}
+                    >
+                      {effectiveDisplayName || displayName}
+                    </span>
+                  </Tooltip>
+                  <span className="text-highlight-red font-bold">
+                    {Number.isFinite(raidViewers)
+                      ? ` is raiding with ${raidViewers.toLocaleString()} ${raidViewers === 1 ? 'viewer' : 'viewers'}!`
+                      : ' is raiding!'}
+                  </span>
+                </>
+              )}
+            </p>
+            {parsed.content && (
+              <p className="text-textSecondary mt-1 leading-relaxed break-words">
+                {renderContent(contentWithEmotes)}
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // Handle system messages directly to apply strict yellow styling without username
   if (isSystemMessage) {
     const eventPadding = calculateHalfPadding(chatDesign?.message_spacing ?? 8);
@@ -3167,6 +3226,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           </div>
           <div className="flex-1 min-w-0">
             <p className="text-warning font-medium text-xs leading-relaxed">
+              {sourceMarkEl}
               {renderContent(contentWithEmotes)}
             </p>
           </div>
@@ -3183,6 +3243,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
 
   // Build dynamic styles based on chat design settings
   // Use consistent padding on container - spacing between messages is handled via py classes
+  const deletedStyle = chatDesign?.deleted_message_style ?? DEFAULT_DELETED_STYLE;
   const messageSpacing = chatDesign?.message_spacing ?? 8;
   const messageStyle: React.CSSProperties = {
     paddingTop: `${Math.max(4, messageSpacing / 2)}px`,
@@ -3249,6 +3310,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     .padStart(2, '0');
   const showHighlightBg = displayStyle === 'standard';
   const showHighlightBorder = displayStyle !== 'none';
+  // Keep tinted: a mention or reply to you holds its color while on screen,
+  // and so does a phrase/user/badge match whose rule asks for it. The rule's
+  // own choice wins over the Highlight Appearance display style.
+  const mentionHoldBg =
+    (isMentioned || isReplyToMe) && chatDesign?.mention_hold === true && borderLeftColor
+      ? mentionHoldBackground(borderLeftColor, tintOpacityPct)
+      : phraseMatch?.hold && !isMentioned && !isReplyToMe
+        ? mentionHoldBackground(phraseMatch.color, tintOpacityPct)
+        : undefined;
 
   // Compose built-in event tint styles inline. The configurable color drives
   // a gradient (alpha controlled by tintOpacityPct). Phrase/mention/reply
@@ -3270,15 +3340,51 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           .padStart(2, '0')}, transparent)`
       : undefined;
 
+  // The left edge (slider or line buttons) acts on a chatter this viewer can
+  // act on: not the viewer, not the channel's owner and, unless the viewer
+  // owns the channel, not another moderator (Twitch refuses mod-on-mod
+  // actions). Line buttons take the edge while they are on, so the slider
+  // grip is not drawn then.
+  const sliderTargetId = parsed.provider && parsed.provider !== 'twitch' ? providerUserId : parsed.tags.get('user-id');
+  const viewerOwnsChannel = !!broadcasterId && currentUser?.user_id === broadcasterId;
+  const canActOnChatter =
+    canModerateThisRow &&
+    !!broadcasterId &&
+    !!sliderTargetId &&
+    !isOwnMessage &&
+    sliderTargetId !== broadcasterId &&
+    (viewerOwnsChannel || !/(?:^|,)moderator\//.test(parsed.tags.get('badges') ?? ''));
+  const lineButtonsOn = chatDesign?.mod_line_buttons === true;
+  const showModLine = canActOnChatter && lineButtonsOn && !!modLine?.length && !!thisMessageId;
+  const showModSlider = canActOnChatter && !lineButtonsOn && chatDesign?.mod_slider !== false;
+
+  // Right-click anywhere on a message replies to it, as on the name. A part
+  // that handled the click itself keeps it (the name; an emote, which goes
+  // into the composer), links and buttons keep the plain no-menu default, and
+  // a text selection touching this row falls through to the Copy menu.
+  const handleRowContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.defaultPrevented || !onUsernameRightClick) return;
+    const messageId = parsed.tags.get('id');
+    if (!messageId) return;
+    if ((e.target as HTMLElement).closest('a, button, input, textarea')) return;
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && selection.toString().trim() && selection.containsNode(e.currentTarget, true)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    onUsernameRightClick(messageId, parsed.username);
+  };
+
   return (
     <div
       className={`group relative isolate px-3 hover:bg-glass transition-colors ${borderClass} ${animationClass
         }${ftClass} ${isRedemption ? 'highlight-message-gradient' : ''
-        } ${isFromSharedChat ? 'border-l-2 border-l-accent/50 bg-accent/5' : ''
-        } ${moderationContext && (chatDesign?.deleted_message_style ?? 'strikethrough') !== 'keep' ? 'opacity-50' : ''} ${bodyDragEnabled ? 'select-none cursor-grab' : ''} ${isBeingDragged ? 'overflow-hidden' : ''}`}
+        } ${isFromSharedChat && !(isMentioned || isReplyToMe) ? 'sn-shared-row' : ''
+        } ${moderationContext && deletedRowDimmed(deletedStyle) ? 'opacity-50' : ''} ${isBeingDragged ? 'overflow-hidden' : ''}`}
       style={{
         ...messageStyle,
-        ...(builtInEventBg ? { backgroundImage: builtInEventBg } : {}),
+        // A partner row's channel color (sn-shared-row's edge and wash).
+        ...(isFromSharedChat && sharedSource ? ({ '--sn-src': sharedSource.color } as React.CSSProperties) : {}),
+        ...(mentionHoldBg ?? builtInEventBg ? { backgroundImage: mentionHoldBg ?? builtInEventBg } : {}),
         ...(ftRing ? ({ '--sn-ft-color': builtInEventColor } as React.CSSProperties) : {}),
         borderLeftColor: (isMentioned || isReplyToMe)
           ? borderLeftColor
@@ -3308,12 +3414,20 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           ? { paddingLeft: 18, paddingRight: 18, paddingTop: 7, paddingBottom: 7, minHeight: 36 }
           : {}),
       }}
-      onPointerDown={handleBodyPickup}
+      data-mod-dock={dockOffered ? 'true' : undefined}
+      onContextMenu={handleRowContextMenu}
       onPointerEnter={(e) => {
         if (!hoverArmed) setHoverArmed(true);
         if (animateEmotes === 'hover' && e.pointerType !== 'touch') setRowHovering(true);
       }}
-      onPointerLeave={animateEmotes === 'hover' ? () => setRowHovering(false) : undefined}
+      onPointerLeave={
+        animateEmotes === 'hover' || timeoutLengthsOpen
+          ? () => {
+              setRowHovering(false);
+              setTimeoutLengthsOpen(false);
+            }
+          : undefined
+      }
     >
       {/* Atmosphere wash: the same animated aurora as the member's profile
           backdrop, masked to fade out before the text so it stays readable. */}
@@ -3345,15 +3459,21 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         </>
       )}
 
-      {/* "Grab to drag" hint: an accent bar down the left edge that fades in on
-          hover whenever whole-message drag is enabled (pairs with the grab
-          cursor). Full-height accent + soft shadow so it pops over the Atmosphere
-          and on any theme. */}
-      {bodyDragEnabled && (
-        <div
-          aria-hidden="true"
-          className="pointer-events-none absolute inset-y-1 left-0 z-20 w-1.5 rounded-r-md bg-accent shadow-[1px_0_4px_rgba(0,0,0,0.45)] opacity-0 group-hover:opacity-100 transition-opacity duration-150"
-        />
+      {/* The left-edge handle, the only place a mod gesture starts: with
+          Message edge on Slider it is the slider's grip; on Tiles it lifts the
+          chatter to the tiles. One edge at a time, so the setting always says
+          what is there. An accent bar fades in on hover over a 12 px strip
+          that wears the grab cursor. Full-height accent + soft shadow so it
+          pops over the Atmosphere and on any theme. */}
+      {hoverArmed && showModSlider && (
+        <ModSlider provider={parsed.provider ?? 'twitch'} target={modTarget()} messageId={thisMessageId} />
+      )}
+      {hoverArmed && bodyDragEnabled && chatDesign?.mod_slider === false && !lineButtonsOn && (
+        // The slider's grip look (globals.css .sn-mod-grip), so both edges
+        // read the same; mounted once the row is hovered, like the slider.
+        <div aria-hidden="true" data-mod-edge="true" className="sn-mod-grip" onPointerDown={handleBodyPickup}>
+          <div className="sn-mod-grip-bar pointer-events-none" />
+        </div>
       )}
 
       {/* Built-in event label (first-time chatter, returning, self, raid) */}
@@ -3368,13 +3488,28 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         </div>
       )}
       {/* Channel points redemption indicator (highlight, gigantify, animate, skip-subs-mode, custom reward) */}
-      {redemptionLabel && (
-        <div className="flex items-center justify-end gap-1">
-          <svg className="w-3 h-3 text-highlight-cyan opacity-60" viewBox="0 0 20 20" fill="currentColor">
+      {redemptionLabel && !isRewardEventRow && (
+        <div className="flex min-w-0 items-center justify-end gap-1">
+          <svg className="w-3 h-3 flex-shrink-0 text-highlight-cyan opacity-60" viewBox="0 0 20 20" fill="currentColor">
             <path d="M10 6a4 4 0 014 4h-2a2 2 0 00-2-2V6z" />
             <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-2 0a6 6 0 11-12 0 6 6 0 0112 0z" clipRule="evenodd" />
           </svg>
-          <span className="text-xs text-highlight-cyan font-normal opacity-60">{redemptionLabel}</span>
+          <span className="min-w-0 truncate text-xs text-highlight-cyan font-normal opacity-60">{redemptionLabel}</span>
+          {redeemedTitle && redeemedCost && (
+            <span className="inline-flex flex-shrink-0 items-center gap-0.5 text-xs text-highlight-cyan/80 font-medium tabular-nums">
+              {redemptionPointsIcon ? (
+                <img
+                  src={redemptionPointsIcon}
+                  alt=""
+                  className="w-3 h-3 inline-block rounded-full object-cover"
+                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                />
+              ) : (
+                <ChannelPointsIcon size={12} className="text-highlight-cyan/80" />
+              )}
+              {Number(redeemedCost).toLocaleString()}
+            </span>
+          )}
         </div>
       )}
       {/* Reply indicator */}
@@ -3400,7 +3535,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               <svg className="flex-shrink-0" style={{ width: '1.1em', height: '1.1em' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
               </svg>
-              <span className="font-semibold">{getDisplayedName(parsed.replyInfo.parentUserId, parsed.replyInfo.parentDisplayName, userOverrides)}</span>
+              <span className="font-semibold">{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}</span>
               <span className="truncate flex-1">
                 {replyPreviewSegments
                   ? replyPreviewSegments.map((seg, i) =>
@@ -3441,25 +3576,41 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             block hugging the badges + name + message (the timestamp gets its
             own separate frost above), so the text/badges stay readable over a
             busy wash. */}
-        <div className={atmosphereFrost ? `inline-block max-w-full rounded-md px-1.5 py-0.5 ${frostClass}` : 'min-w-0'}>
+        {/* The row carries the chat font size so badges, name and text are all
+            measured against the same line: the badge group centres on it and the
+            text sits on its baseline, so a tall emote grows the line without
+            moving the name away from the badges. */}
+        <div
+          className={atmosphereFrost ? `inline-block max-w-full rounded-md px-1.5 py-0.5 ${frostClass}` : 'min-w-0'}
+          style={{ fontSize: `${chatDesign?.font_size ?? 14}px`, lineHeight: 1.625 }}
+        >
           {/* Where this row came from, when it is not the platform being watched.
               FIRST, ahead of the avatar and every badge, because it answers
               "which community is this" before anything about who they are in
               it — and because a mark that has to be hunted for between badges
               is not doing its one job. Small on purpose: it is a marker, not a
               badge, and most rows in a merged feed do not carry one at all. */}
-          {showPlatformMark && (
+          {/* Line buttons lead even that: a moderator's tool, in the same spot
+              on every line they can act on. */}
+          {showModLine && thisMessageId && <ModLineButtons target={modTarget()} messageId={thisMessageId} />}
+          {sourceMarkEl ?? (showPlatformMark && (
             <ProviderLogo
               provider={rowSourceProvider}
               size={Math.round((chatDesign?.font_size ?? 14) * 0.85)}
               className="mr-1 inline-block align-middle"
             />
-          )}
+          ))}
           {/* YouTube / TikTok native inline avatar — leads the row (before badges)
               so it shows even for chatters with no badges. The picture rides every
               message (those adapters stamp it onto the `avatar` tag). */}
           {chatDesign?.show_avatars !== false && (parsed.provider === 'youtube' || parsed.provider === 'tiktok') && parsed.tags.get('avatar') && (
-            <img
+            // A 7TV picture (YouTube chatters can link one) draws as a still
+            // here under On hover, since a chat row is the densest list there
+            // is; Always moves it while the row is on screen.
+            <SevenTvAvatar
+              cosmeticsId={cosmeticsKey}
+              ask={false}
+              px={Math.round((chatDesign?.font_size ?? 14) * 1.4)}
               src={parsed.tags.get('avatar')}
               alt=""
               className="inline-block rounded-full mr-1.5 align-middle object-cover"
@@ -3475,14 +3626,22 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           )}
           {/* Badges */}
           {isSN || (isFromSharedChat && channelProfileImage) || visibleBadges.length > 0 || seventvBadge || thirdPartyBadges.length > 0 ? (
-            <span className="inline-flex items-center gap-1 mr-1.5 align-middle">
-              {/* Shared chat channel profile image badge */}
+            <span
+              className="sn-badge-strip mr-1.5"
+              // .sn-chat-badge is sized in em: this row must carry the chat
+              // font size, as every event layout's badge row already does.
+              style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
+            >
+              {/* The partner channel's face leads the row: round, ringed in
+                  its own color (sn-shared-face), never one more badge square. */}
               {isFromSharedChat && channelProfileImage && (
-                <Tooltip content={`Chatting from ${fetchedChannelName || 'shared channel'}`} side="top">
-                  <img
+                <Tooltip content={`From ${sharedSource?.display_name || fetchedChannelName || 'a shared chat'}`} side="top">
+                  <SevenTvAvatar
+                    cosmeticsId={sourceRoomId}
+                    px={Math.round((chatDesign?.font_size ?? 14) * 1.3)}
                     src={channelProfileImage}
-                    alt={`${fetchedChannelName || 'Channel'} profile`}
-                    className="w-5 h-5 cursor-pointer hover:scale-110 transition-transform object-cover"
+                    alt={`From ${sharedSource?.display_name || fetchedChannelName || 'a shared chat'}`}
+                    className="sn-chat-badge sn-shared-face block cursor-pointer hover:scale-110 transition-transform object-cover"
                     onClick={async () => {
                       if (fetchedChannelName) {
                         try {
@@ -3499,66 +3658,20 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   />
                 </Tooltip>
               )}
-              {/* Twitch badges, in the order Rust set (chat_layout::twitch_badge_rank):
-                  roles, then subscription, then earned in the channel, then global. */}
-              {visibleBadges.map((badge, idx) => {
-                if (!badge.info) return null;
-                return (
-                  <Tooltip key={`${badge.key}-${idx}`} content={badge.info.title} side="top">
-                    <img
-                      src={getTwitchBadgeUrl(badge.key, badge.info)}
-                      alt={badge.info.title}
-                      className="sn-chat-badge cursor-pointer hover:scale-110 transition-transform"
-                      onClick={() => onBadgeClick?.(badge.key, badge.info)}
-                      onError={(e) => {
-                        // Hide broken badge images
-                        Logger.warn('[Badge] Failed to load badge:', badge.key, badge.info.image_url_1x);
-                        e.currentTarget.style.display = 'none';
-                      }}
-                    />
-                  </Tooltip>
-                );
-              })}
-              {seventvBadge && (
-                <Tooltip content={`Click for details: ${seventvBadge.description || seventvBadge.name}`} side="top">
-                  <button
-                    onClick={() => openBadgesWithBadgeInMain(seventvBadge.id)}
-                    className="inline-block cursor-pointer hover:scale-110 transition-transform"
-                  >
-                    <FallbackImage
-                      src={getBadgeImageUrl(seventvBadge)}
-                      fallbackUrls={getBadgeFallbackUrls(seventvBadge.id).slice(1)}
-                      alt={seventvBadge.description || seventvBadge.name}
-                      className="sn-chat-badge"
-                    />
-                  </button>
-                </Tooltip>
-              )}
-              {/* Third-party badges (FFZ, Chatterino, Homies, Moltorino, ...). The
-                  row is a 20px box, so the 2x variant is the right one: `imageUrl`
-                  is the 4x file, which for Moltorino is a 72px, 120-frame, ~960KB
-                  animated webp per badge. Member-loadout badges carry one URL for
-                  every size, so the fallback keeps them unchanged. */}
-              {thirdPartyBadges.filter(badge => badge && badge.imageUrl).map((badge, idx) => (
-                <Tooltip key={`tp-badge-${badge.id}-${idx}`} content={`${badge.title} (${badge.provider.toUpperCase()})`} side="top">
-                  <img
-                    src={badge.image2x || badge.imageUrl}
-                    alt={badge.title}
-                    className="sn-chat-badge"
-                    onError={(e) => {
-                      e.currentTarget.style.display = 'none';
-                    }}
-                  />
-                </Tooltip>
-              ))}
-              {/* StreamNook identity badge sits rightmost, next to the name (see utils/badgeOrder). */}
-              {isSN && snBadgeOn && <StreamNookBadge userId={senderUserId} />}
+              <ChatBadgeIcons
+                twitchBadges={visibleBadges}
+                seventvBadge={seventvBadge}
+                thirdPartyBadges={thirdPartyBadges}
+                streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+                onBadgeClick={onBadgeClick}
+                keyPrefix="badge"
+              />
             </span>
           ) : null}
 
           {/* Message content */}
           <span
-            className="leading-relaxed align-middle"
+            className="leading-relaxed"
             style={{
               fontSize: `${chatDesign?.font_size ?? 14}px`,
               fontWeight: chatDesign?.font_weight ?? 400,
@@ -3573,7 +3686,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                     className="cursor-pointer hover:underline inline-block"
                     onClick={(e) => {
                       const userId = clickUserId;
-                      const displayName = parsed.tags.get('display-name') || parsed.username;
+                      const displayName = parsed.displayName || parsed.tags.get('display-name') || parsed.username;
                       if (userId && onUsernameClick) {
                         onUsernameClick(
                           userId,
@@ -3616,12 +3729,12 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   name={renderedName}
                   nameTextStyle={usernameStyle}
                   nameStyle={nameStyle}
-                  separator={nameSeparator}
+                  separator={isRewardEventRow ? 'none' : nameSeparator}
                   accentColor={prefixAccentColor}
                   interactive
                   onClick={(e) => {
                     const userId = clickUserId;
-                    const displayName = parsed.tags.get('display-name') || parsed.username;
+                    const displayName = parsed.displayName || parsed.tags.get('display-name') || parsed.username;
                     if (userId && onUsernameClick) {
                       onUsernameClick(
                         userId,
@@ -3659,14 +3772,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   tooltipClassName={MEMBER_REVEAL_CARD_CLASS}
                 />
                 <span style={{ fontWeight: 'var(--chat-body-weight, 300)' }} className="text-textPrimary break-words">
-                  <span
-                    style={
-                      moderationContext && (chatDesign?.deleted_message_style ?? 'strikethrough') === 'strikethrough'
-                        ? { textDecoration: 'line-through' }
-                        : undefined
-                    }
-                  >
-                    {' '}{replyMentionNode}{giantPluck ? giantPluck.inline : renderContent(contentWithEmotes)}
+                  <span style={moderationContext ? deletedBodyStyle(deletedStyle) : undefined}>
+                    {' '}{isRewardEventRow && <span className="text-textSecondary">redeemed </span>}{replyMentionNode}{giantPluck ? giantPluck.inline : renderContent(contentWithEmotes)}
                   </span>
                   {redemptionCost && (
                     <span className="inline-flex items-center gap-0.5 ml-1 align-middle text-highlight-cyan/90 font-medium">
@@ -3683,15 +3790,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                       {Number(redemptionCost).toLocaleString()}
                     </span>
                   )}
-                  {moderationContext && (chatDesign?.deleted_message_style ?? 'strikethrough') === 'strikethrough' && (
-                    <span className="ml-1.5 text-xs text-error/70 font-medium">
-                      {moderationContext.type === 'timeout'
-                        ? `[timed out for ${moderationContext.duration}s]`
-                        : moderationContext.type === 'ban'
-                          ? '[banned]'
-                          : '[deleted by mod]'}
-                    </span>
-                  )}
+                  {moderationContext && <ModerationTag context={moderationContext} style={deletedStyle} />}
                   {showRepeatCount && (
                     <Tooltip content={repeatTooltip} side="top">
                       <span
@@ -3732,16 +3831,111 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           ))}
         </div>
       )}
-      {/* Inline quick-actions ON the message itself (top-right) — NOT the mod
-          menu: Copy for everyone + Pin for mods (when the pin style includes
-          inline). Hover-revealed; data-no-drag so they never start a mod drag. */}
-      {hoverArmed && (onMessageCopy || showInlinePin) && broadcasterId && (
+      {/* Hover actions: one cluster inside the row's own box, top right. Copy
+          for everyone and Pin for mods sit at the right, where Copy always
+          was; for a mod the quick timeout (its length printed) comes next,
+          then Delete, and Ban farthest from Copy. Inside the row every button
+          belongs to the line under the pointer (a menu above the row covered
+          the line before it), and the list holds still while a mod points at
+          the row (ChatMessageList), so nothing slides away mid-aim. The other
+          lengths open on a click, in place, and their close button lands on
+          the chevron's own spot, so a double click only toggles. data-no-drag
+          so nothing here starts a mod drag. */}
+      {hoverArmed && (onMessageCopy || (showInlinePin && !!broadcasterId) || dockOffered) && (
         <div
           data-no-drag="true"
-          className="absolute top-1 right-2 z-[50] opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5 p-0.5 rounded-lg bg-tertiary/90 backdrop-blur-sm border border-white/10 shadow-[0_4px_12px_rgba(0,0,0,0.4)]"
+          data-row-dock="true"
+          className="absolute top-px right-2 z-[50] opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-0.5 p-0.5 rounded-lg backdrop-blur-md border border-white/10 shadow-[0_4px_12px_rgba(0,0,0,0.4)]"
+          // It sits over the message's end, so the text under it must not
+          // show through; fully opaque at 0% glassiness.
+          style={{ backgroundColor: 'color-mix(in srgb, var(--color-background-tertiary) calc(95% + (1 - var(--glass-strength, 1)) * 5%), transparent)' }}
         >
-          {showInlinePin && thisMessageId && parsed.provider === 'twitch' && (
-            <Tooltip content={isThisPinned ? 'Unpin message' : 'Pin message'} side="left">
+          {dockOffered && (timeoutLengthsOpen ? (
+            <>
+              <DockTimeoutPresets
+                provider={parsed.provider ?? 'twitch'}
+                onPick={(seconds, withReason) => {
+                  setTimeoutLengthsOpen(false);
+                  if (withReason) { prefillModCommand(seconds); return; }
+                  void modBan(seconds);
+                }}
+              />
+              <Tooltip content="Close lengths" side="top">
+                <button
+                  aria-label="Close lengths"
+                  onClick={(e) => { e.preventDefault(); setTimeoutLengthsOpen(false); }}
+                  className="flex h-[22px] w-4 items-center justify-center rounded-md text-white/50 hover:text-white hover:bg-surface-hover transition-colors"
+                >
+                  <X size={10} weight="bold" />
+                </button>
+              </Tooltip>
+            </>
+          ) : (
+            <>
+              {/* Ban and timeouts only where they can land: not on your own
+                  message, the owner's, or another mod's unless it is your
+                  channel. Delete works on any message you moderate. */}
+              {canActOnChatter && (
+                <Tooltip content={`Ban ${modTarget().targetName}. Shift-click to add a reason.`} side="top">
+                  <button
+                    aria-label={`Ban ${modTarget().targetName}`}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (e.shiftKey) { prefillModCommand(null); return; }
+                      void modBan(null);
+                    }}
+                    className="p-1 rounded-md text-white/50 hover:text-error hover:bg-error/15 transition-colors"
+                  >
+                    <Prohibit size={14} weight="bold" />
+                  </button>
+                </Tooltip>
+              )}
+              {thisMessageId && (
+                <Tooltip content="Delete this message" side="top">
+                  <button
+                    aria-label="Delete this message"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      void modDelete(thisMessageId);
+                    }}
+                    className="p-1 rounded-md text-white/50 hover:text-error hover:bg-error/15 transition-colors"
+                  >
+                    <Trash size={14} weight="bold" />
+                  </button>
+                </Tooltip>
+              )}
+              {canActOnChatter && (
+              <>
+              <Tooltip content={`Time out ${modTarget().targetName} for 10m. Shift-click to add a reason.`} side="top">
+                <button
+                  aria-label={`Time out ${modTarget().targetName} for 10m`}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    if (e.shiftKey) { prefillModCommand(600); return; }
+                    void modBan(600);
+                  }}
+                  className="flex h-[22px] items-center gap-1 rounded-md px-1 text-[11px] font-semibold leading-none text-white/50 hover:text-warning hover:bg-warning/20 transition-colors"
+                >
+                  <Clock size={14} weight="bold" />
+                  10m
+                </button>
+              </Tooltip>
+              <Tooltip content="Other lengths" side="top">
+                <button
+                  aria-label="Other timeout lengths"
+                  onClick={(e) => { e.preventDefault(); setTimeoutLengthsOpen(true); }}
+                  className="flex h-[22px] w-4 items-center justify-center rounded-md text-white/50 hover:text-warning hover:bg-warning/20 transition-colors"
+                >
+                  <CaretDown size={10} weight="bold" />
+                </button>
+              </Tooltip>
+              </>
+              )}
+            </>
+          ))}
+          {dockOffered && (onMessageCopy || showInlinePin) && <div className="mx-0.5 h-4 w-px bg-white/10" />}
+          {showInlinePin && broadcasterId && thisMessageId && parsed.provider === 'twitch' && (
+            <Tooltip content={isThisPinned ? 'Unpin message' : 'Pin message'} side="top">
               <button
                 onClick={async (e) => {
                   e.preventDefault();
@@ -3761,106 +3955,23 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                     useAppStore.getState().addToast(isThisPinned ? "Couldn't unpin that message" : "Couldn't pin that message", 'error');
                   });
                 }}
-                className={`p-1.5 rounded-md transition-colors ${isThisPinned ? 'text-accent hover:text-error hover:bg-error/15' : 'text-white/50 hover:text-accent hover:bg-accent/15'}`}
+                className={`p-1 rounded-md transition-colors ${isThisPinned ? 'text-accent hover:text-error hover:bg-error/15' : 'text-white/50 hover:text-accent hover:bg-accent/15'}`}
               >
-                {isThisPinned ? (
-                  <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="2" x2="22" y1="2" y2="22"/><line x1="12" x2="12" y1="17" y2="22"/><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h12"/><path d="M15 9.34V6h1a2 2 0 0 0 0-4H7.89"/></svg>
-                ) : (
-                  <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" x2="12" y1="17" y2="22"/><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"/></svg>
-                )}
+                {isThisPinned ? <PushPinSlash size={14} weight="bold" /> : <PushPin size={14} weight="bold" />}
               </button>
             </Tooltip>
           )}
           {onMessageCopy && (
-            <Tooltip content="Copy message" side="left">
+            <Tooltip content="Copy message" side="top">
               <button
+                aria-label="Copy message"
                 onClick={(e) => { e.preventDefault(); onMessageCopy(parsed.content); }}
-                className="p-1.5 rounded-md text-white/50 hover:text-white hover:bg-surface-hover transition-colors"
+                className="p-1 rounded-md text-white/50 hover:text-white hover:bg-surface-hover transition-colors"
               >
-                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                <Copy size={14} weight="bold" />
               </button>
             </Tooltip>
           )}
-        </div>
-      )}
-
-      {/* Moderation menu: floats ABOVE the message (7TV-style), mod-only. The
-          punitive actions live here, away from the message text; Copy + Pin are
-          inline above. */}
-      {hoverArmed && canModerateThisRow && showModButtons && broadcasterId && (
-        <div
-          data-no-drag="true"
-          className="absolute bottom-full right-2 mb-0.5 opacity-0 group-hover:opacity-100 transition-[opacity,transform] duration-200 flex items-center gap-0.5 p-0.5 backdrop-blur-md border border-white/10 shadow-[0_8px_24px_rgba(0,0,0,0.55)] rounded-xl overflow-visible z-[50] translate-y-1 group-hover:translate-y-0"
-          // Themed (was hardcoded zinc-900); transition stays scoped so the
-          // backdrop-filter itself is never animated.
-          style={{ backgroundColor: 'color-mix(in srgb, var(--color-background-tertiary) 95%, transparent)' }}
-        >
-              {/* Delete Message (Twitch + Kick). */}
-              <Tooltip content="Delete Message" side="top">
-                <button
-                  onClick={(e) => {
-                    e.preventDefault();
-                    const msgId = parsed.tags.get('id');
-                    if (msgId) void modDelete(msgId);
-                  }}
-                  className="p-2 rounded-lg hover:bg-error/15 text-white/50 hover:text-error transition-colors"
-                >
-                  <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                </button>
-              </Tooltip>
-              <div className="w-px h-5 bg-white/10" />
-
-              {/* Quick Timeout (10m) */}
-              <div className="relative flex group/timeout">
-            <Tooltip content="Timeout User (10m) — shift-click to add a reason" side="top">
-              <button
-                onClick={(e) => {
-                  e.preventDefault();
-                  if (e.shiftKey) { prefillModCommand(600); return; }
-                  void modBan(600);
-                }}
-                className="p-2 rounded-lg hover:bg-warning/20 text-white/50 hover:text-warning transition-colors"
-              >
-                <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-              </button>
-            </Tooltip>
-            
-            {/* Timeout Dropdown */}
-            <div className="absolute bottom-full left-1/2 -translate-x-1/2 opacity-0 pointer-events-none group-hover/timeout:opacity-100 group-hover/timeout:pointer-events-auto transition-opacity px-2 pb-1.5">
-              <div className="flex bg-tertiary border border-white/10 rounded-md shadow-xl overflow-hidden">
-                {timeoutPresets.map(opt => (
-                  <button
-                    key={opt.val}
-                    className="px-2 py-1 text-[10px] font-bold text-white/70 hover:text-warning hover:bg-white/10 transition-colors border-r border-white/5 last:border-0"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      if (e.shiftKey) { prefillModCommand(opt.val); return; }
-                      void modBan(opt.val);
-                    }}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="w-px h-5 bg-white/10" />
-
-          {/* Quick Ban */}
-          <Tooltip content="Ban User — shift-click to add a reason" side="top">
-            <button
-              onClick={(e) => {
-                e.preventDefault();
-                if (e.shiftKey) { prefillModCommand(null); return; }
-                void modBan(null);
-              }}
-              className="p-2 rounded-lg hover:bg-error/15 text-white/50 hover:text-error transition-colors"
-            >
-              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-            </button>
-          </Tooltip>
         </div>
       )}
     </div>

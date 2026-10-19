@@ -4,7 +4,7 @@ import { useAppStore, ensureHomeSnapshotSync, announceHome, clipSourceOf, HomeTa
 import { IS_LINUX, IS_MOBILE } from '../utils/platform';
 import { createPortal } from 'react-dom';
 import { glowThumbProps } from '../utils/mediaGlow';
-import { Search, Heart, X, Pickaxe, LayoutGrid, Flame, ArrowUpRight, Undo2, Users, User, Loader2, Clock, Play, Check, Plus, Compass, List } from 'lucide-react';
+import { Search, Heart, X, Pickaxe, LayoutGrid, Flame, ArrowUpRight, Undo2, Users, User, Loader2, Clock, Play, Check, Plus, Compass, List, MessageSquare } from 'lucide-react';
 import { Package, UsersThree } from 'phosphor-react';
 import { MediaCard } from './MediaCard';
 import ContinueWatchingRow from './ContinueWatchingRow';
@@ -27,6 +27,8 @@ import { WATCHABLE_PROVIDERS, PROVIDER_WATCH, providerLabel, type ProviderId, ty
 import { useFollowsStore } from '../stores/followsStore';
 import { favoriteIdOf, favoriteMetaOf } from '../utils/favorites';
 import { streamProvider, streamKey, followIdentifier, isTwitchStream } from '../utils/streamProvider';
+import { lastLiveLabel } from '../utils/lastLive';
+import { streamMiddleClickHandlers } from '../utils/openInMultiNook';
 import { isPortraitGrid, thumbFitFor } from '../utils/thumbFit';
 import { makeKey } from '../utils/providerKey';
 
@@ -43,6 +45,8 @@ import {
 
 import { formatViewerCount } from '../utils/streamStats';
 import { useStreamAvatars } from '../hooks/useStreamAvatars';
+import { SevenTvAvatar } from './SevenTvAvatar';
+import { sevenTvIdForStream } from '../services/sevenTvPictures';
 import { useVisibleAvatarKeys } from '../hooks/useVisibleAvatarKeys';
 import { useTitleBarNavDensity } from '../hooks/useTitleBarNavDensity';
 import { Logger } from '../utils/logger';
@@ -52,6 +56,7 @@ import { CardChip } from './ui/CardChip';
 import { AutomationPulse } from './ui/AutomationPulse';
 import { TogetherChip } from './SharedViewers';
 import { groupFor } from '../utils/sharedViewers';
+import { signInReasonText, useTwitchSignInReason } from '../utils/twitchSignIn';
 // Types for drops data
 interface DropCampaign {
     id: string;
@@ -193,6 +198,8 @@ const Home = () => {
         setVideosPeriod,
         setMediaSearchQuery,
     } = useAppStore.getState();
+    // Set when StreamNook signed you out of Twitch itself; the login wall says why.
+    const twitchSignInReason = useTwitchSignInReason();
     const {
         followedStreams,
         recommendedStreams,
@@ -431,6 +438,19 @@ const Home = () => {
 
     const [categoryStreams, setCategoryStreams] = useState<TwitchStream[]>([]);
     const [categoryStreamsCursor, setCategoryStreamsCursor] = useState<string | null>(null);
+    // A channel hidden from a card's menu leaves the grids on screen at once.
+    // Rust leaves it out of every list it answers from then on; these two
+    // came from answers given before the hide.
+    useEffect(() => {
+        const onHidden = (e: Event) => {
+            const id = (e as CustomEvent<string>).detail;
+            const keep = (s: TwitchStream) => favoriteIdOf(s) !== id;
+            setCategoryStreams((prev) => prev.filter(keep));
+            setProviderStreams((prev) => prev.filter(keep));
+        };
+        window.addEventListener('sn:channel-hidden', onHidden);
+        return () => window.removeEventListener('sn:channel-hidden', onHidden);
+    }, []);
     const [hasMoreCategoryStreams, setHasMoreCategoryStreams] = useState(true);
     const [isLoadingMoreCategoryStreams, setIsLoadingMoreCategoryStreams] = useState(false);
     const [isLoadingCategoryStreams, setIsLoadingCategoryStreams] = useState(false);
@@ -989,6 +1009,16 @@ const Home = () => {
                             setHasMoreCategoryStreams(false);
                         })
                         .finally(() => { if (isMountedRef.current) setIsLoadingCategoryStreams(false); });
+                }
+                // The header (description, followers, tags) comes back with it:
+                // a remount starts with no details, and only a fresh click used
+                // to fetch them.
+                if (categoryDetails?.id !== selectedCategory.id && !isLoadingCategoryDetails) {
+                    setIsLoadingCategoryDetails(true);
+                    invoke('get_category_info', { gameName: selectedCategory.name })
+                        .then(details => { if (isMountedRef.current) setCategoryDetails(details as CategoryInfo | null); })
+                        .catch(e => { if (isMountedRef.current) Logger.error('Failed to load category details:', e); })
+                        .finally(() => { if (isMountedRef.current) setIsLoadingCategoryDetails(false); });
                 }
             } else if (selectedCategory.name) {
                 // Badge overlay navigation — category has no ID, load by name
@@ -1620,6 +1650,11 @@ const Home = () => {
     // cached categories, each landing on its own; the Discover list likewise
     // arrives finished (`unifiedDiscover`).
     const unifiedCategories = useAppStore((s) => s.otherCategories);
+    // The favorites row above the Categories grid, built in Rust with live
+    // counts. It is also the answer to "is this one favorited": Rust updates
+    // it the moment a heart is clicked.
+    const favoriteCategories = useAppStore((s) => s.favoriteCategories);
+    const favoriteCategoryIds = useMemo(() => new Set(favoriteCategories.map((c) => c.id)), [favoriteCategories]);
 
     // The Categories tab shows category TILES until one is picked; every other
     // tab (and a drilled-into category) shows a stream grid.
@@ -1893,6 +1928,7 @@ const Home = () => {
                                                                 : `glass-panel media-card cursor-pointer hover:bg-glass-hover ${isOverlayMode ? '!bg-black/40 !border-white/5' : ''}`
                                                     }`}
                                                     onClick={(e) => !isQueued && handleStreamClick(e, stream)}
+                                                    {...(isQueued ? {} : streamMiddleClickHandlers(stream))}
                                                     onContextMenu={(e) => !isQueued && useContextMenuStore.getState().openMenu(e, stream)}
                                                 >
                                                     {isQueued && !isSuckingUp ? (
@@ -2036,7 +2072,12 @@ const Home = () => {
                                                                         {/* No placeholder when a platform ships no avatar: a row of
                                                                             identical grey monograms is noise, not information. */}
                                                                         {(stream.profile_image_url || cardAvatars[streamKey(stream)]) && (
-                                                                            <img
+                                                                            <SevenTvAvatar
+                                                                                cosmeticsId={sevenTvIdForStream(stream)}
+                                                                                px={16}
+                                                                                motion="hover"
+                                                                                // Hovering anywhere on the card moves it.
+                                                                                hoverScope="[data-avatar-key]"
                                                                                 loading="lazy"
                                                                                 src={stream.profile_image_url || cardAvatars[streamKey(stream)]}
                                                                                 alt=""
@@ -2179,25 +2220,19 @@ const Home = () => {
                                         })();
     };
 
+    // An offline Twitch channel opens its offline room: the chat, the channel's
+    // offline screen, and the stream itself the moment it goes live.
+    const openOfflineRoom = (user: TwitchStream, playVod = false) => {
+        const store = useAppStore.getState();
+        if (store.isHomeActive) store.toggleHome();
+        void store.startOfflineChat(user.user_login, user, { playVod });
+    };
+
     // ONE offline-channel card, shared by the Offline Channels roster and the
     // Favourites section (a favourite is usually NOT live, and burying it in a
     // roster of hundreds of follows is indistinguishable from doing nothing).
     const renderOfflineCard = (user: TwitchStream) => {
                                                 const lastOnline = offlineLastBroadcasts[user.id];
-                                                let relativeTimeResult = '';
-                                                if (lastOnline) {
-                                                    const date = new Date(lastOnline);
-                                                    if (!isNaN(date.getTime())) {
-                                                        const diffInSeconds = Math.floor((new Date().getTime() - date.getTime()) / 1000);
-                                                        if (diffInSeconds < 60) relativeTimeResult = `${diffInSeconds}s ago`;
-                                                        else if (diffInSeconds < 3600) relativeTimeResult = `${Math.floor(diffInSeconds / 60)}m ago`;
-                                                        else if (diffInSeconds < 86400) relativeTimeResult = `${Math.floor(diffInSeconds / 3600)}h ago`;
-                                                        else if (diffInSeconds < 2592000) relativeTimeResult = `${Math.floor(diffInSeconds / 86400)}d ago`;
-                                                        else if (diffInSeconds < 31536000) relativeTimeResult = `${Math.floor(diffInSeconds / 2592000)}mo ago`;
-                                                        else relativeTimeResult = `${Math.floor(diffInSeconds / 31536000)}y ago`;
-                                                    }
-                                                }
-
                                                 return (
                                                     <div
                                                         // Composite key: this list now mixes platforms, and a bare
@@ -2219,7 +2254,18 @@ const Home = () => {
                                                                         cardAvatars[streamKey(user)] ||
                                                                         user.thumbnail_url;
                                                                     return offlineAvatar ? (
-                                                                        <img src={offlineAvatar} alt={user.user_name} className="w-full h-full object-cover" />
+                                                                        <SevenTvAvatar
+                                                                            cosmeticsId={sevenTvIdForStream(user)}
+                                                                            px={40}
+                                                                            motion="hover"
+                                                                            // The card's hover overlay covers the picture and
+                                                                            // takes the pointer, so the card's hover moves it.
+                                                                            hoverScope="[data-avatar-key]"
+                                                                            loading="lazy"
+                                                                            src={offlineAvatar}
+                                                                            alt={user.user_name}
+                                                                            className="w-full h-full object-cover"
+                                                                        />
                                                                     ) : (
                                                                         <User size={14} className="text-textSecondary" />
                                                                     );
@@ -2229,9 +2275,20 @@ const Home = () => {
                                                                 <h4 className="text-sm font-semibold text-textPrimary truncate transition-colors">
                                                                     {user.user_name}
                                                                 </h4>
-                                                                <p className="text-[10px] text-textSecondary truncate">
-                                                                    {relativeTimeResult ? `Last live ${relativeTimeResult}` : 'Offline'}
-                                                                </p>
+                                                                {/* The platform, as the live cards show it: a bare mark at
+                                                                    the end of the line, only while the list mixes platforms. */}
+                                                                <div className="flex items-center justify-between gap-1">
+                                                                    <p className="text-[10px] text-textSecondary truncate">
+                                                                        {lastLiveLabel(lastOnline)}
+                                                                    </p>
+                                                                    {isUnifiedView && (
+                                                                        <Tooltip content={providerLabel(streamProvider(user))} side="top">
+                                                                            <span className="flex flex-shrink-0 items-center opacity-80">
+                                                                                <ProviderLogo provider={streamProvider(user)} size={11} />
+                                                                            </span>
+                                                                        </Tooltip>
+                                                                    )}
+                                                                </div>
                                                             </div>
                                                         </div>
 
@@ -2248,6 +2305,7 @@ const Home = () => {
                                                                 <Tooltip content={offlineIsFavorite ? 'Remove from favorites' : 'Add to favorites'} side="top">
                                                                     <button
                                                                         onClick={(e) => { void handleFavoriteClick(e, user); }}
+                                                                        // glass-exempt: an icon button over the card art, with no surface of its own.
                                                                         className="absolute top-1 right-1 z-20 p-1 flex items-center justify-center bg-transparent transition-transform duration-300 hover:scale-110 active:scale-95"
                                                                     >
                                                                         <Heart
@@ -2263,31 +2321,52 @@ const Home = () => {
                                                         })()}
 
                                                         {/* Action Overlay (Optimized - No blur on hidden elements).
-                                                            Twitch only: "Watch VOD" starts Twitch's offline-chat mode
-                                                            and the profile modal is Twitch-shaped, so neither works for
-                                                            a provider channel. Better no action than a broken one. */}
+                                                            Twitch only: the offline room and the profile modal are
+                                                            Twitch-shaped, so neither works for a provider channel.
+                                                            Better no action than a broken one. A click anywhere on
+                                                            the card opens the channel's offline room (its chat);
+                                                            "VOD" opens the room and plays the latest broadcast. */}
                                                         {streamProvider(user) === 'twitch' && (
-                                                        <div className="absolute inset-0 bg-[#0c0c0d]/90 opacity-0 group-hover:opacity-100 transition-all duration-200 flex items-center justify-center gap-2 z-10">
+                                                        <div
+                                                            role="button"
+                                                            tabIndex={0}
+                                                            aria-label={`Open ${user.user_name}'s chat`}
+                                                            onClick={() => openOfflineRoom(user)}
+                                                            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openOfflineRoom(user); } }}
+                                                            className="absolute inset-0 bg-[#0c0c0d]/90 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-all duration-200 flex items-center justify-center gap-2 z-10 cursor-pointer"
+                                                        >
                                                             <button
                                                                 onClick={(e) => {
                                                                     e.stopPropagation();
-                                                                    const store = useAppStore.getState();
-                                                                    if (store.isHomeActive) store.toggleHome();
-                                                                    store.startOfflineChat(user.user_login, user);
+                                                                    openOfflineRoom(user);
                                                                 }}
-                                                                className="px-3 py-1.5 rounded-lg glass-button text-[12px] font-bold text-white hover:bg-white/20 transition-all border border-transparent shadow-lg flex items-center gap-1.5"
+                                                                // no-live-blur on all three: the overlay under them is 90% opaque,
+                                                                // so their blur draws nothing and costs a layer per card.
+                                                                className="no-live-blur px-3 py-1.5 rounded-lg glass-button text-[12px] font-bold text-white hover:bg-white/20 transition-all border border-transparent shadow-lg flex items-center gap-1.5"
                                                             >
-                                                                <Play size={14} strokeWidth={2.5} />
-                                                                <span>Watch VOD</span>
+                                                                <MessageSquare size={14} strokeWidth={2.5} />
+                                                                <span>Chat</span>
                                                             </button>
-                                                            
+                                                            <Tooltip content="Watch the latest broadcast" side="top">
+                                                                <button
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        openOfflineRoom(user, true);
+                                                                    }}
+                                                                    className="no-live-blur px-2.5 py-1.5 rounded-lg glass-button text-[12px] font-bold text-textSecondary hover:text-textPrimary hover:bg-white/20 transition-all border border-transparent shadow-lg flex items-center gap-1.5"
+                                                                >
+                                                                    <Play size={14} strokeWidth={2.5} />
+                                                                    <span>VOD</span>
+                                                                </button>
+                                                            </Tooltip>
+
                                                             <Tooltip content="Profile" side="top">
                                                                 <button
                                                                     onClick={(e) => {
                                                                         e.stopPropagation();
                                                                         setProfileModalUser(user);
                                                                     }}
-                                                                    className="p-[7px] rounded-lg glass-button text-textSecondary hover:text-textPrimary hover:bg-white/20 transition-all border border-transparent shadow-lg"
+                                                                    className="no-live-blur p-[7px] rounded-lg glass-button text-textSecondary hover:text-textPrimary hover:bg-white/20 transition-all border border-transparent shadow-lg"
                                                                 >
                                                                     <User size={14} strokeWidth={2.5} />
                                                                 </button>
@@ -2389,13 +2468,22 @@ const Home = () => {
         );
     };
 
-    const renderCategoryCard = (game: TwitchCategory) => {
+    const toggleFavoriteCategory = (e: React.MouseEvent, game: TwitchCategory, favorite: boolean) => {
+        e.stopPropagation();
+        invoke('set_favorite_category', {
+            category: { id: game.id, name: game.name, box_art_url: game.box_art_url },
+            favorite,
+        }).catch((err) => Logger.warn('[Home] Could not change the favorite category:', err));
+    };
+
+    const renderCategoryCard = (game: TwitchCategory, keyPrefix = '') => {
         const dropsCampaign = dropsGameIds.get(game.id);
         const hasDrops = !!dropsCampaign;
+        const isFavoriteCategory = favoriteCategoryIds.has(game.id);
 
         return (
             <div
-                key={game.id}
+                key={keyPrefix + game.id}
                 className={`glass-panel media-card cursor-pointer hover:bg-glass-hover transition-all duration-200 group overflow-hidden relative ${isOverlayMode ? '!bg-black/40 !border-white/5' : ''} ${hasDrops ? 'ring-2 ring-accent shadow-accent/40' : ''}`}
                 style={hasDrops ? { boxShadow: '0 0 15px var(--color-accent-muted)' } : undefined}
                 onClick={() => handleCategoryClick(game)}
@@ -2446,11 +2534,30 @@ const Home = () => {
                     <Tooltip content={game.name} side="bottom"><h3 className="text-textPrimary font-medium text-sm line-clamp-2 group-hover:text-accent transition-colors">
                         {game.name}
                     </h3></Tooltip>
-                    {game.viewer_count !== undefined && (
-                        <p className="text-textSecondary text-xs mt-0.5">
-                            {game.viewer_count.toLocaleString()} viewers
-                        </p>
-                    )}
+                    {/* Viewers, and the favorite heart at the row's end: on the
+                        card, never over the artwork, like the stream cards. */}
+                    <div className="mt-0.5 flex items-center justify-between gap-1">
+                        <span className="text-textSecondary text-xs truncate">
+                            {game.viewer_count != null ? `${game.viewer_count.toLocaleString()} viewers` : ''}
+                        </span>
+                        <Tooltip content={isFavoriteCategory ? 'Remove from favorites' : 'Add to favorites'} side="top">
+                            <button
+                                type="button"
+                                onClick={(e) => toggleFavoriteCategory(e, game, !isFavoriteCategory)}
+                                aria-label={isFavoriteCategory ? `Remove ${game.name} from favorites` : `Add ${game.name} to favorites`}
+                                aria-pressed={isFavoriteCategory}
+                                className="-m-1 flex flex-shrink-0 items-center justify-center bg-transparent p-1 transition-transform duration-300 hover:scale-110 active:scale-95"
+                            >
+                                <Heart
+                                    size={14}
+                                    fill={isFavoriteCategory ? 'url(#glass-heart-fill)' : 'none'}
+                                    stroke={isFavoriteCategory ? 'url(#glass-heart-stroke)' : 'currentColor'}
+                                    strokeWidth={isFavoriteCategory ? 1.5 : 2}
+                                    className={`transition-all duration-300 ${isFavoriteCategory ? 'drop-shadow-[0_4px_8px_color-mix(in_srgb,var(--color-highlight-pink)_50%,transparent)]' : 'text-textSecondary hover:text-textPrimary opacity-0 group-hover:opacity-100 focus-visible:opacity-100'}`}
+                                />
+                            </button>
+                        </Tooltip>
+                    </div>
                 </div>
             </div>
         );
@@ -2460,6 +2567,18 @@ const Home = () => {
         (selectedCategory.id && dropsGameIds.has(selectedCategory.id)) ||
         (selectedCategory.name && dropsGameNames.has(selectedCategory.name.toLowerCase()))
     ));
+
+    // The category page's own favorite: the same star the tiles set. A page
+    // opened by name alone (the badge overlay) has its id once the details load.
+    const categoryPageFavorite: TwitchCategory | null =
+        activeTab === 'category' && selectedCategory && (selectedCategory.id || categoryDetails?.id)
+            ? {
+                id: selectedCategory.id || categoryDetails?.id || '',
+                name: selectedCategory.name || categoryDetails?.name || '',
+                box_art_url: selectedCategory.box_art_url || categoryDetails?.boxArtUrl || '',
+            }
+            : null;
+    const isCategoryPageFavorite = !!categoryPageFavorite && favoriteCategoryIds.has(categoryPageFavorite.id);
 
     const renderClipCard = (clip: TwitchClip) => (
         <MediaCard
@@ -2637,7 +2756,9 @@ const Home = () => {
                                 drill-down and is gone entirely while watching — so from
                                 here they were unreachable most of the time. They live in
                                 the title bar now, which is mounted in every view. */}
-                            {isAuthenticated && (
+                            {/* Kept while Twitch is owed a new sign-in, so looking for
+                                your follows finds the wall that says why they went. */}
+                            {(isAuthenticated || twitchSignInReason) && (
                                 <Tooltip content="Following" delay={200} disabled={!navIcons}>
                                 <button
                                     aria-label={navIcons ? 'Following' : undefined}
@@ -2838,7 +2959,7 @@ const Home = () => {
                                     exit={{ opacity: 0, y: -4 }}
                                     transition={{ duration: 0.12 }}
                                     style={{ position: 'fixed', top: historyRect.top, left: historyRect.left, width: historyRect.width }}
-                                    className="z-[1000] rounded-xl overflow-hidden py-1 shadow-xl border border-borderSubtle bg-background/95 backdrop-blur-md"
+                                    className="z-[1000] rounded-xl overflow-hidden py-1 shadow-xl border border-borderSubtle bg-glass-base/95 backdrop-blur-md"
                                 >
                                     <div className="flex items-center justify-between px-3 py-1">
                                         <span className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-textSecondary">
@@ -2977,6 +3098,28 @@ const Home = () => {
                                 <h1 className="text-2xl sm:text-3xl font-black text-transparent bg-clip-text bg-gradient-to-r from-textPrimary to-textSecondary truncate leading-tight">
                                     {categoryDetails?.displayName || selectedCategory.name}
                                 </h1>
+                                {/* Beside the title, ahead of the Followers chip, so
+                                    the chip arriving with the details never moves it. */}
+                                {categoryPageFavorite && (
+                                    <button
+                                        type="button"
+                                        onClick={(e) => toggleFavoriteCategory(e, categoryPageFavorite, !isCategoryPageFavorite)}
+                                        aria-label={`Favorite ${categoryPageFavorite.name}`}
+                                        aria-pressed={isCategoryPageFavorite}
+                                        className={`glass-button flex items-center gap-1.5 whitespace-nowrap px-2.5 py-1 shrink-0 text-[11px] font-bold tracking-wide hover:text-textPrimary active:scale-95 ${isCategoryPageFavorite ? 'text-textPrimary' : 'text-textSecondary'}`}
+                                    >
+                                        {/* One word in both states, so the button never
+                                            changes width; the heart says which. */}
+                                        <Heart
+                                            size={12}
+                                            fill={isCategoryPageFavorite ? 'url(#glass-heart-fill)' : 'none'}
+                                            stroke={isCategoryPageFavorite ? 'url(#glass-heart-stroke)' : 'currentColor'}
+                                            strokeWidth={isCategoryPageFavorite ? 1.5 : 2}
+                                            className={isCategoryPageFavorite ? 'drop-shadow-[0_2px_6px_color-mix(in_srgb,var(--color-highlight-pink)_50%,transparent)]' : ''}
+                                        />
+                                        <span>Favorite</span>
+                                    </button>
+                                )}
                                {categoryDetails?.followersCount != null && (
                                     <div className="glass-badge flex items-center gap-1.5 whitespace-nowrap !bg-white/5 backdrop-blur-md px-2.5 py-1 shrink-0">
                                         <Users size={12} className="text-accent" />
@@ -3138,6 +3281,16 @@ const Home = () => {
                     the platform's own category tiles render above instead. */}
                 {activeTab === 'browse' && !isProviderView && (
                     <>
+                        {/* Favorites first: the categories you hearted, in the
+                            order you hearted them, with live counts from Rust. */}
+                        {favoriteCategories.length > 0 && (
+                            <div className="mb-6 border-b border-borderSubtle/40 pb-4">
+                                <h3 className="mb-3 text-sm font-semibold text-textSecondary">Favorites</h3>
+                                <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-8 gap-3">
+                                    {favoriteCategories.map((game) => renderCategoryCard(game, 'fav-'))}
+                                </div>
+                            </div>
+                        )}
                         {isLoadingGames ? (
                             <div className="relative h-full min-h-[400px] flex items-center justify-center">
                                 <LoadingWidget useFunnyMessages={false} message="Loading categories..." fullScreen={false} />
@@ -3398,6 +3551,7 @@ const Home = () => {
                                                         }`}
                                                         style={!isQueued && hasDrops ? { boxShadow: '0 0 12px var(--color-accent-muted)' } : undefined}
                                                         onClick={(e) => !isQueued && handleStreamClick(e, stream)}
+                                                        {...(isQueued ? {} : streamMiddleClickHandlers(stream))}
                                                         onContextMenu={(e) => !isQueued && useContextMenuStore.getState().openMenu(e, stream)}
                                                     >
                                                         {isQueued && !isSuckingUp ? (
@@ -3482,7 +3636,12 @@ const Home = () => {
                                                                     <div className="flex items-center justify-between">
                                                                         <div className="flex items-center gap-1 min-w-0">
                                                                             {(stream.profile_image_url || cardAvatars[streamKey(stream)]) && (
-                                                                                <img
+                                                                                <SevenTvAvatar
+                                                                                    cosmeticsId={sevenTvIdForStream(stream)}
+                                                                                    px={16}
+                                                                                    motion="hover"
+                                                                                    // Hovering anywhere on the card moves it.
+                                                                                    hoverScope="[data-avatar-key]"
                                                                                     loading="lazy"
                                                                                     src={stream.profile_image_url || cardAvatars[streamKey(stream)]}
                                                                                     alt=""
@@ -3697,9 +3856,13 @@ const Home = () => {
                         !isAuthenticated && activeTab === 'following' && !isProviderView ? (
                             <div className="flex items-center justify-center h-full">
                                 <div className="text-center glass-panel p-6 max-w-sm">
-                                    <h3 className="text-base font-bold text-textPrimary mb-1">Not Logged In</h3>
+                                    <h3 className="text-base font-bold text-textPrimary mb-1">
+                                        {twitchSignInReason ? 'Sign In Again' : 'Not Logged In'}
+                                    </h3>
                                     <p className="text-textSecondary text-sm mb-4">
-                                        Log in to see your followed streams.
+                                        {twitchSignInReason
+                                            ? signInReasonText(twitchSignInReason)
+                                            : 'Log in to see your followed streams.'}
                                     </p>
                                     <div className="flex justify-center">
                                         <PlatformLoginButton
@@ -3707,6 +3870,7 @@ const Home = () => {
                                             onClick={loginToTwitch}
                                             busy={isLoading}
                                             busyLabel="Logging in…"
+                                            label={twitchSignInReason ? 'Sign in with Twitch' : undefined}
                                         />
                                     </div>
                                 </div>
@@ -4004,11 +4168,20 @@ const Home = () => {
                                                 <button
                                                     key={user.id}
                                                     onClick={() => setProfileModalUser(user)}
+                                                    data-avatar-hover=""
                                                     className="flex items-center gap-3 px-3 py-2 rounded-xl glass-panel hover:bg-white/[0.05] border border-borderSubtle hover:border-accent/40 transition-all text-left shadow-sm group w-[180px] sm:w-[200px]"
                                                 >
                                                     <div className="w-10 h-10 rounded-full bg-glass flex items-center justify-center overflow-hidden ring-1 ring-borderSubtle group-hover:ring-accent/40 flex-shrink-0">
                                                         {user.thumbnail_url ? (
-                                                            <img src={user.thumbnail_url} alt={user.user_name} className="w-full h-full object-cover" />
+                                                            <SevenTvAvatar
+                                                                cosmeticsId={sevenTvIdForStream(user)}
+                                                                px={40}
+                                                                motion="hover"
+                                                                hoverScope="[data-avatar-hover]"
+                                                                src={user.thumbnail_url}
+                                                                alt={user.user_name}
+                                                                className="w-full h-full object-cover"
+                                                            />
                                                         ) : (
                                                             <User size={14} className="text-textSecondary" />
                                                         )}

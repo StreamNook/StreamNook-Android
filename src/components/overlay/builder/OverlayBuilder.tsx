@@ -9,15 +9,16 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
-import { RotateCcw, RefreshCw, Link2, Plus, X, AlertTriangle, Play, Pause, Copy, Trash2, Pencil, Check, ChevronRight, LogIn } from 'lucide-react';
+import { RotateCcw, RefreshCw, Link2, Plus, X, AlertTriangle, Play, Pause, Copy, Trash2, Pencil, Check, ChevronRight, LogIn, Download, Upload, Undo2, Redo2 } from 'lucide-react';
 import { Tooltip } from '../../ui/Tooltip';
 import { Dropdown } from '../../ui/Dropdown';
 import { SettingsSection, SettingsRow, SettingsSubGroup, SegmentedSelect } from '../../settings/_primitives';
+import SectionNav from '../../settings/SectionNav';
 import { SevenTVLogo } from '../../emotesets/SevenTVLogo';
 import streamNookLogo from '../../../assets/streamnook-logo.png';
 import { OverlayChat } from '../OverlayChat';
 import { ProviderIcon } from '../ProviderIcon';
-import { SAMPLE_MESSAGES, randomSampleMessage, seedFlowMessages, type OverlayMessage } from '../sampleMessages';
+import { hasSampleFocus, randomSampleMessage, samplesFocusing, seedFlowMessages, type OverlayMessage } from '../sampleMessages';
 import {
   BUBBLE_SHAPES,
   CATEGORY_TEMPLATE_TOKENS,
@@ -38,11 +39,15 @@ import {
   OVERLAY_ENTRANCES,
   OVERLAY_LIMITS,
   OVERLAY_TEXT_ALIGNS,
+  OVERLAY_TEXT_ENTRY_MAX,
   OVERLAY_TEXT_WEIGHTS,
   PROVIDER_CATEGORY_LABELS,
   PROVIDER_EVENT_CATEGORIES,
   THIRD_PARTY_BADGE_PROVIDERS,
+  TWITCH_BADGE_CATEGORIES,
   clampOverlayStyle,
+  overlayFontStack,
+  overlayStyleTooLarge,
   type EventCategory,
   type OverlayStyle,
 } from '../overlayConfig';
@@ -60,7 +65,25 @@ import {
   parseYouTubeIdentifier,
 } from '../../../utils/parseChannelInput';
 import { useOverlayHost } from './overlayHost';
-import { newProfileUid, profileFromServer, reconcileProfiles, type OverlayProfile, type OverlaySource, type ServerOverlay } from './profileSync';
+import {
+  EditHistory,
+  MAX_OVERLAY_FILE_BYTES,
+  OVERLAY_FILE_EXTENSION,
+  buildOverlayFile,
+  historyShortcut,
+  newProfileUid,
+  overlayFileName,
+  overlayNeedsSave,
+  parseOverlayFile,
+  profileSaveSnapshot,
+  profileFromImport,
+  profileFromServer,
+  reconcileProfiles,
+  type ImportedOverlayFile,
+  type OverlayProfile,
+  type OverlaySource,
+  type ServerOverlay,
+} from './profileSync';
 
 const STORAGE_KEY = 'sn_overlay_style_v1';
 const SOURCES_KEY = 'sn_overlay_sources_v1';
@@ -72,6 +95,9 @@ const OVERLAY_ID_KEY = 'sn_overlay_id_v1';
 // makes the calls: on desktop Rust holds the token, on the site the session
 // cookie proves the account.
 const PUBLISH_PATH = '/api/overlays';
+// The server refuses a style over OVERLAY_STYLE_MAX_CHARS; the long lists are
+// what get a style there.
+const TOO_LARGE_TO_SAVE = 'This overlay is too large to save. Remove some hidden phrases or command filters.';
 const SOURCE_PROVIDERS: ProviderId[] = ['twitch', 'kick', 'youtube', 'tiktok'];
 
 function loadOverlayId(): string | null {
@@ -256,7 +282,7 @@ const SCENE_STYLES: Record<SceneBg, CSSProperties> = {
 // like a live chat. OverlayChat caps to what fits and animates each new row, so
 // this just grows the list (bounded) and lets the renderer do the rest.
 const SampleFlowFeed = ({ style }: { style: OverlayStyle }) => {
-  const [msgs, setMsgs] = useState<OverlayMessage[]>(() => seedFlowMessages(8));
+  const [msgs, setMsgs] = useState<OverlayMessage[]>(() => seedFlowMessages(16));
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     const tick = () => {
@@ -535,6 +561,7 @@ const CommandFilterEditor = ({ filters, onAdd, onRemove }: {
           value={val}
           onChange={(e) => setVal(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
+          maxLength={OVERLAY_TEXT_ENTRY_MAX}
           placeholder={mode === 'prefix' ? '! or #' : '!title'}
           className="flex-1 min-w-0 rounded-lg bg-glass border border-borderLight px-3 py-1.5 text-sm text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/60"
         />
@@ -576,6 +603,7 @@ const PhraseEditor = ({ phrases, onAdd, onRemove }: {
           value={val}
           onChange={(e) => setVal(e.target.value)}
           onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }}
+          maxLength={OVERLAY_TEXT_ENTRY_MAX}
           placeholder="Word or phrase to hide"
           className="flex-1 min-w-0 rounded-lg bg-glass border border-borderLight px-3 py-1.5 text-sm text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/60"
         />
@@ -605,12 +633,87 @@ const CUSTOM_FONT = '__custom__';
 const CUSTOM_FONT_STARTER = "'Poppins', sans-serif";
 const primaryFamilyName = (ff: string) => (ff || '').split(',')[0].trim().replace(/^["']|["']$/g, '');
 
+// Overlay files where the host has no file dialogs of its own (the web
+// builder): a browser download, and the browser's file picker.
+const downloadOverlayFile = (name: string, style: OverlayStyle): string => {
+  const fileName = overlayFileName(name);
+  const url = URL.createObjectURL(new Blob([buildOverlayFile(name, style)], { type: 'application/json' }));
+  // In the document while it is clicked: some browsers ignore a click on a
+  // detached link.
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return fileName;
+};
+// Settles exactly once: the chosen file (checked), null when the streamer
+// cancelled, or an Error whose message is a line for the builder.
+const pickOverlayFileInBrowser = (): Promise<ImportedOverlayFile | null> =>
+  new Promise((resolve, reject) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = `.${OVERLAY_FILE_EXTENSION},.json,application/json`;
+    input.style.display = 'none';
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('focus', onFocus);
+      input.remove();
+      settle();
+    };
+    // Browsers without the input's cancel event: the window gets focus back
+    // when the picker closes. A chosen file's change event can arrive just
+    // after that focus, so only an input still empty a moment later is a cancel.
+    const onFocus = () => {
+      setTimeout(() => {
+        if (!input.files?.length) finish(() => resolve(null));
+      }, 1000);
+    };
+    input.addEventListener('cancel', () => finish(() => resolve(null)));
+    input.addEventListener('change', () => {
+      const file = input.files?.[0];
+      if (!file) return finish(() => resolve(null));
+      if (file.size > MAX_OVERLAY_FILE_BYTES) {
+        return finish(() => reject(new Error('That file is too large to be an overlay file.')));
+      }
+      // parseOverlayFile throws a builder line for anything that is not an
+      // overlay file; chained this way the throw rejects the picker.
+      const read = file.text().then(parseOverlayFile);
+      finish(() => read.then(resolve, reject));
+    });
+    document.body.appendChild(input);
+    window.addEventListener('focus', onFocus);
+    input.click();
+  });
+
 // A few sample emoji shown in the Emoji-style dropdown so users can compare vendor
 // styles at a glance. Built from codepoints (no literal emoji in source).
 const EMOJI_SAMPLES = [0x1f600, 0x1f602, 0x1f60d].map((cp) => ({
   cp: cp.toString(16),
   char: String.fromCodePoint(cp),
 }));
+
+// What one undo step puts back: the look, the sources and the name.
+type OverlayEdit = { style: OverlayStyle; sources: OverlaySource[]; name: string };
+// Every overlay's undo history, by uid. Module-level so it outlives the editor:
+// closing the builder and opening it again keeps it for the session.
+const editHistory = new EditHistory<OverlayEdit>();
+// Cmd on Apple keyboards, Ctrl everywhere else. A user-agent test, so the site
+// runs it too.
+const MAC_KEYS = typeof navigator !== 'undefined' && /Macintosh|Mac OS X|iPhone|iPad|iPod/.test(navigator.userAgent);
+const MOD_KEY = MAC_KEYS ? 'Cmd' : 'Ctrl';
+// Fields that own Ctrl+Z: their own text undo keeps working there.
+const TEXT_INPUT_TYPES = new Set(['text', 'search', 'url', 'email', 'password', 'tel', 'number']);
+const isTextEntry = (target: EventTarget | null): boolean => {
+  if (typeof HTMLElement === 'undefined' || !(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable || target.tagName === 'TEXTAREA') return true;
+  return target instanceof HTMLInputElement && TEXT_INPUT_TYPES.has(target.type);
+};
 
 const OverlayEditor = () => {
   const host = useOverlayHost();
@@ -636,6 +739,11 @@ const OverlayEditor = () => {
     return () => clearTimeout(t);
   }, [resetArmed]);
   const [flow, setFlow] = useState(false);
+  // The last edited setting whose sample sits above the visible tail (the giant
+  // emote, a YouTube avatar). The static sample brings that row into view, and
+  // keeps it there until another such setting is edited.
+  const [sampleFocus, setSampleFocus] = useState<string | null>(null);
+  const sampleFeed = useMemo(() => samplesFocusing(sampleFocus), [sampleFocus]);
   const [sources, setSources] = useState<OverlaySource[]>(initial.profiles[initial.active].sources);
   const [sceneBg, setSceneBg] = useState<SceneBg>('scene');
   const [previewMode, setPreviewMode] = useState<'sample' | 'live'>('sample');
@@ -657,9 +765,38 @@ const OverlayEditor = () => {
   // decide whether the editor is still on the profile the push was for.
   const activeUidRef = useRef<string>(initial.profiles[initial.active].uid);
 
+  // ── Undo and redo ─────────────────────────────────────────────────────────
+  // An undo sets style and sources exactly like an edit, so the effects below
+  // mirror it into the profile and auto-save it to a published overlay's link
+  // the same way (or not at all, when it lands back on the saved copy), and a
+  // draft stays a draft.
+  //
+  // What the editor showed after the last change, so the next change is
+  // recorded with the state it replaced. Loading an overlay and undoing set
+  // this first, so neither is recorded as an edit. `snap` is filled lazily.
+  const shownRef = useRef<{ uid: string; edit: OverlayEdit; snap: string | null }>({
+    uid: initial.profiles[initial.active].uid,
+    edit: {
+      style: initial.profiles[initial.active].style,
+      sources: initial.profiles[initial.active].sources,
+      name: initial.profiles[initial.active].name,
+    },
+    snap: null,
+  });
+  // A pointer is down: everything until it lifts is one gesture (a slider drag).
+  const pointerHeldRef = useRef(false);
+  const [canUndo, setCanUndo] = useState(() => editHistory.canUndo(initial.profiles[initial.active].uid));
+  const [canRedo, setCanRedo] = useState(() => editHistory.canRedo(initial.profiles[initial.active].uid));
+  const refreshHistory = () => {
+    setCanUndo(editHistory.canUndo(activeUidRef.current));
+    setCanRedo(editHistory.canRedo(activeUidRef.current));
+  };
+
   // The scaled stage measures its own width so the overlay canvas fits the pane
   // at true proportions (scaled down when the canvas is wider than the pane).
   const stageWrapRef = useRef<HTMLDivElement>(null);
+  // The controls column: the section rail lists and follows its sections.
+  const controlsRef = useRef<HTMLDivElement>(null);
   const [stageW, setStageW] = useState(360);
   useLayoutEffect(() => {
     const el = stageWrapRef.current;
@@ -689,12 +826,35 @@ const OverlayEditor = () => {
   const STAGE_PAD = 44;
   const scale = Math.min(1, (stageW - STAGE_PAD) / style.width, (maxStageH - STAGE_PAD) / style.height);
 
+  // The name of the overlay being edited. It rides in the published style, so
+  // a rename is an edit like any other: an undo step and a save.
+  const activeName = profiles.find((p) => p.uid === activeUidRef.current)?.name ?? '';
+
+  // Record every change to the overlay being edited as an undo step.
+  useEffect(() => {
+    const uid = activeUidRef.current;
+    const shown = shownRef.current;
+    const { edit: was } = shown;
+    if (shown.uid === uid && was.style === style && was.sources === sources && was.name === activeName) return;
+    const edit = { style, sources, name: activeName };
+    const snap = profileSaveSnapshot(edit);
+    shownRef.current = { uid, edit, snap };
+    // Another overlay was loaded, or a change that changed nothing.
+    if (shown.uid !== uid) return;
+    if ((shown.snap ?? profileSaveSnapshot(was)) === snap) return;
+    editHistory.record(uid, was, Date.now(), pointerHeldRef.current);
+    refreshHistory();
+  }, [style, sources, activeName]);
+
   // The working state (style/sources/id) IS the active profile: mirror every
   // change into the profiles list, and keep writing the legacy single-overlay
-  // keys so anything still reading them sees the overlay being edited.
+  // keys so anything still reading them sees the overlay being edited. Matched
+  // by uid, not position, so a list that changed under the editor (an import
+  // landing while the account list refreshes) can never take another
+  // overlay's look.
   useEffect(() => {
     setProfiles((list) =>
-      list.map((p, i) => (i === activeIdx ? { ...p, style, sources } : p)),
+      list.map((p) => (p.uid === activeUidRef.current ? { ...p, style, sources } : p)),
     );
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(style));
@@ -709,8 +869,10 @@ const OverlayEditor = () => {
     } catch { /* ignore */ }
   }, [profiles, activeIdx]);
 
-  const set = <K extends keyof OverlayStyle>(key: K, val: OverlayStyle[K]) =>
+  const set = <K extends keyof OverlayStyle>(key: K, val: OverlayStyle[K]) => {
     setStyle((s) => ({ ...s, [key]: val }));
+    if (hasSampleFocus(key)) setSampleFocus(key);
+  };
 
   // Per-row reset. Returns undefined while every key it covers still matches the
   // StreamNook default, so SettingsRow shows nothing — the icon appearing IS the
@@ -737,6 +899,12 @@ const OverlayEditor = () => {
     setStyle((s) => {
       const hidden = s.hiddenBadgeProviders ?? [];
       return { ...s, hiddenBadgeProviders: hidden.includes(id) ? hidden.filter((k) => k !== id) : [...hidden, id] };
+    });
+
+  const toggleTwitchBadgeCategory = (id: string) =>
+    setStyle((s) => {
+      const hidden = s.hiddenTwitchBadgeCategories ?? [];
+      return { ...s, hiddenTwitchBadgeCategories: hidden.includes(id) ? hidden.filter((k) => k !== id) : [...hidden, id] };
     });
 
   const toggleSourceFilter = (id: ProviderId) =>
@@ -800,6 +968,8 @@ const OverlayEditor = () => {
     }
     setAddError(null);
     const chan = channel;
+    // A step of its own, even when a lookup made it land late.
+    editHistory.seal();
     setSources((list) =>
       list.some((s) => s.provider === provider && s.channel.toLowerCase() === chan.toLowerCase())
         ? list
@@ -877,22 +1047,35 @@ const OverlayEditor = () => {
   // The debounced auto-save, holding exactly what it will send, so switching
   // overlays or closing the builder can send it now instead of dropping it.
   const pendingSaveRef = useRef<{ timer: ReturnType<typeof setTimeout>; profile: OverlayProfile } | null>(null);
-  // Loading an overlay (on open, on switch, or a newer copy from the account)
-  // changes the editor without the user editing anything; that must not count
-  // as an edit and save straight back. True at mount for the same reason.
-  const skipSaveRef = useRef(true);
+  // Each overlay's look and sources as last saved or loaded (by uid). Loading
+  // an overlay (on open, on switch, or a newer copy from the account) changes
+  // the editor without the user editing anything, and an effect can run twice
+  // on mount; neither differs from this, so neither saves straight back.
+  const savedSnapshotsRef = useRef(
+    new Map<string, string>(initial.profiles.map((p) => [p.uid, profileSaveSnapshot(p)])),
+  );
   const profilesRef = useRef(profiles);
   useEffect(() => {
     profilesRef.current = profiles;
   }, [profiles]);
+  // The list position follows the overlay being edited (by uid), so the picker
+  // and the per-overlay actions point at it even after the list moved under it.
+  useEffect(() => {
+    const i = profiles.findIndex((p) => p.uid === activeUidRef.current);
+    if (i >= 0 && i !== activeIdx) setActiveIdx(i);
+  }, [profiles, activeIdx]);
   // A line under the publish controls when the account's copy replaced this one.
   const [notice, setNotice] = useState<string | null>(null);
+  // The notice a failed auto-save put up, so the next save that lands can take
+  // it down again.
+  const saveFailNoticeRef = useRef<string | null>(null);
 
   const saveError = (err?: string, status?: number): string =>
     err === 'unauthenticated' ? 'Sign in to Twitch to publish an overlay.'
       : err === 'no_channels' ? 'Add at least one source first.'
         : err === 'overlay_limit' ? 'Overlay limit reached (10 per account). Delete one you no longer use first.'
-          : `Publish failed (${err || status}).`;
+          : err === 'style_too_large' ? TOO_LARGE_TO_SAVE
+            : `Publish failed (${err || status}).`;
 
   // Save one overlay. `copy` = the manual publish action (copies the OBS link and
   // shows state); auto-save passes false to update the same link silently, so the
@@ -910,15 +1093,18 @@ const OverlayEditor = () => {
     inFlightRef.current.add(forUid);
     if (copy) { setPublishState('publishing'); setPublishError(null); setNotice(null); }
     try {
+      // The name rides inside the style so the other surfaces show it. A style
+      // the server would refuse is not sent at all.
+      const sentStyle = { ...forProfile.style, profileName: forProfile.name };
+      if (overlayStyleTooLarge(sentStyle)) throw new Error(TOO_LARGE_TO_SAVE);
       // Always `create`: an unusable id mints a fresh overlay rather than folding
-      // this one into another overlay on the account. The name rides inside the
-      // style so the other surfaces show it.
+      // this one into another overlay on the account.
       const res = await apiRequest('POST', PUBLISH_PATH, undefined, {
         id: forProfile.id ?? undefined,
         create: true,
         base_updated_at: forProfile.id ? versionsRef.current.get(forUid) ?? undefined : undefined,
         channels: forProfile.sources,
-        style: { ...forProfile.style, profileName: forProfile.name },
+        style: sentStyle,
       });
       if (res.status === 409) {
         const body = res.json<{ error?: string; overlay?: ServerOverlay }>();
@@ -927,7 +1113,10 @@ const OverlayEditor = () => {
           const theirs = profileFromServer(body.overlay, forProfile.name, forUid);
           if (theirs) {
             againRef.current.delete(forUid);
+            // Its history was made on a copy that no longer exists.
+            editHistory.forget(forUid);
             versionsRef.current.set(forUid, theirs.version);
+            savedSnapshotsRef.current.set(forUid, profileSaveSnapshot(theirs));
             setProfiles((list) => list.map((p) => (p.uid === forUid ? theirs : p)));
             if (activeUidRef.current === forUid) {
               applyProfile(theirs);
@@ -949,6 +1138,7 @@ const OverlayEditor = () => {
       if (!data?.id || !data?.url) throw new Error('Publish failed (bad reply).');
       versionsRef.current.set(forUid, data.updated_at ?? null);
       idsRef.current.set(forUid, data.id);
+      savedSnapshotsRef.current.set(forUid, profileSaveSnapshot(forProfile));
       // Stamp the id and version onto the overlay this save was for, and strip
       // the id from any other entry that claims the same overlay.
       setProfiles((list) =>
@@ -962,6 +1152,12 @@ const OverlayEditor = () => {
         overlayIdRef.current = data.id;
         try { localStorage.setItem(OVERLAY_ID_KEY, data.id); } catch { /* ignore */ }
         setPublishedUrl(data.url);
+        // A save went through, so an earlier failed auto-save's line is stale.
+        const stale = saveFailNoticeRef.current;
+        if (stale) {
+          saveFailNoticeRef.current = null;
+          setNotice((n) => (n === stale ? null : n));
+        }
         if (copy) {
           try { await navigator.clipboard.writeText(data.url); } catch { /* clipboard may be blocked; URL still shown */ }
           setPublishState('done');
@@ -972,9 +1168,16 @@ const OverlayEditor = () => {
         setPublishState('idle');
       }
     } catch (e) {
+      const message = e instanceof Error ? e.message : 'Publish failed.';
       if (copy && activeUidRef.current === forUid) {
-        setPublishError(e instanceof Error ? e.message : 'Publish failed.');
+        setPublishError(message);
         setPublishState('error');
+      } else if (!copy && activeUidRef.current === forUid) {
+        // An auto-save that fails would otherwise leave OBS behind the builder
+        // without a word.
+        const line = message === TOO_LARGE_TO_SAVE ? message : `Your latest change did not reach the OBS link. ${message}`;
+        saveFailNoticeRef.current = line;
+        setNotice(line);
       }
     } finally {
       inFlightRef.current.delete(forUid);
@@ -1011,7 +1214,7 @@ const OverlayEditor = () => {
       host.signIn();
       return;
     }
-    const p = profiles[activeIdx];
+    const p = profiles.find((x) => x.uid === activeUidRef.current);
     if (!p) return;
     cancelPendingSave(p.uid);
     void pushProfile({ ...p, style, sources }, true);
@@ -1020,42 +1223,129 @@ const OverlayEditor = () => {
   // Keep the published link a LIVE MIRROR of the builder: once published, save
   // any style/source change (debounced), so the streamer never has to re-copy.
   useEffect(() => {
-    if (skipSaveRef.current) {
-      skipSaveRef.current = false;
+    // The overlay being edited, by uid: auto-save never sends this look to
+    // another overlay's link, even if the list moved under the editor.
+    const p = profiles.find((x) => x.uid === activeUidRef.current);
+    if (!p) return;
+    const profile = { ...p, style, sources };
+    // Only a real edit to a published overlay saves: its look, sources or name
+    // differ from what it last saved or loaded. An edit put back before the
+    // debounce sends nothing, and a draft never sends.
+    if (!overlayNeedsSave(profile, savedSnapshotsRef.current.get(p.uid))) {
+      if (pendingSaveRef.current?.profile.uid === p.uid) {
+        clearTimeout(pendingSaveRef.current.timer);
+        pendingSaveRef.current = null;
+      }
       return;
     }
-    const p = profiles[activeIdx];
-    if (!p?.id) return;
     if (pendingSaveRef.current) clearTimeout(pendingSaveRef.current.timer);
-    const profile = { ...p, style, sources };
     const timer = setTimeout(() => {
       pendingSaveRef.current = null;
       void pushProfileRef.current(profile, false);
     }, 1500);
     pendingSaveRef.current = { timer, profile };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [style, sources]);
+  }, [style, sources, activeName]);
   // Closing the builder sends an edit still waiting on its debounce.
   useEffect(() => () => flushPendingSave(), []);
 
   // Load an overlay's saved state into the working editor state.
   const applyProfile = (p: OverlayProfile) => {
-    skipSaveRef.current = true;
+    savedSnapshotsRef.current.set(p.uid, profileSaveSnapshot(p));
     activeUidRef.current = p.uid;
     overlayIdRef.current = p.id;
-    setStyle(clampOverlayStyle({ ...DEFAULT_OVERLAY_STYLE, ...p.style } as OverlayStyle));
+    const loaded = clampOverlayStyle({ ...DEFAULT_OVERLAY_STYLE, ...p.style } as OverlayStyle);
+    // A load is not an edit: the recorder sees exactly what it already shows.
+    editHistory.seal();
+    shownRef.current = { uid: p.uid, edit: { style: loaded, sources: p.sources, name: p.name }, snap: null };
+    setStyle(loaded);
     setSources(p.sources);
     setPublishedUrl(p.id ? `https://streamnook.app/overlay/${p.id}` : null);
     setPublishState('idle');
     setPublishError(null);
     setRenaming(false);
     setConfirmDelete(false);
+    refreshHistory();
   };
+
+  // Put back a step of the overlay being edited, through the same state an
+  // edit sets.
+  const restoreEdit = (uid: string, edit: OverlayEdit) => {
+    // A name comes back only while no other overlay has taken it.
+    const list = profilesRef.current;
+    const name = uniqueProfileName(edit.name, list.filter((p) => p.uid !== uid));
+    const restored = name === edit.name ? edit : { ...edit, name };
+    shownRef.current = { uid, edit: restored, snap: null };
+    setStyle(restored.style);
+    setSources(restored.sources);
+    if (list.find((p) => p.uid === uid)?.name !== name) {
+      setProfiles((l) => l.map((p) => (p.uid === uid ? { ...p, name } : p)));
+    }
+    refreshHistory();
+  };
+  const undo = () => {
+    if (fileBusy) return;
+    const uid = activeUidRef.current;
+    const prev = editHistory.undo(uid, shownRef.current.edit);
+    if (prev) restoreEdit(uid, prev);
+  };
+  const redo = () => {
+    if (fileBusy) return;
+    const uid = activeUidRef.current;
+    const next = editHistory.redo(uid, shownRef.current.edit);
+    if (next) restoreEdit(uid, next);
+  };
+  const historyActionsRef = useRef({ undo, redo });
+  useEffect(() => {
+    historyActionsRef.current = { undo, redo };
+  });
+  // Gesture edges seal the open step, so a click, a toggle or a reset is a
+  // step of its own and a drag is one step however long it pauses. Capture
+  // phase: the seal lands before the handler that makes the change. The
+  // shortcuts listen last and leave a press the page already answered alone.
+  useEffect(() => {
+    const onPointerDown = () => {
+      pointerHeldRef.current = true;
+      editHistory.seal();
+    };
+    const onPointerUp = () => {
+      pointerHeldRef.current = false;
+      editHistory.seal();
+    };
+    const onFocusOut = () => editHistory.seal();
+    const onKeySeal = (e: KeyboardEvent) => {
+      if (e.key === 'Enter' || (e.key === ' ' && !isTextEntry(e.target))) editHistory.seal();
+    };
+    const onShortcut = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing || isTextEntry(e.target)) return;
+      const action = historyShortcut(e, MAC_KEYS);
+      if (!action) return;
+      e.preventDefault();
+      historyActionsRef.current[action]();
+    };
+    window.addEventListener('pointerdown', onPointerDown, true);
+    window.addEventListener('pointerup', onPointerUp, true);
+    window.addEventListener('pointercancel', onPointerUp, true);
+    window.addEventListener('focusout', onFocusOut, true);
+    window.addEventListener('keydown', onKeySeal, true);
+    window.addEventListener('keydown', onShortcut);
+    return () => {
+      window.removeEventListener('pointerdown', onPointerDown, true);
+      window.removeEventListener('pointerup', onPointerUp, true);
+      window.removeEventListener('pointercancel', onPointerUp, true);
+      window.removeEventListener('focusout', onFocusOut, true);
+      window.removeEventListener('keydown', onKeySeal, true);
+      window.removeEventListener('keydown', onShortcut);
+      pointerHeldRef.current = false;
+      editHistory.seal();
+    };
+  }, []);
 
   // Take an overlay out of the list (deleted on another device), keeping the
   // editor on a neighbour and the list never empty.
   const dropProfile = (uid: string, message: string) => {
     cancelPendingSave(uid);
+    editHistory.forget(uid);
     const list = profilesRef.current;
     const idx = list.findIndex((p) => p.uid === uid);
     if (idx < 0) return;
@@ -1072,8 +1362,12 @@ const OverlayEditor = () => {
     setNotice(message);
   };
 
+  // Set while an overlay file is being saved or opened. The list stays put
+  // meanwhile: no switching, new, duplicate or delete.
+  const [fileBusy, setFileBusy] = useState(false);
+
   const switchProfile = (idx: number) => {
-    if (idx === activeIdx || !profiles[idx]) return;
+    if (fileBusy || idx === activeIdx || !profiles[idx]) return;
     // Send the overlay being left if it has an edit waiting, then load the new one.
     flushPendingSave();
     setNotice(null);
@@ -1081,8 +1375,8 @@ const OverlayEditor = () => {
     applyProfile(profiles[idx]);
   };
 
-  const uniqueProfileName = (base: string): string => {
-    const names = new Set(profiles.map((p) => p.name.toLowerCase()));
+  const uniqueProfileName = (base: string, list: OverlayProfile[] = profiles): string => {
+    const names = new Set(list.map((p) => p.name.toLowerCase()));
     if (!names.has(base.toLowerCase())) return base;
     for (let n = 2; ; n++) if (!names.has(`${base} ${n}`.toLowerCase())) return `${base} ${n}`;
   };
@@ -1092,6 +1386,7 @@ const OverlayEditor = () => {
   // same chat in different styles). Either way it is a draft on this device
   // until its first publish mints its own link.
   const addProfile = (duplicate: boolean) => {
+    if (fileBusy) return;
     flushPendingSave();
     setNotice(null);
     const p: OverlayProfile = {
@@ -1108,21 +1403,68 @@ const OverlayEditor = () => {
     applyProfile(p);
   };
 
+  // Export: this overlay's look to a file anyone can open. Import: a shared
+  // file as a NEW draft overlay (its own link on first publish), keeping this
+  // streamer's sources. Neither touches a published overlay.
+  const exportOverlay = async () => {
+    const name = profiles[activeIdx]?.name ?? 'Overlay';
+    setFileBusy(true);
+    try {
+      const saved = host.exportOverlayFile ? await host.exportOverlayFile(name, style) : downloadOverlayFile(name, style);
+      if (saved) setNotice(`Saved "${name}" to ${saved}. Anyone can open it with Import.`);
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFileBusy(false);
+    }
+  };
+  const importOverlay = async () => {
+    setFileBusy(true);
+    let file: ImportedOverlayFile | null;
+    try {
+      file = host.importOverlayFile ? await host.importOverlayFile() : await pickOverlayFileInBrowser();
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e));
+      return;
+    } finally {
+      setFileBusy(false);
+    }
+    if (!file) return;
+    flushPendingSave();
+    // The dialog was open a while, and the account list can refresh when the
+    // window gets focus back: read the list and the overlay being edited as
+    // they are now, not as they were at the click.
+    const list = profilesRef.current;
+    const current = list.find((x) => x.uid === activeUidRef.current) ?? { sources, style };
+    const p = profileFromImport(file, uniqueProfileName(file.name, list), { sources: current.sources, style: current.style });
+    setProfiles((l) => [...l, p]);
+    setActiveIdx(list.length);
+    applyProfile(p);
+    const skipped = file.dropped.length;
+    const tooLarge = overlayStyleTooLarge({ ...p.style, profileName: p.name });
+    setNotice(
+      `Imported "${p.name}" as a new overlay.`
+        + (skipped ? ` ${skipped} setting${skipped === 1 ? '' : 's'} in the file could not be used.` : '')
+        + (tooLarge ? ' It is too large to publish as it is: remove some hidden phrases or command filters first.' : ''),
+    );
+  };
+
   const commitRename = () => {
     const name = renameValue.trim();
     setRenaming(false);
     if (!name || name === profiles[activeIdx].name) return;
+    // The name travels inside the published style, so the auto-save sends a
+    // rename of a published overlay like any other edit.
     setProfiles((list) => list.map((p, i) => (i === activeIdx ? { ...p, name: uniqueProfileName(name) } : p)));
-    // The name travels inside the published style; nudge a save.
-    if (overlayIdRef.current) setStyle((s) => ({ ...s }));
   };
 
   const deleteProfile = async () => {
-    if (profiles.length <= 1) return;
+    if (fileBusy || profiles.length <= 1) return;
     // Local state math runs synchronously BEFORE the request below, so a save
     // response landing meanwhile can't be clobbered by a stale list.
     const victim = profiles[activeIdx];
     cancelPendingSave(victim.uid);
+    editHistory.forget(victim.uid);
     const nextList = profiles.filter((_, i) => i !== activeIdx);
     const nextIdx = Math.max(0, activeIdx - 1);
     setProfiles(nextList);
@@ -1164,6 +1506,12 @@ const OverlayEditor = () => {
       next.every((p, i) => p === current[i] || (p.uid === current[i].uid && p.version === current[i].version && p.id === current[i].id));
     if (unchanged) return;
     for (const p of next) versionsRef.current.set(p.uid, p.version);
+    // An overlay the account replaced or removed loses its history: the steps
+    // were made on a copy that no longer exists.
+    for (const p of current) {
+      const now = next.find((n) => n.uid === p.uid);
+      if (!now || now.version !== p.version || now.id !== p.id) editHistory.forget(p.uid);
+    }
     const activeUid = activeUidRef.current;
     const idx = Math.max(0, next.findIndex((p) => p.uid === activeUid));
     setProfiles(next);
@@ -1255,9 +1603,27 @@ const OverlayEditor = () => {
   return (
     // The preview column's widest size is the host's to pick: the app's settings
     // pane is narrow, the site page has room for a larger preview.
+    // On wide screens a section rail leads the controls, so the builder carries
+    // its own quick navigation on any host (the app hides its dialog-wide rail
+    // on this tab; the site page has none). The rail lives INSIDE the controls
+    // column, never as a grid column of its own: two breakpoint templates on
+    // one grid resolve in stylesheet order, and the losing order put the
+    // controls in the preview's column and pushed the preview off the page.
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(340px,var(--overlay-builder-preview-max,430px))]">
+      <div className="flex min-w-0 gap-6">
+      {/* ── Section rail ─────────────────────────────────────────── */}
+      {/* From 1440 px only: below that the preview column leaves the controls
+          too little room to give 168 px to the rail. */}
+      <div className="hidden w-[168px] flex-shrink-0 min-[1440px]:block">
+        <SectionNav
+          containerRef={controlsRef}
+          tabKey="overlay-builder"
+          stickyTop="calc(var(--overlay-builder-sticky-top, 0.25rem) + 0.5rem)"
+        />
+      </div>
+
       {/* ── Controls ─────────────────────────────────────────────── */}
-      <div className="space-y-5 min-w-0">
+      <div ref={controlsRef} className="space-y-5 min-w-0 flex-1">
         {/* Which overlay you are editing, and the two things you do to it.
             Sticks against the settings dialog's scroll port so switching
             overlays never means scrolling back to the top; data-settings-sticky
@@ -1299,6 +1665,7 @@ const OverlayEditor = () => {
               value={String(activeIdx)}
               options={profiles.map((p, i) => ({ value: String(i), label: p.name }))}
               onChange={(v) => switchProfile(parseInt(v, 10))}
+              disabled={fileBusy}
               className="max-w-[200px]"
             />
           )}
@@ -1312,20 +1679,31 @@ const OverlayEditor = () => {
             <Tooltip content="Rename">
               <button
                 onClick={() => { setRenameValue(profiles[activeIdx]?.name ?? ''); setRenaming(true); }}
-                className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors"
+                disabled={fileBusy}
+                className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50"
               >
                 <Pencil size={13} />
               </button>
             </Tooltip>
           )}
           <Tooltip content="New overlay">
-            <button onClick={() => addProfile(false)} className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors">
+            <button onClick={() => addProfile(false)} disabled={fileBusy} className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50">
               <Plus size={13} />
             </button>
           </Tooltip>
           <Tooltip content="Duplicate">
-            <button onClick={() => addProfile(true)} className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors">
+            <button onClick={() => addProfile(true)} disabled={fileBusy} className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50">
               <Copy size={13} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Export to a file you can share">
+            <button onClick={() => void exportOverlay()} disabled={fileBusy} className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50">
+              <Download size={13} />
+            </button>
+          </Tooltip>
+          <Tooltip content="Import a shared file as a new overlay">
+            <button onClick={() => void importOverlay()} disabled={fileBusy} className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50">
+              <Upload size={13} />
             </button>
           </Tooltip>
           {profiles.length > 1 && (
@@ -1337,7 +1715,8 @@ const OverlayEditor = () => {
                   void deleteProfile();
                 }}
                 onBlur={() => setConfirmDelete(false)}
-                className={`glass-button rounded-md p-1.5 transition-colors ${confirmDelete ? 'text-error' : 'text-textSecondary hover:text-error'}`}
+                disabled={fileBusy}
+                className={`glass-button rounded-md p-1.5 transition-colors disabled:opacity-50 ${confirmDelete ? 'text-error' : 'text-textSecondary hover:text-error'}`}
               >
                 <Trash2 size={13} />
               </button>
@@ -1348,6 +1727,26 @@ const OverlayEditor = () => {
               the bottom of whichever tab you happened to be on it read as
               buried. The OBS size reminder follows on its own line below. */}
           <div className="ml-auto flex items-center gap-1.5">
+            {/* History of this overlay's look and sources. Held, like the
+                rest of the row, while a file dialog is open. */}
+            <Tooltip content={`Undo (${MOD_KEY}+Z)`}>
+              <button
+                onClick={undo}
+                disabled={fileBusy || !canUndo}
+                className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50 disabled:hover:text-textSecondary"
+              >
+                <Undo2 size={13} />
+              </button>
+            </Tooltip>
+            <Tooltip content={`Redo (${MOD_KEY}+Shift+Z)`}>
+              <button
+                onClick={redo}
+                disabled={fileBusy || !canRedo}
+                className="glass-button rounded-md p-1.5 text-textSecondary hover:text-textPrimary transition-colors disabled:opacity-50 disabled:hover:text-textSecondary"
+              >
+                <Redo2 size={13} />
+              </button>
+            </Tooltip>
             {/* Two-step, because this throws away every setting on the overlay
                 and the first click used to do it outright. Arming inline keeps
                 it one gesture away without a dialog to dismiss; it disarms
@@ -1360,7 +1759,10 @@ const OverlayEditor = () => {
                   setResetArmed(false);
                   setStyle({ ...DEFAULT_OVERLAY_STYLE });
                 }}
-                className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-colors flex-shrink-0 ${
+                // Like every other action in this row, held while the export or
+                // import file dialog is open.
+                disabled={fileBusy}
+                className={`inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[12px] transition-colors flex-shrink-0 disabled:opacity-50 ${
                   resetArmed ? 'text-error' : 'text-textMuted hover:text-textPrimary'
                 }`}
               >
@@ -1380,7 +1782,7 @@ const OverlayEditor = () => {
             >
               <button
                 onClick={publish}
-                disabled={publishState === 'publishing' || (!!host.accountId && sources.length === 0)}
+                disabled={fileBusy || publishState === 'publishing' || (!!host.accountId && sources.length === 0)}
                 // Accent on GLASS, not a filled accent slab. Publish does need to
                 // outrank the four icon buttons beside it (it is the action you
                 // come back to after every tweak, and as a plain glass button it
@@ -1474,7 +1876,7 @@ const OverlayEditor = () => {
               Paste a channel link from any platform and it is added to that platform.
             </p>
           </div>
-          <SettingsRow onReset={resetFor('sources')} title="Platform filter" description="Hide a platform's messages without removing its source.">
+          <SettingsRow onReset={resetFor('sources')} title="Platforms" description="Hide a platform's messages without removing its source.">
             <div className="flex flex-wrap gap-2">
               {SOURCE_PROVIDERS.map((id) => {
                 // Only a platform you've actually added as a source can be toggled;
@@ -1543,10 +1945,10 @@ const OverlayEditor = () => {
           </SettingsRow>
           {style.background === 'solid' && (
             <SettingsSubGroup>
-              <SettingsRow onReset={resetFor('backgroundColor')} title="Background color" control={
+              <SettingsRow onReset={resetFor('backgroundColor')} title="Color" control={
                 <input type="color" value={style.backgroundColor} onChange={(e) => set('backgroundColor', e.target.value)} className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle" />
               } />
-              <SettingsRow onReset={resetFor('backgroundOpacity')} title="Background opacity">
+              <SettingsRow onReset={resetFor('backgroundOpacity')} title="Opacity">
                 <Slider value={style.backgroundOpacity} min={0} max={1} step={0.05} onChange={(v) => set('backgroundOpacity', v)} format={(v) => `${Math.round(v * 100)}%`} />
               </SettingsRow>
             </SettingsSubGroup>
@@ -1570,7 +1972,7 @@ const OverlayEditor = () => {
                   value={primaryFamilyName(style.fontFamily)}
                   onChange={(e) => set('fontFamily', `'${e.target.value.replace(/['"]/g, '')}', sans-serif`)}
                   placeholder="e.g. Poppins"
-                  style={{ fontFamily: style.fontFamily }}
+                  style={{ fontFamily: overlayFontStack(style.fontFamily) }}
                   className="w-full min-w-0 rounded-lg bg-glass border border-borderLight px-3 py-1.5 text-sm text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/60"
                 />
                 <p className="text-[12px] leading-relaxed text-textMuted">
@@ -1580,62 +1982,90 @@ const OverlayEditor = () => {
             </SettingsRow>
             </SettingsSubGroup>
           )}
-          <SettingsRow onReset={resetFor('fontSize')} title="Font size">
+          <SettingsRow onReset={resetFor('fontSize')} title="Size">
             <Slider value={style.fontSize} min={OVERLAY_LIMITS.fontSize.min} max={OVERLAY_LIMITS.fontSize.max} onChange={(v) => set('fontSize', v)} format={(v) => `${v}px`} />
           </SettingsRow>
           <SettingsRow onReset={resetFor('lineHeight')} title="Line height" description="Spacing within a wrapped message.">
             <Slider value={style.lineHeight} min={OVERLAY_LIMITS.lineHeight.min} max={OVERLAY_LIMITS.lineHeight.max} step={0.05} onChange={(v) => set('lineHeight', v)} format={(v) => v.toFixed(2)} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('messageGap')} title="Message spacing" description="Gap between messages.">
+          <SettingsRow onReset={resetFor('messageGap')} title="Spacing" description="Gap between messages.">
             <Slider value={style.messageGap} min={OVERLAY_LIMITS.messageGap.min} max={OVERLAY_LIMITS.messageGap.max} onChange={(v) => set('messageGap', v)} format={(v) => `${v}px`} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('textAlign')} title="Text alignment" description="Left, center, or right; event cards line up the same way.">
+          <SettingsRow onReset={resetFor('textAlign')} title="Alignment" description="Left, center, or right; event cards line up the same way.">
             <SegmentedSelect value={style.textAlign ?? 'left'} onChange={(v) => set('textAlign', v)} options={OVERLAY_TEXT_ALIGNS} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('fontWeight')} title="Text weight" description="How heavy the text is. Usernames stay bold either way.">
+          <SettingsRow onReset={resetFor('fontWeight')} title="Weight" description="How heavy the text is. Usernames stay bold either way.">
             <SegmentedSelect value={String(style.fontWeight ?? 400)} onChange={(v) => set('fontWeight', parseInt(v, 10))} options={OVERLAY_TEXT_WEIGHTS} />
           </SettingsRow>
           <SettingsRow onReset={resetFor('textItalic')} title="Italic" description="Slant message text. Actions (/me) are italic either way." control={<Toggle enabled={style.textItalic === true} onChange={() => set('textItalic', style.textItalic !== true)} />} />
           <SettingsRow onReset={resetFor('textStrikethrough')} title="Strikethrough" description="Draw a line through message text." control={<Toggle enabled={style.textStrikethrough === true} onChange={() => set('textStrikethrough', style.textStrikethrough !== true)} />} />
-          <SettingsRow onReset={resetFor('bodyTextColor')} title="Text color" control={
+          <SettingsRow onReset={resetFor('bodyTextColor')} title="Color" control={
             <input type="color" value={style.bodyTextColor} onChange={(e) => set('bodyTextColor', e.target.value)} className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle" />
           } />
-          <SettingsRow onReset={resetFor('textShadow')} title="Text shadow" description="An outline behind text so it stays readable over any scene." control={<Toggle enabled={style.textShadow} onChange={() => set('textShadow', !style.textShadow)} />} />
-          <SettingsSubGroup>
-            <SettingsRow onReset={resetFor('textShadowColor')} title="Shadow color" disabled={!style.textShadow} control={
-              <input type="color" value={style.textShadowColor || '#000000'} onChange={(e) => set('textShadowColor', e.target.value)} disabled={!style.textShadow} className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle disabled:cursor-not-allowed" />
-            } />
-            <SettingsRow onReset={resetFor('textShadowSize')} title="Shadow size" description="How far the shadow spreads. 0 turns it off." disabled={!style.textShadow}>
-              <Slider value={style.textShadowSize ?? 2} min={OVERLAY_LIMITS.textShadowSize.min} max={OVERLAY_LIMITS.textShadowSize.max} step={0.5} onChange={(v) => set('textShadowSize', v)} format={(v) => `${v}px`} />
-            </SettingsRow>
-            <SettingsRow onReset={resetFor('textShadowOpacity')} title="Shadow strength" description="How solid the shadow is." disabled={!style.textShadow}>
-              <Slider value={style.textShadowOpacity ?? 0.85} min={OVERLAY_LIMITS.textShadowOpacity.min} max={OVERLAY_LIMITS.textShadowOpacity.max} step={0.05} onChange={(v) => set('textShadowOpacity', v)} format={(v) => `${Math.round(v * 100)}%`} />
-            </SettingsRow>
-          </SettingsSubGroup>
+          <SettingsRow onReset={resetFor('textShadow')} title="Shadow" description="An outline behind text so it stays readable over any scene." control={<Toggle enabled={style.textShadow} onChange={() => set('textShadow', !style.textShadow)} />} />
+          {style.textShadow && (
+            <SettingsSubGroup>
+              <SettingsRow onReset={resetFor('textShadowColor')} title="Color" control={
+                <input type="color" value={style.textShadowColor || '#000000'} onChange={(e) => set('textShadowColor', e.target.value)} className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle" />
+              } />
+              <SettingsRow onReset={resetFor('textShadowSize')} title="Size" description="How far the shadow spreads. 0 turns it off.">
+                <Slider value={style.textShadowSize ?? 2} min={OVERLAY_LIMITS.textShadowSize.min} max={OVERLAY_LIMITS.textShadowSize.max} step={0.5} onChange={(v) => set('textShadowSize', v)} format={(v) => `${v}px`} />
+              </SettingsRow>
+              <SettingsRow onReset={resetFor('textShadowOpacity')} title="Strength" description="How solid the shadow is.">
+                <Slider value={style.textShadowOpacity ?? 0.85} min={OVERLAY_LIMITS.textShadowOpacity.min} max={OVERLAY_LIMITS.textShadowOpacity.max} step={0.05} onChange={(v) => set('textShadowOpacity', v)} format={(v) => `${Math.round(v * 100)}%`} />
+              </SettingsRow>
+            </SettingsSubGroup>
+          )}
           <SettingsRow onReset={resetFor('emojiStyle')} title="Emoji style" description="One consistent emoji set across every platform." help="System uses your machine's own emoji font instead." control={<Dropdown value={style.emojiStyle} options={emojiStyleOptions} onChange={(v) => set('emojiStyle', v)} align="right" />} />
         </SettingsSection>
 
-        <SettingsSection label="Emotes & badges" description="Emote sizing and every badge type.">
+        <SettingsSection label="Emotes & Badges" description="Emote sizing and every badge type.">
           <SettingsRow onReset={resetFor('emoteScale')} title="Emote size">
             <Slider value={style.emoteScale} min={OVERLAY_LIMITS.emoteScale.min} max={OVERLAY_LIMITS.emoteScale.max} step={0.05} onChange={(v) => set('emoteScale', v)} format={(v) => `${v.toFixed(2)}x`} />
           </SettingsRow>
           <SettingsRow onReset={resetFor('giantEmotes')} title="Giant emotes" description="The Gigantify an Emote power-up, drawn at 4x like Twitch does." help="The last emote of a gigantified message renders at 4x below the message." control={<Toggle enabled={style.giantEmotes !== false} onChange={() => set('giantEmotes', style.giantEmotes === false)} />} />
           <SettingsSubGroup>
-            <SettingsRow onReset={resetFor('giantEmoteAlign')} title="Giant emote placement" description="Where the big emote sits." help="Left, Center, and Right give it its own line below the message. Inline leaves it where it was typed, so an emote-only message shows it right after the name." disabled={style.giantEmotes === false}>
+            <SettingsRow onReset={resetFor('giantEmoteAlign')} title="Placement" description="Where the big emote sits." help="Left, Center, and Right give it its own line below the message. Inline leaves it where it was typed, so an emote-only message shows it right after the name." disabled={style.giantEmotes === false}>
               <SegmentedSelect value={style.giantEmoteAlign ?? 'center'} onChange={(v) => set('giantEmoteAlign', v)} options={GIANT_EMOTE_ALIGNS} />
             </SettingsRow>
           </SettingsSubGroup>
-          <SettingsRow onReset={resetFor('showGifs')} title="Chat GIFs" titleBadge={<SourceScope sources={['twitch']} />} description="GIFs that Tier 2 and Tier 3 subscribers post in chat, drawn big like a gigantified emote." help="Follows Giant emote placement: Left, Center and Right give each GIF its own line below the message, Inline leaves it where it was typed. Off shows the short description Twitch sends in its place." control={<Toggle enabled={style.showGifs !== false} onChange={() => set('showGifs', style.showGifs === false)} />} />
-          <SettingsRow onReset={resetFor('showPersonalEmotes')} title="7TV personal emotes" titleBadge={<SourceScope sources={['twitch']} />} description="Emotes a 7TV subscriber brings into every channel." help="A subscriber's personal 7TV set works in every channel, so chatters can show emotes your channel never added. Off renders those as the word that was typed. Your channel's own 7TV emotes are unaffected." control={<Toggle enabled={style.showPersonalEmotes !== false} onChange={() => set('showPersonalEmotes', style.showPersonalEmotes === false)} />} />
-          <SettingsRow onReset={resetFor('showBadges')} title="Show badges" description="Badges the platform sends: subscriber, moderator, VIP, and the rest." help="These arrive with each message from Twitch, Kick, YouTube and TikTok. Chat-client badges and the StreamNook member badge are separate, on the Third-party badges switch below, so turning this off leaves those showing." control={<Toggle enabled={style.showBadges} onChange={() => set('showBadges', !style.showBadges)} />} />
+          <SettingsRow onReset={resetFor('showGifs')} title="GIFs" titleBadge={<SourceScope sources={['twitch']} />} description="GIFs that Tier 2 and Tier 3 subscribers post in chat, drawn big like a gigantified emote." help="Each GIF sits right after the name, where it was typed, like the words of a message. Off shows the short description Twitch sends in its place." control={<Toggle enabled={style.showGifs !== false} onChange={() => set('showGifs', style.showGifs === false)} />} />
+          <SettingsSubGroup>
+            <SettingsRow onReset={resetFor('gifScale')} title="Size" description="How big GIFs draw on your overlay." help="1.00x is the size GIFs have always drawn at. It sits on top of Emote size, so a bigger Emote size makes GIFs bigger too." disabled={style.showGifs === false}>
+              <Slider value={style.gifScale ?? 1} min={OVERLAY_LIMITS.gifScale.min} max={OVERLAY_LIMITS.gifScale.max} step={0.05} onChange={(v) => set('gifScale', v)} format={(v) => `${v.toFixed(2)}x`} />
+            </SettingsRow>
+          </SettingsSubGroup>
+          <SettingsRow onReset={resetFor('showPersonalEmotes')} title="Personal emotes" titleBadge={<SourceScope sources={['twitch']} />} description="Emotes a 7TV subscriber brings into every channel from their personal set." help="A subscriber's personal 7TV set works in every channel, so chatters can show emotes your channel never added. Off renders those as the word that was typed. Your channel's own 7TV emotes are unaffected." control={<Toggle enabled={style.showPersonalEmotes !== false} onChange={() => set('showPersonalEmotes', style.showPersonalEmotes === false)} />} />
+          <SettingsRow onReset={resetFor('showBadges')} title="Badges" description="Badges the platform sends: subscriber, moderator, VIP, and the rest." help="These arrive with each message from Twitch, Kick, YouTube and TikTok. Chat-client badges and the StreamNook member badge are separate, on the Add-on badges switch below, so turning this off leaves those showing." control={<Toggle enabled={style.showBadges} onChange={() => set('showBadges', !style.showBadges)} />} />
+          <SettingsSubGroup>
+          <SettingsRow onReset={resetFor('hiddenTwitchBadgeCategories')} title="Twitch badges" titleBadge={<SourceScope sources={['twitch']} />} description="Pick which kinds of Twitch badges show." help="Prediction is every blue, pink and gray pick. Gifted subs is gift leaders and sub gifter badges. Bits is bits leaders and cheer badges. Authority roles is lead mod, mod and VIP. Everything else covers Prime, Turbo, and event and game badges. Your own broadcaster badge always shows." disabled={!style.showBadges}>
+            <div className="flex flex-wrap gap-2">
+              {TWITCH_BADGE_CATEGORIES.map((c) => {
+                const on = style.showBadges && !(style.hiddenTwitchBadgeCategories ?? []).includes(c.id);
+                return (
+                  <button
+                    key={c.id}
+                    onClick={() => toggleTwitchBadgeCategory(c.id)}
+                    disabled={!style.showBadges}
+                    style={{ borderRadius: 8 }}
+                    className={`px-2.5 py-1.5 text-[13px] font-medium transition-all disabled:opacity-40 disabled:cursor-not-allowed ${on ? 'glass-input text-textPrimary' : 'glass-button text-textSecondary hover:text-textPrimary'}`}
+                  >
+                    {c.label}
+                  </button>
+                );
+              })}
+            </div>
+          </SettingsRow>
+          <SettingsRow onReset={resetFor('ffzCustomRoleBadges')} title="Custom mod & VIP badges" titleBadge={<SourceScope sources={['twitch']} />} description="Show your channel's own FrankerFaceZ moderator and VIP badges." help="Off shows Twitch's standard moderator and VIP badges. A channel's custom art can be anything, so it stays off until you turn it on." disabled={!style.showBadges} control={<Toggle enabled={style.ffzCustomRoleBadges === true} onChange={() => set('ffzCustomRoleBadges', style.ffzCustomRoleBadges !== true)} />} />
+          </SettingsSubGroup>
           {/* Scales every badge in the row, not just the platform ones, so this
               only goes dead when BOTH badge switches are off. */}
           <SettingsRow onReset={resetFor('badgeScale')} title="Badge size" disabled={!style.showBadges && style.showThirdPartyBadges === false}>
             <Slider value={style.badgeScale} min={OVERLAY_LIMITS.badgeScale.min} max={OVERLAY_LIMITS.badgeScale.max} step={0.05} onChange={(v) => set('badgeScale', v)} format={(v) => `${v.toFixed(2)}x`} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('showThirdPartyBadges')} title="Third-party badges" description="7TV, FFZ, Chatterino, and more." help="Native platform badges follow the Show badges toggle above." control={<Toggle enabled={style.showThirdPartyBadges} onChange={() => set('showThirdPartyBadges', !style.showThirdPartyBadges)} />} />
+          <SettingsRow onReset={resetFor('showThirdPartyBadges')} title="Add-on badges" description="Third-party badges: 7TV, FFZ, Chatterino, and more." help="Native platform badges follow the Badges toggle above." control={<Toggle enabled={style.showThirdPartyBadges} onChange={() => set('showThirdPartyBadges', !style.showThirdPartyBadges)} />} />
           <SettingsSubGroup>
-          <SettingsRow onReset={resetFor('hiddenBadgeProviders')} title="Badge providers" description="Pick which providers show." help="StreamNook is the member badge. The rest are third-party.">
+          <SettingsRow onReset={resetFor('hiddenBadgeProviders')} title="Services" description="Pick which badge services show." help="StreamNook is the member badge. The rest are third-party.">
             <div className="flex flex-wrap gap-2">
               {THIRD_PARTY_BADGE_PROVIDERS.map((p) => {
                 const on = style.showThirdPartyBadges !== false && !(style.hiddenBadgeProviders ?? []).includes(p.id);
@@ -1658,8 +2088,8 @@ const OverlayEditor = () => {
 
         <SettingsSection label="Chatters" description="Picture, name, and cosmetics of the person behind each message.">
           <SettingsRow onReset={resetFor('showAvatars')} title="Profile pictures" titleBadge={<SourceScope sources={['youtube', 'tiktok']} />} description="Avatars beside names." help="YouTube and TikTok send avatars. Twitch and Kick don't have them, so nothing changes there." control={<Toggle enabled={style.showAvatars} onChange={() => set('showAvatars', !style.showAvatars)} />} />
-          <SettingsRow onReset={resetFor('showAtSign')} title="@ before usernames" titleBadge={<SourceScope sources={['youtube']} />} description="Keep the @ on YouTube handles." help="YouTube names arrive as @handles. Off drops the leading @ from every name." control={<Toggle enabled={style.showAtSign} onChange={() => set('showAtSign', !style.showAtSign)} />} />
-          <SettingsRow onReset={resetFor('readableNameColors')} title="Readable name colors" description="Brighten names too dark to read." help="Walks a chatter's own color lighter until it stands out against your bubbles, your background, or the stream. The hue stays the same, and 7TV paints are never changed." control={<Toggle enabled={style.readableNameColors} onChange={() => set('readableNameColors', !style.readableNameColors)} />} />
+          <SettingsRow onReset={resetFor('showAtSign')} title="@ prefix" titleBadge={<SourceScope sources={['youtube']} />} description="Keep the @ before YouTube usernames." help="YouTube names arrive as @handles. Off drops the leading @ from every name." control={<Toggle enabled={style.showAtSign} onChange={() => set('showAtSign', !style.showAtSign)} />} />
+          <SettingsRow onReset={resetFor('readableNameColors')} title="Readable colors" description="Brighten name colors too dark to read." help="Walks a chatter's own color lighter until it stands out against your bubbles, your background, or the stream. The hue stays the same, and 7TV paints are never changed." control={<Toggle enabled={style.readableNameColors} onChange={() => set('readableNameColors', !style.readableNameColors)} />} />
           <SettingsRow onReset={resetFor('showPaints')}
             title={<span className="inline-flex items-center gap-1.5"><SevenTVLogo className="h-[11px] w-auto text-[#29b6f6]" /> Paints</span>}
             description="Colored and animated username gradients."
@@ -1679,7 +2109,7 @@ const OverlayEditor = () => {
           </SettingsRow>
           <SettingsSubGroup>
           <SettingsRow onReset={resetFor('firstTimeColor')}
-            title="Highlight color"
+            title="Color"
             description="Default matches the style: Twitch pink or StreamNook purple." help="One color drives the outline, fill, bar, and label together."
             disabled={style.firstTimeStyle === 'off'}
             control={
@@ -1699,7 +2129,7 @@ const OverlayEditor = () => {
               </div>
             }
           />
-          <SettingsRow onReset={resetFor('firstTimeFill')} title="Fill the highlight" description="A faint tint inside the outline." help="Color-matched to the outline, so the message reads highlighted instead of just bordered. The StreamNook style has its own wash." disabled={style.firstTimeStyle !== 'twitch'} control={<Toggle enabled={style.firstTimeFill} onChange={() => set('firstTimeFill', !style.firstTimeFill)} />} />
+          <SettingsRow onReset={resetFor('firstTimeFill')} title="Fill" description="A faint tint inside the outline." help="Color-matched to the outline, so the message reads highlighted instead of just bordered. The StreamNook style has its own wash." disabled={style.firstTimeStyle !== 'twitch'} control={<Toggle enabled={style.firstTimeFill} onChange={() => set('firstTimeFill', !style.firstTimeFill)} />} />
           <SettingsRow onReset={resetFor('firstTimeAnimation')} title="Animation" description="Plays on the border when the message lands." help="Sheen sweeps a glint across it. Pulse breathes it brighter. Chase sends a spark around it." disabled={style.firstTimeStyle === 'off'}>
             <SegmentedSelect
               value={style.firstTimeAnimation}
@@ -1707,11 +2137,11 @@ const OverlayEditor = () => {
               options={OVERLAY_ANIMATIONS.map((a) => ({ value: a.value, label: a.label }))}
             />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('firstTimeAnimateRepeat')} title="Repeat the animation" description="Keep it going while the message is on screen." help="Sheen and Pulse replay every 5 seconds. Chase spins continuously." disabled={style.firstTimeStyle === 'off' || style.firstTimeAnimation === 'none'} control={<Toggle enabled={style.firstTimeAnimateRepeat} onChange={() => set('firstTimeAnimateRepeat', !style.firstTimeAnimateRepeat)} />} />
+          <SettingsRow onReset={resetFor('firstTimeAnimateRepeat')} title="Loop" description="Keep the animation going while the message is on screen." help="Sheen and Pulse replay every 5 seconds. Chase spins continuously." disabled={style.firstTimeStyle === 'off' || style.firstTimeAnimation === 'none'} control={<Toggle enabled={style.firstTimeAnimateRepeat} onChange={() => set('firstTimeAnimateRepeat', !style.firstTimeAnimateRepeat)} />} />
           </SettingsSubGroup>
         </SettingsSection>
 
-        <SettingsSection label="Messages" description="How messages render and flow.">
+        <SettingsSection label="Messages" description="How each message looks.">
           <SettingsRow onReset={resetFor('replyStyle')} title="Replies" description="How a reply shows the message it answers." help={'Context line shows "Replying to @name: their message" above it. @username puts just the name in front of the message, the way Twitch chat did before threading. Off shows the message on its own.'}>
             <SegmentedSelect value={style.replyStyle} options={REPLY_STYLES} onChange={(v) => set('replyStyle', v)} />
           </SettingsRow>
@@ -1719,16 +2149,16 @@ const OverlayEditor = () => {
             <SegmentedSelect value={style.linkStyle} options={LINK_STYLES} onChange={(v) => set('linkStyle', v)} />
           </SettingsRow>
           <SettingsSubGroup>
-            <SettingsRow onReset={resetFor('linkColor')} title="Link color" disabled={style.linkStyle !== 'accent'} control={
+            <SettingsRow onReset={resetFor('linkColor')} title="Color" disabled={style.linkStyle !== 'accent'} control={
               <input type="color" value={style.linkColor || DEFAULT_LINK_COLOR} onChange={(e) => set('linkColor', e.target.value)} disabled={style.linkStyle !== 'accent'} className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle disabled:cursor-not-allowed" />
             } />
-            <SettingsRow onReset={resetFor('linkUnderline')} title="Underline links" control={<Toggle enabled={style.linkUnderline !== false} onChange={() => set('linkUnderline', style.linkUnderline === false)} />} />
+            <SettingsRow onReset={resetFor('linkUnderline')} title="Underline" control={<Toggle enabled={style.linkUnderline !== false} onChange={() => set('linkUnderline', style.linkUnderline === false)} />} />
           </SettingsSubGroup>
-          <SettingsRow onReset={resetFor('showTimestamps')} title="Show timestamps" control={<Toggle enabled={style.showTimestamps} onChange={() => set('showTimestamps', !style.showTimestamps)} />} />
-          <SettingsRow onReset={resetFor('bubble')} title="Message bubbles" description="Each message in its own bubble. Reads better over busy gameplay." help="A member's atmosphere replaces the bubble on their rows." control={<Toggle enabled={style.bubble} onChange={() => set('bubble', !style.bubble)} />} />
+          <SettingsRow onReset={resetFor('showTimestamps')} title="Timestamps" control={<Toggle enabled={style.showTimestamps} onChange={() => set('showTimestamps', !style.showTimestamps)} />} />
+          <SettingsRow onReset={resetFor('bubble')} title="Bubbles" description="Each message in its own bubble. Reads better over busy gameplay." help="A member's atmosphere replaces the bubble on their rows." control={<Toggle enabled={style.bubble} onChange={() => set('bubble', !style.bubble)} />} />
           {style.bubble && (
             <SettingsSubGroup>
-              <SettingsRow onReset={resetFor('bubbleShape')} title="Bubble shape" description="Rounded, pill, or speech bubble." help="Rounded uses the corner radius below. Pill fully rounds the ends. Speech tucks in the bottom-left corner like a messenger bubble.">
+              <SettingsRow onReset={resetFor('bubbleShape')} title="Shape" description="Rounded, pill, or speech bubble." help="Rounded uses the corner radius below. Pill fully rounds the ends. Speech tucks in the bottom-left corner like a messenger bubble.">
                 <SegmentedSelect
                   value={style.bubbleShape}
                   onChange={(v) => set('bubbleShape', v)}
@@ -1738,24 +2168,27 @@ const OverlayEditor = () => {
               <SettingsRow onReset={resetFor('bubbleRadius')} title="Corner radius" disabled={style.bubbleShape === 'pill'}>
                 <Slider value={style.bubbleRadius} min={OVERLAY_LIMITS.bubbleRadius.min} max={OVERLAY_LIMITS.bubbleRadius.max} step={1} onChange={(v) => set('bubbleRadius', Math.round(v))} format={(v) => `${v}px`} />
               </SettingsRow>
-              <SettingsRow onReset={resetFor('bubbleColor')} title="Bubble color" control={
+              <SettingsRow onReset={resetFor('bubbleColor')} title="Color" control={
                 <input type="color" value={style.bubbleColor} onChange={(e) => set('bubbleColor', e.target.value)} className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle" />
               } />
-              <SettingsRow onReset={resetFor('bubbleOpacity')} title="Bubble opacity">
+              <SettingsRow onReset={resetFor('bubbleOpacity')} title="Opacity">
                 <Slider value={style.bubbleOpacity} min={OVERLAY_LIMITS.bubbleOpacity.min} max={OVERLAY_LIMITS.bubbleOpacity.max} step={0.05} onChange={(v) => set('bubbleOpacity', v)} format={(v) => `${Math.round(v * 100)}%`} />
               </SettingsRow>
             </SettingsSubGroup>
           )}
-          <SettingsRow onReset={resetFor('maxMessageLines')} title="Max lines per message" description="Cut long messages off so one wall of text can't eat the canvas.">
+          <SettingsRow onReset={resetFor('maxMessageLines')} title="Max lines" description="Lines per message; long ones are cut off so one wall of text can't eat the canvas.">
             <Slider value={style.maxMessageLines} min={OVERLAY_LIMITS.maxMessageLines.min} max={OVERLAY_LIMITS.maxMessageLines.max} step={1} onChange={(v) => set('maxMessageLines', Math.round(v))} format={(v) => (v === 0 ? 'No limit' : `${v}`)} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('maxMessageAgeSec')} title="Remove messages after" description="Takes a message off the overlay once it has been up this long, so a quiet stream never shows stale chat.">
+        </SettingsSection>
+
+        <SettingsSection label="Behavior" description="How chat flows: where new messages land, how long they stay, and what happens on reload.">
+          <SettingsRow onReset={resetFor('maxMessageAgeSec')} title="Lifetime" description="Removes a message from the overlay once it has been up this long, so a quiet stream never shows stale chat.">
             <Slider value={style.maxMessageAgeSec} min={OVERLAY_LIMITS.maxMessageAgeSec.min} max={OVERLAY_LIMITS.maxMessageAgeSec.max} step={5} onChange={(v) => set('maxMessageAgeSec', Math.round(v))} format={(v) => (v === 0 ? 'Never' : `${v}s`)} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('restoreOnReload')} title="Restore chat on reload" description="Bring back the last messages when the OBS source reloads." help="Off means the overlay comes back cleared when you reopen OBS or start a stream." control={<Toggle enabled={style.restoreOnReload} onChange={() => set('restoreOnReload', !style.restoreOnReload)} />} />
-          <SettingsRow onReset={resetFor('loadRecentChat')} title="Recent chat on start" titleBadge={<SourceScope sources={['twitch']} />} description="Open with the channel's last messages." help="When the overlay starts, it fills with up to 40 recent Twitch messages instead of waiting for new ones. Deleted messages stay gone." control={<Toggle enabled={style.loadRecentChat} onChange={() => set('loadRecentChat', !style.loadRecentChat)} />} />
+          <SettingsRow onReset={resetFor('restoreOnReload')} title="Restore on reload" description="Bring back the last chat messages when the OBS source reloads." help="Off means the overlay comes back cleared when you reopen OBS or start a stream." control={<Toggle enabled={style.restoreOnReload} onChange={() => set('restoreOnReload', !style.restoreOnReload)} />} />
+          <SettingsRow onReset={resetFor('loadRecentChat')} title="Recent chat" titleBadge={<SourceScope sources={['twitch']} />} description="Open with the channel's last messages when the overlay starts." help="When the overlay starts, it fills with up to 40 recent Twitch messages instead of waiting for new ones. Deleted messages stay gone." control={<Toggle enabled={style.loadRecentChat} onChange={() => set('loadRecentChat', !style.loadRecentChat)} />} />
           <SettingsRow onReset={resetFor('modCommands')} title="Mod commands" titleBadge={<SourceScope sources={['twitch']} />} description="Mods can reload or clear the overlay from chat." help="The broadcaster and moderators type !refreshoverlay to reload it or !clearoverlay to empty it. The command itself never shows on the overlay." control={<Toggle enabled={style.modCommands} onChange={() => set('modCommands', !style.modCommands)} />} />
-          <SettingsRow onReset={resetFor('direction')} title="New messages" description="Where incoming messages appear.">
+          <SettingsRow onReset={resetFor('direction')} title="Direction" description="Where new messages appear.">
             <SegmentedSelect
               value={style.direction}
               onChange={(v) => set('direction', v)}
@@ -1773,20 +2206,20 @@ const OverlayEditor = () => {
 
         <>
         <SettingsSection label="Filters" description="Keep bots and command spam out of the overlay.">
-          <SettingsRow onReset={resetFor('hideBots')} title="Hide bot messages" description="Nightbot, StreamElements, other known bots, and anyone with a bot badge." help="Channel bots vary and some slip through. Hide any it misses by name under Hidden accounts." control={<Toggle enabled={style.hideBots} onChange={() => set('hideBots', !style.hideBots)} />} />
-          <SettingsRow onReset={resetFor('hideCommands')} title="Hide command messages" description="Keeps chat commands like !title off the overlay; choose which ones below." control={<Toggle enabled={style.hideCommands} onChange={() => set('hideCommands', !style.hideCommands)} />} />
+          <SettingsRow onReset={resetFor('hideBots')} title="Hide bots" description="Nightbot, StreamElements, other known bots, and anyone with a bot badge." help="Channel bots vary and some slip through. Hide any it misses by name under Hidden Accounts." control={<Toggle enabled={style.hideBots} onChange={() => set('hideBots', !style.hideBots)} />} />
+          <SettingsRow onReset={resetFor('hideCommands')} title="Hide commands" description="Keeps chat commands like !title off the overlay; choose which ones below." control={<Toggle enabled={style.hideCommands} onChange={() => set('hideCommands', !style.hideCommands)} />} />
           {style.hideCommands && (
             <SettingsSubGroup>
-              <SettingsRow onReset={resetFor('commandFilters')} title="Commands to hide">
+              <SettingsRow onReset={resetFor('commandFilters')} title="Commands">
                 <CommandFilterEditor filters={style.commandFilters ?? []} onAdd={addCommandFilter} onRemove={removeCommandFilter} />
               </SettingsRow>
             </SettingsSubGroup>
           )}
-          <SettingsRow onReset={resetFor('hidePhrases')} title="Hide messages containing" description="Words or phrases that keep a message off the overlay." help="Matched anywhere in the message, in any case, whatever channel moderation does. Events are unaffected.">
+          <SettingsRow onReset={resetFor('hidePhrases')} title="Phrases" description="Hide messages containing these words or phrases." help="Matched anywhere in the message, in any case, whatever channel moderation does. Events are unaffected.">
             <PhraseEditor phrases={style.hidePhrases ?? []} onAdd={addPhrase} onRemove={removePhrase} />
           </SettingsRow>
         </SettingsSection>
-        <SettingsSection label="Hidden accounts" description="Hide specific people on each source, by username or display name.">
+        <SettingsSection label="Hidden Accounts" description="Hide specific people on each source, by username or display name.">
           {sources.length === 0 ? (
             <p className="py-3 text-[13px] text-textMuted">Add a source first, then hide accounts on it.</p>
           ) : (
@@ -1804,21 +2237,22 @@ const OverlayEditor = () => {
         </>
 
         <SettingsSection label="Events" description="Subs, gifts, raids, and more. How they look, and which ones each source shows.">
-          <SettingsRow onReset={resetFor('cheerDisplay')} title="Bits messages" titleBadge={<SourceScope sources={['twitch']} />} description="Show a cheer inline like a normal message, or as an event card like subs and raids.">
+          <SettingsRow onReset={resetFor('cheerDisplay')} title="Cheers" titleBadge={<SourceScope sources={['twitch']} />} description="Show a bits cheer inline like a normal message, or as an event card like subs and raids.">
             <SegmentedSelect value={style.cheerDisplay ?? 'message'} onChange={(v) => set('cheerDisplay', v)} options={CHEER_DISPLAYS} />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('eventStyle')} title="Event style" description="A subtle tint, a thin platform-colored ring, or the StreamNook gradient wash." help="Every style shows the sender's badges and paint name.">
+          <SettingsRow onReset={resetFor('seventvEmoteChanges')} title={<span className="inline-flex items-center gap-1.5"><SevenTVLogo className="h-[11px] w-auto text-[#29b6f6]" /> Emote changes</span>} description="Show when an emote is added to, removed from or renamed in your 7TV set." help="Each change shows who made it and the emote, styled like your other events." control={<Toggle enabled={style.seventvEmoteChanges !== false} onChange={() => set('seventvEmoteChanges', style.seventvEmoteChanges === false)} />} />
+          <SettingsRow onReset={resetFor('eventStyle')} title="Style" description="A subtle tint, a thin platform-colored ring, or the StreamNook gradient wash." help="Every style shows the sender's badges and paint name.">
             <SegmentedSelect
               value={style.eventStyle}
               onChange={(v) => set('eventStyle', v)}
               options={[{ value: 'plain', label: 'Plain' }, { value: 'outline', label: 'Outline' }, { value: 'streamnook', label: 'StreamNook' }]}
             />
           </SettingsRow>
+          {style.eventStyle === 'outline' && (
           <SettingsSubGroup>
           <SettingsRow onReset={resetFor('eventOutlineColor')}
             title="Outline color"
             description="One fixed ring color for every event. Default gives each event its own platform's color."
-            disabled={style.eventStyle !== 'outline'}
             control={
               <div className="flex items-center gap-2">
                 {!!style.eventOutlineColor && (
@@ -1830,26 +2264,26 @@ const OverlayEditor = () => {
                   type="color"
                   value={style.eventOutlineColor || '#9147ff'}
                   onChange={(e) => set('eventOutlineColor', e.target.value)}
-                  disabled={style.eventStyle !== 'outline'}
-                  className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle disabled:cursor-not-allowed"
+                  className="h-7 w-10 rounded cursor-pointer bg-transparent border border-borderSubtle"
                 />
               </div>
             }
           />
-          <SettingsRow onReset={resetFor('eventFill')} title="Fill the outline" description="A nearly transparent tint inside the ring, matched to the outline's color." disabled={style.eventStyle !== 'outline'} control={<Toggle enabled={style.eventFill} onChange={() => set('eventFill', !style.eventFill)} />} />
-          <SettingsRow onReset={resetFor('eventAnimation')} title="Animation" description="Plays on the ring when the event lands." help="Sheen sweeps a glint across it. Pulse breathes it brighter. Chase sends a spark around it." disabled={style.eventStyle !== 'outline'}>
+          <SettingsRow onReset={resetFor('eventFill')} title="Fill" description="A nearly transparent tint inside the ring, matched to the outline's color." control={<Toggle enabled={style.eventFill} onChange={() => set('eventFill', !style.eventFill)} />} />
+          <SettingsRow onReset={resetFor('eventAnimation')} title="Animation" description="Plays on the ring when the event lands." help="Sheen sweeps a glint across it. Pulse breathes it brighter. Chase sends a spark around it.">
             <SegmentedSelect
               value={style.eventAnimation}
               onChange={(v) => set('eventAnimation', v)}
               options={OVERLAY_ANIMATIONS.map((a) => ({ value: a.value, label: a.label }))}
             />
           </SettingsRow>
-          <SettingsRow onReset={resetFor('eventAnimateRepeat')} title="Repeat the animation" description="Keep it going while the event is on screen." help="Sheen and Pulse replay every 5 seconds. Chase spins continuously." disabled={style.eventStyle !== 'outline' || style.eventAnimation === 'none'} control={<Toggle enabled={style.eventAnimateRepeat} onChange={() => set('eventAnimateRepeat', !style.eventAnimateRepeat)} />} />
+          <SettingsRow onReset={resetFor('eventAnimateRepeat')} title="Loop" description="Keep the animation going while the event is on screen." help="Sheen and Pulse replay every 5 seconds. Chase spins continuously." disabled={style.eventAnimation === 'none'} control={<Toggle enabled={style.eventAnimateRepeat} onChange={() => set('eventAnimateRepeat', !style.eventAnimateRepeat)} />} />
           </SettingsSubGroup>
+          )}
           <SettingsRow
-            title="Custom event text"
+            title="Wording"
             onReset={resetFor('eventTemplates')}
-            description="Your own wording for each event, with tokens for the details." help="Leave one blank to keep what the platform sends. Click a token to drop it in at the cursor, or open the full list to see everything you can reference."
+            description="Custom event text: your own wording for each event, with tokens for the details." help="Leave one blank to keep what the platform sends. Click a token to drop it in at the cursor, or open the full list to see everything you can reference."
           >
             <TokenLegend />
           </SettingsRow>
@@ -1870,43 +2304,45 @@ const OverlayEditor = () => {
             ))}
           </SettingsSubGroup>
           <SettingsRow
-            title="Show events"
-            description="Each platform filters on its own."
+            title="Platforms"
+            description="Which events show, set per platform. Each platform filters on its own."
             help={sourceProviders.length
               ? "Turn a type off and that platform's version of it never reaches the overlay. The other platforms are untouched."
               : "Add sources and this narrows to just those platforms. Turning a type off hides only that platform's version of it."}
           />
-          {eventProviders.map((provider) => (
-            <SettingsRow
-              key={`pe-${provider}`}
-              title={<span className="inline-flex items-center gap-1.5"><ProviderIcon provider={provider} size="14px" /> {PROVIDERS[provider].label}</span>}
-              // Scoped to this platform: every source filters on its own, so
-              // restoring one must not un-hide what was turned off on another.
-              onReset={(style.hiddenProviderEvents ?? []).some((k) => k.startsWith(`${provider}:`))
-                ? () => setStyle((st) => ({
-                    ...st,
-                    hiddenProviderEvents: (st.hiddenProviderEvents ?? []).filter((k) => !k.startsWith(`${provider}:`)),
-                  }))
-                : undefined}
-            >
-              <div className="flex flex-wrap gap-2">
-                {(PROVIDER_EVENT_CATEGORIES[provider] ?? []).map((cat) => {
-                  const key = `${provider}:${cat}`;
-                  const on = !(style.hiddenProviderEvents ?? []).includes(key);
-                  return (
-                    <button
-                      key={key}
-                      onClick={() => toggleProviderEvent(key)}
-                      style={{ borderRadius: 8 }}
-                      className={`px-2.5 py-1.5 text-[13px] font-medium transition-all ${on ? 'glass-input text-textPrimary' : 'glass-button text-textSecondary hover:text-textPrimary'}`}
-                    >
-                      {catLabel(provider, cat)}
-                    </button>
-                  );
-                })}
-              </div>
-            </SettingsRow>
-          ))}
+          <SettingsSubGroup>
+            {eventProviders.map((provider) => (
+              <SettingsRow
+                key={`pe-${provider}`}
+                title={<span className="inline-flex items-center gap-1.5"><ProviderIcon provider={provider} size="14px" /> {PROVIDERS[provider].label}</span>}
+                // Scoped to this platform: every source filters on its own, so
+                // restoring one must not un-hide what was turned off on another.
+                onReset={(style.hiddenProviderEvents ?? []).some((k) => k.startsWith(`${provider}:`))
+                  ? () => setStyle((st) => ({
+                      ...st,
+                      hiddenProviderEvents: (st.hiddenProviderEvents ?? []).filter((k) => !k.startsWith(`${provider}:`)),
+                    }))
+                  : undefined}
+              >
+                <div className="flex flex-wrap gap-2">
+                  {(PROVIDER_EVENT_CATEGORIES[provider] ?? []).map((cat) => {
+                    const key = `${provider}:${cat}`;
+                    const on = !(style.hiddenProviderEvents ?? []).includes(key);
+                    return (
+                      <button
+                        key={key}
+                        onClick={() => toggleProviderEvent(key)}
+                        style={{ borderRadius: 8 }}
+                        className={`px-2.5 py-1.5 text-[13px] font-medium transition-all ${on ? 'glass-input text-textPrimary' : 'glass-button text-textSecondary hover:text-textPrimary'}`}
+                      >
+                        {catLabel(provider, cat)}
+                      </button>
+                    );
+                  })}
+                </div>
+              </SettingsRow>
+            ))}
+          </SettingsSubGroup>
           {sourceProviders.includes('youtube') && (
             <SettingsRow onReset={resetFor('superchatCurrency')}
               title="Super Chat currency"
@@ -1915,6 +2351,7 @@ const OverlayEditor = () => {
             />
           )}
         </SettingsSection>
+      </div>
       </div>
 
       {/* ── Preview studio ───────────────────────────────────────── */}
@@ -1979,7 +2416,7 @@ const OverlayEditor = () => {
                 flow ? (
                   <SampleFlowFeed style={style} />
                 ) : (
-                  <OverlayChat messages={SAMPLE_MESSAGES} style={style} superSample={2} />
+                  <OverlayChat messages={sampleFeed} style={style} superSample={2} />
                 )
               ) : (
                 // Kept mounted through all add/remove/swap so the feed diffs

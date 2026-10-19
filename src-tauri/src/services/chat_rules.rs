@@ -22,7 +22,7 @@
 //! `flags.similar`, `reward.title`, `reward.cost`) evaluate to their empty
 //! value and `validate_filter` lists them so the editor can say so.
 
-use crate::models::chat_layout::{BuiltInStamp, ChatMessage, HighlightStamp};
+use crate::models::chat_layout::{BuiltInStamp, ChatMessage, HighlightStamp, ScrollbarMark};
 use crate::models::settings::Settings;
 use regex::{Regex, RegexSet};
 use serde::Deserialize;
@@ -54,6 +54,8 @@ struct HighlightPhrase {
     sound_id: Option<String>,
     #[serde(default)]
     cooldown_seconds: Option<f64>,
+    #[serde(default)]
+    hold: bool,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -70,6 +72,8 @@ struct HighlightUser {
     sound_id: Option<String>,
     #[serde(default)]
     cooldown_seconds: Option<f64>,
+    #[serde(default)]
+    hold: bool,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -86,6 +90,8 @@ struct HighlightBadge {
     sound_id: Option<String>,
     #[serde(default)]
     cooldown_seconds: Option<f64>,
+    #[serde(default)]
+    hold: bool,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -190,7 +196,12 @@ fn default_true() -> bool {
 }
 
 const DEFAULT_COOLDOWN_SECONDS: f64 = 3.0;
-const VALID_SOUND_IDS: [&str; 5] = ["boop", "tick", "soft", "whisper", "gentle"];
+/// The built-in tones; `BUILT_IN_SOUNDS` in src/utils/notificationSound.ts
+/// lists the same ids (checked by its test).
+const VALID_SOUND_IDS: [&str; 12] = [
+    "boop", "tick", "soft", "whisper", "gentle", "morse", "pager", "flip", "arcade", "gadget",
+    "ringtone", "granvals",
+];
 
 fn normalize_sound(raw: &Option<String>) -> Option<String> {
     let s = raw.as_deref()?;
@@ -268,6 +279,7 @@ struct RuleMeta {
     color: String,
     sound_id: Option<String>,
     cooldown_ms: u64,
+    hold: bool,
 }
 
 struct BadgeRule {
@@ -303,11 +315,20 @@ pub struct CompiledRules {
     hide_bots: bool,
     hidden_global: HashSet<String>,
     hidden_per_channel: HashMap<String, HashSet<String>>,
+    /// Hidden channels' accounts (`hidden_channels::chat_accounts`):
+    /// `twitch:<user id>`, or `provider:<login>` elsewhere.
+    hidden_accounts: HashSet<String>,
+    /// Their logins, for clearing rows already on screen.
+    hidden_account_logins: HashSet<String>,
     ignore_set: Option<RegexSet>,
     pub filters: Vec<CompiledFilter>,
     /// Patterns that failed to compile, for the settings UI.
     pub errors: Vec<RuleError>,
     pub history_cap: usize,
+    /// The chat design's mention and reply colours, for their scrollbar
+    /// ticks. Empty leaves the tick to the page's theme colour.
+    mention_color: String,
+    reply_color: String,
 }
 
 impl Default for BuiltIn {
@@ -385,6 +406,12 @@ pub fn channel_filter_key(provider: &str, channel: &str) -> String {
 }
 
 impl CompiledRules {
+    /// What a fresh install compiles to, without installing it.
+    #[cfg(test)]
+    pub(crate) fn defaults_for_test() -> CompiledRules {
+        Self::compile(&Default::default(), &Default::default(), &Default::default())
+    }
+
     fn compile(
         hl: &ChatHighlightSettings,
         cf: &ChatFilterSettings,
@@ -408,6 +435,7 @@ impl CompiledRules {
                         color: p.color.clone(),
                         sound_id: normalize_sound(&p.sound_id),
                         cooldown_ms: cooldown_ms(p.cooldown_seconds),
+                        hold: p.hold,
                     });
                 }
                 Err(e) => errors.push(RuleError {
@@ -448,6 +476,7 @@ impl CompiledRules {
                 color: u.color.clone(),
                 sound_id: normalize_sound(&u.sound_id),
                 cooldown_ms: cooldown_ms(u.cooldown_seconds),
+                hold: u.hold,
             });
         }
 
@@ -472,6 +501,7 @@ impl CompiledRules {
                     color: b.color.clone(),
                     sound_id: normalize_sound(&b.sound_id),
                     cooldown_ms: cooldown_ms(b.cooldown_seconds),
+                    hold: b.hold,
                 },
                 key,
                 wildcard,
@@ -584,10 +614,14 @@ impl CompiledRules {
             hide_bots: cf.hide_bots,
             hidden_global,
             hidden_per_channel,
+            hidden_accounts: HashSet::new(),
+            hidden_account_logins: HashSet::new(),
             ignore_set,
             filters,
             errors,
             history_cap,
+            mention_color: String::new(),
+            reply_color: String::new(),
         }
     }
 
@@ -634,10 +668,38 @@ const SUB_TYPES: &[&str] = &[
     "onetapstreakexpired",
 ];
 
+/// Built-in filter ids for the local views (`/localmod`, `/localsub`,
+/// `/localascii`): a pane in one of those views shows only rows carrying the
+/// id. Stamped on every message whatever the saved filters are.
+pub const LOCAL_MOD_FILTER: &str = "local:mod";
+pub const LOCAL_SUB_FILTER: &str = "local:sub";
+pub const LOCAL_ASCII_FILTER: &str = "local:ascii";
+
+pub fn local_view_ids(facts: &MessageFacts<'_>) -> Vec<String> {
+    let has = |name: &str| facts.badge_names.iter().any(|b| b == name);
+    let staff = has("broadcaster") || has("moderator") || has("lead_moderator");
+    let mut ids = Vec::new();
+    if staff {
+        ids.push(LOCAL_MOD_FILTER.to_string());
+    }
+    if staff || facts.subbed || has("subscriber") || has("founder") {
+        ids.push(LOCAL_SUB_FILTER.to_string());
+    }
+    if facts.content.is_ascii() {
+        ids.push(LOCAL_ASCII_FILTER.to_string());
+    }
+    ids
+}
+
 pub struct MessageFacts<'a> {
     pub login: String,
     pub display_lower: String,
     pub user_id: &'a str,
+    /// The message came from Twitch. The engine's own identity is the Twitch
+    /// account, so user-id comparisons (own message, reply to me) only mean
+    /// anything here: another platform's ids live in a different space and can
+    /// collide with the Twitch id numerically.
+    pub twitch: bool,
     pub color: &'a str,
     /// `name/version` lowercased.
     pub badge_keys: Vec<String>,
@@ -652,6 +714,9 @@ pub struct MessageFacts<'a> {
     pub reward_id: String,
     pub reply_parent_user_id: &'a str,
     pub msg_type: &'a str,
+    /// A /announce row (here or relayed through shared chat): the colour name
+    /// Twitch sent with it (`PRIMARY`, `BLUE`, ...), `PRIMARY` when absent.
+    pub announcement: Option<&'a str>,
     pub ts_ms: i64,
     /// "monitored" | "restricted" when the sender is flagged in this channel.
     pub suspicious: Option<String>,
@@ -757,10 +822,20 @@ impl<'a> MessageFacts<'a> {
             .or_else(|| msg.timestamp.parse::<i64>().ok())
             .unwrap_or(0);
 
+        let announcement = if msg_type == "announcement"
+            || msg_id_tag == "announcement"
+            || tag("source-msg-id") == "announcement"
+        {
+            Some(msg.tags.get("msg-param-color").map(|s| s.as_str()).unwrap_or("PRIMARY"))
+        } else {
+            None
+        };
+
         MessageFacts {
             login,
             display_lower,
             user_id: &msg.user_id,
+            twitch: msg.provider.is_empty() || msg.provider.eq_ignore_ascii_case("twitch"),
             color: msg.color.as_deref().unwrap_or(""),
             badge_keys,
             badge_names,
@@ -779,6 +854,7 @@ impl<'a> MessageFacts<'a> {
                 .map(|r| r.parent_user_id.as_str())
                 .unwrap_or(""),
             msg_type,
+            announcement,
             ts_ms,
             suspicious,
         }
@@ -833,6 +909,8 @@ pub struct Verdict {
     pub drop: bool,
     pub matched_highlight: bool,
     pub mentioned: bool,
+    /// A reply to one of the signed-in account's own messages.
+    pub reply_to_me: bool,
 }
 
 /// Full result of one evaluation, applied to the message after the borrowed
@@ -845,6 +923,7 @@ struct Evaluation {
     built_in: Option<BuiltInStamp>,
     filter_ids: Vec<String>,
     suspicious: Option<String>,
+    scrollbar_mark: Option<ScrollbarMark>,
 }
 
 impl Evaluation {
@@ -857,6 +936,7 @@ impl Evaluation {
             built_in: None,
             filter_ids: Vec::new(),
             suspicious: None,
+            scrollbar_mark: None,
         }
     }
 }
@@ -868,6 +948,7 @@ impl Evaluation {
 fn newly_hidden_frames(prev: &CompiledRules, next: &CompiledRules) -> Vec<String> {
     let mut frames = Vec::new();
     let mut everywhere: Vec<String> = next.hidden_global.difference(&prev.hidden_global).cloned().collect();
+    everywhere.extend(next.hidden_account_logins.difference(&prev.hidden_account_logins).cloned());
     if next.hide_bots && !prev.hide_bots {
         everywhere.extend(KNOWN_BOTS.iter().map(|b| b.to_string()));
     }
@@ -927,6 +1008,8 @@ impl ChatRules {
         );
         // So is the composer's emote match mode.
         crate::services::emote_match::refresh_settings(settings);
+        // And what the native row view reads.
+        crate::services::chat_row_view::refresh(settings);
         let hl_v = settings.extra.get("chat_highlights");
         let cf_v = settings.extra.get("chat_filters");
         let cq_v = settings.extra.get("chat_query");
@@ -937,6 +1020,12 @@ impl ChatRules {
                 None => 0u8.hash(&mut hasher),
             }
         }
+        // Hidden channels whose chat is hidden ride the same rules.
+        let hidden_accounts = crate::services::hidden_channels::chat_accounts(settings);
+        hidden_accounts.hash(&mut hasher);
+        // The mention and reply colours ride the scrollbar ticks.
+        settings.chat_design.mention_color.hash(&mut hasher);
+        settings.chat_design.reply_color.hash(&mut hasher);
         let h = hasher.finish().max(1);
         if RULES_HASH.load(std::sync::atomic::Ordering::Acquire) == h {
             return;
@@ -953,7 +1042,13 @@ impl ChatRules {
             .cloned()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
-        let compiled = CompiledRules::compile(&hl, &cf, &cq);
+        let mut compiled = CompiledRules::compile(&hl, &cf, &cq);
+        for (account, login) in hidden_accounts {
+            compiled.hidden_accounts.insert(account);
+            compiled.hidden_account_logins.insert(login);
+        }
+        compiled.mention_color = settings.chat_design.mention_color.clone();
+        compiled.reply_color = settings.chat_design.reply_color.clone();
         for e in &compiled.errors {
             log::warn!(
                 "[ChatRules] {} rule {} skipped: {}",
@@ -990,7 +1085,7 @@ impl ChatRules {
             tauri::async_runtime::spawn(async move {
                 if let Some(tx) = crate::services::irc_service::IrcService::broadcaster().await {
                     for frame in frames {
-                        let _ = tx.send(frame);
+                        let _ = tx.send(crate::services::chat_bridge_route::BridgeFrame::all(frame));
                     }
                 }
             });
@@ -1001,16 +1096,33 @@ impl ChatRules {
     /// the verdict; the caller decides whether a dropped message still feeds
     /// logs and history (it does: the record is not the display).
     pub fn evaluate(msg: &mut ChatMessage, rules: &CompiledRules) -> Verdict {
+        Self::evaluate_into_history(msg, rules, true)
+    }
+
+    /// `evaluate` for a row that is not the record of a message: the composer's
+    /// own copy of something you sent, which the echo replaces by id. It gets
+    /// the same stamps, but only the echo goes into history (otherwise `/logs`
+    /// and search list every message you send twice).
+    pub fn evaluate_unrecorded(msg: &mut ChatMessage, rules: &CompiledRules) -> Verdict {
+        Self::evaluate_into_history(msg, rules, false)
+    }
+
+    fn evaluate_into_history(msg: &mut ChatMessage, rules: &CompiledRules, record: bool) -> Verdict {
+        // Every row a window receives passes here, so the author's shown name
+        // is settled here too (before the facts read the display name).
+        crate::services::chatter_name::stamp(msg);
         let ev = {
             let facts = MessageFacts::from_message(msg);
             let ev = Self::evaluate_facts(&facts, rules);
-            if !ev.drop {
+            if record && !ev.drop {
                 crate::services::chat_history::ChatHistory::push(
                     msg,
                     &facts,
                     ev.highlight.is_some(),
                     ev.mentioned,
                 );
+                // A running `/nuke` window sees every recorded message here.
+                crate::services::nuke::observe(&facts.channel_key, msg, facts.ts_ms);
             }
             ev
         };
@@ -1018,6 +1130,7 @@ impl ChatRules {
             drop: ev.drop,
             matched_highlight: ev.highlight.is_some(),
             mentioned: ev.mentioned,
+            reply_to_me: ev.reply_to_me,
         };
         if !ev.drop {
             Self::apply(msg, ev);
@@ -1032,15 +1145,17 @@ impl ChatRules {
         msg.metadata.built_in = ev.built_in;
         msg.metadata.filter_ids = ev.filter_ids;
         msg.metadata.suspicious = ev.suspicious;
+        msg.metadata.scrollbar_mark = ev.scrollbar_mark;
         msg.metadata.rules_evaluated = true;
     }
 
     fn evaluate_facts(facts: &MessageFacts<'_>, rules: &CompiledRules) -> Evaluation {
         let own = Self::own_identity();
-        let is_own = own
-            .as_ref()
-            .map(|(_, id)| !id.is_empty() && id == facts.user_id)
-            .unwrap_or(false);
+        let is_own = facts.twitch
+            && own
+                .as_ref()
+                .map(|(_, id)| !id.is_empty() && id == facts.user_id)
+                .unwrap_or(false);
 
         // 1. Ignores. Own messages are exempt so hiding yourself can never
         //    eat your sends (same rule the JS gate had).
@@ -1062,6 +1177,17 @@ impl ChatRules {
                     return Evaluation::dropped();
                 }
             }
+            if !rules.hidden_accounts.is_empty() {
+                let account = if facts.twitch {
+                    format!("twitch:{}", facts.user_id)
+                } else {
+                    let provider = facts.filter_channel_key.split(':').next().unwrap_or("");
+                    format!("{}:{}", provider, facts.login)
+                };
+                if rules.hidden_accounts.contains(&account) {
+                    return Evaluation::dropped();
+                }
+            }
             if let Some(set) = &rules.ignore_set {
                 if set.is_match(facts.content) {
                     return Evaluation::dropped();
@@ -1076,7 +1202,9 @@ impl ChatRules {
             .unwrap_or(false);
         let reply_to_me = own
             .as_ref()
-            .map(|(_, id)| !id.is_empty() && !is_own && facts.reply_parent_user_id == id)
+            .map(|(_, id)| {
+                facts.twitch && !id.is_empty() && !is_own && facts.reply_parent_user_id == id
+            })
             .unwrap_or(false);
 
         // 3. Highlight rules: phrase, then user, then badge; first wins. A
@@ -1156,6 +1284,10 @@ impl ChatRules {
             }
         }
 
+        filter_ids.extend(local_view_ids(facts));
+
+        let scrollbar_mark = scrollbar_mark(facts, rules, mentioned, reply_to_me, &highlight);
+
         Evaluation {
             drop: false,
             mentioned,
@@ -1164,6 +1296,7 @@ impl ChatRules {
             built_in,
             filter_ids,
             suspicious: facts.suspicious.clone(),
+            scrollbar_mark,
         }
     }
 
@@ -1195,6 +1328,67 @@ impl ChatRules {
     }
 }
 
+/// The scrollbar tick for a row that survived the ignores, one per row,
+/// strongest first: what is addressed to you, then what you asked to see, then
+/// channel events. Which kinds are drawn is the viewer's choice at draw time,
+/// so a row is stamped whether or not its kind is currently shown.
+fn scrollbar_mark(
+    facts: &MessageFacts<'_>,
+    rules: &CompiledRules,
+    mentioned: bool,
+    reply_to_me: bool,
+    highlight: &Option<HighlightStamp>,
+) -> Option<ScrollbarMark> {
+    let mark = |kind: &str, color: Option<String>| {
+        Some(ScrollbarMark {
+            kind: kind.to_string(),
+            color: color.filter(|c| !c.trim().is_empty()),
+        })
+    };
+    if mentioned {
+        return mark("mention", Some(rules.mention_color.clone()));
+    }
+    if reply_to_me {
+        return mark("reply", Some(rules.reply_color.clone()));
+    }
+    if let Some(h) = highlight {
+        return mark("highlight", Some(h.color.clone()));
+    }
+    if let Some(name) = facts.announcement {
+        return mark("announcement", announcement_color(name).map(str::to_string));
+    }
+    if facts.flags & F_SUB != 0 {
+        return mark("sub", None);
+    }
+    if facts.flags & F_REDEEMED != 0 {
+        return mark("redeem", None);
+    }
+    // Built-in events wear their tint colour only while that tint is on, the
+    // same as the row; otherwise the kind's theme colour keeps them apart
+    // (the raid default is the same red as a mention).
+    let tint = |b: &BuiltIn| b.enabled.then(|| b.color.clone());
+    if facts.flags & F_RAID != 0 {
+        return mark("raid", tint(&rules.raider));
+    }
+    if facts.flags & F_FIRST != 0 {
+        return mark("first_time", tint(&rules.first_time));
+    }
+    None
+}
+
+/// The tint an announcement row is drawn with, for Twitch's colour names.
+/// `PRIMARY` (the channel's own colour) has no fixed value and takes the
+/// theme accent.
+fn announcement_color(name: &str) -> Option<&'static str> {
+    match name.to_ascii_uppercase().as_str() {
+        "BLUE" => Some("#3b82f6"),
+        "GREEN" => Some("#22c55e"),
+        "ORANGE" => Some("#f97316"),
+        "PURPLE" => Some("#a855f7"),
+        _ => None,
+    }
+}
+
 fn stamp(kind: &str, m: &RuleMeta) -> HighlightStamp {
     HighlightStamp {
         rule_id: m.id.clone(),
@@ -1202,6 +1396,7 @@ fn stamp(kind: &str, m: &RuleMeta) -> HighlightStamp {
         color: m.color.clone(),
         sound_id: m.sound_id.clone(),
         cooldown_ms: m.cooldown_ms,
+        hold: m.hold,
     }
 }
 
@@ -1853,6 +2048,7 @@ mod tests {
             drop: ev.drop,
             matched_highlight: ev.highlight.is_some(),
             mentioned: ev.mentioned,
+            reply_to_me: ev.reply_to_me,
         };
         if !ev.drop {
             ChatRules::apply(m, ev);
@@ -1877,6 +2073,31 @@ mod tests {
         assert_eq!(hl.rule_id, "a");
         assert_eq!(hl.kind, "phrase");
         assert_eq!(hl.cooldown_ms, 3000);
+        assert!(!hl.hold);
+    }
+
+    #[test]
+    fn keep_tinted_rides_the_stamp_for_every_rule_kind() {
+        let rules = rules_from(
+            r##"{
+                "phrases":[{"id":"p","pattern":"hello","enabled":true,"color":"#1","hold":true}],
+                "users":[{"id":"u","username":"alice","enabled":true,"color":"#2","hold":true}],
+                "badges":[{"id":"b","badge_key":"subscriber/*","enabled":true,"color":"#3","hold":true}]
+            }"##,
+            "{}",
+            "{}",
+        );
+        let mut m = msg("bob", "hello there");
+        eval_with(&rules, &mut m);
+        assert!(m.metadata.highlight.as_ref().unwrap().hold);
+        let mut m = msg("alice", "hi");
+        eval_with(&rules, &mut m);
+        assert!(m.metadata.highlight.as_ref().unwrap().hold);
+        let mut m = msg("carol", "hi");
+        eval_with(&rules, &mut m);
+        let hl = m.metadata.highlight.as_ref().unwrap();
+        assert_eq!(hl.rule_id, "b");
+        assert!(hl.hold);
     }
 
     #[test]
@@ -1949,6 +2170,36 @@ mod tests {
         eval_with(&rules, &mut m);
         assert!(!m.metadata.is_mentioned);
         assert!(m.metadata.highlight.is_some());
+    }
+
+    #[test]
+    fn another_platforms_ids_never_match_the_twitch_identity() {
+        ChatRules::set_own_identity("brandon", "999");
+        let rules = rules_from("{}", "{}", "{}");
+        let reply_to = |provider: &str, sender_id: &str| {
+            let mut m = msg("bob", "agreed");
+            m.provider = provider.into();
+            m.user_id = sender_id.into();
+            m.metadata.reply_info = Some(crate::models::chat_layout::ReplyInfo {
+                parent_user_id: "999".into(),
+                ..Default::default()
+            });
+            m
+        };
+        let mut twitch = reply_to("twitch", "1");
+        eval_with(&rules, &mut twitch);
+        assert!(twitch.metadata.is_reply_to_me);
+        // A Kick user replying to a Kick user whose numeric id happens to be
+        // our Twitch id is not a reply to us.
+        let mut kick = reply_to("kick", "1");
+        eval_with(&rules, &mut kick);
+        assert!(!kick.metadata.is_reply_to_me);
+        // Nor is a Kick sender with that id us: they can still mention us.
+        let mut kick = msg("bob", "hi @brandon");
+        kick.provider = "kick".into();
+        kick.user_id = "999".into();
+        eval_with(&rules, &mut kick);
+        assert!(kick.metadata.is_mentioned);
     }
 
     #[test]
@@ -2052,6 +2303,28 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_channel_is_dropped_by_account_not_by_name() {
+        let mut rules = rules_from("{}", "{}", "{}");
+        rules.hidden_accounts.insert("twitch:42".into());
+        rules.hidden_accounts.insert("kick:carl".into());
+        // Twitch: the user id, so a rename does not escape it.
+        let mut renamed = msg("newname", "hi");
+        assert!(eval_with(&rules, &mut renamed).drop);
+        let mut other = msg("bob", "hi");
+        other.user_id = "43".into();
+        assert!(!eval_with(&rules, &mut other).drop);
+        // Kick: provider and login, so a Twitch "carl" still talks.
+        let mut kick = msg("carl", "hi");
+        kick.provider = "kick".into();
+        kick.channel = "kick:xqc".into();
+        kick.user_id = "9".into();
+        assert!(eval_with(&rules, &mut kick).drop);
+        let mut twitch_carl = msg("carl", "hi");
+        twitch_carl.user_id = "44".into();
+        assert!(!eval_with(&rules, &mut twitch_carl).drop);
+    }
+
+    #[test]
     fn filter_validation_reports_errors_and_unsupported_vars() {
         assert!(ChatRules::validate_filter("author.name ==").is_err());
         assert!(ChatRules::validate_filter("author.nmae == \"x\"").is_err());
@@ -2102,5 +2375,165 @@ mod tests {
         assert!(!mentions_login("@brandonfan hi", "brandon"));
         assert!(mentions_login("@brandonfan and @brandon", "brandon"));
         assert!(!mentions_login("brandon", "brandon"));
+    }
+
+    fn mark_of(m: &ChatMessage) -> Option<(String, Option<String>)> {
+        m.metadata
+            .scrollbar_mark
+            .as_ref()
+            .map(|k| (k.kind.clone(), k.color.clone()))
+    }
+
+    fn with_tags(mut m: ChatMessage, tags: &[(&str, &str)]) -> ChatMessage {
+        for (k, v) in tags {
+            m.tags.insert((*k).into(), (*v).into());
+        }
+        m
+    }
+
+    #[test]
+    fn scrollbar_marks_classify_mentions_highlights_and_events() {
+        ChatRules::set_own_identity("brandon", "999");
+        let mut rules = rules_from(
+            r##"{"phrases":[{"id":"p","pattern":"clutch","enabled":true,"color":"#00ff88"}],
+                 "built_in":{"first_time_chatter":{"color":"#123456"}}}"##,
+            "{}",
+            "{}",
+        );
+        rules.mention_color = "#ff4444".into();
+        rules.reply_color = "#ff6b6b".into();
+
+        // A ping wears the mention colour, and beats the phrase it also matches.
+        let mut m = msg("bob", "clutch @brandon");
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("mention".into(), Some("#ff4444".into()))));
+
+        // A reply to one of yours.
+        let mut m = with_tags(msg("bob", "agreed"), &[]);
+        m.metadata.reply_info = Some(crate::models::chat_layout::ReplyInfo {
+            parent_user_id: "999".into(),
+            ..Default::default()
+        });
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("reply".into(), Some("#ff6b6b".into()))));
+
+        // A highlight phrase carries its rule's colour.
+        let mut m = msg("bob", "what a clutch");
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("highlight".into(), Some("#00ff88".into()))));
+
+        // A plain line has no tick.
+        let mut m = msg("bob", "hello");
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), None);
+    }
+
+    #[test]
+    fn scrollbar_marks_classify_subs_announcements_and_redeems() {
+        let rules = rules_from("{}", "{}", "{}");
+
+        let mut m = with_tags(msg("bob", "6 months!"), &[("msg-id", "resub")]);
+        m.metadata.msg_type = Some("resub".into());
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("sub".into(), None)));
+
+        let mut m = with_tags(msg("bob", ""), &[("msg-id", "subgift")]);
+        m.metadata.msg_type = Some("subgift".into());
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("sub".into(), None)));
+
+        // Announcement colours: a named one is fixed, PRIMARY is the theme's.
+        let mut m = with_tags(
+            msg("mod", "drops are live"),
+            &[("msg-id", "announcement"), ("msg-param-color", "GREEN")],
+        );
+        m.metadata.msg_type = Some("announcement".into());
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("announcement".into(), Some("#22c55e".into()))));
+
+        let mut m = with_tags(msg("mod", "hi all"), &[("msg-id", "announcement")]);
+        m.metadata.msg_type = Some("announcement".into());
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("announcement".into(), None)));
+
+        // Relayed through shared chat.
+        let mut m = with_tags(
+            msg("mod", "hello partner chat"),
+            &[("source-msg-id", "announcement"), ("msg-param-color", "purple")],
+        );
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("announcement".into(), Some("#a855f7".into()))));
+
+        let mut m = with_tags(msg("bob", "play this"), &[("custom-reward-id", "r1")]);
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("redeem".into(), None)));
+
+        let mut m = with_tags(msg("bob", "LOOK"), &[("msg-id", "highlighted-message")]);
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("redeem".into(), None)));
+
+        // Raid tint is off by default: the tick takes the theme colour.
+        let mut m = with_tags(msg("raider", ""), &[("msg-id", "raid")]);
+        m.metadata.msg_type = Some("raid".into());
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("raid".into(), None)));
+
+        // First-message tint is on by default: the tick wears its colour.
+        let mut m = with_tags(msg("newbie", "hi"), &[("first-msg", "1")]);
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("first_time".into(), Some("#a855f7".into()))));
+
+        // With the tints flipped, so are the tick colours.
+        let flipped = rules_from(
+            r##"{"built_in":{"raider":{"enabled":true,"color":"#ff8800"},"first_time_chatter":{"enabled":false}}}"##,
+            "{}",
+            "{}",
+        );
+        let mut m = with_tags(msg("raider", ""), &[("msg-id", "raid")]);
+        m.metadata.msg_type = Some("raid".into());
+        eval_with(&flipped, &mut m);
+        assert_eq!(mark_of(&m), Some(("raid".into(), Some("#ff8800".into()))));
+        let mut m = with_tags(msg("newbie", "hi"), &[("first-msg", "1")]);
+        eval_with(&flipped, &mut m);
+        assert_eq!(mark_of(&m), Some(("first_time".into(), None)));
+    }
+
+    #[test]
+    fn scrollbar_mark_skips_dropped_rows_and_empty_colours() {
+        let rules = rules_from("{}", r#"{"hidden_users":["spammer"]}"#, "{}");
+        let mut m = with_tags(msg("spammer", "x"), &[("msg-id", "resub")]);
+        m.metadata.msg_type = Some("resub".into());
+        let v = eval_with(&rules, &mut m);
+        assert!(v.drop);
+        assert!(m.metadata.scrollbar_mark.is_none());
+
+        // No mention colour configured: the tick falls back to the theme.
+        ChatRules::set_own_identity("brandon", "999");
+        let mut m = msg("bob", "@brandon hi");
+        eval_with(&rules, &mut m);
+        assert_eq!(mark_of(&m), Some(("mention".into(), None)));
+
+        // The stamp rides the wire only when present.
+        let plain = serde_json::to_value(&msg("bob", "x").metadata).unwrap();
+        assert!(plain.get("scrollbar_mark").is_none());
+    }
+
+    #[test]
+    fn local_view_ids_follow_badges_and_text() {
+        let sub = msg("bob", "hello");
+        let ids = local_view_ids(&MessageFacts::from_message(&sub));
+        assert_eq!(ids, vec![LOCAL_SUB_FILTER.to_string(), LOCAL_ASCII_FILTER.to_string()]);
+
+        let mut plain = msg("eve", "héllo");
+        plain.badges.clear();
+        plain.tags.clear();
+        assert!(local_view_ids(&MessageFacts::from_message(&plain)).is_empty());
+
+        let mut moderator = msg("mod", "hi");
+        moderator.badges[0].name = "moderator".into();
+        moderator.tags.clear();
+        let ids = local_view_ids(&MessageFacts::from_message(&moderator));
+        assert!(ids.contains(&LOCAL_MOD_FILTER.to_string()));
+        assert!(ids.contains(&LOCAL_SUB_FILTER.to_string()));
     }
 }

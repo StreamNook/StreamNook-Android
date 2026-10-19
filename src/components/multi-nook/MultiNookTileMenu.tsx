@@ -12,11 +12,12 @@ import {
   UserMinus,
   Loader2,
   Radio,
+  ArrowLeftRight,
 } from 'lucide-react';
 import { useContextMenuStore } from '../../stores/contextMenuStore';
 import { usemultiNookStore } from '../../stores/multiNookStore';
 import { useAppStore } from '../../stores/AppStore';
-import { buildShareUrl } from '../../utils/shareLink';
+import { shareLinkFor } from '../../utils/shareLink';
 import { Logger } from '../../utils/logger';
 
 const ROW =
@@ -52,6 +53,7 @@ export const MultiNookTileMenu: React.FC = () => {
 
   const slots = usemultiNookStore((s) => s.slots);
   const maximizedSlotId = usemultiNookStore((s) => s.maximizedSlotId);
+  const layoutMode = useAppStore((s) => s.settings.multi_nook_layout?.mode ?? 'grid');
   const [copied, setCopied] = useState(false);
 
   // Every way out of the menu clears the share confirmation, so it is never
@@ -71,6 +73,8 @@ export const MultiNookTileMenu: React.FC = () => {
     if (!isOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
+      // Handled: the same press must not also leave the tile's full screen.
+      e.preventDefault();
       setCopied(false);
       closeMenu();
     };
@@ -111,10 +115,16 @@ export const MultiNookTileMenu: React.FC = () => {
     undockSlot,
     removeSlot,
     toggleFocusSlot,
+    makeMainSlot,
   } = usemultiNookStore.getState();
 
   const isMaximized = maximizedSlotId === slotId;
   const isDocked = !!slot.isMinimized;
+  // In a main layout, a small tile can take the large spot.
+  const canMakeMain =
+    (layoutMode === 'main_row' || layoutMode === 'main_column') &&
+    !isDocked &&
+    slots.find((s) => !s.isMinimized)?.id !== slotId;
   const label = slot.channelName || slot.channelLogin;
   // "Close the others" only means something when there ARE others.
   const hasOthers = slots.length > 1;
@@ -155,7 +165,9 @@ export const MultiNookTileMenu: React.FC = () => {
   const handleShare = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      await navigator.clipboard.writeText(buildShareUrl(slot.channelLogin));
+      await navigator.clipboard.writeText(
+        await shareLinkFor({ provider: slot.provider, user_login: slot.channelLogin }),
+      );
       setCopied(true);
       window.setTimeout(dismiss, 1100);
     } catch (err) {
@@ -226,6 +238,13 @@ export const MultiNookTileMenu: React.FC = () => {
             docked tile, which is offscreen. */}
         {!isDocked && (
           <>
+            {canMakeMain && (
+              <button onClick={run(() => makeMainSlot(slotId))} className={ROW}>
+                <ArrowLeftRight size={16} />
+                <span>Make main</span>
+              </button>
+            )}
+
             <button onClick={run(() => toggleMaximizeSlot(slotId))} className={ROW}>
               {isMaximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
               <span>{isMaximized ? 'Back to grid' : 'Spotlight'}</span>

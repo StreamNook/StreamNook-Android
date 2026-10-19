@@ -1,5 +1,5 @@
 import { Window } from '@tauri-apps/api/window';
-import { User, Settings, Proportions, MessageCircle, Pickaxe, Clock, Tv, Download, LogIn, Check, Pin, PinOff, Lightbulb } from 'lucide-react';
+import { Settings, Proportions, MessageCircle, Pickaxe, Clock, Tv, Download, Check, Pin, PinOff, Lightbulb } from 'lucide-react';
 import { Minus, X, CornersOut, CornersIn, ArrowsOut, ArrowsIn, Medal, Package, PuzzlePiece } from 'phosphor-react';
 import { IS_MAC, MAC_TRAFFIC_LIGHT_INSET_PX } from '../utils/platform';
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
@@ -11,6 +11,7 @@ import PenroseLogo from './PenroseLogo';
 import PlatformSwitcher from './PlatformSwitcher';
 import NavFlipper from './NavFlipper';
 import { MultiNookToggle, MultiChatButton } from './titlebar/WindowActions';
+import AccountStack from './titlebar/AccountStack';
 import AboutWidget from './AboutWidget';
 import UpdateOverlay, { type UpdatePhase } from './UpdateOverlay';
 import CompactStreamStats from './CompactStreamStats';
@@ -24,13 +25,15 @@ import { deriveDropProgressDisplay } from '../utils/dropProgressDisplay';
 
 import { Logger } from '../utils/logger';
 import { useVisibleInterval } from '../utils/useVisibleInterval';
-import { handleTitleBarMouseDown } from '../utils/titleBarDrag';
+import { handleTitleBarMouseDown, isTitlebarDragActive } from '../utils/titleBarDrag';
 import { START_UPDATE_EVENT } from '../utils/updateEvents';
 import { Tooltip } from './ui/Tooltip';
 import { AutomationPulse, type AutomationTone } from './ui/AutomationPulse';
 import PluginTitleBarButtons from '../plugins-ui/PluginTitleBarButtons';
 import { usePluginUpdates } from '../stores/pluginUpdatesStore';
-import { useStreamOnlyFullscreen } from '../hooks/useStreamOnlyFullscreen';
+import { useTitleBarAutoHide, useTitleBarLifted } from '../hooks/useTitleBarAutoHide';
+import { exitPlayerFullscreen, exitPlayerFullscreenForBarAction } from '../utils/windowFullscreen';
+import { opensPageOverPlayer, pointerAtTopEdge, titleBarTuckMode, titleBarTucked } from '../utils/titleBarTuck';
 
 /** Maps a bundle-update-progress payload to a 0–100 fill. The download stage
  *  carries a real byte percentage ("Downloading 47%"); the quick post-download
@@ -54,15 +57,12 @@ const TitleBar = () => {
   // subscribing; state goes through a shallow-compared selector. This was a
   // whole-store subscription, so the title bar re-rendered on every unrelated
   // store tick.
-  const { openSettings, setShowDropsOverlay, setShowMarketplaceOverlay, setShowBadgesOverlay, setShowWhispersOverlay, toggleTheaterMode, toggleWindowFullscreen, toggleKeepOnTop, addToast } = useAppStore.getState();
-  const { isAuthenticated, currentUser, dropProgressActive, dropProgressComplete, isTheaterMode, isWindowFullscreen, streamUrl, currentMediaType, settings, whisperImportState, updateInfo } = useAppStore(
+  const { openSettings, setShowDropsOverlay, setShowMarketplaceOverlay, setShowBadgesOverlay, setShowWhispersOverlay, toggleTheaterMode, toggleWindowFullscreen, toggleKeepOnTop } = useAppStore.getState();
+  const { dropProgressActive, dropProgressComplete, isTheaterMode, streamUrl, currentMediaType, settings, whisperImportState, updateInfo } = useAppStore(
     useShallow((s) => ({
-      isAuthenticated: s.isAuthenticated,
-      currentUser: s.currentUser,
       dropProgressActive: s.dropProgressActive,
       dropProgressComplete: s.dropProgressComplete,
       isTheaterMode: s.isTheaterMode,
-      isWindowFullscreen: s.isWindowFullscreen,
       streamUrl: s.streamUrl,
       currentMediaType: s.currentMediaType,
       settings: s.settings,
@@ -82,11 +82,6 @@ const TitleBar = () => {
   const [showAbout, setShowAbout] = useState(false);
   const [, setShowSplash] = useState(false);
   const [dropsSettings, setDropsSettings] = useState<DropsSettings | null>(null);
-  // Whether the separate drops/points credential (its own Twitch sign-in) is
-  // present. null = not yet checked. Drives the drops button's "needs sign-in"
-  // cue — a logout (main or drops) clears this credential and swaps the gift for
-  // a sign-in button.
-  const [dropsAuthed, setDropsAuthed] = useState<boolean | null>(null);
   const [isMaximized, setIsMaximized] = useState(false);
   const prevDropProgressActive = useRef(dropProgressActive);
   
@@ -177,62 +172,8 @@ const TitleBar = () => {
   }, [loadDropsSettings]);
   useVisibleInterval(loadDropsSettings, 60 * 60 * 1000);
 
-  // Track the drops/points sign-in so the drops button can flag when it's gone.
-  // Re-checks on login changes, on a slow interval, and on window focus (which
-  // fires right after the drops-login window closes, clearing the cue promptly).
-  const checkDropsAuth = useCallback(async () => {
-    try {
-      setDropsAuthed(await invoke<boolean>('is_drops_authenticated'));
-    } catch {
-      setDropsAuthed(null);
-    }
-  }, []);
-  useEffect(() => {
-    checkDropsAuth();
-  }, [checkDropsAuth, isAuthenticated]);
-  useVisibleInterval(checkDropsAuth, 60 * 1000);
-  useEffect(() => {
-    const onFocus = () => checkDropsAuth();
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
-  }, [checkDropsAuth]);
-
-  // Start the drops/points (separate Twitch) sign-in directly from the title bar
-  // login button: open Twitch's device-code page, poll for the token, then clear
-  // the prompt. Mirrors the flow the Drops panel and setup wizard use.
-  const [isDropsLoggingIn, setIsDropsLoggingIn] = useState(false);
-  const handleDropsLogin = useCallback(async () => {
-    if (isDropsLoggingIn) return;
-    setIsDropsLoggingIn(true);
-    try {
-      const url = await invoke<string>('start_drops_login');
-      // Opened from Rust bound to the active account's web profile, so it reuses
-      // the main login's twitch.tv session — just authorize, no re-login.
-      await invoke('open_drops_login_window', { url });
-    } catch (e) {
-      Logger.error('[TitleBar] Drops login failed:', e);
-      // Say what actually went wrong: the generic line sent people reinstalling.
-      addToast(`Drops sign-in failed: ${e instanceof Error ? e.message : String(e)}`, 'error');
-      setIsDropsLoggingIn(false);
-    }
-  }, [isDropsLoggingIn, addToast]);
-
-  // The overlay reports completion, so the outcome arrives as an event rather
-  // than as the resolution of the call that started it.
-  useEffect(() => {
-    const uns: Array<() => void> = [];
-    listen('drops-login-complete', () => {
-      setIsDropsLoggingIn(false);
-      addToast('Signed in — drops & channel points enabled', 'success');
-      void checkDropsAuth();
-    }).then((u) => uns.push(u));
-    listen<string>('drops-login-error', (e) => {
-      setIsDropsLoggingIn(false);
-      Logger.error('[TitleBar] Drops login failed:', e.payload);
-      addToast(`Drops sign-in failed: ${e.payload}`, 'error');
-    }).then((u) => uns.push(u));
-    return () => uns.forEach((u) => u());
-  }, [addToast, checkDropsAuth]);
+  // The drops/points sign-in is a row in the account flyout (AccountStack),
+  // fed by the roster Rust pushes, so nothing here polls for it.
 
   // Seed the progress badge from the bridge-cached automation status (a plugin
   // powering automation reports through it). Live updates arrive on the
@@ -539,18 +480,46 @@ const TitleBar = () => {
 
   // Replaces data-tauri-drag-region: a borderless window doesn't get Windows'
   // restore-on-drag, so dragging while maximized has to unmaximize first.
+  // In either full screen a press or double-click on the bar does nothing: no
+  // window drag, no maximize.
+  const anyFullscreen = useAppStore((s) => s.isWindowFullscreen || s.isPlayerFullscreen);
   const onTitleBarMouseDown = useCallback(
-    (e: React.MouseEvent<HTMLElement>) => handleTitleBarMouseDown(e, isMaximized),
-    [isMaximized],
+    (e: React.MouseEvent<HTMLElement>) =>
+      handleTitleBarMouseDown(e, isMaximized, { fullscreen: anyFullscreen }),
+    [isMaximized, anyFullscreen],
   );
 
-  // Stream-only full screen: the bar tucks up out of sight and a thin strip at
-  // the top edge brings it back. It stays while the cursor is over it (menus it
-  // portals count, React tracks enter/leave through the component tree) and
-  // tucks again a moment after the cursor leaves. The leave handler runs in
-  // every mode, so a bar revealed when full screen ends never comes back
-  // pre-revealed the next time.
-  const streamOnlyFullscreen = useStreamOnlyFullscreen();
+  // Stream-only full screen, "Title bar auto-hide" and the player's full
+  // screen: the bar tucks up out of sight and the pointer reaching the top edge
+  // brings it back. It stays while the cursor is over it and tucks again a
+  // moment after the cursor leaves. The leave handler runs in every mode, so a
+  // bar revealed when the mode ends never comes back pre-revealed the next time.
+  //
+  // "Over it" is checked two ways, because the bar holds content from two
+  // trees. React's enter/leave follow the component tree, so the menus the bar
+  // portals OUT (accounts, platforms, the drops card) count as inside it. The
+  // Island's door and Home's strip are portaled IN from elsewhere, so React
+  // reports the pointer reaching them as a leave; the tuck timer therefore
+  // also asks the DOM's :hover before it fires.
+  //
+  // The layout never follows the reveal: in this mode nothing reserves the
+  // bar's row, so the bar coming back overlays the stream instead of pushing it
+  // down (see useTitleBarAutoHide).
+  const autoHides = useTitleBarAutoHide();
+  // The player's own full screen (double-click, its button, F) pins the player
+  // over the whole window in a layer far above the bar, so the bar has to tuck
+  // and come back from above that layer too. Layout is not involved: the player
+  // covers the window, so nothing underneath moves.
+  const playerFullscreen = useAppStore((s) => s.isPlayerFullscreen);
+  const tucks = titleBarTuckMode({ layoutAutoHides: autoHides, playerFullscreen });
+  // In the tucking modes the bar comes back OVER the player, whose top-right
+  // buttons and title overlays share the bar's resting layer and come later in
+  // the page, so at its resting layer the bar was drawn and clicked under them.
+  // It lifts above the player's whole stack for as long as the mode lasts,
+  // unless a page is open over the stream (its own About card and update
+  // dialog included), which keeps it under that page as usual.
+  const lifted = useTitleBarLifted(showAbout || updatePhase !== 'idle');
+  const barRef = useRef<HTMLDivElement>(null);
   const [barRevealed, setBarRevealed] = useState(false);
   const tuckTimerRef = useRef<number | null>(null);
   const cancelTuck = useCallback(() => {
@@ -559,33 +528,204 @@ const TitleBar = () => {
       tuckTimerRef.current = null;
     }
   }, []);
+  // Only while the bar tucks: anywhere else a pass over the bar would re-render
+  // this whole component twice for a state nothing reads.
   const revealBar = useCallback(() => {
     cancelTuck();
-    setBarRevealed(true);
-  }, [cancelTuck]);
-  const scheduleTuck = useCallback(() => {
-    cancelTuck();
-    tuckTimerRef.current = window.setTimeout(() => {
-      tuckTimerRef.current = null;
-      setBarRevealed(false);
-    }, 400);
-  }, [cancelTuck]);
+    if (tucks) setBarRevealed(true);
+  }, [cancelTuck, tucks]);
+  const scheduleTuckAfter = useCallback(
+    (delayMs: number) => {
+      cancelTuck();
+      const arm = () => {
+        tuckTimerRef.current = window.setTimeout(() => {
+          // A window drag runs inside the OS move loop, where the page can see a
+          // leave it never made. Wait it out rather than tucking mid-drag. The
+          // same for a pointer still on the bar's own pixels: content portaled
+          // in from outside its tree (the Island's door) reads as a leave.
+          if (isTitlebarDragActive() || barRef.current?.matches(':hover')) {
+            arm();
+            return;
+          }
+          tuckTimerRef.current = null;
+          setBarRevealed(false);
+        }, delayMs);
+      };
+      arm();
+    },
+    [cancelTuck],
+  );
+  const scheduleTuck = useCallback(() => scheduleTuckAfter(400), [scheduleTuckAfter]);
+  // The top edge reveals the bar, but the bar slides in UNDER the pointer, and
+  // a pointer that then heads straight back down may never register as having
+  // entered it, so no leave would ever come to tuck it. Arm the tuck on reveal;
+  // entering the bar cancels it. Touch has no hover to hold the bar out, so a
+  // tap at the top keeps it long enough to reach a control.
+  const revealFromEdge = useCallback(
+    (holdMs: number = 1000) => {
+      revealBar();
+      scheduleTuckAfter(holdMs);
+    },
+    [revealBar, scheduleTuckAfter],
+  );
   useEffect(() => cancelTuck, [cancelTuck]);
-  const barTucked = streamOnlyFullscreen && !barRevealed;
+
+  // In use, so it stays out whatever the pointer does: a menu of its own open
+  // (any trigger inside the bar reporting aria-expanded, the Island's door
+  // included), keyboard focus inside it, or Settings open over the stream.
+  // Click focus does not count, or a button pressed once would pin the bar
+  // until the next click elsewhere.
+  const [barMenuOpen, setBarMenuOpen] = useState(false);
+  const [barKeyboardFocus, setBarKeyboardFocus] = useState(false);
+  const settingsOpen = useAppStore((s) => s.isSettingsOpen);
+  useEffect(() => {
+    const el = barRef.current;
+    if (!tucks || !el) {
+      setBarMenuOpen(false);
+      return;
+    }
+    let open = !!el.querySelector('[aria-expanded="true"]');
+    setBarMenuOpen(open);
+    // The mode starting under the pointer (back to the stream from the bar's
+    // own nav) keeps the bar out until the pointer leaves it, rather than
+    // pulling it away mid-hover.
+    if (el.matches(':hover')) {
+      setBarRevealed(true);
+      scheduleTuck();
+    }
+    const mo = new MutationObserver(() => {
+      const next = !!el.querySelector('[aria-expanded="true"]');
+      // A menu that closes under the pointer (an item was picked) unmounts
+      // without a leave ever reaching the bar, so the bar would stay out
+      // until the next pass over it. Start the tuck unless the pointer is on
+      // the bar itself.
+      if (open && !next && !el.matches(':hover')) scheduleTuck();
+      open = next;
+      setBarMenuOpen(next);
+    });
+    mo.observe(el, { subtree: true, childList: true, attributes: true, attributeFilter: ['aria-expanded'] });
+    return () => mo.disconnect();
+  }, [tucks, scheduleTuck]);
+  // Keyboard focus, through React for the menus the bar portals out (they are
+  // in its tree, not its DOM)...
+  const onBarFocus = useCallback((e: React.FocusEvent<HTMLElement>) => {
+    const target = e.target as HTMLElement;
+    setBarKeyboardFocus(typeof target.matches === 'function' && target.matches(':focus-visible'));
+  }, []);
+  const onBarBlur = useCallback(() => setBarKeyboardFocus(false), []);
+  // ...and through the DOM for what is portaled in (the Island's door, the
+  // bar's first Tab stop), which React never reports to the bar.
+  useEffect(() => {
+    const el = barRef.current;
+    if (!el) return;
+    const onIn = (e: FocusEvent) => {
+      const target = e.target;
+      setBarKeyboardFocus(target instanceof Element && target.matches(':focus-visible'));
+    };
+    const onOut = (e: FocusEvent) => {
+      const next = e.relatedTarget;
+      if (!(next instanceof Node) || !el.contains(next)) setBarKeyboardFocus(false);
+    };
+    // A key pressed while focus sits in the bar is keyboard use too, even when
+    // that focus came from a click: Esc closing the notification list leaves
+    // focus on its door, and the bar must not tuck away from under it. It
+    // stays out until focus leaves the bar.
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Control' || e.key === 'Shift' || e.key === 'Alt' || e.key === 'Meta') return;
+      setBarKeyboardFocus(true);
+    };
+    el.addEventListener('focusin', onIn);
+    el.addEventListener('focusout', onOut);
+    el.addEventListener('keydown', onKey);
+    return () => {
+      el.removeEventListener('focusin', onIn);
+      el.removeEventListener('focusout', onOut);
+      el.removeEventListener('keydown', onKey);
+    };
+  }, []);
+  const barTucked = titleBarTucked({
+    autoHides: tucks,
+    revealed: barRevealed,
+    inUse: barMenuOpen || barKeyboardFocus || settingsOpen,
+  });
+  // The top edge brings the bar back by POSITION, not by what is under the
+  // pointer. The outermost pixels are window resizing on Windows (a native
+  // window above the page, in every state but maximized) and on Linux
+  // (LinuxResizeEdges, above everything), so the strip below never sees a
+  // pointer there; the zone reaches past both. A pointer that leaves the page
+  // through the top edge counts too, which is how full screen reports the
+  // pointer pressed against the top of the screen.
+  useEffect(() => {
+    if (!barTucked) return;
+    const onMove = (e: PointerEvent) => {
+      if (pointerAtTopEdge(e.clientY)) revealFromEdge(e.pointerType === 'mouse' ? undefined : 4000);
+    };
+    const onDown = (e: PointerEvent) => {
+      if (e.pointerType !== 'mouse' && pointerAtTopEdge(e.clientY)) revealFromEdge(4000);
+    };
+    const onOut = (e: MouseEvent) => {
+      if (e.relatedTarget === null && pointerAtTopEdge(e.clientY)) revealFromEdge();
+    };
+    window.addEventListener('pointermove', onMove, { passive: true });
+    window.addEventListener('pointerdown', onDown, { passive: true });
+    document.addEventListener('mouseout', onOut);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerdown', onDown);
+      document.removeEventListener('mouseout', onOut);
+    };
+  }, [barTucked, revealFromEdge]);
+  // Anything that opens a page, overlay or modal while the player's full screen
+  // is up (a shortcut, the command palette, a notification, the account
+  // picture) would open under the video, so it leaves the player's full screen
+  // first. A tick later, because a bar click has usually started that exit
+  // already and the store only hears of it once the bridge has run.
+  useEffect(
+    () =>
+      useAppStore.subscribe((next, prev) => {
+        if (!next.isPlayerFullscreen || !opensPageOverPlayer(prev, next)) return;
+        window.setTimeout(() => {
+          if (useAppStore.getState().isPlayerFullscreen) exitPlayerFullscreen();
+        }, 0);
+      }),
+    [],
+  );
+  // Anything in the bar (or a menu it portals) that would take the viewer
+  // somewhere else leaves the player's full screen first, through the player's
+  // own exit, so the page it opens is not hidden under the video and the
+  // window's full screen follows the player's as it always does.
+  const onBarClickCapture = useCallback(
+    (e: React.MouseEvent<HTMLElement>) => {
+      if (playerFullscreen) exitPlayerFullscreenForBarAction(e.target);
+    },
+    [playerFullscreen],
+  );
 
   return (
     <>
       {barTucked && (
-        <div aria-hidden className="fixed inset-x-0 top-0 h-1 z-[51]" onMouseEnter={revealBar} />
+        <div
+          aria-hidden
+          className="fixed inset-x-0 top-0 h-1 z-[51]"
+          // Over the player's full-screen stack, or the edge is dead there.
+          style={playerFullscreen ? { zIndex: 'var(--sn-z-titlebar-edge)' } : undefined}
+          onMouseEnter={() => revealFromEdge()}
+        />
       )}
       {/* macOS decorates this window with an Overlay title bar, so AppKit
           draws real traffic lights at the leading edge. Reserve their footprint
           rather than drawing anything underneath them. */}
       <div
+        ref={barRef}
         onMouseDown={IS_MAC ? undefined : onTitleBarMouseDown}
-        onMouseEnter={cancelTuck}
+        onClickCapture={onBarClickCapture}
+        onMouseEnter={revealBar}
         onMouseLeave={scheduleTuck}
-        data-tauri-drag-region={IS_MAC ? true : undefined}
+        onFocus={onBarFocus}
+        onBlur={onBarBlur}
+        // In full screen there is no window to move, and Tauri's region
+        // would turn a double-click into a maximize.
+        data-tauri-drag-region={IS_MAC && !anyFullscreen ? true : undefined}
         // Paints nothing: no fill, no blur, no rule under it. Everything in
         // here is already a floating glazed pill, so with the plate gone the
         // chrome reads as objects over the page instead of a bar across it —
@@ -617,10 +757,15 @@ const TitleBar = () => {
         // densest strip cannot fit, the centre gives way and the window controls
         // are never pushed off the edge.
         data-titlebar
-        className={`absolute inset-x-0 top-0 grid grid-cols-[1fr_minmax(0,auto)_1fr] gap-x-3 items-center h-[40px] px-3 select-none z-50 transition-[transform,opacity] duration-200 ease-out ${
+        className={`absolute inset-x-0 top-0 grid grid-cols-[1fr_minmax(0,auto)_1fr] gap-x-3 items-center h-[40px] px-3 select-none z-50 transition-[transform,opacity] duration-200 ease-out motion-reduce:transition-none ${
           barTucked ? '-translate-y-full opacity-0 pointer-events-none' : ''
         }`}
-        style={IS_MAC ? { paddingLeft: MAC_TRAFFIC_LIGHT_INSET_PX } : undefined}
+        style={{
+          ...(IS_MAC ? { paddingLeft: MAC_TRAFFIC_LIGHT_INSET_PX } : null),
+          // Lifted, the bar sits above the player's whole stack (full screen
+          // or the tucking layout); the player's own layers never change.
+          ...(lifted ? { zIndex: 'var(--sn-z-titlebar-over-player)' } : null),
+        }}
       >
         {/* The centre of the bar, as two slots other components portal into.
             Slots rather than real children, because the things that belong here
@@ -694,21 +839,12 @@ const TitleBar = () => {
               // "done" check instead of the idle gift. Active progress wins over it.
               const showCompleteBadge = dropProgressComplete && !dropProgressActive;
 
-              // Drops and channel points run off a separate Twitch sign-in that
-              // logout clears (signing out of the main account signs drops out
-              // too). Whenever that credential is missing, swap the gift for a
-              // sign-in button (clicking it starts the drops sign-in) — including
-              // after a full sign-out, not only while the main account is in.
-              const needsDropsAuth = dropsAuthed === false;
-
               // The drops button pulses while automation runs.
               // Silver = channel points only, Gold = drops only, Iridescent = both
               let automationTone: AutomationTone | null = null;
               let title = 'Drops & Points';
 
-              if (needsDropsAuth) {
-                title = 'Sign in to enable drops & channel points';
-              } else if (isBothActive) {
+              if (isBothActive) {
                 automationTone = 'iridescent';
                 title = 'Drops & Points (Both Active)';
               } else if (dropProgressActive) {
@@ -722,23 +858,6 @@ const TitleBar = () => {
               }
 
               const isAnyAutomationActive = dropProgressActive || channelPointsActive;
-
-              // Credential missing: the drops slot becomes a direct "Login"
-              // button rather than the gift, so the action is unmistakable.
-              if (needsDropsAuth) {
-                return (
-                  <Tooltip content={title} delay={200}>
-                    <button
-                      onClick={handleDropsLogin}
-                      disabled={isDropsLoggingIn}
-                      className="flex items-center gap-1 px-1.5 py-1 text-[11px] font-medium text-textSecondary hover:text-accent transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
-                    >
-                      <LogIn size={12} />
-                      {isDropsLoggingIn ? 'Signing in…' : 'Login'}
-                    </button>
-                  </Tooltip>
-                );
-              }
 
               return (
                 <Tooltip content={title} delay={200}>
@@ -778,7 +897,7 @@ const TitleBar = () => {
             {showDropsPreview && dropProgressActive && dropProgress?.current_drop && createPortal(
               <div
                 className="drops-preview-card-right"
-                style={{ position: 'fixed', top: previewPos.top, left: previewPos.left, zIndex: 9999 }}
+                style={{ position: 'fixed', top: previewPos.top, left: previewPos.left, zIndex: 'var(--sn-z-titlebar-menu)' }}
                 onMouseEnter={() => {
                   if (previewTimeoutRef.current) clearTimeout(previewTimeoutRef.current);
                 }}
@@ -1001,23 +1120,8 @@ const TitleBar = () => {
             </button>
           </Tooltip>
 
-          {/* Profile Button */}
-          <Tooltip content={isAuthenticated ? 'Profile' : 'Sign in'} delay={200}>
-            <button
-              onClick={() => openSettings('Profile')}
-              className="titlebar-icon-btn"
-            >
-              {isAuthenticated && currentUser?.profile_image_url ? (
-                <img
-                  src={currentUser.profile_image_url}
-                  alt="Profile"
-                  className="w-[20px] h-[20px] rounded-full object-cover"
-                />
-              ) : (
-                <User size={20} />
-              )}
-            </button>
-          </Tooltip>
+          {/* Who you are signed in as, on every platform; hover lists them. */}
+          <AccountStack />
 
           {/* Compact View Button - only show when stream is playing */}
           {streamUrl && (
@@ -1046,6 +1150,9 @@ const TitleBar = () => {
                 aria-pressed={settings?.immersive_glow === true}
                 className={`titlebar-icon-btn ${settings?.immersive_glow ? 'is-immersive' : ''}`}
                 aria-label="Immersive"
+                // Changes the look of the picture in place, so it keeps the
+                // player's full screen.
+                data-keeps-player-fullscreen
               >
                 {/* On, the bulb lights up instead of taking the accent tint
                     every other toggle uses. The tint says "this control is on";
@@ -1114,20 +1221,29 @@ const TitleBar = () => {
               On Windows and Linux they also take the platform's caption
               geometry (see .titlebar-window-controls); on macOS this slot holds
               only the About logo, so it keeps the app's own spacing. */}
-          <div className={IS_MAC ? 'flex items-center gap-1' : 'flex items-center titlebar-window-controls -mr-3'}>
+          <div
+            className={IS_MAC ? 'flex items-center gap-1' : 'flex items-center titlebar-window-controls -mr-3'}
+            // Minimize, maximize and close act on the window, not the page: they
+            // never leave the player's full screen on their way (the full-screen
+            // button leaves it itself). On macOS this slot holds only About,
+            // which opens a page and so has to leave it like any other.
+            data-keeps-player-fullscreen={IS_MAC ? undefined : true}
+          >
           {/* macOS already has full screen on the green traffic light, so a
               second control for it is redundant chrome. The slot goes to About,
               which lost its home on the leading edge to the traffic lights. */}
           {IS_MAC ? (
             <PenroseLogo onClick={() => setShowAbout(true)} />
           ) : (
-          <Tooltip content={isWindowFullscreen ? "Exit full screen (F11)" : "Full screen (F11)"} delay={200}>
+          // Either full screen reads as full screen here. The player's one is
+          // left through the player, so Plyr and the window stay in step.
+          <Tooltip content={anyFullscreen ? "Exit full screen (F11)" : "Full screen (F11)"} delay={200}>
             <button
-              onClick={() => toggleWindowFullscreen()}
+              onClick={() => (playerFullscreen ? exitPlayerFullscreen() : toggleWindowFullscreen())}
               className="titlebar-window-btn"
-              aria-label={isWindowFullscreen ? "Exit full screen" : "Full screen"}
+              aria-label={anyFullscreen ? "Exit full screen" : "Full screen"}
             >
-              {isWindowFullscreen ? (
+              {anyFullscreen ? (
                 <ArrowsIn size={14} />
               ) : (
                 <ArrowsOut size={14} />
@@ -1152,8 +1268,9 @@ const TitleBar = () => {
             </button>
           </Tooltip>
           {/* Maximize snaps to the work area (taskbar stays); it is redundant and
-              confusing while borderless full screen already covers everything. */}
-          {!isWindowFullscreen && (
+              confusing while borderless full screen already covers everything,
+              and on a full-screen window it brings the taskbar back over it. */}
+          {!anyFullscreen && (
           <Tooltip content={isMaximized ? "Restore" : "Maximize"} delay={200}>
             <button
               onClick={handleMaximize}

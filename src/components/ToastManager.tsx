@@ -10,6 +10,7 @@ import { Logger } from '../utils/logger';
 import { playNotificationSound as playGatedNotificationSound } from '../utils/notificationSound';
 import { liveActivityText } from '../utils/liveActivity';
 import { IS_MOBILE } from '../utils/platform';
+import { SevenTvAvatar } from './SevenTvAvatar';
 interface LiveNotification {
   streamer_name: string;
   streamer_login: string;
@@ -19,6 +20,8 @@ interface LiveNotification {
   stream_title?: string;
   stream_url: string;
   is_test?: boolean;
+  /** The streamer's cosmetics id, for their 7TV picture. */
+  seventv_id?: string | null;
 }
 
 // Component to render stream title with Apple-style emojis (inline)
@@ -220,7 +223,10 @@ const ToastManager = () => {
           <div className="flex items-start gap-3 w-full max-w-full">
             {/* Streamer Avatar */}
             {notification.streamer_avatar && (
-              <img
+              <SevenTvAvatar
+                cosmeticsId={notification.seventv_id}
+                px={40}
+                motion="animate"
                 src={notification.streamer_avatar}
                 alt={notification.streamer_name}
                 className="w-10 h-10 rounded-full object-cover flex-shrink-0"
@@ -315,14 +321,16 @@ const ToastManager = () => {
     }
   };
 
+  // Border only. The fill is .glass-panel's, which follows the Glassiness
+  // slider down to solid at 0%; a background utility here replaces it.
   const getToastColor = (type: string) => {
     switch (type) {
-      case 'success': return 'border-green-500/30 bg-green-500/5';
-      case 'error': return 'border-red-500/30 bg-red-500/5';
-      case 'warning': return 'border-yellow-500/30 bg-yellow-500/5';
-      case 'live': return 'border-accent/40 bg-accent/5';
-      case 'channel_points': return 'border-orange-500/30 bg-orange-500/5';
-      default: return 'border-accent/30 bg-accent/5';
+      case 'success': return 'border-green-500/30';
+      case 'error': return 'border-red-500/30';
+      case 'warning': return 'border-yellow-500/30';
+      case 'live': return 'border-accent/40';
+      case 'channel_points': return 'border-orange-500/30';
+      default: return 'border-accent/30';
     }
   };
 
@@ -374,7 +382,9 @@ const ToastItem = ({ toast, removeToast, getToastIcon, getToastColor, enter }: T
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isClickable = toast.type === 'live' && toast.action;
-  const canPause = toast.type === 'live';
+  // A live toast, and any toast with an action, holds while hovered (the
+  // store leaves their timer to this item).
+  const canPause = toast.type === 'live' || !!toast.action;
 
   // Set up the initial auto-dismiss timer (only runs once on mount)
   useEffect(() => {
@@ -442,7 +452,7 @@ const ToastItem = ({ toast, removeToast, getToastIcon, getToastColor, enter }: T
       } : undefined}
       onMouseEnter={handleMouseEnter}
       onMouseLeave={handleMouseLeave}
-      className={`glass-panel backdrop-blur-lg p-4 rounded-lg shadow-lg border ${getToastColor(toast.type)} w-[min(380px,calc(100vw-24px))] pointer-events-auto ${isClickable ? 'cursor-pointer hover:bg-accent/20 transition-colors' : ''} ${isPaused && isClickable ? 'shimmer-border' : ''}`}
+      className={`glass-panel p-4 rounded-lg shadow-lg border ${getToastColor(toast.type)} w-[min(380px,calc(100vw-24px))] pointer-events-auto ${isClickable ? 'cursor-pointer' : ''} ${isPaused && isClickable ? 'shimmer-border' : ''}`}
     >
       <div className="flex items-start gap-3">
         {getToastIcon(toast.type) && (

@@ -5,15 +5,20 @@
 //! the emote sets they run over.
 //!
 //! Two profiles:
-//! - `Cycle` is the Tab cycle: provider tier, then favorites, then name, with
-//!   names deduplicated case-insensitively. A leading `:` moves Twitch to the
-//!   front; a leading `@` is a chatter query and matches no emote.
+//! - `Cycle` is the Tab cycle: provider tier, then favorites, then name. A
+//!   leading `:` moves Twitch to the front; a leading `@` is a chatter query
+//!   and matches no emote.
 //! - `Search` is the list: how well the name matches what was typed comes
 //!   first, so an exact Twitch match is never buried under provider order. It
 //!   always looks inside names too, because a Twitch channel emote starts with
 //!   the streamer's prefix (`vulpLove`), so "starts with lo" could never find it.
-//!   Names deduplicate EXACTLY, because `LOADING` and `Loading` are different
-//!   tokens that render as different emotes.
+//!
+//! Both match case-insensitively but keep names EXACTLY: `LULE` and `lule` are
+//! different tokens that render as different emotes, so both are offered. Only
+//! an identical name defined by two providers collapses to one row, and a
+//! Twitch emote always keeps its name (Twitch tags it in the sent message).
+//! Names that differ only by case sit next to each other, the one whose case
+//! matches what was typed first.
 //!
 //! Callers hand names in with `offer`; the rest of a row (`Seed`) is only built
 //! for names that matched, so a scan over thousands of names allocates for the
@@ -21,8 +26,9 @@
 
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{OnceLock, RwLock};
 
 use crate::models::settings::Settings;
 use crate::services::emote_service::{Emote, EmoteProvider, EmoteSet};
@@ -32,6 +38,11 @@ pub const GLOBAL_EMOTE_TYPE: &str = "global";
 
 /// Marks a 7TV row from the viewer's own personal set, usable in every channel.
 pub const PERSONAL_EMOTE_TYPE: &str = "personal";
+
+/// A personal row whose name the channel also uses: the channel's emote is
+/// hidden behind it in the viewer's own messages.
+const PERSONAL_REPLACES_LABEL: &str = "7TV Personal, replaces channel's";
+const PERSONAL_REPLACES_DETAIL: &str = "Personal, replaces channel's";
 
 /// The most rows one call returns.
 pub const MAX_LIMIT: usize = 200;
@@ -105,15 +116,130 @@ impl Order {
 // "Contains" instead of "starts with", from chat_input.emote_tab_complete_match_mode.
 static CONTAINS_MODE: AtomicBool = AtomicBool::new(false);
 
+// Chatter names after the emotes in the Tab cycle and the phone strip, from
+// chat_input.emote_tab_complete_include_chatters (on unless turned off).
+static INCLUDE_CHATTERS: AtomicBool = AtomicBool::new(true);
+
+/// The viewer's nicknames for chatters (user id -> nickname), from
+/// chat_customization.user_overrides, so a nickname finds its chatter too.
+fn nicknames() -> &'static RwLock<HashMap<String, String>> {
+    static NICKS: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+    NICKS.get_or_init(Default::default)
+}
+
 /// Pick up the match mode from saved settings. Runs on boot and every save.
 pub fn refresh_settings(settings: &Settings) {
     let includes = settings
+        .chat_input
         .extra
-        .get("chat_input")
-        .and_then(|v| v.get("emote_tab_complete_match_mode"))
+        .get("emote_tab_complete_match_mode")
         .and_then(|v| v.as_str())
         == Some("includes");
     CONTAINS_MODE.store(includes, AtomicOrdering::Relaxed);
+    let chatters = settings
+        .chat_input
+        .extra
+        .get("emote_tab_complete_include_chatters")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    INCLUDE_CHATTERS.store(chatters, AtomicOrdering::Relaxed);
+    let nicks: HashMap<String, String> = settings
+        .extra
+        .get("chat_customization")
+        .and_then(|g| g.get("user_overrides"))
+        .and_then(|o| o.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(id, v)| {
+                    let nick = v.get("nickname")?.as_str()?.trim();
+                    (!nick.is_empty()).then(|| (id.clone(), nick.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(mut guard) = nicknames().write() {
+        *guard = nicks;
+    }
+}
+
+/// The most chatter rows one answer adds.
+pub const MAX_CHATTERS: usize = 5;
+/// The Tab cycle's and the phone strip's row cap, chatters included.
+pub const CYCLE_CAP: usize = 50;
+
+/// What a chatter row inserts: the display name when it differs from the
+/// login only by case, else the login (a localized display name mentions
+/// nobody), with `@` when the word had one.
+fn chatter_insert(login: &str, display: &str, at: bool) -> String {
+    let name = if !display.is_empty() && display.eq_ignore_ascii_case(login) { display } else { login };
+    format!("{}{name}", if at { "@" } else { "" })
+}
+
+/// Chatter rows for the cycle `word` after `emotes`: recent chatters of
+/// `channel` (newest first) whose login, display name or nickname starts with
+/// the word (contains it, in "includes" mode), minus a leading `@`. None for a
+/// `:` word, once `emotes` fills the cap, or while the setting is off. A name
+/// an emote row already shows is skipped.
+pub fn chatter_rows(
+    word: &str,
+    emotes: &[Row],
+    contains: bool,
+    chatters: &[(String, String, String)],
+) -> Vec<Row> {
+    if !INCLUDE_CHATTERS.load(AtomicOrdering::Relaxed) || word.starts_with(':') || emotes.len() >= CYCLE_CAP {
+        return Vec::new();
+    }
+    let at = word.starts_with('@');
+    let needle = word.trim_start_matches('@').to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let nicks = nicknames().read().map(|g| g.clone()).unwrap_or_default();
+    let hit = |s: &str| {
+        let s = s.to_lowercase();
+        if contains { s.contains(&needle) } else { s.starts_with(&needle) }
+    };
+    let mut taken: HashSet<String> = emotes.iter().map(|r| r.name.to_lowercase()).collect();
+    let room = (CYCLE_CAP - emotes.len()).min(MAX_CHATTERS);
+    let mut out = Vec::new();
+    for (login, user_id, display) in chatters {
+        if out.len() >= room {
+            break;
+        }
+        let shown = if display.is_empty() { login.as_str() } else { display.as_str() };
+        let nick = nicks.get(user_id).map(String::as_str);
+        if !(hit(login) || hit(shown) || nick.is_some_and(hit)) {
+            continue;
+        }
+        if !taken.insert(shown.to_lowercase()) {
+            continue;
+        }
+        out.push(Row {
+            slot: Slot::Twitch,
+            id: user_id.clone(),
+            name: format!("{}{shown}", if at { "@" } else { "" }),
+            insert_text: Some(chatter_insert(login, shown, at)),
+            url: String::new(),
+            local_path: None,
+            provider: "user",
+            source_label: "Chatter",
+            source_detail: "Chatter",
+            match_at: None,
+            match_len: None,
+            group: None,
+            is_zero_width: None,
+            modifier_flags: None,
+            emote_type: None,
+            owner_name: None,
+            original_name: None,
+            animated: None,
+            width: None,
+            favorite: false,
+            locked: false,
+            login: Some(login.clone()),
+        });
+    }
+    out
 }
 
 pub fn contains_mode() -> bool {
@@ -151,6 +277,7 @@ pub struct Context<'a> {
 }
 
 /// Everything a row needs besides its name.
+#[derive(Default)]
 pub struct Seed {
     pub id: String,
     pub url: String,
@@ -162,6 +289,12 @@ pub struct Seed {
     pub global: bool,
     /// Belongs to the channel being typed in.
     pub own: bool,
+    /// Who made it, where the provider says (the emote menu's hover credit).
+    pub owner_name: Option<String>,
+    /// The emote's own name when this set shows it under an alias.
+    pub original_name: Option<String>,
+    pub animated: Option<bool>,
+    pub width: Option<u32>,
 }
 
 struct Hit {
@@ -170,8 +303,25 @@ struct Hit {
     kind: Kind,
     /// Byte offset of the match in `name`, where it is known (ASCII names).
     at: Option<usize>,
+    /// The typed text appears in the name with the same case, so `LU` picks
+    /// `LULE` over `lule`.
+    case_exact: bool,
     favorite: bool,
+    /// An FFZ subscriber effect the viewer cannot use (offered only when the
+    /// caller asked for locked rows, so the menu can show it greyed out).
+    locked: bool,
     seed: Seed,
+}
+
+impl Hit {
+    fn is_personal(&self) -> bool {
+        self.slot == Slot::SevenTv && self.seed.emote_type.as_deref() == Some(PERSONAL_EMOTE_TYPE)
+    }
+
+    /// A channel name lookup the sender's personal set is consulted before.
+    fn shadowable(&self) -> bool {
+        matches!(self.slot, Slot::SevenTv | Slot::Bttv | Slot::Ffz)
+    }
 }
 
 struct Ranked {
@@ -210,7 +360,28 @@ pub struct Row {
     pub is_zero_width: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modifier_flags: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emote_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub animated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub favorite: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub locked: bool,
+    /// A chatter row's login (provider `user`); absent on emote rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
 }
+
+/// How many emotes matched per provider, counted before the row cap, so the
+/// emote menu's tabs can say how many each one holds.
+pub type ProviderCounts = std::collections::BTreeMap<&'static str, usize>;
 
 pub struct Collector<'a> {
     ctx: Context<'a>,
@@ -225,6 +396,8 @@ pub struct Collector<'a> {
     browse: bool,
     /// Nothing can match (an @ query, a bare colon, an empty cycle query).
     inert: bool,
+    /// Offer FFZ subscriber effects the viewer cannot use, marked locked.
+    include_locked: bool,
     hits: [Vec<Hit>; Slot::COUNT],
 }
 
@@ -260,26 +433,36 @@ impl<'a> Collector<'a> {
             needle,
             browse,
             inert,
+            include_locked: false,
             hits: Default::default(),
         }
     }
 
-    fn kind_of(&self, name: &str) -> Option<(Kind, Option<usize>)> {
+    /// The emote menu shows FFZ subscriber effects greyed out rather than
+    /// hiding them; completion never offers what cannot be sent.
+    pub fn include_locked(mut self, on: bool) -> Self {
+        self.include_locked = on;
+        self
+    }
+
+    /// How `name` matches, where, and whether the typed case matches too.
+    fn kind_of(&self, name: &str) -> Option<(Kind, Option<usize>, bool)> {
         if self.browse {
-            return Some((Kind::Prefix, None));
+            return Some((Kind::Prefix, None, false));
         }
         let q = self.needle_lower.as_str();
-        if name.is_ascii() && q.is_ascii() {
-            let (nb, qb) = (name.as_bytes(), q.as_bytes());
+        if name.is_ascii() && q.is_ascii() && self.needle.len() == q.len() {
+            let (nb, qb, typed) = (name.as_bytes(), q.as_bytes(), self.needle.as_bytes());
             if nb.len() < qb.len() {
                 return None;
             }
+            let same_case = |i: usize| &nb[i..i + typed.len()] == typed;
             if nb[..qb.len()].eq_ignore_ascii_case(qb) {
                 if nb.len() == qb.len() {
                     let kind = if name == self.needle { Kind::ExactCase } else { Kind::Exact };
-                    return Some((kind, Some(0)));
+                    return Some((kind, Some(0), same_case(0)));
                 }
-                return Some((Kind::Prefix, Some(0)));
+                return Some((Kind::Prefix, Some(0), same_case(0)));
             }
             if !self.contains {
                 return None;
@@ -288,10 +471,10 @@ impl<'a> Collector<'a> {
             for i in 1..=nb.len() - qb.len() {
                 if nb[i..i + qb.len()].eq_ignore_ascii_case(qb) {
                     if starts_word(nb, i) {
-                        return Some((Kind::WordStart, Some(i)));
+                        return Some((Kind::WordStart, Some(i), same_case(i)));
                     }
                     if found.is_none() {
-                        found = Some((Kind::Contains, Some(i)));
+                        found = Some((Kind::Contains, Some(i), same_case(i)));
                     }
                 }
             }
@@ -302,11 +485,11 @@ impl<'a> Collector<'a> {
         let lower = name.to_lowercase();
         if lower == q {
             let kind = if name == self.needle { Kind::ExactCase } else { Kind::Exact };
-            Some((kind, None))
+            Some((kind, None, name == self.needle))
         } else if lower.starts_with(q) {
-            Some((Kind::Prefix, None))
+            Some((Kind::Prefix, None, name.starts_with(self.needle.as_str())))
         } else if self.contains && lower.contains(q) {
-            Some((Kind::Contains, None))
+            Some((Kind::Contains, None, name.contains(self.needle.as_str())))
         } else {
             None
         }
@@ -321,7 +504,8 @@ impl<'a> Collector<'a> {
         ffz_sub_only: bool,
         seed: impl FnOnce() -> Seed,
     ) {
-        if self.inert || (ffz_sub_only && !self.ctx.ffz_subwoofer) {
+        let locked = ffz_sub_only && !self.ctx.ffz_subwoofer;
+        if self.inert || (locked && !self.include_locked) {
             return;
         }
         // YouTube emoji names are `:shortcut:`; what people type is the inside.
@@ -331,7 +515,7 @@ impl<'a> Collector<'a> {
         } else {
             (name, 0)
         };
-        let Some((kind, at)) = self.kind_of(key) else {
+        let Some((kind, at, case_exact)) = self.kind_of(key) else {
             return;
         };
         let favorite = self.ctx.favorites.contains(id);
@@ -340,7 +524,9 @@ impl<'a> Collector<'a> {
             name: name.to_string(),
             kind,
             at: at.map(|a| a + lead),
+            case_exact,
             favorite,
+            locked,
             seed: seed(),
         });
     }
@@ -370,6 +556,10 @@ impl<'a> Collector<'a> {
                 modifier_flags: e.modifier_flags,
                 global,
                 own,
+                owner_name: e.owner_name.clone(),
+                original_name: e.original_name.clone(),
+                animated: e.animated,
+                width: e.width,
             }
         });
     }
@@ -399,24 +589,57 @@ impl<'a> Collector<'a> {
 
     /// Deduplicate, rank and cap. Returns the rows and how many matched in all.
     pub fn finish(self) -> (Vec<Row>, usize) {
+        let (rows, total, _) = self.finish_counted();
+        (rows, total)
+    }
+
+    /// `finish`, plus how many matched per provider before the cap.
+    pub fn finish_counted(self) -> (Vec<Row>, usize, ProviderCounts) {
         let match_len = (!self.needle.is_empty()).then(|| self.needle.len());
         let Collector { profile, order, limit, browse, mut hits, .. } = self;
+        // In the viewer's own messages a personal emote beats the channel's
+        // third-party emote of the same exact name (Twitch's own emotes are
+        // tagged by Twitch and still win). Offering the channel's row would
+        // preview art that never appears, so the personal row takes the name
+        // and says what it replaces.
+        let personal: HashMap<String, String> = hits
+            .iter()
+            .flatten()
+            .filter(|h| h.is_personal())
+            .map(|h| (h.name.clone(), h.seed.id.clone()))
+            .collect();
+        let mut replaced: HashSet<String> = HashSet::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut merged: Vec<Ranked> = Vec::new();
-        // Walking in tier order is what makes the better provider keep a
-        // name both of them define.
-        for (tier, slot) in order.slots().iter().enumerate() {
+        let slots = order.slots();
+        let tier_of = |slot: Slot| slots.iter().position(|s| *s == slot).unwrap_or(0) as u8;
+        // The first provider walked keeps a name two of them define. Twitch
+        // goes first whatever the ranking order: a name Twitch would tag in the
+        // sent message is Twitch's emote, so a third-party row of the same name
+        // would preview art that never appears. Then the ranking order decides.
+        let walk = std::iter::once(Slot::Twitch).chain(slots.into_iter().filter(|s| *s != Slot::Twitch));
+        for slot in walk {
             for hit in std::mem::take(&mut hits[slot.index()]) {
-                let key = match profile {
-                    Profile::Cycle => hit.name.to_lowercase(),
-                    Profile::Search => hit.name.clone(),
-                };
-                if seen.insert(key) {
-                    merged.push(Ranked { tier: tier as u8, hit });
+                if hit.shadowable() && !hit.is_personal() {
+                    if let Some(mine) = personal.get(&hit.name) {
+                        // The same emote in both sets replaces nothing.
+                        if *mine != hit.seed.id {
+                            replaced.insert(hit.name);
+                        }
+                        continue;
+                    }
+                }
+                // Exact name: `LULE` and `lule` are two emotes.
+                if seen.insert(hit.name.clone()) {
+                    merged.push(Ranked { tier: tier_of(slot), hit });
                 }
             }
         }
         let total = merged.len();
+        let mut counts = ProviderCounts::new();
+        for r in &merged {
+            *counts.entry(r.hit.slot.wire()).or_default() += 1;
+        }
         let cmp = |a: &Ranked, b: &Ranked| compare(profile, browse, a, b);
         if browse {
             merged.sort_by(cmp);
@@ -426,16 +649,32 @@ impl<'a> Collector<'a> {
         } else {
             if merged.len() > limit {
                 merged.select_nth_unstable_by(limit - 1, cmp);
-                merged.truncate(limit);
+                // A case variant of a name that made the cut comes along, so
+                // `LULE` is never cut while `lule` is shown.
+                let cut = merged.split_off(limit);
+                let kept: HashSet<String> = merged.iter().map(|r| r.hit.name.to_lowercase()).collect();
+                merged.extend(cut.into_iter().filter(|r| kept.contains(&r.hit.name.to_lowercase())));
             }
             merged.sort_by(cmp);
+            merged = gather_case_variants(merged);
+            // The cap never splits a case pair: when it lands inside one, the
+            // rest of that pair comes along.
+            let mut end = limit.min(merged.len());
+            while end > 0
+                && end < merged.len()
+                && merged[end].hit.name.to_lowercase() == merged[end - 1].hit.name.to_lowercase()
+            {
+                end += 1;
+            }
+            merged.truncate(end);
         }
         let rows = merged
             .into_iter()
             .map(|r| {
                 let h = r.hit;
-                let label = source_label(h.slot, &h.seed);
-                let detail = source_detail(h.slot, &h.seed);
+                let replaces = h.is_personal() && replaced.contains(&h.name);
+                let label = if replaces { PERSONAL_REPLACES_LABEL } else { source_label(h.slot, &h.seed) };
+                let detail = if replaces { PERSONAL_REPLACES_DETAIL } else { source_detail(h.slot, &h.seed) };
                 Row {
                     slot: h.slot,
                     group: browse.then(|| GROUPS[group_rank(&h) as usize]),
@@ -451,11 +690,45 @@ impl<'a> Collector<'a> {
                     match_len: h.at.and(match_len),
                     is_zero_width: h.seed.is_zero_width,
                     modifier_flags: h.seed.modifier_flags,
+                    emote_type: h.seed.emote_type,
+                    owner_name: h.seed.owner_name,
+                    original_name: h.seed.original_name,
+                    animated: h.seed.animated,
+                    width: h.seed.width,
+                    favorite: h.favorite,
+                    locked: h.locked,
+                    login: None,
                 }
             })
             .collect();
-        (rows, total)
+        (rows, total, counts)
     }
+}
+
+/// Pull names that differ only by case together, at the place of the first one
+/// ranked, the variant whose case matches what was typed first. Everything else
+/// keeps its rank. `LULE` (Twitch) and `lule` (7TV) are two emotes, and someone
+/// typing either needs to see both side by side.
+fn gather_case_variants(sorted: Vec<Ranked>) -> Vec<Ranked> {
+    let folded: Vec<String> = sorted.iter().map(|r| r.hit.name.to_lowercase()).collect();
+    let mut members: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, key) in folded.iter().enumerate() {
+        members.entry(key.as_str()).or_default().push(i);
+    }
+    if members.len() == sorted.len() {
+        return sorted;
+    }
+    let mut slots: Vec<Option<Ranked>> = sorted.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len());
+    for key in &folded {
+        let Some(mut group) = members.remove(key.as_str()) else {
+            continue;
+        };
+        // Stable, so variants of the same case keep their rank order.
+        group.sort_by_key(|&i| !slots[i].as_ref().is_some_and(|r| r.hit.case_exact));
+        out.extend(group.into_iter().filter_map(|i| slots[i].take()));
+    }
+    out
 }
 
 /// Whether byte `i` of an ASCII name begins a word: a capital after a lowercase
@@ -632,9 +905,13 @@ mod tests {
             emote_type: emote_type.map(String::from),
             owner_id: owner.map(String::from),
             owner_name: None,
+            original_name: None,
+            owner_ref: None,
             width: None,
+            height: None,
             modifier_flags: None,
             ffz_sub_only: None,
+            animated: None,
         }
     }
 
@@ -696,9 +973,109 @@ mod tests {
     fn cycle_keeps_provider_tier_then_name() {
         let f = Fixture::new();
         let (rows, _) = f.run("lo", Profile::Cycle, Order::Default, false);
-        // 7TV first (Loading, lol), then the BTTV/FFZ names not already taken
-        // case-insensitively (LOADING and LoL both are), then Twitch.
-        assert_eq!(names(&rows), vec!["Loading", "lol"]);
+        // 7TV first (Loading, lol). BTTV's LOADING and FFZ's LoL are different
+        // emotes, each beside the 7TV name it differs from only by case; the
+        // variant typed in the same case ("lo") leads its pair.
+        assert_eq!(names(&rows), vec!["Loading", "LOADING", "lol", "LoL"]);
+    }
+
+    fn case_pair(extra_7tv: &[&str]) -> EmoteSet {
+        let mut s = EmoteSet::new();
+        s.twitch = vec![emote(EmoteProvider::Twitch, "t-LULE", "LULE", Some("subscriptions"), Some("99"))];
+        s.seven_tv = std::iter::once("lule")
+            .chain(extra_7tv.iter().copied())
+            .map(|n| emote(EmoteProvider::SevenTV, &format!("s-{n}"), n, None, None))
+            .collect();
+        s
+    }
+
+    fn run_set(set: &EmoteSet, query: &str, profile: Profile, order: Order, limit: usize) -> Vec<Row> {
+        let favorites = HashSet::new();
+        let globals = HashSet::new();
+        let mut c = Collector::new(
+            Spec { query, profile, order, contains: false, limit },
+            Context { channel_id: Some("42"), favorites: &favorites, seventv_globals: &globals, ffz_subwoofer: false },
+        );
+        c.offer_set(set);
+        c.finish().0
+    }
+
+    #[test]
+    fn names_that_differ_only_by_case_are_both_offered_typed_case_first() {
+        let set = case_pair(&["luluDance"]);
+        for profile in [Profile::Cycle, Profile::Search] {
+            for order in [Order::Default, Order::TwitchFirst] {
+                let cases = [("lu", "lule", "LULE"), ("LU", "LULE", "lule"), ("lule", "lule", "LULE"), ("LULE", "LULE", "lule")];
+                for (query, first, second) in cases {
+                    let rows = run_set(&set, query, profile, order, 50);
+                    let n = names(&rows);
+                    let at = |x: &str| n.iter().position(|r| *r == x).unwrap_or_else(|| panic!("{x} missing for {query} {profile:?} {order:?}: {n:?}"));
+                    assert_eq!(at(second), at(first) + 1, "{query} {profile:?} {order:?}: {n:?}");
+                    assert_eq!(rows[at("LULE")].provider, "twitch");
+                    assert_eq!(rows[at("lule")].provider, "7tv");
+                }
+            }
+        }
+        // The pair leads the 7TV-first cycle as a pair, ahead of luluDance.
+        let rows = run_set(&set, "LU", Profile::Cycle, Order::Default, 50);
+        assert_eq!(names(&rows), vec!["LULE", "lule", "luluDance"]);
+    }
+
+    #[test]
+    fn a_case_variant_survives_the_row_cap_beside_its_pair() {
+        let set = case_pair(&["lulw", "luna"]);
+        let rows = run_set(&set, "lu", Profile::Cycle, Order::Default, 2);
+        assert_eq!(names(&rows), vec!["lule", "LULE"]);
+    }
+
+    #[test]
+    fn a_case_pair_on_the_last_row_keeps_both_variants() {
+        // `lubba` ranks first, then the lule/LULE pair: a cap of 2 lands inside
+        // the pair, which comes along whole rather than losing LULE.
+        let set = case_pair(&["lubba", "lulw"]);
+        let rows = run_set(&set, "lu", Profile::Cycle, Order::Default, 50);
+        let n = names(&rows);
+        let first = n.iter().position(|r| *r == "lule" || *r == "LULE").expect("pair offered");
+        assert!(first > 0, "a name ranks ahead of the pair: {n:?}");
+        let rows = run_set(&set, "lu", Profile::Cycle, Order::Default, first + 1);
+        let capped = names(&rows);
+        assert_eq!(capped.len(), first + 2, "{capped:?}");
+        assert!(capped.contains(&"lule") && capped.contains(&"LULE"), "{capped:?}");
+        // A cap that ends between two unrelated names stays exact.
+        let rows = run_set(&set, "lu", Profile::Cycle, Order::Default, first);
+        assert_eq!(rows.len(), first);
+    }
+
+    #[test]
+    fn an_identical_twitch_and_7tv_name_keeps_the_twitch_emote() {
+        let mut set = EmoteSet::new();
+        set.twitch = vec![emote(EmoteProvider::Twitch, "t1", "xqcL", Some("subscriptions"), Some("71"))];
+        set.seven_tv = vec![emote(EmoteProvider::SevenTV, "s1", "xqcL", None, None)];
+        for profile in [Profile::Cycle, Profile::Search] {
+            for order in [Order::Default, Order::TwitchFirst] {
+                let rows = run_set(&set, "xq", profile, order, 50);
+                assert_eq!(rows.len(), 1, "{profile:?} {order:?}");
+                assert_eq!(rows[0].id, "t1", "{profile:?} {order:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_personal_emote_only_hides_the_identical_name() {
+        let favorites = HashSet::new();
+        let globals = HashSet::new();
+        for profile in [Profile::Cycle, Profile::Search] {
+            let mut c = Collector::new(
+                Spec { query: "buh", profile, order: Order::Default, contains: false, limit: 10 },
+                Context { channel_id: Some("42"), favorites: &favorites, seventv_globals: &globals, ffz_subwoofer: false },
+            );
+            c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "chan", "buh", None, None));
+            c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "chanUpper", "BUH", None, None));
+            c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "mine", "buh", Some(PERSONAL_EMOTE_TYPE), None));
+            let (rows, _) = c.finish();
+            let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+            assert_eq!(ids, vec!["mine", "chanUpper"], "{profile:?}");
+        }
     }
 
     #[test]
@@ -859,6 +1236,85 @@ mod tests {
     }
 
     #[test]
+    fn picker_mode_counts_before_the_cap_and_shows_locked_ffz() {
+        let favorites: HashSet<String> = ["fav".to_string()].into_iter().collect();
+        let globals = HashSet::new();
+        let mut c = Collector::new(
+            Spec { query: "pog", profile: Profile::Search, order: Order::Default, contains: false, limit: 2 },
+            Context { channel_id: None, favorites: &favorites, seventv_globals: &globals, ffz_subwoofer: false },
+        )
+        .include_locked(true);
+        let mut owned = emote(EmoteProvider::SevenTV, "fav", "PogU", None, None);
+        owned.owner_name = Some("Alpha".into());
+        owned.original_name = Some("PogUOriginal".into());
+        owned.width = Some(64);
+        c.offer_emote(Slot::SevenTv, &owned);
+        c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "s2", "Pogpega", None, None));
+        c.offer_emote(Slot::Bttv, &emote(EmoteProvider::BTTV, "b1", "PogChamp2", None, None));
+        let mut locked = emote(EmoteProvider::FFZ, "9", "PogSub", None, None);
+        locked.ffz_sub_only = Some(true);
+        c.offer_emote(Slot::Ffz, &locked);
+        let (rows, total, counts) = c.finish_counted();
+        assert_eq!(total, 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(counts.get("7tv"), Some(&2));
+        assert_eq!(counts.get("bttv"), Some(&1));
+        assert_eq!(counts.get("ffz"), Some(&1));
+        let pogu = rows.iter().find(|r| r.name == "PogU").unwrap();
+        assert!(pogu.favorite);
+        assert_eq!(pogu.owner_name.as_deref(), Some("Alpha"));
+        assert_eq!(pogu.original_name.as_deref(), Some("PogUOriginal"));
+        assert_eq!(pogu.width, Some(64));
+
+        // Completion never offers what cannot be sent.
+        let mut c = Collector::new(
+            Spec { query: "pogsub", profile: Profile::Search, order: Order::Default, contains: false, limit: 10 },
+            Context { channel_id: None, favorites: &favorites, seventv_globals: &globals, ffz_subwoofer: false },
+        );
+        c.offer_emote(Slot::Ffz, &locked);
+        assert!(c.finish().0.is_empty());
+    }
+
+    #[test]
+    fn a_personal_emote_takes_the_name_from_the_channel_emote_it_hides() {
+        let favorites = HashSet::new();
+        let globals = HashSet::new();
+        for profile in [Profile::Cycle, Profile::Search] {
+            let mut c = Collector::new(
+                Spec { query: "buh", profile, order: Order::Default, contains: false, limit: 10 },
+                Context { channel_id: Some("42"), favorites: &favorites, seventv_globals: &globals, ffz_subwoofer: false },
+            );
+            // The channel's rows are offered first, as they are in chat.
+            c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "pumpkin", "buh", None, None));
+            c.offer_emote(Slot::Bttv, &emote(EmoteProvider::BTTV, "b", "buh", None, None));
+            c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "s", "buhShakey", None, None));
+            c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "mine", "buh", Some(PERSONAL_EMOTE_TYPE), None));
+            let (rows, _) = c.finish();
+            let buh: Vec<&Row> = rows.iter().filter(|r| r.name == "buh").collect();
+            assert_eq!(buh.len(), 1, "{profile:?}");
+            assert_eq!(buh[0].id, "mine");
+            assert_eq!(buh[0].source_detail, "Personal, replaces channel's");
+            let shakey = rows.iter().find(|r| r.name == "buhShakey").unwrap();
+            assert_eq!(shakey.source_label, "7TV");
+        }
+    }
+
+    #[test]
+    fn a_twitch_emote_is_never_hidden_by_a_personal_one() {
+        let favorites = HashSet::new();
+        let globals = HashSet::new();
+        let mut c = Collector::new(
+            Spec { query: "Kappa", profile: Profile::Search, order: Order::TwitchFirst, contains: false, limit: 10 },
+            Context { channel_id: None, favorites: &favorites, seventv_globals: &globals, ffz_subwoofer: false },
+        );
+        c.offer_emote(Slot::Twitch, &emote(EmoteProvider::Twitch, "t1", "Kappa", Some("globals"), Some("0")));
+        c.offer_emote(Slot::SevenTv, &emote(EmoteProvider::SevenTV, "mine", "Kappa", Some(PERSONAL_EMOTE_TYPE), None));
+        let (rows, _) = c.finish();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "t1");
+    }
+
+    #[test]
     fn ffz_sub_only_offered_to_subscribers_only() {
         let favorites = HashSet::new();
         let globals = HashSet::new();
@@ -891,6 +1347,7 @@ mod tests {
             modifier_flags: None,
             global: false,
             own: true,
+            ..Default::default()
         });
         let (rows, _) = c.finish();
         assert_eq!(rows[0].name, ":face-blue-smiling:");
@@ -939,5 +1396,74 @@ mod tests {
     fn alpha_is_case_insensitive_with_lowercase_first() {
         assert_eq!(alpha("apple", "Banana"), Ordering::Less);
         assert_eq!(alpha("kappa", "Kappa"), Ordering::Less);
+    }
+
+    fn chatter(login: &str, id: &str, display: &str) -> (String, String, String) {
+        (login.to_string(), id.to_string(), display.to_string())
+    }
+
+    #[test]
+    fn chatters_follow_the_emotes_newest_first_and_capped() {
+        let recent = vec![
+            chatter("lulu", "1", "Lulu"),
+            chatter("luke", "2", "Luke"),
+            chatter("bob", "3", "Bob"),
+            chatter("lunar", "4", "ルナ"),
+        ];
+        let rows = chatter_rows("lu", &[], false, &recent);
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["Lulu", "Luke", "ルナ"]);
+        assert!(rows.iter().all(|r| r.provider == "user"));
+        // A localized display name inserts the login, which Twitch resolves.
+        assert_eq!(rows[2].insert_text.as_deref(), Some("lunar"));
+        assert_eq!(rows[0].insert_text.as_deref(), Some("Lulu"));
+        assert_eq!(rows[2].login.as_deref(), Some("lunar"));
+    }
+
+    #[test]
+    fn an_at_word_completes_to_a_mention_and_a_colon_word_to_none() {
+        let recent = vec![chatter("lulu", "1", "Lulu")];
+        let rows = chatter_rows("@lu", &[], false, &recent);
+        assert_eq!(rows[0].name, "@Lulu");
+        assert_eq!(rows[0].insert_text.as_deref(), Some("@Lulu"));
+        assert!(chatter_rows(":lu", &[], false, &recent).is_empty());
+        assert!(chatter_rows("@", &[], false, &recent).is_empty());
+    }
+
+    #[test]
+    fn chatters_skip_emote_names_and_respect_the_cap() {
+        let recent = vec![chatter("lulw", "1", "LULW"), chatter("lulu", "2", "lulu")];
+        let emote = Row {
+            slot: Slot::Bttv,
+            id: "e".into(),
+            name: "LULW".into(),
+            insert_text: None,
+            url: String::new(),
+            local_path: None,
+            provider: "bttv",
+            source_label: "",
+            source_detail: "",
+            match_at: None,
+            match_len: None,
+            group: None,
+            is_zero_width: None,
+            modifier_flags: None,
+            emote_type: None,
+            owner_name: None,
+            original_name: None,
+            animated: None,
+            width: None,
+            favorite: false,
+            locked: false,
+            login: None,
+        };
+        let rows = chatter_rows("lul", std::slice::from_ref(&emote), false, &recent);
+        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["lulu"]);
+        let full = vec![emote; CYCLE_CAP];
+        assert!(chatter_rows("lul", &full, false, &recent).is_empty());
+        // Includes mode finds a name in the middle.
+        let mid = chatter_rows("ulu", &[], true, &recent);
+        assert_eq!(mid.len(), 1);
+        assert!(chatter_rows("ulu", &[], false, &recent).is_empty());
     }
 }

@@ -192,6 +192,9 @@ export interface OverlayStyle {
   eventAnimateRepeat: boolean;
   /** How a bits cheer renders: inline as a normal message, or as an event card. */
   cheerDisplay: CheerDisplay;
+  /** Show a row when the channel's 7TV emote set changes (an emote added,
+   *  removed or renamed), styled like the other events. */
+  seventvEmoteChanges: boolean;
   /** Hide messages from known bot accounts / users carrying a bot badge. */
   hideBots: boolean;
   /** Legacy global event hides (e.g. 'raid', 'cheer'), applied to every platform.
@@ -228,6 +231,13 @@ export interface OverlayStyle {
    *  '7tv'). Each provider toggles independently, on top of the global
    *  showThirdPartyBadges master. See THIRD_PARTY_BADGE_PROVIDERS. */
   hiddenBadgeProviders: string[];
+  /** Twitch badge categories to hide, by id (e.g. 'predictions', 'roles'), on top
+   *  of the showBadges master. See TWITCH_BADGE_CATEGORIES. */
+  hiddenTwitchBadgeCategories: string[];
+  /** Draw a channel's own FrankerFaceZ moderator and VIP badge art instead of
+   *  Twitch's. Off shows Twitch's standard moderator and VIP badges, since a
+   *  channel's custom art can be anything. */
+  ffzCustomRoleBadges: boolean;
   /** How unicode emoji render. 'system' uses the OS/font emoji (varies by machine);
    *  the vendor styles re-render EVERY emoji from every platform as that one style's
    *  images, so a merged overlay looks consistent regardless of platform or OS. */
@@ -327,9 +337,12 @@ export interface OverlayStyle {
   /** Where the gigantified emote lands. See GiantEmoteAlign. */
   giantEmoteAlign: GiantEmoteAlign;
   /** Twitch chat GIFs (GIPHY-backed, Tier 2/3 subscribers): draw them at the
-   *  gigantified size with the same placement. Off shows the description
+   *  gigantified size, inline after the name. Off shows the description
    *  Twitch puts in the message text instead. */
   showGifs: boolean;
+  /** Chat GIF size multiplier on top of the gigantified size (which already
+   *  follows emoteScale). 1 = the size GIFs have always drawn at. */
+  gifScale: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -579,12 +592,42 @@ export const THIRD_PARTY_BADGE_PROVIDERS: { id: string; label: string }[] = [
   { id: 'ffz', label: 'FFZ' },
   { id: 'chatterino', label: 'Chatterino' },
   { id: 'homies', label: 'Homies' },
+  { id: 'homies-custom', label: 'Homies custom' },
   { id: 'moltorino', label: 'Moltorino' },
   { id: 'bttv', label: 'BTTV' },
   { id: 'chatsen', label: 'Chatsen' },
   { id: 'chatty', label: 'Chatty' },
   { id: 'dankchat', label: 'DankChat' },
 ];
+
+// Twitch badge categories a streamer can hide, each listing its Twitch badge SET
+// ids. The same table as TWITCH_BADGE_CATEGORY_SETS in the backend's
+// models/chat_layout.rs: the hosted overlay page has no backend, so the renderer
+// classifies by itself, and twitchBadgeCategories.test.ts fails when the two
+// tables differ. 'other' is every remaining set; the broadcaster and staff
+// badges sit in no category and follow only the Badges switch.
+export const TWITCH_BADGE_CATEGORIES: { id: string; label: string; sets: string[] }[] = [
+  { id: 'subscriber', label: 'Subscriber', sets: ['subscriber', 'founder'] },
+  { id: 'predictions', label: 'Prediction', sets: ['predictions'] },
+  { id: 'gifted-subs', label: 'Gifted subs', sets: ['sub-gifter', 'sub-gift-leader'] },
+  { id: 'bits', label: 'Bits', sets: ['bits', 'bits-leader', 'bits-charity', 'anonymous-cheerer'] },
+  { id: 'blossom', label: 'Blossom', sets: ['blossom-badge'] },
+  { id: 'bloom', label: 'Bloom', sets: ['bloom-badge'] },
+  { id: 'roles', label: 'Authority roles', sets: ['lead_moderator', 'moderator', 'vip'] },
+  { id: 'other', label: 'Everything else', sets: [] },
+];
+
+const TWITCH_BADGE_SETS_NEVER_CATEGORISED = new Set(['broadcaster', 'staff', 'admin', 'global_mod']);
+const TWITCH_BADGE_CATEGORY_BY_SET = new Map(
+  TWITCH_BADGE_CATEGORIES.flatMap((c) => c.sets.map((set) => [set, c.id] as const)),
+);
+
+/** The hide category of one Twitch badge set id, or null for a set no category
+ *  covers (the broadcaster and staff badges, or an empty id). */
+export function twitchBadgeCategory(setId: string | null | undefined): string | null {
+  if (!setId || TWITCH_BADGE_SETS_NEVER_CATEGORISED.has(setId)) return null;
+  return TWITCH_BADGE_CATEGORY_BY_SET.get(setId) ?? 'other';
+}
 
 // Font choices mirror the app's Theme › Font list so an overlay can match the
 // streamer's in-app look. Values are CSS font-family strings.
@@ -639,6 +682,7 @@ export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
   eventAnimation: 'none',
   eventAnimateRepeat: false,
   cheerDisplay: 'message',
+  seventvEmoteChanges: true,
   hideBots: false,
   hiddenEvents: [],
   hiddenProviderEvents: [],
@@ -650,6 +694,8 @@ export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
   showThirdPartyBadges: true,
   showAtmospheres: true,
   hiddenBadgeProviders: [],
+  hiddenTwitchBadgeCategories: [],
+  ffzCustomRoleBadges: false,
   emojiStyle: 'apple',
   bubble: false,
   bubbleShape: 'rounded',
@@ -683,6 +729,7 @@ export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
   giantEmotes: true,
   giantEmoteAlign: 'center',
   showGifs: true,
+  gifScale: 1,
 };
 
 // Clamp ranges so a builder (or a hand-edited saved config) can't produce a
@@ -697,6 +744,7 @@ export const OVERLAY_LIMITS = {
   lineHeight: { min: 1, max: 2.2 },
   messageGap: { min: 0, max: 28 },
   emoteScale: { min: 0.5, max: 3 },
+  gifScale: { min: 0.5, max: 2 },
   badgeScale: { min: 0.5, max: 2.5 },
   fontWeight: { min: 300, max: 700 },
   textShadowSize: { min: 0, max: 12 },
@@ -707,6 +755,24 @@ export const OVERLAY_LIMITS = {
   maxMessageAgeSec: { min: 0, max: 600 },
   maxMessageLines: { min: 0, max: 6 },
 } as const;
+
+/** Longest hidden phrase or command filter the builder accepts as a new entry. */
+export const OVERLAY_TEXT_ENTRY_MAX = 200;
+
+/** Longest hidden phrase or command filter an overlay file carries. Entries
+ *  saved before new ones were capped at OVERLAY_TEXT_ENTRY_MAX can be longer;
+ *  they travel whole up to this length, and a longer one is left out and
+ *  reported. The desktop file reader (overlay_file.rs) uses the same number. */
+export const OVERLAY_FILE_TEXT_ENTRY_MAX = 1000;
+
+/** The most characters a published overlay's style may serialize to. The
+ *  overlay server refuses a bigger one (style_too_large), measuring it as the
+ *  length of JSON.stringify of the style it receives. */
+export const OVERLAY_STYLE_MAX_CHARS = 16_000;
+
+/** Whether a style, exactly as it is sent to the server, is over the server's cap. */
+export const overlayStyleTooLarge = (style: unknown): boolean =>
+  JSON.stringify(style ?? {}).length > OVERLAY_STYLE_MAX_CHARS;
 
 // Coerce commandFilters into valid { value, mode } entries. Repairs legacy shapes
 // (a plain string from an earlier version → inferred mode) and drops empties, so a
@@ -769,6 +835,11 @@ export const clampOverlayStyle = (s: OverlayStyle): OverlayStyle => {
     hidePhrases: phrases,
     hiddenEvents: [],
     hiddenProviderEvents: Array.from(providerEvents),
+    // Absent on configs saved before badge categories existed → every badge shows.
+    hiddenTwitchBadgeCategories: Array.from(new Set(
+      (Array.isArray(s.hiddenTwitchBadgeCategories) ? s.hiddenTwitchBadgeCategories : [])
+        .filter((id) => TWITCH_BADGE_CATEGORIES.some((c) => c.id === id)),
+    )),
     bubbleOpacity: clamp(s.bubbleOpacity ?? 0.55, OVERLAY_LIMITS.bubbleOpacity.min, OVERLAY_LIMITS.bubbleOpacity.max),
     bubbleRadius: Math.round(clamp(s.bubbleRadius ?? 10, OVERLAY_LIMITS.bubbleRadius.min, OVERLAY_LIMITS.bubbleRadius.max)),
     maxMessageAgeSec: Math.round(clamp(s.maxMessageAgeSec ?? 0, OVERLAY_LIMITS.maxMessageAgeSec.min, OVERLAY_LIMITS.maxMessageAgeSec.max)),
@@ -791,6 +862,17 @@ export const clampOverlayStyle = (s: OverlayStyle): OverlayStyle => {
         : 'center',
     // Absent on configs saved before chat GIFs existed → on, like Twitch.
     showGifs: s.showGifs !== false,
+    // Absent on configs saved before the switch existed → Twitch's own art, the
+    // look those overlays always had.
+    ffzCustomRoleBadges: s.ffzCustomRoleBadges === true,
+    // Absent on configs saved before 7TV emote rows existed → shown.
+    seventvEmoteChanges: s.seventvEmoteChanges !== false,
+    // Absent on configs saved before the GIF size existed → 1, today's size.
+    gifScale: clamp(
+      Number.isFinite(s.gifScale) ? s.gifScale : 1,
+      OVERLAY_LIMITS.gifScale.min,
+      OVERLAY_LIMITS.gifScale.max,
+    ),
     textAlign: s.textAlign === 'center' || s.textAlign === 'right' ? s.textAlign : 'left',
     cheerDisplay: s.cheerDisplay === 'event' ? 'event' : 'message',
     fontWeight:
@@ -818,3 +900,241 @@ export const clampOverlayStyle = (s: OverlayStyle): OverlayStyle => {
     eventTemplates: sanitizeEventTemplates(s.eventTemplates),
   };
 };
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+// Installed fonts, matched by every name a streamer might type.
+//
+// CSS `font-family` only ever matches an installed font by its FAMILY name
+// ("Montserrat"). The names Windows shows in its font viewer and in file names
+// are often FACE names ("Montserrat Bold", "Uni Sans Heavy Caps") or PostScript
+// names ("Montserrat-Bold"), and Chromium (OBS's browser source, WebView2,
+// every browser) never matches those as a family, so the overlay fell back to
+// sans-serif. `local()` inside an @font-face does match full face names and
+// PostScript names. So a custom font gets an alias family whose sources are
+// local() lookups under each of those spellings, placed right after the typed
+// name in the stack: a real family name (installed or a webfont) still wins,
+// and a face or PostScript name resolves too.
+
+/** Generic CSS family keywords: never a webfont load, never an alias. */
+const GENERIC_FONT_FAMILIES = new Set([
+  'system-ui', 'ui-sans-serif', 'ui-monospace', 'ui-serif', 'sans-serif', 'serif',
+  'monospace', 'cursive', 'fantasy', '-apple-system', 'blinkmacsystemfont',
+  'inherit', 'initial', 'unset',
+]);
+
+/** A font-family list split into its families at the commas outside quotes,
+ *  each trimmed, or null when a quote never closes. */
+export function splitFontFamilies(ff: string): string[] | null {
+  const parts: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (let i = 0; i < ff.length; i++) {
+    const c = ff[i];
+    if (quote) {
+      cur += c;
+      if (c === '\\' && i + 1 < ff.length) cur += ff[++i];
+      else if (c === quote) quote = null;
+    } else if (c === '"' || c === "'") {
+      quote = c;
+      cur += c;
+    } else if (c === ',') {
+      parts.push(cur.trim());
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  if (quote) return null;
+  parts.push(cur.trim());
+  return parts.filter(Boolean);
+}
+
+/** First family in a font-family string, unquoted. */
+export const primaryFontFamily = (ff: string): string => {
+  const first = (splitFontFamilies(ff || '') ?? [(ff || '').split(',')[0]])[0] ?? '';
+  const quoted = /^(["'])([\s\S]*)\1$/.exec(first.trim());
+  return quoted ? quoted[2] : first.trim().replace(/^["']|["']$/g, '');
+};
+
+/** A named family rather than a generic keyword. */
+export const isCustomFontFamily = (fam: string): boolean =>
+  !!fam && !GENERIC_FONT_FAMILIES.has(fam.toLowerCase());
+
+/** FNV-1a over the name's UTF-16 code units, in base 36. */
+const shortHash = (s: string): string => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+};
+
+/** The alias family that finds an installed font by its face or PostScript name.
+ *  The readable part keeps only ASCII letters and digits, so the hash of the
+ *  full name keeps two names apart that share it (every Japanese name, or
+ *  "游ゴシック Medium" and "游明朝 Medium"). */
+export const localFontAlias = (family: string): string => {
+  const slug = family.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40).replace(/^-+|-+$/g, '');
+  return `sn-local-${slug ? `${slug}-` : ''}${shortHash(family)}`;
+};
+
+const cssString = (s: string): string =>
+  `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/[\n\r\f]/g, ' ')}'`;
+
+/** The @font-face rule behind localFontAlias: local() under the typed name, its
+ *  Regular face, and the PostScript spellings (spaces dropped, "-Regular"). The
+ *  face claims every weight, so a name typed as a Bold face draws bold names
+ *  in that face as it is instead of thickening it a second time. */
+export function localFontFaceCss(family: string): string {
+  const compact = family.replace(/\s+/g, '');
+  const names = Array.from(new Set([family, `${family} Regular`, compact, `${compact}-Regular`]));
+  return `@font-face{font-family:${cssString(localFontAlias(family))};src:${names.map((n) => `local(${cssString(n)})`).join(',')};font-weight:100 900;}`;
+}
+
+/** The alias families to keep declared after `family` was used: most recently
+ *  used last, at most `max`, so the oldest gives way first. */
+export function touchLocalFontAliases(current: readonly string[], family: string, max: number): string[] {
+  const next = current.filter((f) => f !== family);
+  next.push(family);
+  return next.length > max ? next.slice(next.length - max) : next;
+}
+
+/** The font-family stack the overlay renders with: the chosen stack with the
+ *  installed-font alias right after its first family. Generic stacks
+ *  ('system-ui, sans-serif') and lists with an unclosed quote come back
+ *  unchanged. */
+export function overlayFontStack(fontFamily: string): string {
+  const parts = splitFontFamilies(fontFamily || '');
+  if (!parts || parts.length === 0) return fontFamily;
+  const fam = primaryFontFamily(fontFamily);
+  if (!isCustomFontFamily(fam)) return fontFamily;
+  return [parts[0], `'${localFontAlias(fam)}'`, ...parts.slice(1)].join(', ');
+}
+
+// ---------------------------------------------------------------------------
+// 7TV emote set changes
+// ---------------------------------------------------------------------------
+
+/** One change to a channel's 7TV emote set, as an overlay row shows it. */
+export interface SeventvEmoteChange {
+  action: 'added' | 'removed' | 'renamed';
+  /** Who made the change on 7TV. */
+  actor: string;
+  /** The emote's name in the set (the new name for a rename). */
+  name: string;
+  /** The name before a rename. */
+  oldName?: string;
+  /** The emote's image, when known. */
+  emoteUrl?: string;
+}
+
+/** A 7TV emote's image by id, at the size the overlay draws emotes. */
+export const seventvEmoteImageUrl = (id: string): string => `https://cdn.7tv.app/emote/${id}/3x.webp`;
+
+/**
+ * The changes in one 7TV EventAPI `emote_set.update` body: `pushed` rows were
+ * added, `pulled` rows removed, and an `updated` row whose name changed was
+ * renamed (a flag-only update is not a change a viewer sees).
+ */
+export function seventvChangesFromDispatch(body: unknown): SeventvEmoteChange[] {
+  const b = body as {
+    actor?: { display_name?: unknown; username?: unknown } | null;
+    pushed?: unknown;
+    pulled?: unknown;
+    updated?: unknown;
+  } | null;
+  if (!b || typeof b !== 'object') return [];
+  const actorRaw = b.actor?.display_name || b.actor?.username;
+  const actor = typeof actorRaw === 'string' && actorRaw.trim() ? actorRaw.trim() : 'Someone';
+  type Row = { key?: unknown; value?: unknown; old_value?: unknown };
+  const rows = (list: unknown): Row[] =>
+    Array.isArray(list) ? (list as Row[]).filter((c) => c && c.key === 'emotes') : [];
+  const emote = (v: unknown): { id?: string; name?: string } => {
+    const e = v as { id?: unknown; name?: unknown; data?: { id?: unknown } } | null;
+    const id = typeof e?.id === 'string' ? e.id : typeof e?.data?.id === 'string' ? e.data.id : undefined;
+    return { id, name: typeof e?.name === 'string' ? e.name : undefined };
+  };
+  const out: SeventvEmoteChange[] = [];
+  for (const r of rows(b.pushed)) {
+    const e = emote(r.value);
+    if (e.name) out.push({ action: 'added', actor, name: e.name, ...(e.id ? { emoteUrl: seventvEmoteImageUrl(e.id) } : {}) });
+  }
+  for (const r of rows(b.pulled)) {
+    const e = emote(r.old_value);
+    if (e.name) out.push({ action: 'removed', actor, name: e.name, ...(e.id ? { emoteUrl: seventvEmoteImageUrl(e.id) } : {}) });
+  }
+  for (const r of rows(b.updated)) {
+    const before = emote(r.old_value);
+    const after = emote(r.value);
+    if (!after.name || !before.name || after.name === before.name) continue;
+    const id = after.id ?? before.id;
+    out.push({ action: 'renamed', actor, name: after.name, oldName: before.name, ...(id ? { emoteUrl: seventvEmoteImageUrl(id) } : {}) });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// FrankerFaceZ room moderator and VIP art
+// ---------------------------------------------------------------------------
+
+/** FFZ's moderator art is a white glyph its own client draws on the moderator
+ *  badge's green square. */
+export const FFZ_MOD_BACKDROP = '#34AE0A';
+
+const FFZ_ROOM_BADGE_CDN = 'https://cdn.frankerfacez.com/room-badge/';
+
+/**
+ * The largest image of a channel's FFZ moderator and VIP art, from its room
+ * payload (`/v1/room/id/{id}`: `room.mod_urls`, `room.vip_badge`, each
+ * `{"1","2","4"}`). Rooms that list only "1" still serve every scale on FFZ's
+ * room-badge CDN, so the 4x address is built from the listed one. Null for a
+ * role the room does not replace.
+ */
+export function ffzRoomRoleArt(payload: unknown): { moderator: string | null; vip: string | null } {
+  const room = (payload as { room?: Record<string, unknown> } | null)?.room;
+  const pick = (urls: unknown): string | null => {
+    if (!urls || typeof urls !== 'object') return null;
+    const listed = (scale: string): string | null => {
+      const u = (urls as Record<string, unknown>)[scale];
+      return typeof u === 'string' && u.startsWith('https://') ? u : null;
+    };
+    const direct = listed('4');
+    if (direct) return direct;
+    const any = listed('2') ?? listed('1');
+    if (!any) return null;
+    return any.startsWith(FFZ_ROOM_BADGE_CDN) ? `${any.slice(0, any.lastIndexOf('/'))}/4` : any;
+  };
+  return { moderator: pick(room?.mod_urls), vip: pick(room?.vip_badge) };
+}
+
+/** Width and height from a PNG's header, or null for bytes that are not a PNG. */
+export function pngDimensions(bytes: Uint8Array): { w: number; h: number } | null {
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (bytes.length < 24 || sig.some((b, i) => bytes[i] !== b)) return null;
+  if (String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]) !== 'IHDR') return null;
+  const read = (o: number) => ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) >>> 0;
+  const w = read(16);
+  const h = read(20);
+  return w > 0 && h > 0 ? { w, h } : null;
+}
+
+/** A glyph PNG on a rounded square of `color` (radius side / 9, FFZ's own
+ *  shape), as an SVG data URI: the same finished badge the app paints. Null
+ *  for bytes that are not a PNG or a colour that is not `#RRGGBB`. */
+export function badgeWithBackdrop(png: Uint8Array, color: string): string | null {
+  if (!/^#[0-9a-f]{6}$/i.test(color)) return null;
+  const size = pngDimensions(png);
+  if (!size) return null;
+  let bin = '';
+  for (let i = 0; i < png.length; i++) bin += String.fromCharCode(png[i]);
+  const glyph = btoa(bin);
+  const radius = Math.min(size.w, size.h) / 9;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${size.w}" height="${size.h}" viewBox="0 0 ${size.w} ${size.h}">` +
+    `<rect width="${size.w}" height="${size.h}" rx="${radius}" fill="${color}"/>` +
+    `<image width="${size.w}" height="${size.h}" href="data:image/png;base64,${glyph}"/></svg>`;
+  return `data:image/svg+xml;base64,${btoa(svg)}`;
+}

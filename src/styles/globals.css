@@ -1020,6 +1020,24 @@ body[data-window-blurred="true"] .glaze-inset::after {
 .chat-header-stat > svg {
   color: var(--color-text-muted);
 }
+/* The viewer count opens the viewers list. */
+.chat-header-stat--button {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.chat-header-stat--button:hover,
+.chat-header-stat--button[aria-pressed='true'] {
+  color: var(--color-text-primary);
+}
+.chat-header-stat--button:hover > svg,
+.chat-header-stat--button[aria-pressed='true'] > svg {
+  color: var(--color-accent);
+}
 .chat-header-rule {
   width: 1px;
   height: 12px;
@@ -1069,6 +1087,90 @@ body[data-window-blurred="true"] .glaze-inset::after {
     inset 2px 2px 5px -2px rgba(0, 0, 0, 0.55),
     inset -2px -2px 5px -2px rgba(255, 255, 255, 0.09);
 }
+/* One scale for everything in the chat header row. Each object is a 26px
+   capsule of the flat glaze (the live numbers and the action buttons are two
+   of them), a control inside a capsule is a 22px pill, text is 11.5px and
+   faces are 18px. Anything new in the row takes these, so nothing reads as a
+   different size from its neighbour. */
+.chat-header-capsule {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  height: 26px;
+  padding: 0 2px;
+  border-radius: 9999px;
+  font-size: 11.5px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.chat-header-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 10px;
+  border-radius: 9999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* The moderator's Chat / Mods switch. Words at rest, icons when the header is
+   at its narrowest. */
+.chat-header-seg {
+  padding-inline: 14px;
+}
+.chat-header-seg-icon {
+  display: none;
+}
+
+/* Density steps, set on the row by ChatWidget when it runs out of width. Each
+   step gives up less than the next, so nothing ever leaves past the edge. */
+.chat-header-row:is([data-density='1'], [data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']),
+.chat-header-row:is([data-density='1'], [data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-actions {
+  gap: 5px;
+}
+.chat-header-row:is([data-density='1'], [data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-seg {
+  padding-inline: 9px;
+}
+/* The viewer count opens the same list. */
+.chat-header-row:is([data-density='1'], [data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-btn--dup {
+  display: none;
+}
+.chat-header-row:is([data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-seg {
+  padding-inline: 8px;
+}
+.chat-header-row:is([data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-seg-icon {
+  display: block;
+}
+.chat-header-row:is([data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-seg-label,
+.chat-header-row:is([data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-badge-label,
+.chat-header-row:is([data-density='2'], [data-density='3'], [data-density='4'], [data-density='5']) .chat-header-filter .dropdown-label {
+  display: none;
+}
+.chat-header-row:is([data-density='3'], [data-density='4'], [data-density='5']) .chat-header-uptime,
+.chat-header-row:is([data-density='3'], [data-density='4'], [data-density='5']) .chat-header-rule,
+.chat-header-row:is([data-density='3'], [data-density='4'], [data-density='5']) .chat-header-stats--uptime-only {
+  display: none;
+}
+/* Last: the count goes and the viewers button takes its place. */
+.chat-header-row:is([data-density='4'], [data-density='5']) .chat-header-stats {
+  display: none;
+}
+.chat-header-row:is([data-density='4'], [data-density='5']) .chat-header-btn--dup {
+  display: inline-grid;
+}
+/* Past the live numbers: the chat list capsule keeps its picture and count
+   and drops the name, which its tooltip still gives, and the way into
+   combining waits for room. */
+.chat-header-row[data-density='5'] .chat-dock-name,
+.chat-header-row[data-density='5'] .blend-trigger {
+  display: none;
+}
+
 /* The pin toggle carries a caret, so it is wider than an icon button. */
 .chat-header-btn--pin {
   display: inline-flex;
@@ -1318,8 +1420,8 @@ body[data-window-blurred="true"] .glaze-inset::after {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  height: 20px;
-  min-width: 20px;
+  height: 22px;
+  min-width: 22px;
   justify-content: center;
   padding: 0 5px;
   border-radius: 9999px;
@@ -1345,6 +1447,43 @@ body[data-window-blurred="true"] .glaze-inset::after {
   border-radius: 50%;
   background: var(--color-accent);
   box-shadow: 0 0 0 1.5px var(--color-background);
+}
+
+/* The combined chat's one header control: the linked platforms overlap like
+   an avatar group, so three sources take barely more room than one. Each mark
+   sits on a disc ringed in the header's colour so the overlap reads as a
+   stack rather than a smudge. */
+.blend-sources {
+  gap: 0;
+  padding: 0 1px;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+.blend-sources:hover,
+.blend-sources.is-open {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+.blend-sources-marks {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px;
+}
+.blend-sources-mark {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  overflow: hidden;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--color-background-tertiary, #1f1f23), #fff 7%);
+  box-shadow: 0 0 0 1.5px var(--color-background, #0e0e10);
+}
+.blend-sources-mark + .blend-sources-mark {
+  margin-left: -5px;
+}
+.blend-sources-mark.is-off > * {
+  opacity: 0.4;
+  filter: grayscale(1);
 }
 
 /* The panel's way on to linking by hand. */
@@ -1597,9 +1736,9 @@ html[data-motion="off"] .sn-bulb-rainbow stop {
   --color-surface-active: rgba(151, 177, 185, 0.35);
 
   /* Text colors */
-  --color-text-primary: #ffffff;
+  --color-text-primary: #ebf0f2;
   --color-text-secondary: #97b1b9;
-  --color-text-muted: rgba(151, 177, 185, 0.6);
+  --color-text-muted: rgba(151, 177, 185, 0.75);
 
   /* Accent colors */
   --color-accent: #97b1b9;
@@ -1758,6 +1897,136 @@ html[data-motion="off"] .sn-bulb-rainbow stop {
 /* Chat scroll anchoring for stable scroll position when messages are removed */
 .scrollbar-thin {
   overflow-anchor: auto;
+}
+
+/* Scrollbar marks (chat/ScrollbarMarks.tsx): ticks over a chat's 8px scrollbar
+   where mentions, subs, announcements and the like sit. A decoration, never a
+   surface: small solid bars, no fill behind them, no blur, and clicks go
+   through to the scrollbar. Ticks are written by script (transform + height),
+   never animated. A tick's own colour (the row's tint) is inline; these are
+   the theme colours for kinds that have none. Phones draw no scrollbar and
+   mount no ticks. */
+.sn-scroll-marks {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  pointer-events: none;
+  z-index: 1;
+  contain: strict;
+}
+.sn-scroll-marks > i {
+  position: absolute;
+  top: 0;
+  left: 1px;
+  right: 1px;
+  border-radius: 1px;
+  background-color: var(--color-highlight-blue);
+  box-shadow: 0 0 0 0.5px rgb(0 0 0 / 0.35);
+}
+.sn-scroll-marks > i[data-kind='mention'] { background-color: var(--color-highlight-red); }
+.sn-scroll-marks > i[data-kind='reply'] { background-color: var(--color-highlight-red); }
+.sn-scroll-marks > i[data-kind='highlight'] { background-color: var(--color-highlight-yellow); }
+.sn-scroll-marks > i[data-kind='pinned'] { background-color: var(--color-text-primary); }
+.sn-scroll-marks > i[data-kind='sub'] { background-color: var(--color-highlight-purple); }
+.sn-scroll-marks > i[data-kind='redeem'] { background-color: var(--color-highlight-cyan); }
+.sn-scroll-marks > i[data-kind='raid'] { background-color: var(--color-highlight-orange); }
+.sn-scroll-marks > i[data-kind='first_time'] { background-color: var(--color-highlight-green); }
+/* Chat composer row (ChatWidget). In a narrow chat column (`data-narrow`, set
+   by utils/composerNarrow.ts) the tools beside the field compress in place:
+   tighter gaps, 28px buttons, the inline points balance folds into the icon
+   (its hover bubble keeps the number). The field keeps a usable width and
+   nothing moves to a second row. */
+.sn-composer-row[data-narrow] {
+  gap: 0.25rem;
+}
+.sn-composer-row[data-narrow] .sn-composer-tool {
+  width: 1.75rem;
+  padding-left: 0;
+  padding-right: 0;
+}
+/* A profile stat tile's count, stepped by fitHeaderDensity: the full number
+   while it fits, its short form ("123.5M") once it would be cut. */
+.sn-stat-value .sn-stat-short,
+.sn-stat-value[data-density='1'] .sn-stat-full {
+  display: none;
+}
+.sn-stat-value[data-density='1'] .sn-stat-short {
+  display: inline;
+}
+/* The slow-mode count in the 28px send button: three characters at 13px
+   (up to 28.5px) would touch or cut the edges. 10px is 13px scaled with the
+   button (28/36), so it keeps the full button's margins. One size for the
+   whole countdown, so nothing jumps as it ticks. */
+.sn-composer-row[data-narrow] .sn-send-count {
+  font-size: 10px;
+}
+.sn-composer-row[data-narrow] .sn-composer-points-count {
+  display: none;
+}
+/* The wallet's bits gem on the points icon. With the bits count on the
+   button it is redundant, until a narrow column folds that count away. */
+.sn-wallet-pip-always {
+  display: none;
+}
+.sn-composer-row[data-narrow] .sn-wallet-pip-always {
+  display: block;
+}
+/* The placeholder stays on one line, cut with an ellipsis, at any width. */
+.sn-composer-input::placeholder {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The room's chat modes, one chip at the field's trailing edge
+   (chat/RoomModeIndicator). The field, its overlays and the length count read
+   `--sn-room-pad`, which the chip sets to its own width, so the typed text
+   never runs under it and nothing outside the box moves when a mode switches.
+   A narrow row drops the "+N"; hovering still lists every mode. */
+.sn-composer-field {
+  --sn-room-pad: 12px;
+}
+.sn-room-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 7px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--color-text-primary) 7%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+}
+.sn-room-chip-more {
+  opacity: 0.7;
+}
+.sn-composer-row[data-narrow] .sn-room-chip-more {
+  display: none;
+}
+
+/* macOS overlay scrollbars take no width and show only while in use, so the
+   ticks there come and go with the bar (ScrollbarMarks `overlay`) instead of
+   sitting on the message text. Opacity only. */
+.sn-scroll-marks[data-overlay] {
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.sn-scroll-marks[data-overlay][data-show] {
+  opacity: 1;
+  transition-duration: 0.1s;
+}
+html[data-motion="reduced"] .sn-scroll-marks[data-overlay] {
+  transition: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sn-scroll-marks[data-overlay] {
+    transition: none;
+  }
 }
 
 /* ===== Sidebar layering =====
@@ -2262,7 +2531,8 @@ body {
    same no-glow inset bevel as glass-panel. Theme-aware, so it tracks light/dark
    themes alongside the textPrimary/textSecondary it carries. */
 .stats-hud {
-  background-color: color-mix(in srgb, var(--color-background-tertiary) 94%, transparent);
+  /* Near-opaque at every slider position, and fully opaque at 0%. */
+  background-color: color-mix(in srgb, var(--color-background-tertiary) calc(94% + (1 - var(--glass-strength, 1)) * 6%), transparent);
   backdrop-filter: blur(16px);
   border: 1px solid transparent;
   border-radius: 10px;
@@ -2445,6 +2715,47 @@ body {
   background-color: var(--color-surface);
 }
 
+/* What happened to a removed message, in the Italic style: an upright pill
+   after the slanted text, toned by what the moderator did. Sized in em so it
+   follows the chat text size. The label shares the message's baseline: items
+   align on baseline and the icon opts out (align-self: center), so the pill's
+   own baseline is the label text rather than the icon's bottom edge. */
+.sn-mod-tag {
+  --sn-mod-tone: var(--color-text-secondary);
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3em;
+  padding: 0.12em 0.55em 0.12em 0.42em;
+  border-radius: 999px;
+  font-size: 0.78em;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  vertical-align: baseline;
+  color: var(--sn-mod-tone);
+  background-color: color-mix(in srgb, var(--sn-mod-tone) 12%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sn-mod-tone) 24%, transparent);
+}
+.sn-mod-tag svg {
+  align-self: center;
+  width: 1.1em;
+  height: 1.1em;
+  flex: none;
+}
+.sn-mod-tag--timeout { --sn-mod-tone: var(--color-warning); }
+.sn-mod-tag--ban { --sn-mod-tone: var(--color-error); }
+.sn-mod-tag__detail {
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+.sn-mod-tag__detail::before {
+  content: '\B7';
+  margin-right: 0.3em;
+}
+
 /* Keyboard-moderation focus ring on a chat message row. Winters' Glass: a solid
    inset accent bar on the left plus a faint surface tint, no outer glow. */
 .chat-message-row.is-mod-focus {
@@ -2493,7 +2804,8 @@ body {
 
 /* User Profile Card specific styling with black transparency */
 .user-profile-card {
-  background-color: rgba(0, 0, 0, 0.65);
+  /* 65% black at full glass, solid at 0%: it pops over chat and video. */
+  background-color: color-mix(in srgb, #000 calc(65% + (1 - var(--glass-strength, 1)) * 35%), transparent);
   border-radius: 8px;
   backdrop-filter: blur(10px);
   border: 1px solid var(--color-border-subtle);
@@ -2594,7 +2906,7 @@ body {
      out with the slider is exactly what left it a ghost over a bright stream.
      So the base stays a near-opaque theme surface at every slider position and
      the frost, the tint and the top light are what make it read as glass. */
-  background-color: color-mix(in srgb, var(--color-background-tertiary) 92%, transparent);
+  background-color: color-mix(in srgb, var(--color-background-tertiary) calc(92% + (1 - var(--glass-strength, 1)) * 8%), transparent);
   background-image:
     linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.012) 45%, transparent),
     linear-gradient(var(--color-background-secondary), var(--color-background-secondary));
@@ -2627,6 +2939,43 @@ body {
     inset 0 1px 0 0 rgba(255, 255, 255, 0.10),
     var(--hairline-contour),
     0 0 20px rgba(0, 0, 0, 0.5);
+}
+
+/* Glass under. Every Tailwind background modifier (bg-white/10, hover:bg-accent/20,
+   !bg-red-500/15) mixes its tint over --glass-under instead of over transparent
+   (tailwind.config.js). A glass class sets it to its own opaque base, faded in as
+   the slider drops, so a tint on a glass element sits on a solid base at 0%
+   instead of replacing it and leaving the element see-through. At full glass the
+   base is transparent, so nothing changes there. Descendants get transparent
+   again (zero specificity, so a nested glass class still sets its own), because
+   a tint on a child already sits on its parent's base.
+
+   The same rule for a hand-written fill on a glass element (an inline style):
+   color-mix(in srgb, <tint> <alpha>, var(--glass-under, transparent)).
+   For a fill that is not on a glass element, ride the slider directly:
+   color-mix(in srgb, <colour> calc(A% + (1 - var(--glass-strength, 1)) * (100% - A%)), transparent)
+   which is A% at full glass and opaque at 0%. glassiness.test.ts holds both. */
+:where(.glass-panel, .glass-modal, .liquid-glass-panel, .glass-flyout, .sn-popover,
+  .glass-button, .glass-button-static, .glass-button-active, .glass-button-secondary,
+  .glass-badge, .glass-input) * {
+  --glass-under: transparent;
+}
+.glass-panel,
+.glass-modal,
+.liquid-glass-panel,
+.glass-flyout {
+  --glass-under: color-mix(in srgb, var(--color-background-tertiary) calc((1 - var(--glass-strength, 1)) * 100%), transparent);
+}
+.sn-popover {
+  --glass-under: color-mix(in srgb, var(--color-background) calc((1 - var(--glass-strength, 1)) * 100%), transparent);
+}
+.glass-button,
+.glass-button-static,
+.glass-button-active,
+.glass-button-secondary,
+.glass-badge,
+.glass-input {
+  --glass-under: color-mix(in srgb, var(--color-surface) calc((1 - var(--glass-strength, 1)) * 100%), transparent);
 }
 
 /* Glassiness floor. At 0% the slider sets html[data-glass="off"]; strip every
@@ -2662,11 +3011,45 @@ html[data-blur="off"] *::after {
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
 }
+/* Blur off: a popover has nothing softening what is behind it, and at its
+   capped glass strength (77.5% tint) the text under a menu read crisp through
+   it. With no blur the tint is all there is, so it goes solid: the glass
+   contract's "never crisp". The theme's popover light stays in its image
+   layers. (Phones do the same for their static popovers, mobile.css.) */
+html[data-blur="off"] .sn-popover {
+  --sn-popover-tint: 100%;
+}
+
 .atm-frost.atm-frost--flat,
 html[data-blur="off"] .atm-frost {
   background-color: rgba(5, 6, 13, 0.66);
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
+}
+
+/* ===== Full-screen layers =====
+   One scale for everything that has to paint over the player's own full
+   screen. Plyr's CSS full screen pins the player over the whole window, so its
+   overlays, the title bar out over it, the bar's menus and tooltips all have to
+   agree on order. Every value below is defined here; the rules further down
+   and the components read these, never their own numbers.
+
+   The top of the range is deliberately left free: the player's own overlays
+   used to sit AT 2147483646/7, which left nothing above them, and a tie at the
+   max is decided by DOM order, where the player (later in the page) beats the
+   title bar. */
+:root {
+  --sn-z-player-fs: 10000000;          /* .plyr in full screen */
+  --sn-z-player-fs-osd: 10000001;      /* volume readout */
+  --sn-z-player-fs-chat: 10000002;     /* the full-screen chat column */
+  --sn-z-player-fs-popover: 10000003;  /* player panels opened in full screen (Audio Boost, chapters, stats), over the chat column */
+  --sn-z-player-fs-tile: 2147483000;   /* a full-screen MultiNook cell over its siblings */
+  --sn-z-player-fs-title: 2147483000;  /* stream title overlay */
+  --sn-z-player-fs-badge: 2147483001;  /* subscribe overlay */
+  --sn-z-titlebar-over-player: 2147483100; /* the title bar lifted over the player: its full screen, or the tucking layout */
+  --sn-z-titlebar-menu: 2147483200;    /* menus and popovers the bar opens */
+  --sn-z-tooltip: 2147483300;          /* tooltips, over the menus they explain */
+  --sn-z-titlebar-edge: 2147483400;    /* the reveal strip at the top edge */
 }
 
 /* ===== Motion preferences (Interface > Motion) =====
@@ -2716,6 +3099,19 @@ html[data-motion="reduced"] .animate-ping,
 html[data-motion="reduced"] .animate-pulse,
 html[data-motion="reduced"] .animate-shimmer {
   animation: none !important;
+}
+
+/* A profile card's sub tile: the progress line to the next sub badge fills once
+   as it appears. Transform only, so it never repaints; off and reduced still it. */
+@keyframes sub-progress-grow {
+  from { transform: scaleX(0); }
+}
+.sub-progress-fill {
+  transform-origin: left center;
+  animation: sub-progress-grow 0.9s cubic-bezier(0.22, 1, 0.36, 1) 0.1s both;
+}
+html[data-motion="reduced"] .sub-progress-fill {
+  animation: none;
 }
 
 .glass-button:hover {
@@ -2918,12 +3314,65 @@ html[data-motion="reduced"] .animate-shimmer {
   height: calc(1.4em * var(--sn-badge-scale, 1));
 }
 
+/* The StreamNook mark is opaque to the edge of its canvas, where Twitch and
+   7TV badge art keeps a transparent margin, so at the same box it read larger
+   than the badges beside it. The inset gives it the same visual weight. */
+.sn-chat-badge--sn {
+  box-sizing: border-box;
+  padding: 0.09em;
+}
+
+/* A Twitch Shared Chat row from a partner channel: that channel's own color
+   (--sn-src, from the core, floored for the theme; the accent until it
+   answers) on a 3px left edge, washing in from it and gone by the middle, so
+   two partners read as two colors at chat speed. Behind the row's content
+   (the row is isolated), so it never fights a mention's border or a member's
+   background. The home channel's rows carry nothing. */
+.sn-shared-row::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  box-shadow: inset 3px 0 0 var(--sn-src, var(--color-accent));
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--sn-src, var(--color-accent)) 10%, transparent),
+    transparent 55%
+  );
+}
+
+/* The partner channel's face leading its row: round, ringed in the channel's
+   color, a step apart from the badges that follow. */
+.sn-shared-face {
+  border-radius: 9999px;
+  box-shadow: 0 0 0 1.5px var(--sn-src, var(--color-accent));
+  margin-right: 0.15em;
+}
+
+/* Every chat row's badge group, centred on the name it sits beside. An
+   image-only inline-flex box takes its baseline from the images' bottom edge,
+   so the offset lowers that edge until the badge centre meets the text centre
+   (0.38em above the baseline in the chat font), whatever the badge scale.
+   Measured from the baseline, the badges stay put when a tall emote grows the
+   line; `middle` measured from the x-height drew them about 2px low. */
+.sn-badge-strip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  vertical-align: calc(0.38em - 0.7em * var(--sn-badge-scale, 1));
+}
+
 /* Message arrival. CSS only, on the row itself, chosen by data-entrance on
    the list: the animation runs once when the element is inserted and never
    again. History rows (.is-backfill) sit out, so a join's backfill does not
-   ripple. Opacity for fade; a short transform for slide and rise, kept brief
-   so a fast chat never has more than a couple of rows mid-flight. The
-   data-motion kill switch and the OS reduced-motion preference both apply. */
+   ripple. Only the last three rows can play it: an animation starts when
+   its selector first matches, so rows that arrive all at once (a remount on
+   a chat switch, a held backlog catching up) stay still instead of the whole
+   column sliding. Opacity for fade; a short transform for slide and rise,
+   kept brief so a fast chat never has more than a couple of rows mid-flight.
+   The data-motion kill switch and the OS reduced-motion preference both
+   apply. */
 @keyframes sn-enter-fade {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -2936,17 +3385,33 @@ html[data-motion="reduced"] .animate-shimmer {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
-[data-entrance='fade'] > .chat-message-row:not(.is-backfill) {
+[data-entrance='fade'] > .chat-message-row:not(.is-backfill):nth-last-child(-n + 3) {
   animation: sn-enter-fade 220ms ease-out both;
 }
-[data-entrance='slide'] > .chat-message-row:not(.is-backfill) {
+[data-entrance='slide'] > .chat-message-row:not(.is-backfill):nth-last-child(-n + 3) {
   animation: sn-enter-slide 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
-[data-entrance='rise'] > .chat-message-row:not(.is-backfill) {
+[data-entrance='rise'] > .chat-message-row:not(.is-backfill):nth-last-child(-n + 3) {
   animation: sn-enter-rise 240ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 @media (prefers-reduced-motion: reduce) {
   [data-entrance] > .chat-message-row {
+    animation: none;
+  }
+}
+
+/* The chat dock's tab row unfolding: the wrapped lines reveal downward from
+   the row's own line, so the row reads as opening rather than a menu
+   appearing over it. clip-path only: nothing about the layout animates. */
+@keyframes sn-tabs-unfold {
+  from { clip-path: inset(0 -12px calc(100% - 26px) -12px); }
+  to { clip-path: inset(0 -12px -24px -12px); }
+}
+.sn-tabs-unfolded {
+  animation: sn-tabs-unfold 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sn-tabs-unfolded {
     animation: none;
   }
 }
@@ -3198,6 +3663,28 @@ html[data-motion="reduced"] .animate-shimmer {
   background-size: 100% 100%;
 }
 
+.raid-gradient {
+  background-color: var(--color-background);
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-highlight-red) 18%, transparent) 0%,
+    color-mix(in srgb, var(--color-highlight-orange) 12%, transparent) 50%,
+    color-mix(in srgb, var(--color-highlight-red) 18%, transparent) 100%
+  );
+  background-size: 100% 100%;
+}
+
+.raid-gradient:hover {
+  background-color: var(--color-background);
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--color-highlight-red) 25%, transparent) 0%,
+    color-mix(in srgb, var(--color-highlight-orange) 18%, transparent) 50%,
+    color-mix(in srgb, var(--color-highlight-red) 25%, transparent) 100%
+  );
+  background-size: 100% 100%;
+}
+
 /* Highlighted message gradient - purple/pink theme for channel points redemption */
 @keyframes highlight-message-glow {
   0% {
@@ -3355,6 +3842,25 @@ html[data-motion="reduced"] .animate-shimmer {
   animation: hype-train-flow-seamless 15s linear infinite;
 }
 
+/* The remaining/time label on the strip, stepped down by fitHeaderDensity
+   while it overflows its side: the subs go first, then the bits; the timer
+   always stays. Whole words leave, so no number is ever cut. */
+.hype-train-need[data-density='1'] .hype-train-subs,
+.hype-train-need[data-density='2'] .hype-train-left {
+  display: none;
+}
+/* The level side the same way: the train icon goes, "LVL n" stays whole. */
+.hype-train-level[data-density='1'] .hype-train-icon {
+  display: none;
+}
+
+/* The emote picker's source tabs, stepped down by fitHeaderDensity when the
+   panel is too narrow for every count: the counts go (their tooltips keep
+   the exact numbers), the logos stay. */
+.sn-emote-tabs[data-density='1'] .sn-emote-tab-count {
+  display: none;
+}
+
 /* Golden progress bar for Golden Kappa trains */
 .hype-train-progress-golden {
   background: linear-gradient(
@@ -3440,7 +3946,7 @@ html[data-motion="reduced"] .animate-shimmer {
    background rather than a literal colour, so a light theme gets a light frost
    instead of a dark hole punched through it. */
 .hype-train-track {
-  background: color-mix(in srgb, var(--color-background) 62%, transparent);
+  background: color-mix(in srgb, var(--color-background) calc(62% + (1 - var(--glass-strength, 1)) * 38%), transparent);
   -webkit-backdrop-filter: blur(12px) saturate(115%);
   backdrop-filter: blur(12px) saturate(115%);
   border: 1px solid var(--color-border-subtle);
@@ -3895,11 +4401,11 @@ html[data-motion="reduced"] .animate-shimmer {
   --plyr-video-control-color: var(--color-text-primary);
   --plyr-video-control-color-hover: var(--color-accent);
   --plyr-video-control-background-hover: var(--color-surface);
-  --plyr-menu-background: rgba(0, 0, 0, 0.85);
+  --plyr-menu-background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
   --plyr-menu-color: var(--color-text-primary);
   --plyr-menu-border-color: var(--color-border-light);
   --plyr-menu-radius: 4px;
-  --plyr-tooltip-background: rgba(0, 0, 0, 0.85);
+  --plyr-tooltip-background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
   --plyr-tooltip-color: var(--color-text-primary);
   --plyr-tooltip-radius: 4px;
   --plyr-font-family: "Satoshi", -apple-system, BlinkMacSystemFont, sans-serif;
@@ -4054,6 +4560,9 @@ body[data-player-covered="true"] .video-player-container[data-immersive="true"] 
      bar. Plyr centres its thumb with a margin computed from this token, so it
      has to be the CAPSULE's height; the width is set separately below. */
   --plyr-range-thumb-height: var(--scrub-thumb-h);
+  /* Plyr nudges the box right by half a thumb to make room for the widened
+     range below; half the capsule's width, for the same reason as there. */
+  left: calc(var(--scrub-thumb-w) * 0.5);
 }
 
 .video-player-container .plyr__progress__container {
@@ -4063,6 +4572,22 @@ body[data-player-covered="true"] .video-player-container[data-immersive="true"] 
 .video-player-container .plyr__progress input[type="range"] {
   height: var(--scrub-track-h);
   transition: height var(--scrub-grow-duration) var(--scrub-grow-ease);
+}
+
+/* Plyr widens the range by one thumb so the thumb's centre travels exactly
+   the progress box, which its tooltip and seek math measure. It sizes that
+   from the thumb HEIGHT (its thumb is round), and the height token above is
+   the capsule's 16px, but the capsule is only 4px wide: the thumb then
+   travelled 6px past each end of the box. Every finished seek wrote Plyr's
+   value back and pulled a held thumb up to 6px off the pointer, so a slow
+   drag hopped back and forth. Widen by the capsule's WIDTH instead, which
+   also keeps the VOD bar the live timeline's length (that one fills the
+   box itself). */
+.video-player-container .plyr__progress input[type="range"],
+.video-player-container .plyr__progress .plyr__progress__buffer {
+  margin-left: calc(var(--scrub-thumb-w) * -0.5);
+  margin-right: calc(var(--scrub-thumb-w) * -0.5);
+  width: calc(100% + var(--scrub-thumb-w));
 }
 
 /* `focus-within` as well as hover, so keyboard seeking gets the same bar the
@@ -4293,7 +4818,7 @@ html[data-watching] .drops-progress-inline {
 
 /* Tooltip */
 .video-player-container .plyr__tooltip {
-  background: rgba(0, 0, 0, 0.85);
+  background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border-light);
@@ -4304,7 +4829,7 @@ html[data-watching] .drops-progress-inline {
 
 /* Menu styling */
 .video-player-container .plyr__menu__container {
-  background: rgba(0, 0, 0, 0.85);
+  background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border-light);
@@ -4422,7 +4947,7 @@ html[data-watching] .drops-progress-inline {
   inset: 0 !important;
   width: 100% !important;
   height: 100% !important;
-  z-index: 10000000 !important;
+  z-index: var(--sn-z-player-fs) !important;
 }
 
 .video-player-container:has(.plyr--fullscreen-fallback) {
@@ -4437,7 +4962,7 @@ html[data-watching] .drops-progress-inline {
      subtree — the fixed .plyr plus the title/subscribe overlays — above all
      other tiles regardless of DOM order. Only applies while a tile is fullscreen;
      harmless for the single player, which has no sibling tiles. */
-  z-index: 2147483646 !important;
+  z-index: var(--sn-z-player-fs-tile) !important;
 }
 
 /* The wheel/middle-click volume readout. It normally sits inside the player box,
@@ -4447,56 +4972,86 @@ html[data-watching] .drops-progress-inline {
 .video-player-container:has(.plyr--fullscreen-fallback) .player-volume-osd {
   position: fixed;
   inset: 0;
-  z-index: 10000001;
+  z-index: var(--sn-z-player-fs-osd);
+}
+
+/* A MultiNook tile's Audio Boost panel, for the same reason: pinned above the
+   fullscreen tile's control bar instead of hidden under the fixed .plyr. */
+.video-player-container:has(.plyr--fullscreen-fallback) .tile-audio-boost-panel {
+  position: fixed;
+  bottom: 4.5rem;
+  right: 0.75rem;
+  z-index: var(--sn-z-player-fs-popover);
+  max-height: calc(100vh - 6rem) !important;
+}
+
+/* The single player's panels (Audio Boost, the chapter list, the stats panel)
+   are siblings of .plyr, not inside it, so the full-screen .plyr covered them:
+   they opened, and every click on them landed on the poster. Pinned to the
+   screen at the offsets they use in the window, which in full screen is the
+   player's own box, and over the full-screen chat column. */
+.video-player-container:has(.plyr--fullscreen-fallback) .player-fs-popover {
+  position: fixed;
+  z-index: var(--sn-z-player-fs-popover);
 }
 
 /* Custom overlay positioning for Plyr fullscreen mode */
 /* When Plyr goes fullscreen, ensure our custom overlays are still visible */
-.video-player-container:fullscreen .subscribe-overlay,
-.video-player-container:-webkit-full-screen .subscribe-overlay,
-.video-player-container:-moz-full-screen .subscribe-overlay,
-.video-player-container:-ms-fullscreen .subscribe-overlay,
-.plyr--fullscreen-active ~ .subscribe-overlay,
-.plyr:fullscreen ~ .subscribe-overlay,
-.plyr:-webkit-full-screen ~ .subscribe-overlay {
+/* Unprefixed :fullscreen only, and never in the same list as a selector that
+   must always apply. A browser drops a whole selector list if any selector in
+   it is unknown: Chromium (WebView2, and CEF on Linux) does not know the -moz-
+   or -ms- variants, and the WKWebView macOS 11 to 13.2 ships (WebKit before
+   Safari 16.4) does not know unprefixed :fullscreen. So the class Plyr sets in
+   either kind of full screen has rules of its own, which every engine keeps.
+   Autoprefixer deletes a rule that still carries the outdated
+   :-webkit-full-screen when a later rule uses :fullscreen, again taking every
+   other selector in its list along. */
+.plyr--fullscreen-active ~ .subscribe-overlay {
   position: fixed;
   top: 12px;
   right: 12px;
-  z-index: 2147483647;
+  z-index: var(--sn-z-player-fs-badge);
 }
 
-.video-player-container:fullscreen .stream-title-overlay,
-.video-player-container:-webkit-full-screen .stream-title-overlay,
-.video-player-container:-moz-full-screen .stream-title-overlay,
-.video-player-container:-ms-fullscreen .stream-title-overlay,
-.plyr--fullscreen-active ~ .stream-title-overlay,
-.plyr:fullscreen ~ .stream-title-overlay,
-.plyr:-webkit-full-screen ~ .stream-title-overlay {
+.video-player-container:fullscreen .subscribe-overlay,
+.plyr:fullscreen ~ .subscribe-overlay {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: var(--sn-z-player-fs-badge);
+}
+
+.plyr--fullscreen-active ~ .stream-title-overlay {
   position: fixed;
   top: 0;
   left: 0;
   right: 0;
-  z-index: 2147483646;
+  z-index: var(--sn-z-player-fs-title);
+}
+
+.video-player-container:fullscreen .stream-title-overlay,
+.plyr:fullscreen ~ .stream-title-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: var(--sn-z-player-fs-title);
 }
 
 /* Alternative approach: Target elements when document has fullscreen element */
-:fullscreen .subscribe-overlay,
-:-webkit-full-screen .subscribe-overlay,
-:-moz-full-screen .subscribe-overlay {
+:fullscreen .subscribe-overlay {
   position: fixed !important;
   top: 12px !important;
   right: 12px !important;
-  z-index: 2147483647 !important;
+  z-index: var(--sn-z-player-fs-badge) !important;
 }
 
-:fullscreen .stream-title-overlay,
-:-webkit-full-screen .stream-title-overlay,
-:-moz-full-screen .stream-title-overlay {
+:fullscreen .stream-title-overlay {
   position: fixed !important;
   top: 0 !important;
   left: 0 !important;
   right: 0 !important;
-  z-index: 2147483646 !important;
+  z-index: var(--sn-z-player-fs-title) !important;
 }
 
 /* PIP mode */
@@ -4552,6 +5107,263 @@ html[data-watching] .drops-progress-inline {
   100% {
     background-position: 200% 0;
   }
+}
+
+/* Mod slider (components/chat/ModSlider.tsx). While a moderator drags a row's
+   left edge, everything in the row slides right by --mod-slide except the
+   track, which stays put and fills the gap with the chosen step. */
+.sn-mod-grip {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  z-index: 30;
+  width: 12px;
+  /* Grab, never a resize cursor: the chat's width splitter sits right beside
+     the first row's edge and wears ew-resize. */
+  cursor: grab;
+  touch-action: none;
+}
+.sn-mod-grip:active,
+.sn-mod-grip.is-active {
+  cursor: grabbing;
+}
+/* The grip itself: a small capsule with six dots, the drag handle people
+   already know, at the row's left edge while the row is hovered. Centered on
+   the row, so a long message keeps it in reach. The slider's grip and the
+   Tiles handle (ChatMessage) share it. */
+.sn-mod-grip-bar {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 8px;
+  height: min(22px, calc(100% - 8px));
+  translate: 0 -50%;
+  /* A tab on the row's edge, clear of the name that starts 12 px in. */
+  border-radius: 0 4px 4px 0;
+  transform-origin: left center;
+  background: var(--color-accent);
+  box-shadow: 1px 1px 4px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  /* Dot ink picked from the accent: near black on a light accent, white on a
+     dark one. The first line is the fallback. */
+  --sn-grip-ink: rgba(0, 0, 0, 0.6);
+  --sn-grip-ink: oklch(from var(--color-accent) clamp(0.15, (0.655 - l) * 1000, 1) 0 0 / 0.8);
+  transition: opacity 150ms ease, scale 150ms ease, background-color 100ms ease;
+}
+.group:hover > .sn-mod-grip .sn-mod-grip-bar,
+.sn-mod-grip.is-hinted .sn-mod-grip-bar {
+  opacity: 0.9;
+}
+.sn-mod-grip:hover .sn-mod-grip-bar,
+.sn-mod-grip.is-active .sn-mod-grip-bar {
+  opacity: 1;
+  scale: 1.15;
+}
+/* While a step is armed the grip takes a light tint of that step, so it reads
+   as part of the track rather than a stray tab. */
+.sn-mod-grip.is-armed .sn-mod-grip-bar {
+  background: color-mix(in srgb, var(--mod-tint) 45%, #fff);
+  box-shadow: none;
+}
+/* Six dots, two columns of three, so the edge reads as something to take
+   hold of. Each 3 x 4 px tile carries one dot at its center. */
+.sn-mod-grip-bar::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 6px;
+  height: 12px;
+  background: radial-gradient(circle, var(--sn-grip-ink) 0.85px, transparent 1.2px) 0 0 / 3px 4px repeat;
+}
+.sn-mod-sliding {
+  overflow: hidden;
+  /* Text pushed past the right edge fades out instead of a hard cut. */
+  -webkit-mask-image: linear-gradient(to left, transparent, #000 24px);
+  mask-image: linear-gradient(to left, transparent, #000 24px);
+}
+.sn-mod-sliding > :not(.sn-mod-track) {
+  transform: translateX(var(--mod-slide, 0px));
+  /* Its own layer for the drag: the text moves without repainting. */
+  will-change: transform;
+}
+.sn-mod-sliding > [data-row-dock] {
+  visibility: hidden;
+}
+.sn-mod-returning > :not(.sn-mod-track) {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* The track spans the row; each layer in it follows the pull by transform
+   alone (scale for the fill, translate for the rest), so a drag frame costs no
+   layout and no paint. --mod-ratio is the pull as a share of the row width. */
+.sn-mod-track {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  overflow: hidden;
+  pointer-events: none;
+}
+.sn-mod-track-fill {
+  position: absolute;
+  inset: 0;
+  transform-origin: left;
+  transform: scaleX(var(--mod-ratio, 0));
+  background: color-mix(in srgb, var(--color-text-primary) 6%, transparent);
+  transition: background-color 100ms ease;
+  will-change: transform;
+}
+.sn-mod-track.is-armed .sn-mod-track-fill {
+  background: color-mix(in srgb, var(--mod-tint) 85%, transparent);
+}
+.sn-mod-track-window {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  transform: translateX(calc(var(--mod-slide, 0px) - 100%));
+  will-change: transform;
+}
+.sn-mod-track-window-inner {
+  position: absolute;
+  inset: 0;
+  transform: translateX(calc(100% - var(--mod-slide, 0px)));
+  will-change: transform;
+}
+/* Ruler notches at the top and bottom edge where each step starts; never
+   behind the label's text. */
+.sn-mod-tick {
+  --sn-tick: color-mix(in srgb, var(--color-text-primary) 22%, transparent);
+  position: absolute;
+  inset-block: 0;
+  width: 1px;
+  background: linear-gradient(
+    to bottom,
+    var(--sn-tick) 0 5px,
+    transparent 5px calc(100% - 5px),
+    var(--sn-tick) calc(100% - 5px)
+  );
+}
+.sn-mod-track.is-armed .sn-mod-tick {
+  --sn-tick: oklch(from var(--mod-tint) clamp(0.15, (0.655 - l) * 1000, 1) 0 0 / 0.3);
+}
+.sn-mod-track.is-armed .sn-mod-tick.is-passed {
+  --sn-tick: oklch(from var(--mod-tint) clamp(0.15, (0.655 - l) * 1000, 1) 0 0 / 0.55);
+}
+.sn-mod-track-cancel {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-left: 8px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+.sn-mod-track-edge {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 10px;
+  transform: translateX(calc(var(--mod-slide, 0px) - 100%));
+  background: linear-gradient(to left, rgba(0, 0, 0, 0.22), transparent);
+  will-change: transform;
+}
+.sn-mod-returning .sn-mod-track-fill {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), background-color 100ms ease;
+}
+.sn-mod-returning :is(.sn-mod-track-window, .sn-mod-track-window-inner, .sn-mod-track-edge) {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* The label rides back with the row and fades, so it is never cut letter by
+   letter at the left edge. */
+.sn-mod-returning .sn-mod-track-label {
+  opacity: 0;
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1), opacity 90ms ease-out;
+}
+/* Each step arms with a soft pop (the label is keyed by step). */
+@keyframes sn-mod-label-in {
+  from {
+    opacity: 0;
+    translate: -4px 0;
+    scale: 0.92;
+  }
+}
+.sn-mod-track-label {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding-inline: 4px 7px;
+  transform: translateX(calc(var(--mod-slide, 0px) - 100%));
+  transform-origin: right center;
+  will-change: transform;
+  /* Ink picked from the tint: near black on light steps (amber timeouts),
+     white on dark ones (Delete, Ban). White stays as the fallback. */
+  color: #fff;
+  color: oklch(from var(--mod-tint) clamp(0.15, (0.655 - l) * 1000, 1) 0 0);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  animation: sn-mod-label-in 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* Ban arms only after a short rest in its zone: meanwhile red fills the
+   track from the left, under the label of the step a release applies now. */
+.sn-mod-track-arming {
+  position: absolute;
+  inset: 0;
+  background: var(--color-error);
+  transform-origin: left;
+  animation: sn-mod-ban-fill 350ms linear forwards;
+}
+@keyframes sn-mod-ban-fill {
+  from {
+    transform: scaleX(0);
+  }
+  to {
+    transform: scaleX(1);
+  }
+}
+/* Line buttons (components/chat/ModLineButtons.tsx, chat/lineArt.ts): one
+   empty element per line a moderator can act on, showing a picture of the
+   buttons the list draws once (rest on its first row, one lit row per
+   button below; the list moves a hovered strip to its lit row). One box per
+   line on purpose: every flush of a fast chat restyles and repaints every
+   row, and three real buttons per row halved the frame rate at 400 msg/s.
+   Empty, so it has no line of its own and its bottom edge is its baseline;
+   the vertical-align centers it on the text the way the badge strip is. */
+.sn-mod-line {
+  display: inline-block;
+  width: var(--sn-line-w);
+  height: var(--sn-line-h);
+  margin-right: 0.45em;
+  vertical-align: calc(0.38em - var(--sn-line-h) / 2);
+  background: var(--sn-line-art) 0 0 / var(--sn-line-w) var(--sn-line-bh) no-repeat;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* The step chips compress in place rather than wrap (fitHeaderDensity). */
+.sn-steps:is([data-density='1'], [data-density='2']) {
+  gap: 4px;
+}
+.sn-steps:is([data-density='1'], [data-density='2']) .sn-step-time {
+  padding-left: 8px;
+  padding-right: 2px;
+}
+.sn-steps:is([data-density='1'], [data-density='2']) .dropdown-label {
+  display: none;
+}
+.sn-steps[data-density='2'] .sn-step-word {
+  display: none;
+}
+.sn-steps[data-density='2'] .sn-step-toggle {
+  padding-inline: 8px;
 }
 
 /* Held-in-drag sweep: a light band crosses the message, then sits fully
@@ -5100,7 +5912,7 @@ html[data-watching] .drops-progress-inline {
      work: blurred, a little more saturated, a little dimmer, so the chip takes
      on the colour of the thumbnail behind it, softly, the way frosted glass
      does, while white text still holds on a bright frame. */
-  background-color: rgba(16, 16, 22, 0.22);
+  background-color: color-mix(in srgb, rgb(16 16 22) calc(22% + (1 - var(--glass-strength, 1)) * 78%), transparent);
   -webkit-backdrop-filter: blur(10px) saturate(175%) brightness(0.82);
   backdrop-filter: blur(10px) saturate(175%) brightness(0.82);
   font-size: 11px;
@@ -5126,7 +5938,7 @@ html[data-watching] .drops-progress-inline {
 .card-chip--neutral {
   /* A little more veil than the coloured kinds: no colour of its own to
      separate it, and the number has to read on anything. */
-  background-color: rgba(16, 16, 22, 0.34);
+  background-color: color-mix(in srgb, rgb(16 16 22) calc(34% + (1 - var(--glass-strength, 1)) * 66%), transparent);
   color: #fff;
   font-variant-numeric: tabular-nums;
 }
@@ -5685,7 +6497,7 @@ html[data-os="linux"] .sn-sidebar-list {
   left: 0;
   width: 220px;
   padding: 12px;
-  background: rgba(20, 20, 22, 0.95);
+  background: color-mix(in srgb, rgb(20 20 22) calc(95% + (1 - var(--glass-strength, 1)) * 5%), transparent);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--color-border-light);
@@ -5703,7 +6515,7 @@ html[data-os="linux"] .sn-sidebar-list {
   left: 12px;
   width: 12px;
   height: 12px;
-  background: rgba(20, 20, 22, 0.95);
+  background: color-mix(in srgb, rgb(20 20 22) calc(95% + (1 - var(--glass-strength, 1)) * 5%), transparent);
   border-left: 1px solid var(--color-border-light);
   border-top: 1px solid var(--color-border-light);
   transform: rotate(45deg);
@@ -5789,7 +6601,7 @@ html[data-os="linux"] .sn-sidebar-list {
    the hand-rolled bordered-chip recipe: fill + inset bevel carry the shape,
    border stays transparent per the no-chip-border rule. */
 .glass-button-secondary {
-  background-color: color-mix(in srgb, var(--color-surface) 60%, transparent);
+  background-color: color-mix(in srgb, var(--color-surface) calc(60% + (1 - var(--glass-strength, 1)) * 40%), transparent);
   border: 1px solid transparent;
   border-radius: 6px;
   box-shadow:
@@ -6456,6 +7268,30 @@ html[data-motion="reduced"] .sn-ffz-anim-leave {
 .sn-timeline--dragging .sn-timeline__tick-label {
   opacity: 1;
 }
+/* "You left here": a hollow ring on the track where the viewer left this
+   broadcast before. Hollow, because a live bar is filled to the edge and a
+   solid accent dot vanished into the fill; a ring is also never mistaken for
+   the solid playhead or a section hairline. Grows with the track, sits under
+   the playhead. */
+.sn-timeline__mark {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.92);
+  background: rgba(0, 0, 0, 0.55);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  transition: width var(--scrub-grow-duration) var(--scrub-grow-ease),
+    height var(--scrub-grow-duration) var(--scrub-grow-ease);
+}
+.sn-timeline:hover .sn-timeline__mark,
+.sn-timeline--dragging .sn-timeline__mark {
+  width: 12px;
+  height: 12px;
+}
 .sn-timeline__tip {
   position: absolute;
   bottom: 100%;
@@ -6464,7 +7300,7 @@ html[data-motion="reduced"] .sn-ffz-anim-leave {
   padding: 4px 8px;
   white-space: nowrap;
   pointer-events: none;
-  background: var(--plyr-tooltip-background, rgba(0, 0, 0, 0.85));
+  background: var(--plyr-tooltip-background, color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent));
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border-light);
@@ -6487,7 +7323,7 @@ html[data-motion="reduced"] .sn-ffz-anim-leave {
   bottom: 0 !important;
   height: 100vh !important;
   width: var(--fs-chat-width, 340px) !important;
-  z-index: 10000002 !important;
+  z-index: var(--sn-z-player-fs-chat) !important;
   background: color-mix(in srgb, var(--color-background) var(--fs-chat-opacity, 55%), transparent) !important;
   transition: opacity 0.2s ease, transform 0.25s ease;
 }
@@ -6550,6 +7386,21 @@ html[data-motion="reduced"] .sn-ffz-anim-leave {
 .sn-chat-overlay-frame[data-chrome="on"] .sn-chat-overlay-chrome {
   opacity: 1;
   transform: none;
+}
+/* Click-through at rest: only the button that turns it off stays on screen,
+   faint, so the way back is always in sight. Pointing at it brings the whole
+   strip back (Rust lets the controls take the mouse). */
+.sn-chat-overlay-frame[data-clickthrough="on"][data-chrome="off"] .sn-chat-overlay-chrome {
+  opacity: 1;
+  transform: none;
+  background-color: transparent;
+  border-bottom-color: transparent;
+}
+.sn-chat-overlay-frame[data-clickthrough="on"][data-chrome="off"] :is(.sn-overlay-title, .sn-overlay-slider, .sn-overlay-close) {
+  opacity: 0;
+}
+.sn-chat-overlay-frame[data-clickthrough="on"][data-chrome="off"] .sn-overlay-clickthrough {
+  opacity: 0.55;
 }
 /* Rows: legible over anything, and every piece of chrome inside the feed
    follows the slider. */
@@ -6677,7 +7528,7 @@ html[data-os="linux"] .sn-chat-overlay-frame {
    here so Plyr keeps the sheet's frame height instead of a quarter of the
    player; skinned like .plyr__tooltip. */
 .video-player-container .plyr__preview-thumb {
-  background: rgba(0, 0, 0, 0.85);
+  background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border-light);
@@ -6686,7 +7537,7 @@ html[data-os="linux"] .sn-chat-overlay-frame {
   z-index: 3;
 }
 .video-player-container .plyr__preview-thumb::before {
-  border-top-color: rgba(0, 0, 0, 0.85);
+  border-top-color: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
 }
 .video-player-container .plyr__preview-thumb__image-container {
   width: 220px;
@@ -6762,7 +7613,7 @@ html[data-os="linux"] .sn-chat-overlay-frame {
   white-space: nowrap;
   text-align: center;
   pointer-events: none;
-  background: rgba(0, 0, 0, 0.85);
+  background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--color-border-light);
@@ -6811,6 +7662,90 @@ html[data-os="linux"] .sn-chat-overlay-frame {
   display: none;
 }
 
+/* Streamer About social link pills: the border and wash tint toward the
+   link's brand colour (--sn-brand, set per pill) on hover and focus. */
+.sn-social-pill {
+  transition: border-color 160ms ease, background-color 160ms ease;
+}
+.sn-social-pill:hover,
+.sn-social-pill:focus-visible {
+  border-color: color-mix(in srgb, var(--sn-brand) 55%, transparent);
+  background-color: color-mix(in srgb, var(--sn-brand) 10%, transparent);
+  outline: none;
+}
+
+/* Streamer About panels: the description is markdown rendered to sanitized
+   HTML in Rust (channel_panels.rs), so it arrives as real elements. */
+.sn-panel-md {
+  overflow-wrap: anywhere;
+}
+.sn-panel-md > * + * {
+  margin-top: 0.5em;
+}
+.sn-panel-md :is(h1, h2, h3, h4, h5, h6) {
+  color: var(--color-text-primary);
+  font-weight: 600;
+  line-height: 1.3;
+}
+.sn-panel-md h1 { font-size: 1.25em; }
+.sn-panel-md h2 { font-size: 1.15em; }
+.sn-panel-md :is(h3, h4, h5, h6) { font-size: 1.05em; }
+.sn-panel-md :is(strong, b) {
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+.sn-panel-md :is(ul, ol) {
+  padding-left: 1.25em;
+}
+.sn-panel-md ul { list-style: disc; }
+.sn-panel-md ol { list-style: decimal; }
+.sn-panel-md li + li {
+  margin-top: 0.15em;
+}
+.sn-panel-md a {
+  color: var(--color-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.sn-panel-md a:hover {
+  opacity: 0.8;
+}
+.sn-panel-md blockquote {
+  border-left: 2px solid rgb(255 255 255 / 0.12);
+  padding-left: 0.6em;
+}
+.sn-panel-md code {
+  border-radius: 4px;
+  background: rgb(255 255 255 / 0.06);
+  padding: 0.05em 0.3em;
+  font-size: 0.95em;
+}
+.sn-panel-md pre {
+  overflow-x: auto;
+  border-radius: 6px;
+  background: rgb(255 255 255 / 0.04);
+  padding: 0.5em 0.6em;
+  scrollbar-width: none;
+}
+.sn-panel-md pre code {
+  background: none;
+  padding: 0;
+}
+.sn-panel-md hr {
+  border: 0;
+  border-top: 1px solid rgb(255 255 255 / 0.08);
+}
+.sn-panel-md img {
+  display: inline-block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+.sn-panel-md center {
+  display: block;
+  text-align: center;
+}
+
 /* ===== Utilities =====
    Last in the file on purpose. These are single-class selectors that have to
    beat single-class COMPONENT selectors (`.glass-button` at 1359, for one), so
@@ -6824,16 +7759,150 @@ html[data-os="linux"] .sn-chat-overlay-frame {
 
    Reach for it whenever the backdrop does not actually vary: the filter is then
    a compositing layer bought for nothing, and in WebView2 it can smear whatever
-   is repainting next to it. Two cases in the app today:
+   is repainting next to it. Cases in the app today:
 
    - The MultiChat popout's title bar (`--flat`), whose own note explains that
      the chat scrolling below it bleeds into a live blur layer there.
    - The setup wizard's primary button, which sits on a flat panel roughly 16px
      under a looping swipe hint. That hint animates `width`, which is a LAYOUT
      property, so every frame of an infinite loop forced layout and paint right
-     inside the region an 8px backdrop blur samples from. */
+     inside the region an 8px backdrop blur samples from.
+   - Chat link-preview cards. Chat rows use `content-visibility: auto`, and a
+     backdrop filter inside one leaves stale copies of the card behind as the
+     list scrolls.
+   - A search field inside a flyout menu (the rule below): the flyout is its
+     backdrop root, so the field could only ever blur the flyout's own fill,
+     while the flyout animates open over live chat. */
 .chrome-glaze--flat,
-.no-live-blur {
+.no-live-blur,
+.glass-flyout .glass-input {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
+}
+
+/* One blur per stack. A light control (8-16px) inside a heavily blurred
+   surface (24px and up) blurs a field that holds nothing sharp any more, so it
+   draws the same pixels and still costs a compositing layer. Measured by
+   screenshot A/B in the running app: the Badges overlay drops ~150 layers, the
+   Drops panel ~90, Settings a few per tab, all with no visible change.
+
+   Positioned descendants keep their blur: a chip or pill placed over a box
+   art or a thumbnail inside the surface blurs real picture content, and that
+   A/B showed a visible change. The heavy surface itself also keeps its blur
+   when it sits on a blurred scrim: blurring the scrim's output again is part
+   of the overlay look, also measured.
+
+   The first list holds every heavy surface, the second every light glass
+   class; glassiness.test.ts fails when a class with a backdrop filter is
+   missing from the list its blur radius belongs in. */
+:is(.liquid-glass-panel, .glass-flyout, .glass-modal, .sn-popover, .sn-glass-veil,
+  .settings-pinned-card, .backdrop-blur-ultra, .backdrop-blur-xl, .backdrop-blur-2xl, .backdrop-blur-3xl, [class*='backdrop-blur-['])
+  :is(.glass-button, .glass-button-static, .glass-button-active, .glass-button-secondary,
+  .glass-input, .glass-panel, .backdrop-blur, .backdrop-blur-sm, .backdrop-blur-md,
+  .backdrop-blur-lg):not(.absolute, .fixed, .sticky) {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* An offline channel's peepoSad, drifting around the player like an old DVD
+   logo while you wait for them. Two wrappers the size of the player, one per
+   axis, each translated by its own size minus the emote's: transform-only,
+   so it runs on the compositor with no layout or paint. 24 s across and 15 s
+   down meet at an end together every 120 s: a true corner hit, which
+   OfflineCard celebrates (keep its DRIFT_* constants in step). The -7 s start
+   puts it mid-path rather than in a corner. It sits under the offline card
+   and pauses with every animation while the window is hidden. */
+.offline-bounce-x,
+.offline-bounce-y {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.offline-bounce-x {
+  animation: offline-bounce-x 24s linear -7s infinite alternate;
+}
+.offline-bounce-y {
+  animation: offline-bounce-y 15s linear -7s infinite alternate;
+}
+@keyframes offline-bounce-x {
+  from { transform: translateX(0); }
+  to { transform: translateX(calc(100% - var(--bounce-w, 84px))); }
+}
+@keyframes offline-bounce-y {
+  from { transform: translateY(0); }
+  to { transform: translateY(calc(100% - var(--bounce-h, 56px))); }
+}
+/* The drift IS the feature, so the app's Motion preference does not stop it,
+   the same call the Penrose loader makes above: Off would otherwise squeeze it
+   to 0.001ms, which on an endless alternate flickers between corners. Timing
+   is restated so it outranks the kill (0,2,2 vs 0,2,1). The OS reduced-motion
+   setting is an accessibility signal and still stills it. */
+html[data-motion] div.offline-bounce-x {
+  animation-duration: 24s !important;
+  animation-delay: -7s !important;
+}
+html[data-motion] div.offline-bounce-y {
+  animation-duration: 15s !important;
+  animation-delay: -7s !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  html .offline-bounce-x,
+  html .offline-bounce-y {
+    animation: none !important;
+  }
+}
+
+/* The rare golden peepoSad: a static gold tint and glow on the drifting
+   emote. Static, so it is rasterized once with its layer and drifts as
+   cheaply as the plain one (no animated filter, which would repaint). */
+.offline-shiny {
+  filter: sepia(1) saturate(5) hue-rotate(-12deg) brightness(1.15)
+    drop-shadow(0 0 6px rgba(255, 205, 60, 0.85)) drop-shadow(0 2px 6px rgba(0, 0, 0, 0.55));
+}
+
+/* Settings > Player > "Hide title bar while watching" preview. A 4.8s loop:
+   the pointer climbs to the top edge, the bar slides down, the pointer leaves,
+   the bar slides away a beat later. Transform and opacity only. */
+.sn-tbt-picture {
+  background:
+    radial-gradient(120% 95% at 28% 72%, color-mix(in srgb, var(--color-accent) 55%, transparent), transparent 70%),
+    radial-gradient(80% 70% at 85% 30%, color-mix(in srgb, var(--color-accent) 25%, transparent), transparent 70%),
+    linear-gradient(160deg, #1b1f2e, #07080d);
+}
+.sn-tbt-bar {
+  animation: sn-tbt-bar 4.8s ease-in-out infinite;
+}
+.sn-tbt-pointer {
+  animation: sn-tbt-pointer 4.8s ease-in-out infinite;
+}
+@keyframes sn-tbt-bar {
+  0%, 30% { transform: translateY(-100%); opacity: 0; }
+  38%, 72% { transform: translateY(0); opacity: 1; }
+  80%, 100% { transform: translateY(-100%); opacity: 0; }
+}
+@keyframes sn-tbt-pointer {
+  0% { transform: translate(110px, 62px); }
+  28%, 64% { transform: translate(58px, 2px); }
+  78%, 100% { transform: translate(110px, 62px); }
+}
+/* Reduced drops decorative loops (see the Motion preferences block), so the
+   preview rests on its revealed frame there as well as with motion off. */
+html[data-motion="off"] .sn-tbt-bar,
+html[data-motion="off"] .sn-tbt-pointer,
+html[data-motion="reduced"] .sn-tbt-bar,
+html[data-motion="reduced"] .sn-tbt-pointer {
+  animation: none;
+}
+html[data-motion="off"] .sn-tbt-pointer,
+html[data-motion="reduced"] .sn-tbt-pointer {
+  transform: translate(58px, 2px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sn-tbt-bar,
+  .sn-tbt-pointer {
+    animation: none;
+  }
+  .sn-tbt-pointer {
+    transform: translate(58px, 2px);
+  }
 }

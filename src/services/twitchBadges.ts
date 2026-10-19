@@ -14,7 +14,19 @@ import { Logger } from '../utils/logger';
 // message (and parseMessage runs per row), so the nested set/version array
 // scans were O(sets x versions) on the chat hot path; these make it two Map
 // hits with the info objects constructed once at index time.
-type BadgeVersionInfo = Record<string, unknown>;
+/** One Twitch badge version as chat rows read it. `id` is the version id
+ *  (the part after the slash in `set/version`); BadgeDetailOverlay keys its
+ *  metadata, earn guide and window lookups on it. */
+export interface BadgeVersionInfo {
+  id: string;
+  image_url_1x?: string;
+  image_url_2x?: string;
+  image_url_4x?: string;
+  title?: string;
+  description?: string;
+  click_action?: string | null;
+  click_url?: string | null;
+}
 type BadgeIndex = Map<string, Map<string, BadgeVersionInfo>>;
 let globalBadgeIndex: BadgeIndex | null = null;
 const channelBadgeIndexes = new Map<string, BadgeIndex>();
@@ -29,6 +41,7 @@ function buildBadgeIndex(payload: any): BadgeIndex {
     const versions = new Map<string, BadgeVersionInfo>();
     for (const v of badgeSet.versions ?? []) {
       versions.set(v.id, {
+        id: v.id,
         image_url_1x: v.image_url_1x,
         image_url_2x: v.image_url_2x,
         image_url_4x: v.image_url_4x,
@@ -50,6 +63,10 @@ function buildBadgeIndex(payload: any): BadgeIndex {
  * `parseBadges()` will return `{info:null}` and ChatMessage won't render them.
  */
 export async function initializeBadgeCache(channelId?: string): Promise<void> {
+  void listenForChannelBadgeChanges();
+  // The room counts as loading from the first moment, before any await: a
+  // change announced while the global set is still loading must reach it.
+  let releaseRoom = channelId ? holdLoadingRoom(channelId) : () => {};
   try {
     const { invoke } = await import('@tauri-apps/api/core');
 
@@ -92,6 +109,9 @@ export async function initializeBadgeCache(channelId?: string): Promise<void> {
         Logger.debug('[BadgeCache] Loaded channel badges into memory cache for:', channelId);
       } catch (e) {
         Logger.warn('[BadgeCache] Failed to fetch channel badges:', e);
+      } finally {
+        releaseRoom();
+        releaseRoom = () => {};
       }
 
       // Still prefetch in unified service so other codepaths (profile lookups)
@@ -104,6 +124,75 @@ export async function initializeBadgeCache(channelId?: string): Promise<void> {
     }
   } catch (error) {
     Logger.warn('[BadgeCache] Failed to initialize badge cache:', error);
+  } finally {
+    releaseRoom();
+  }
+}
+
+let channelBadgeListener: Promise<unknown> | null = null;
+
+/** Channel badge reads in flight, by room id, counted (several callers can
+ *  load one room at once). */
+const loadingChannels = new Map<string, number>();
+/** Rooms whose art changed while a read of them was out. */
+const changedWhileLoading = new Set<string>();
+
+/** Count a read of `channelId` as in flight. The returned release ends it
+ *  once; the last release re-reads the room if its art changed meanwhile,
+ *  since the answer that just landed may predate the change. */
+function holdLoadingRoom(channelId: string): () => void {
+  loadingChannels.set(channelId, (loadingChannels.get(channelId) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const left = (loadingChannels.get(channelId) ?? 1) - 1;
+    if (left > 0) {
+      loadingChannels.set(channelId, left);
+      return;
+    }
+    loadingChannels.delete(channelId);
+    if (changedWhileLoading.delete(channelId) && channelBadgeIndexes.has(channelId)) {
+      void reindexChannelBadges(channelId);
+    }
+  };
+}
+
+/**
+ * Rust announces when a channel's badge art changed (its FFZ moderator / VIP
+ * art arrived or changed, or the setting for it flipped; a null channel means
+ * every channel). Indexed channels are fetched again; new rows draw the new art.
+ * A channel still loading is read again once that read lands, since its answer
+ * may predate the change.
+ */
+function listenForChannelBadgeChanges(): Promise<unknown> {
+  if (channelBadgeListener) return channelBadgeListener;
+  channelBadgeListener = import('@tauri-apps/api/event')
+    .then(({ listen }) =>
+      listen<{ channel_id?: string | null }>('twitch-channel-badges-changed', ({ payload }) => {
+        const ids = payload?.channel_id
+          ? [payload.channel_id]
+          : [...new Set([...channelBadgeIndexes.keys(), ...loadingChannels.keys()])];
+        for (const id of ids) {
+          if (loadingChannels.has(id)) changedWhileLoading.add(id);
+          else if (channelBadgeIndexes.has(id)) void reindexChannelBadges(id);
+        }
+      }),
+    )
+    .catch((e) => {
+      channelBadgeListener = null;
+      Logger.warn('[BadgeCache] Could not listen for channel badge changes:', e);
+    });
+  return channelBadgeListener;
+}
+
+async function reindexChannelBadges(channelId: string): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const channelBadges = await invoke<unknown>('fetch_channel_badges', { channelId });
+    if (channelBadgeIndexes.has(channelId)) channelBadgeIndexes.set(channelId, buildBadgeIndex(channelBadges));
+  } catch (e) {
+    Logger.warn('[BadgeCache] Failed to refetch channel badges:', channelId, e);
   }
 }
 

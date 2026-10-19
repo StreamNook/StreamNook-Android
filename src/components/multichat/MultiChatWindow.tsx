@@ -28,6 +28,11 @@ import { ActivityFeedWidget } from '../activity/ActivityFeedWidget';
 import { startActivityNormalizer, stopActivityNormalizer } from '../../services/activityNormalizer';
 import { useActivityStore } from '../../stores/activityStore';
 import { makeKey, parseKey } from '../../utils/providerKey';
+import { itemSevenTvId, offlineSuggestions } from '../multi-nook/channelSearch';
+import { SevenTvAvatar } from '../SevenTvAvatar';
+import { sevenTvIdForStream } from '../../services/sevenTvPictures';
+import { lastLiveLabel } from '../../utils/lastLive';
+import { fitCount } from '../../utils/fitNumber';
 import {
   isYouTubeChannelId,
   isYouTubeLegacyPath,
@@ -58,6 +63,10 @@ import ErrorBoundary from '../ErrorBoundary';
 import ChatOnlySettingsModal from './ChatOnlySettingsModal';
 import MultiChatToasts from './MultiChatToasts';
 import ViewerCounter from './ViewerCounter';
+import { useMultiChatLive } from './useMultiChatLive';
+import { liveWord, type SourceLive } from './multiChatLive';
+import { isImeComposing } from '../../utils/imeComposing';
+import { useOutsidePress } from '../../hooks/useOutsidePress';
 import CommandPalette from '../CommandPalette';
 import InputContextMenuHost from '../InputContextMenuHost';
 import ClipModal from '../ClipModal';
@@ -89,12 +98,14 @@ import {
   OLED_THEME_ID,
 } from '../../themes';
 import { listenForSettingsUpdates } from '../../utils/settingsBroadcast';
-import { MULTICHAT_BASE_WIDTH, MULTICHAT_GEOMETRY_KEY, openMultiChatWindow } from '../../utils/multichatWindow';
+import { MULTICHAT_BASE_WIDTH, openMultiChatWindow } from '../../utils/multichatWindow';
 import { Tooltip } from '../ui/Tooltip';
+import { TabScroller } from '../ui/TabScroller';
 import { Logger } from '../../utils/logger';
 import type { TwitchStream } from '../../types';
 import streamNookLogoUrl from '../../assets/streamnook-logo-128.webp';
 import SplitLayout from './SplitLayout';
+import BadgeSpotlightHost from '../BadgeSpotlightHost';
 import { registerPaneFocusController } from '../../keybindings/paneFocusController';
 import {
   columnCount,
@@ -532,6 +543,9 @@ export default function MultiChatWindow() {
   }, []);
 
   const [channels, setChannels] = useState<ChannelEntry[]>(initial.channels);
+  // Live state per open source, read from Rust: the title bar's viewer total
+  // and the tab strip's live dots share this one reader.
+  const sourceLive = useMultiChatLive(channels);
   const [layoutMode, setLayoutMode] = useState<LayoutMode>(initial.layoutMode);
   const [isBlendedMode, setIsBlendedMode] = useState(initial.isBlendedMode);
   const [isMentionsMode, setIsMentionsMode] = useState(initial.isMentionsMode);
@@ -660,6 +674,8 @@ export default function MultiChatWindow() {
     members: [],
   });
   const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const markInsidePicker = useOutsidePress(pickerOpen, [pickerRef], () => setPickerOpen(false));
   const [moderatedSet, setModeratedSet] = useState<Set<string>>(new Set());
   useEffect(() => {
     let active = true;
@@ -851,53 +867,11 @@ export default function MultiChatWindow() {
     focusedLeafId,
   ]);
 
-  // Persist the window's position + size (debounced) so a reopen lands on the same
-  // monitor in the same spot. Written to a shared key the spawner reads at creation.
-  useEffect(() => {
-    let unMoved: (() => void) | undefined;
-    let unResized: (() => void) | undefined;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    (async () => {
-      try {
-        const { getCurrentWindow } = await import('@tauri-apps/api/window');
-        const win = getCurrentWindow();
-        // Only the default window owns the shared geometry slot; extra
-        // windows cascade off it at spawn and never overwrite it.
-        if (params.id && params.id !== 'default') return;
-        const save = () => {
-          if (timer) clearTimeout(timer);
-          timer = setTimeout(async () => {
-            try {
-              if (await win.isMinimized()) return;
-              const pos = await win.outerPosition();
-              const size = await win.outerSize();
-              localStorage.setItem(
-                MULTICHAT_GEOMETRY_KEY,
-                JSON.stringify({ x: pos.x, y: pos.y, width: size.width, height: size.height }),
-              );
-            } catch {
-              /* ignore */
-            }
-          }, 400);
-        };
-        unMoved = await win.onMoved(save);
-        unResized = await win.onResized(save);
-      } catch (err) {
-        Logger.debug('[MultiChatWindow] geometry listeners failed:', err);
-      }
-    })();
-    return () => {
-      unMoved?.();
-      unResized?.();
-      if (timer) clearTimeout(timer);
-    };
-  }, []);
-
   // Size the window to the number of side-by-side chat columns so a split
   // layout doesn't squeeze N chats into one chat's width. Tabs mode = 1 column;
-  // split modes render min(channels, layoutMode) columns. We only ever GROW the
-  // window (and clamp to the monitor) — never shrink it out from under a user
-  // who manually narrowed it, and never fight a maximized window.
+  // split modes render min(channels, layoutMode) columns. Rust only ever GROWS
+  // the window and keeps it on screen (grow_popout_width): it never shrinks it
+  // out from under a user who narrowed it, and never fights a maximized window.
   // Blended mode is a single merged feed, not N side-by-side columns, so it must not
   // grow the window one base-width per channel (that's what pushed the composer off a
   // narrow/vertical monitor).
@@ -909,110 +883,34 @@ export default function MultiChatWindow() {
         : Math.min(channels.length, layoutMode);
   useEffect(() => {
     if (visibleColumns < 1) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { getCurrentWindow, LogicalSize, LogicalPosition, currentMonitor } = await import(
-          '@tauri-apps/api/window'
-        );
-        const win = getCurrentWindow();
-        if (cancelled || (await win.isMaximized())) return;
-
-        const scale = await win.scaleFactor();
-        const monitor = await currentMonitor();
-
-        let targetWidth = MULTICHAT_BASE_WIDTH * visibleColumns;
-        if (monitor) {
-          const monitorWidth = monitor.size.width / monitor.scaleFactor;
-          // Leave a margin so the window never butts flush against the screen edge
-          targetWidth = Math.min(targetWidth, Math.max(MULTICHAT_BASE_WIDTH, monitorWidth - 40));
-        }
-
-        const inner = await win.innerSize();
-        const currentWidth = inner.width / scale;
-        const currentHeight = inner.height / scale;
-
-        // Grow only — leave manually-narrowed windows and already-wide windows alone.
-        if (currentWidth >= targetWidth - 2) return;
-
-        await win.setSize(new LogicalSize(Math.round(targetWidth), Math.round(currentHeight)));
-
-        // The popout spawns at the main window's right edge, so a wider window can
-        // spill off-screen. Nudge it left if its right edge passes the monitor.
-        if (monitor) {
-          const pos = await win.outerPosition();
-          const monitorLeft = monitor.position.x / monitor.scaleFactor;
-          const monitorWidth = monitor.size.width / monitor.scaleFactor;
-          const winLeft = pos.x / scale;
-          if (winLeft + targetWidth > monitorLeft + monitorWidth) {
-            const newLeft = Math.max(monitorLeft, monitorLeft + monitorWidth - targetWidth - 10);
-            await win.setPosition(new LogicalPosition(Math.round(newLeft), Math.round(pos.y / scale)));
-          }
-        }
-      } catch (err) {
-        Logger.warn('[MultiChatWindow] column-aware resize failed:', err);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    invoke('grow_popout_width', { width: MULTICHAT_BASE_WIDTH * visibleColumns }).catch((err) =>
+      Logger.warn('[MultiChatWindow] column-aware resize failed:', err),
+    );
   }, [visibleColumns]);
 
-  // Safety net: keep the window inside the monitor it's on. After moving to a smaller
-  // monitor, or restoring a size saved on a larger one, the window can be wider/taller
-  // than the current screen, pushing the composer + send button off the edge. Shrink
-  // to fit and nudge back into view on mount and (debounced) on move. Never touches a
-  // maximized window.
+  // Safety net: after the viewer moves the window (say onto a smaller monitor)
+  // Rust keeps it wholly inside that monitor, so the composer and send button
+  // never end up off the edge. Rust already fitted it when it opened.
   useEffect(() => {
     let unMoved: (() => void) | undefined;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    (async () => {
-      try {
-        const { getCurrentWindow, currentMonitor, LogicalSize, LogicalPosition } = await import(
-          '@tauri-apps/api/window'
-        );
-        const win = getCurrentWindow();
-        const fit = async () => {
-          try {
-            if (await win.isMaximized()) return;
-            const monitor = await currentMonitor();
-            if (!monitor) return;
-            const scale = await win.scaleFactor();
-            const monLeft = monitor.position.x / monitor.scaleFactor;
-            const monTop = monitor.position.y / monitor.scaleFactor;
-            const monW = monitor.size.width / monitor.scaleFactor;
-            const monH = monitor.size.height / monitor.scaleFactor;
-            const inner = await win.innerSize();
-            let w = inner.width / scale;
-            let h = inner.height / scale;
-            if (w > monW + 2 || h > monH + 2) {
-              w = Math.min(w, monW);
-              h = Math.min(h, monH);
-              await win.setSize(new LogicalSize(Math.round(w), Math.round(h)));
-            }
-            const pos = await win.outerPosition();
-            const x = pos.x / scale;
-            const y = pos.y / scale;
-            const cx = Math.min(Math.max(x, monLeft), monLeft + monW - w);
-            const cy = Math.min(Math.max(y, monTop), monTop + monH - h);
-            if (Math.abs(cx - x) > 2 || Math.abs(cy - y) > 2) {
-              await win.setPosition(new LogicalPosition(Math.round(cx), Math.round(cy)));
-            }
-          } catch {
-            /* ignore */
-          }
-        };
-        await fit();
-        if (cancelled) return;
-        unMoved = await win.onMoved(() => {
+    void import('@tauri-apps/api/window')
+      .then(({ getCurrentWindow }) =>
+        getCurrentWindow().onMoved(() => {
           if (timer) clearTimeout(timer);
-          timer = setTimeout(() => void fit(), 300);
-        });
-      } catch (err) {
-        Logger.debug('[MultiChatWindow] fit-to-monitor failed:', err);
-      }
-    })();
+          timer = setTimeout(() => {
+            invoke('fit_popout_on_screen').catch((err) =>
+              Logger.debug('[MultiChatWindow] fit-to-monitor failed:', err),
+            );
+          }, 300);
+        }),
+      )
+      .then((u) => {
+        if (cancelled) u();
+        else unMoved = u;
+      })
+      .catch((err) => Logger.debug('[MultiChatWindow] move listener failed:', err));
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
@@ -1089,7 +987,9 @@ export default function MultiChatWindow() {
       const k = keyOf(entry);
       if (!acquiredKeysRef.current.has(k)) {
         acquiredKeysRef.current.add(k);
-        void acquireChannel(entry.channel, entry.channelId, entry.provider ?? 'twitch').catch(
+        // A background hold: the tab strip keeps every channel joined, and the
+        // pane that shows one marks it on screen (see reviewHold in the chat store).
+        void acquireChannel(entry.channel, entry.channelId, entry.provider ?? 'twitch', { background: true }).catch(
           (err) => Logger.error('[MultiChatWindow] acquire failed:', err),
         );
       }
@@ -1098,7 +998,7 @@ export default function MultiChatWindow() {
       if (!current.has(k)) {
         acquiredKeysRef.current.delete(k);
         const parsed = parseKey(k);
-        void releaseChannel(parsed.channel, parsed.provider).catch((err) =>
+        void releaseChannel(parsed.channel, parsed.provider, { background: true }).catch((err) =>
           Logger.warn('[MultiChatWindow] release failed:', err),
         );
       }
@@ -1112,7 +1012,7 @@ export default function MultiChatWindow() {
     return () => {
       for (const k of Array.from(acquiredKeysRef.current)) {
         const parsed = parseKey(k);
-        void releaseChannel(parsed.channel, parsed.provider).catch((err) =>
+        void releaseChannel(parsed.channel, parsed.provider, { background: true }).catch((err) =>
           Logger.warn('[MultiChatWindow] release on unmount failed:', err),
         );
       }
@@ -1257,7 +1157,7 @@ export default function MultiChatWindow() {
         // channel is streaming (offline chat is the same room). This gives us the
         // broadcaster id + properly-cased name AND confirms the channel exists — a
         // failure here is the "that channel isn't real" gate. (An offline-but-valid
-        // channel still adds; the pane header shows "Offline chat" on its own.)
+        // channel still adds; the pane header then says when it was last live.)
         let channelId: string | null = null;
         let channelName = providedDisplayName ?? login;
         try {
@@ -2021,6 +1921,8 @@ export default function MultiChatWindow() {
       {/* Drag-to-moderate overlay (portals to document.body): brings the main
           app's drag mod tooling into the MultiChat command center. */}
       <ModerationDragLayer />
+      {/* Badge clicks here open their card in this window, not main. */}
+      <BadgeSpotlightHost />
       {/* This window has no full ToastManager (that one also fires live-stream
           notifications); a minimal surface paints add-channel feedback etc. */}
       <MultiChatToasts />
@@ -2080,7 +1982,7 @@ export default function MultiChatWindow() {
         showActivityFeed={showActivityFeed}
         onToggleActivityFeed={() => setShowActivityFeed((v) => !v)}
         onOpenMainApp={showMainApp}
-        channels={channels}
+        liveStats={sourceLive.stats}
       />
       {/* Always mounted so the modal can play its own open/close (fill) animation
           via AnimatePresence; it renders nothing while closed. */}
@@ -2093,6 +1995,7 @@ export default function MultiChatWindow() {
       />
       <TabStrip
         channels={channels}
+        liveByKey={sourceLive.byKey}
         active={activeKey}
         visibleSet={visibleSet}
         layoutMode={layoutMode}
@@ -2225,7 +2128,7 @@ export default function MultiChatWindow() {
               ))}
             </div>
             {modsMode && moderatedTwitch.length > 1 && (
-              <div className="relative">
+              <div ref={pickerRef} onPointerDownCapture={markInsidePicker} className="relative">
                 <button
                   type="button"
                   onClick={() => setPickerOpen((v) => !v)}
@@ -2233,7 +2136,13 @@ export default function MultiChatWindow() {
                   style={{ background: 'rgba(255,255,255,0.05)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.07)' }}
                 >
                   {modChannelEntry && avatarMap[modChannelEntry.channel] && (
-                    <img src={avatarMap[modChannelEntry.channel]} alt="" className="h-4 w-4 shrink-0 rounded-full object-cover" />
+                    <SevenTvAvatar
+                      cosmeticsId={modChannelEntry.channelId}
+                      px={16}
+                      src={avatarMap[modChannelEntry.channel]}
+                      alt=""
+                      className="h-4 w-4 shrink-0 rounded-full object-cover"
+                    />
                   )}
                   <span className="max-w-[140px] truncate">{modChannelEntry?.channelName ?? 'Select channel'}</span>
                   <svg
@@ -2250,10 +2159,9 @@ export default function MultiChatWindow() {
                 </button>
                 {pickerOpen && (
                   <>
-                    <div className="fixed inset-0 z-40" onClick={() => setPickerOpen(false)} />
                     <div
                       className="absolute left-0 top-full z-50 mt-1 min-w-[180px] overflow-hidden rounded-lg border border-borderSubtle py-1 shadow-lg"
-                      style={{ background: 'rgba(18,18,20,0.98)' }}
+                      style={{ background: 'color-mix(in srgb, rgb(18 18 20) calc(98% + (1 - var(--glass-strength, 1)) * 2%), transparent)' }}
                     >
                       {moderatedTwitch.map((c) => {
                         const active = c.channel === modChannelEntry?.channel;
@@ -2268,7 +2176,14 @@ export default function MultiChatWindow() {
                             className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs transition-colors hover:bg-surface-hover ${active ? 'text-accent' : 'text-textPrimary'}`}
                           >
                             {avatarMap[c.channel] ? (
-                              <img src={avatarMap[c.channel]} alt="" className="h-5 w-5 shrink-0 rounded-full object-cover" />
+                              <SevenTvAvatar
+                                cosmeticsId={c.channelId}
+                                px={20}
+                                motion="hover"
+                                src={avatarMap[c.channel]}
+                                alt=""
+                                className="h-5 w-5 shrink-0 rounded-full object-cover"
+                              />
                             ) : (
                               <span className="h-5 w-5 shrink-0 rounded-full bg-white/10" />
                             )}
@@ -2557,6 +2472,8 @@ function GoLiveControl({
     setView('menu');
     setOpen((v) => !v);
   };
+  // The menu is portaled out but stays inside the wrapper in React.
+  const markInside = useOutsidePress(open, [wrapRef], () => setOpen(false));
   const openEdit = () => {
     setSavedSources(readGoLiveSources());
     setView('edit');
@@ -2594,6 +2511,7 @@ function GoLiveControl({
   return (
     <div
       ref={wrapRef}
+      onPointerDownCapture={markInside}
       data-tauri-drag-region="false"
       // Same glass treatment as the channel tabs + add button it sits beside, so
       // the live control reads as part of the strip instead of a flat one-off.
@@ -2649,8 +2567,6 @@ function GoLiveControl({
         </button>
       </Tooltip>
       {open && pos && createPortal(
-        <>
-          <div className="fixed inset-0 z-[1000]" onClick={() => setOpen(false)} />
           <div
             className="glass-panel fixed z-[1001] w-56 rounded-lg border border-borderLight p-1 shadow-xl"
             // Opaque themed surface: a live backdrop-blur flickers over the chat.
@@ -2768,8 +2684,7 @@ function GoLiveControl({
                 </button>
               </>
             )}
-          </div>
-        </>,
+          </div>,
         document.body,
       )}
     </div>
@@ -2800,7 +2715,7 @@ interface TitleBarProps {
   onToggleModLogs: () => void;
   onToggleActivityFeed: () => void;
   onOpenMainApp: () => void;
-  channels: ChannelEntry[];
+  liveStats: SourceLive[];
 }
 
 function TitleBar({
@@ -2825,7 +2740,7 @@ function TitleBar({
   onToggleModLogs,
   onToggleActivityFeed,
   onOpenMainApp,
-  channels,
+  liveStats,
 }: TitleBarProps) {
   // Track maximized state so the corner-control icon swaps between
   // CornersOut (maximize) and CornersIn (restore) — same behavior as
@@ -2880,7 +2795,7 @@ function TitleBar({
       </div>
 
       <div data-tauri-drag-region className="flex flex-1 items-center justify-center">
-        <ViewerCounter channels={channels} />
+        <ViewerCounter stats={liveStats} />
       </div>
 
       {canSplit && (
@@ -3126,6 +3041,8 @@ function LayoutIcon({ mode }: { mode: LayoutMode }) {
 
 interface TabStripProps {
   channels: ChannelEntry[];
+  /** Each tab's live state by its key, from useMultiChatLive. */
+  liveByKey: Map<string, SourceLive>;
   active: string | null;
   visibleSet: Set<string>;
   layoutMode: LayoutMode;
@@ -3163,11 +3080,10 @@ interface TabContextMenuState {
 // pattern so the popout's channel switcher looks and feels identical to the
 // in-app MultiNook switcher. Active tab: `glass-input` + accent text;
 // inactive: `glass-button` + secondary text → primary on hover.
-/** How far the tab strip fades at an edge with tabs scrolled behind it. */
-const TAB_FADE_PX = 24;
 
 function TabStrip({
   channels,
+  liveByKey,
   active,
   visibleSet,
   layoutMode,
@@ -3203,61 +3119,6 @@ function TabStrip({
     return () => window.removeEventListener('keydown', onKey);
   }, [contextMenu]);
 
-  // The tabs scroll sideways with no scrollbar: a bar under a row of pills is
-  // chrome, not information. Overflow shows as a fade on each edge that has tabs
-  // behind it, a mouse wheel scrolls the row, and the active tab is kept in view.
-  const scrollerRef = useRef<HTMLDivElement>(null);
-  const [edges, setEdges] = useState({ left: false, right: false });
-  const measureEdges = useCallback(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    const left = el.scrollLeft > 1;
-    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
-    setEdges((prev) => (prev.left === left && prev.right === right ? prev : { left, right }));
-  }, []);
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el) return;
-    // Re-measure when the window resizes or the tabs change width (added,
-    // removed, renamed). A vertical mouse wheel turns into a sideways scroll;
-    // trackpads already send deltaX, so only a mostly-vertical wheel is taken.
-    const observer = new ResizeObserver(measureEdges);
-    observer.observe(el);
-    if (el.firstElementChild) observer.observe(el.firstElementChild);
-    const onWheel = (e: WheelEvent) => {
-      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || el.scrollWidth <= el.clientWidth) return;
-      e.preventDefault();
-      el.scrollLeft += e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
-    };
-    el.addEventListener('wheel', onWheel, { passive: false });
-    measureEdges();
-    return () => {
-      observer.disconnect();
-      el.removeEventListener('wheel', onWheel);
-    };
-  }, [measureEdges]);
-  // A tab added past the right edge becomes the active one: bring it into view,
-  // clear of the fade, instead of leaving it scrolled out of sight.
-  useEffect(() => {
-    const el = scrollerRef.current;
-    if (!el || !active) return;
-    const tab = el.querySelector<HTMLElement>(`[data-tab-key="${CSS.escape(active)}"]`);
-    if (!tab) return;
-    const t = tab.getBoundingClientRect();
-    const s = el.getBoundingClientRect();
-    if (t.left < s.left + TAB_FADE_PX) {
-      el.scrollBy({ left: t.left - s.left - TAB_FADE_PX, behavior: 'smooth' });
-    } else if (t.right > s.right - TAB_FADE_PX) {
-      el.scrollBy({ left: t.right - s.right + TAB_FADE_PX, behavior: 'smooth' });
-    }
-  }, [active, channels.length]);
-  const edgeMask =
-    edges.left || edges.right
-      ? `linear-gradient(to right, ${edges.left ? `transparent, #000 ${TAB_FADE_PX}px` : '#000'}, ${
-          edges.right ? `#000 calc(100% - ${TAB_FADE_PX}px), transparent` : '#000'
-        })`
-      : undefined;
-
   return (
     <div className="flex flex-shrink-0 items-center gap-2 border-b border-borderSubtle bg-glass/30 px-3 py-2.5 portrait:py-3.5 shadow-sm backdrop-blur-sm">
       {/* Permanent, pinned-left Go Live control: one click loads the streamer's
@@ -3277,15 +3138,8 @@ function TabStrip({
       {/* Only the tabs scroll. The new-window and add buttons sit outside the
           scroller, so a narrow window (a new one is 402 px) can't push "+" off
           its right edge. While the tabs fit, the buttons still follow the last
-          tab, because the scroller takes only the width its tabs need. The
-          standard scrollbar-width (not ::-webkit-scrollbar) hides the bar, so it
-          also beats the macOS thin-bar rule in globals.css. */}
-      <div
-        ref={scrollerRef}
-        onScroll={measureEdges}
-        className="flex min-w-0 flex-initial items-center overflow-x-auto"
-        style={{ scrollbarWidth: 'none', maskImage: edgeMask, WebkitMaskImage: edgeMask }}
-      >
+          tab, because the scroller takes only the width its tabs need. */}
+      <TabScroller activeKey={active} count={channels.length}>
         <div className="flex min-w-max items-center gap-1.5">
         {channels.map((c) => {
           // Provider-namespaced identity — bare `c.channel` collides when the
@@ -3314,6 +3168,7 @@ function TabStrip({
             <TabButton
               key={key}
               entry={c}
+              live={liveByKey.get(key)}
               isActive={isActive}
               isVisible={isVisible}
               isDragOver={dragOver === key}
@@ -3348,7 +3203,7 @@ function TabStrip({
           );
         })}
         </div>
-      </div>
+      </TabScroller>
       <div className="flex flex-shrink-0 items-center gap-1.5">
         <Tooltip content="New MultiChat window. Each window is its own renderer, about 150 MB; splits inside one window are free." side="bottom">
           <button
@@ -3423,6 +3278,8 @@ function TabStrip({
 
 interface TabButtonProps {
   entry: ChannelEntry;
+  /** Undefined or not yet known: no dot and no live word. */
+  live?: SourceLive;
   isActive: boolean;
   isVisible: boolean;
   isDragOver: boolean;
@@ -3442,6 +3299,7 @@ interface TabButtonProps {
 // surfaced — too noisy for chats with high volume.
 function TabButton({
   entry,
+  live,
   isActive,
   isVisible,
   isDragOver,
@@ -3453,10 +3311,9 @@ function TabButton({
   onDragLeave,
   onDrop,
 }: TabButtonProps) {
-  const currentUserLogin = useAppStore((s) => s.currentUser?.login ?? null);
-  const mentionCount = useChannelMentionCount(entry.channel, currentUserLogin);
+  const mentionCount = useChannelMentionCount(entry.provider ?? 'twitch', entry.channel);
   // Track the mention count as of when this tab was last visible. Seeded at mount
-  // so the IVR backfill doesn't light the badge on creation. We ADJUST state during
+  // so a remount never lights the badge for old mentions. We ADJUST state during
   // render (React's supported alternative to an effect for syncing state to a prop)
   // so there's no cascading-render lint and no ref access during render: while
   // visible the baseline tracks the live count so unread stays 0; while hidden it
@@ -3464,7 +3321,11 @@ function TabButton({
   const [lastSeen, setLastSeen] = useState(mentionCount);
   if (isVisible && lastSeen !== mentionCount) setLastSeen(mentionCount);
   const unread = Math.max(0, mentionCount - lastSeen);
-  const unreadLabel = unread > 99 ? '99+' : String(unread);
+  // Capped at 9+ so it fits the tab's right padding, clear of the name.
+  const unreadLabel = fitCount(unread, 9);
+  const label = entry.channelName || entry.channel;
+  const state = liveWord(live);
+  const isLive = state === 'Live';
 
   return (
     <div
@@ -3479,9 +3340,12 @@ function TabButton({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
-      <Tooltip content={entry.channelName || entry.channel}>
+      <Tooltip content={state ? `${label} · ${state}` : label}>
       <button
         type="button"
+        aria-label={[label, state, unread > 0 && !isVisible ? `${unreadLabel} unread` : null]
+          .filter(Boolean)
+          .join(', ')}
         draggable
         onDragStart={onDragStart}
         onClick={onSelect}
@@ -3509,10 +3373,21 @@ function TabButton({
           size={14}
           className="absolute left-2 top-1/2 -translate-y-1/2"
         />
-        <span className="truncate text-center">{entry.channelName || entry.channel}</span>
+        {/* The dot hangs off the label's top-right corner inside the tab's
+            padding, so a channel going live or offline never moves its name. */}
+        <span className="relative min-w-0">
+          <span className="block truncate text-center">{label}</span>
+          {isLive && (
+            <span className="blend-live-dot pointer-events-none absolute -right-1.5 -top-0.5" aria-hidden />
+          )}
+        </span>
+        {/* The unread count sits in the right padding, in the remove
+            button's slot (it gives way to it on hover), so it never covers
+            the name. Centered a little right of the slot so a "9+" clears
+            the live dot. */}
         {unread > 0 && !isVisible && (
           <span
-            className="absolute right-7 top-1/2 grid h-4 min-w-[1rem] -translate-y-1/2 place-items-center rounded-full bg-accent px-1.5 text-[10px] font-bold leading-none text-background"
+            className="absolute right-[12px] top-1/2 grid h-[14px] min-w-[14px] translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-accent px-[3px] text-[9px] font-bold leading-none text-background transition-opacity group-hover:opacity-0"
             aria-label={`${unread} unread message${unread === 1 ? '' : 's'}`}
           >
             {unreadLabel}
@@ -3687,6 +3562,9 @@ function AddChannelPanel({
   // panes, and the cursor hits the chat first). Positioned fixed at the trigger.
   const providerTriggerRef = useRef<HTMLButtonElement>(null);
   const [providerMenuPos, setProviderMenuPos] = useState<{ top: number; left: number } | null>(null);
+  // The trigger's wrapper: the portaled list stays inside it in React.
+  const providerWrapRef = useRef<HTMLDivElement>(null);
+  const markInsideProviderMenu = useOutsidePress(providerMenuOpen, [providerWrapRef], () => setProviderMenuOpen(false));
 
   // Profile images from Helix `/users` — `get_followed_streams` doesn't
   // include `profile_image_url`, so we batch-fetch by user id and cache here.
@@ -3751,10 +3629,36 @@ function AddChannelPanel({
     });
   }, [followedStreams, query]);
 
+  // Offline favorites and follows: an offline chat is the same room, so they
+  // are offered under the live list, the most recently live first (the same
+  // suggestions the main window's chat dock offers).
+  const favoriteChannels = useAppStore((s) => s.settings.favorite_channels);
+  const offlineFollows = useAppStore((s) => s.offlineFollowedChannels);
+  const lastBroadcasts = useAppStore((s) => s.offlineLastBroadcasts);
+  const offline = useMemo(
+    () =>
+      provider === 'twitch'
+        ? offlineSuggestions({
+            favorites: favoriteChannels ?? [],
+            offlineFollows,
+            lastBroadcasts,
+            liveKeys: new Set(followedStreams.map((s) => makeKey('twitch', s.user_login))),
+            excludeKeys: alreadyAddedSet,
+            query,
+            providers: ['twitch'],
+          })
+        : [],
+    [provider, favoriteChannels, offlineFollows, lastBroadcasts, followedStreams, alreadyAddedSet, query],
+  );
+
   const exactFollowedMatch = useMemo(() => {
     if (!query) return null;
-    return followedStreams.find((s) => s.user_login.toLowerCase() === query) ?? null;
-  }, [followedStreams, query]);
+    return (
+      followedStreams.find((s) => s.user_login.toLowerCase() === query) ??
+      offline.find((it) => it.login.toLowerCase() === query) ??
+      null
+    );
+  }, [followedStreams, offline, query]);
 
   // Twitch matches the query against the live-following list; Kick has no public
   // search to autocomplete, so it's add-by-name (any non-empty query is addable).
@@ -3767,9 +3671,9 @@ function AddChannelPanel({
     // Only Twitch shows the (tall, scrollable) live-following list, so cap + grow
     // there. The other providers are add-by-name: the panel sizes to its input row
     // + hint, instead of leaving a big blank area where the list would be.
-    <div className={`flex flex-col border-b border-borderSubtle bg-secondary/40 backdrop-blur-sm ${isTwitch ? 'max-h-[60%]' : ''}`}>
+    <div className={`flex flex-col border-b border-borderSubtle bg-glass-raised/0 backdrop-blur-sm ${isTwitch ? 'max-h-[60%]' : ''}`}>
       <div className="flex items-center gap-2 px-3 py-2">
-        <div className="relative">
+        <div ref={providerWrapRef} onPointerDownCapture={markInsideProviderMenu} className="relative">
           <button
             ref={providerTriggerRef}
             type="button"
@@ -3796,11 +3700,10 @@ function AddChannelPanel({
             providerMenuPos &&
             createPortal(
               <>
-                {/* Backdrop catches the outside click; both are portaled to body and
-                    fixed-positioned so they sit ABOVE the chat panes (the add-bar's
-                    backdrop-blur would otherwise trap them below). Opaque themed
-                    surface (not translucent glass): a live blur flickers over chat. */}
-                <div className="fixed inset-0 z-[1000]" onClick={() => setProviderMenuOpen(false)} />
+                {/* Portaled to body and fixed-positioned so it sits ABOVE the chat
+                    panes (the add-bar's backdrop-blur would otherwise trap it
+                    below). Opaque themed surface (not translucent glass): a live
+                    blur flickers over chat. */}
                 <div
                   role="listbox"
                   className="fixed z-[1001] min-w-[7.5rem] overflow-hidden rounded-md border border-borderLight shadow-lg"
@@ -3834,13 +3737,14 @@ function AddChannelPanel({
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={(e) => {
+            if (isImeComposing(e)) return;
             if (e.key === 'Enter') onSubmit();
             else if (e.key === 'Escape') onCancel();
           }}
           disabled={busy}
           placeholder={
             provider === 'twitch'
-              ? 'Search your live following, or type any channel name'
+              ? 'Search your following, or type any channel name'
               : `Type a ${PROVIDERS[provider].label} channel name`
           }
           className="flex-1 rounded-md border border-borderSubtle bg-background px-3 py-1.5 text-xs text-textPrimary placeholder:text-textMuted focus:border-accent focus:outline-none disabled:opacity-60"
@@ -3859,12 +3763,16 @@ function AddChannelPanel({
       {error && <div className="px-3 pb-1.5 text-[11px] text-error">{error}</div>}
 
       <div className={`overflow-y-auto scrollbar-thin px-1 pb-2 ${isTwitch ? 'min-h-0 flex-1' : ''}`}>
-        {isTwitch && filtered.length === 0 && !showArbitraryAdd && (
+        {isTwitch && filtered.length === 0 && offline.length === 0 && !showArbitraryAdd && (
           <div className="px-3 py-4 text-center text-[11px] text-textMuted">
             {followedStreams.length === 0
               ? 'No live channels in your following right now. Type a channel name and press Enter.'
               : `No follows match "${query}". Press Enter to add anyway.`}
           </div>
+        )}
+
+        {isTwitch && filtered.length > 0 && offline.length > 0 && (
+          <div className="px-3 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-wider text-textMuted">Live</div>
         )}
 
         {!isTwitch && !showArbitraryAdd && (
@@ -3923,6 +3831,55 @@ function AddChannelPanel({
           );
         })}
 
+        {offline.length > 0 && (
+          <>
+            <div className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-textMuted">Offline</div>
+            {offline.map((item) => (
+              <button
+                key={`offline-${item.login}`}
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  onSelectStream({
+                    id: '',
+                    user_id: item.id,
+                    user_login: item.login,
+                    user_name: item.displayName,
+                    title: '',
+                    viewer_count: 0,
+                    game_name: '',
+                    thumbnail_url: '',
+                    started_at: '',
+                    profile_image_url: item.avatarUrl,
+                    is_live: false,
+                  })
+                }
+                className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-surface-hover"
+              >
+                {item.avatarUrl ? (
+                  <SevenTvAvatar
+                    cosmeticsId={itemSevenTvId(item)}
+                    px={36}
+                    motion="hover"
+                    src={item.avatarUrl}
+                    alt=""
+                    draggable={false}
+                    className="h-9 w-9 shrink-0 rounded-full object-cover opacity-80"
+                  />
+                ) : (
+                  <div className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-surface text-xs font-bold text-textMuted">
+                    {item.displayName.charAt(0).toUpperCase()}
+                  </div>
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-semibold text-textSecondary">{item.displayName}</div>
+                  <div className="truncate text-[11px] text-textMuted">{lastLiveLabel(item.lastLiveAt)}</div>
+                </div>
+              </button>
+            ))}
+          </>
+        )}
+
         {showArbitraryAdd && (
           <button
             type="button"
@@ -3970,7 +3927,10 @@ function StreamerAvatar({
 }) {
   if (profileImageUrl) {
     return (
-      <img
+      <SevenTvAvatar
+        cosmeticsId={sevenTvIdForStream(stream)}
+        px={36}
+        motion="hover"
         src={profileImageUrl}
         alt=""
         className="h-9 w-9 rounded-full bg-surface object-cover"

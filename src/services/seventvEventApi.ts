@@ -20,6 +20,7 @@ import {
   systemSourceFor,
 } from '../stores/chatConnectionStore';
 import type { Emote } from '../services/emoteService';
+import { seventvEmoteChanges } from './seventvEmoteChanges';
 import type { ProviderId } from '../types/providers';
 import { forceRefreshCosmetics } from '../services/cosmeticsCache';
 import { useAppStore } from '../stores/AppStore';
@@ -38,6 +39,9 @@ export interface EmoteSetUpdatePayload {
    *  Rust holds no copy of the set (no chat open on it there); the window then
    *  refetches, and the Rust cache was invalidated for that. */
   composed?: { added: Emote[]; removed: { id: string; name: string }[] } | null;
+  /** Present when the channel switched to a different set altogether: that
+   *  set's name (empty when 7TV did not say). The whole set is refetched. */
+  switched_to?: string;
 }
 
 /**
@@ -48,13 +52,17 @@ export interface EmoteSetUpdatePayload {
  * tokenizes it against a dictionary it already patched.
  */
 export async function handleSeventvEmoteSetUpdate(payload: EmoteSetUpdatePayload): Promise<void> {
-  const { channel, channel_id, actor_name, added, removed, renamed } = payload;
+  const { channel, channel_id, actor_name } = payload;
   // 7TV supports all three platforms, so an update can be for any of them. The
   // chat slice is keyed by the composite key for a provider and by the bare
   // login for Twitch; the emote cache is keyed by emoteCacheKey, which the store
   // helpers derive from (channel, platform) themselves.
   const platform = (payload.platform || 'twitch') as ProviderId;
   const chatKey = platform === 'twitch' ? channel : `${platform}:${channel}`;
+
+  // Read before the patch below drops them: a removed or renamed emote's image
+  // comes from the set as it was.
+  const before = getChannelEmotes(channel, platform)?.['7tv'] ?? [];
 
   let patched = false;
   if (payload.composed) {
@@ -82,14 +90,16 @@ export async function handleSeventvEmoteSetUpdate(payload: EmoteSetUpdatePayload
 
   const actor = actor_name || 'Someone';
   const source = systemSourceFor(chatKey);
-  for (const name of added) {
-    injectSystemMessage(chatKey, `${actor} added the emote ${name}`, undefined, source);
+  if (payload.switched_to !== undefined) {
+    const setName = payload.switched_to ? ` to ${payload.switched_to}` : '';
+    injectSystemMessage(chatKey, `${actor} switched the 7TV emote set${setName}`, undefined, source);
   }
-  for (const name of removed) {
-    injectSystemMessage(chatKey, `${actor} removed the emote ${name}`, undefined, source);
-  }
-  for (const r of renamed) {
-    injectSystemMessage(chatKey, `${actor} renamed the emote ${r.old} to ${r.new}`, undefined, source);
+  for (const change of seventvEmoteChanges(payload, before)) {
+    const text =
+      change.action === 'renamed'
+        ? `${actor} renamed the emote ${change.oldName} to ${change.name}`
+        : `${actor} ${change.action} the emote ${change.name}`;
+    injectSystemMessage(chatKey, text, undefined, source, change);
   }
 }
 

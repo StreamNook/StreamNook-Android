@@ -1,8 +1,22 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { CircleHelp, RotateCcw } from 'lucide-react';
+import { createContext, createElement, useContext, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { CircleHelp, RotateCcw, type LucideIcon } from 'lucide-react';
 import { Tooltip } from '../ui/Tooltip';
 import { IS_MOBILE } from '../../utils/platform';
 import { sectionIdFromLabel } from './sectionId';
+import {
+  GROUP_ICON,
+  GROUP_ICON_STROKE,
+  GroupCard,
+  GroupFooter,
+  GroupIcon,
+  GroupLabel,
+} from '../../mobile/ui/GroupedList';
+import { useGroupRowFrame } from '../../mobile/ui/groupSurface';
+import { phoneSettingGlyph } from './phoneGlyphs';
+
+/** The section a phone row sits in, so a short row name that repeats across
+ *  sections ("Style", "Spacing") finds its own glyph. */
+const SectionNameContext = createContext<string | undefined>(undefined);
 
 interface SettingsSectionProps {
   label: string;
@@ -10,21 +24,63 @@ interface SettingsSectionProps {
   children: ReactNode;
   id?: string;
   bare?: boolean;
+  /** A brand mark leading the heading, for a section about one platform. */
+  logo?: ReactNode;
+  /** The words drawn when the logo already names the brand ("Chat" beside
+   *  YouTube's mark). `label` stays the section's name for anchors and search. */
+  shownLabel?: string;
 }
 
 export { sectionIdFromLabel };
 
-export const SettingsSection = ({
+/** The phone's section, in the chat menu's grouped style: the name as a quiet
+ *  label over the icon column, the rows on a solid card, and the one-line
+ *  description as the quiet footer under it. */
+const PhoneSettingsSection = ({
   label,
   description,
   children,
   id,
   bare = false,
+  logo,
+  shownLabel,
+}: SettingsSectionProps) => (
+  <section id={id ?? sectionIdFromLabel(label)} data-settings-section={label}>
+    <GroupLabel
+      as="h3"
+      className={`px-4 pb-2 ${logo ? 'flex items-center gap-1.5' : ''}`}
+      aria-label={shownLabel ? label : undefined}
+    >
+      {logo}
+      {shownLabel ?? label}
+    </GroupLabel>
+    <SectionNameContext.Provider value={label}>
+      {bare ? <div className="space-y-3">{children}</div> : <GroupCard>{children}</GroupCard>}
+    </SectionNameContext.Provider>
+    {description && <GroupFooter className="px-4 pt-2">{description}</GroupFooter>}
+  </section>
+);
+
+export const SettingsSection = (props: SettingsSectionProps) =>
+  IS_MOBILE ? <PhoneSettingsSection {...props} /> : <DesktopSettingsSection {...props} />;
+
+const DesktopSettingsSection = ({
+  label,
+  description,
+  children,
+  id,
+  bare = false,
+  logo,
+  shownLabel,
 }: SettingsSectionProps) => (
   <section id={id ?? sectionIdFromLabel(label)} data-settings-section={label}>
     <div className="px-1 pb-2.5">
-      <h3 className="text-[12px] font-semibold uppercase tracking-[0.14em] text-textPrimary">
-        {label}
+      <h3
+        className={`text-[12px] font-semibold uppercase tracking-[0.14em] text-textPrimary ${logo ? 'flex items-center gap-1.5' : ''}`}
+        aria-label={shownLabel ? label : undefined}
+      >
+        {logo}
+        {shownLabel ?? label}
       </h3>
       {description && (
         <p className="mt-1 text-[12px] leading-relaxed text-textMuted">
@@ -40,8 +96,28 @@ export const SettingsSection = ({
   </section>
 );
 
+/** The arrow beside a changed setting's title that puts its default back.
+ *  Shared by SettingsRow and the nested SubControl lines. */
+export const ResetArrow = ({ onReset }: { onReset: () => void }) => (
+  <Tooltip content="Reset to default">
+    <button
+      type="button"
+      onClick={onReset}
+      aria-label="Reset to default"
+      // Touch has no hover tooltip and needs a bigger target than the glyph.
+      className={`inline-flex align-middle text-textMuted hover:text-textPrimary transition-colors ${IS_MOBILE ? '-my-1.5 p-1.5' : 'ml-1.5'}`}
+    >
+      {/* A step up on the phone, beside its 15px row names. */}
+      <RotateCcw size={IS_MOBILE ? 13 : 11} />
+    </button>
+  </Tooltip>
+);
+
 interface SettingsRowProps {
   title: ReactNode;
+  /** A brand mark leading the title, for a row about one service. Kept apart
+   *  from `title` so the title stays the plain string search lands on. */
+  logo?: ReactNode;
   /** Small inline element after the title (e.g. a source-scope indicator). */
   titleBadge?: ReactNode;
   description?: string;
@@ -56,10 +132,92 @@ interface SettingsRowProps {
    *  actually differs from the default — the affordance's presence is the signal
    *  that something was changed here, so an always-present one says nothing. */
   onReset?: () => void;
+  /** The phone's leading glyph, for a row whose title the glyph table cannot
+   *  name (a date, a value built at runtime). Other rows take theirs from the
+   *  table by section and title. The desktop draws no glyph. */
+  icon?: LucideIcon;
 }
 
-export const SettingsRow = ({
+export const SettingsRow = (props: SettingsRowProps) =>
+  IS_MOBILE ? <PhoneSettingsRow {...props} /> : <DesktopSettingsRow {...props} />;
+
+/** The phone's row, in the chat menu's grouped style: a leading glyph, the
+ *  name at 15px with its control on the same line, the description under the
+ *  name, and the nested settings under that, all in the column after the
+ *  glyph so the hairlines start where the text does. */
+const PhoneSettingsRow = ({
   title,
+  logo,
+  titleBadge,
+  description,
+  help,
+  control,
+  children,
+  disabled = false,
+  onReset,
+  icon,
+}: SettingsRowProps) => {
+  const section = useContext(SectionNameContext);
+  const frame = useGroupRowFrame();
+  // Touch has no hover, so a tap opens the explanation in place, under the
+  // description, and a second tap closes it.
+  const [helpOpen, setHelpOpen] = useState(false);
+  const glyph = icon ?? phoneSettingGlyph(section, typeof title === 'string' ? title : '');
+  return (
+    <div
+      className={`settings-row ${frame} py-2.5 ${disabled ? 'opacity-50 pointer-events-none' : ''}`}
+      // What a search result scrolls to. A title that carries a live value
+      // ("Text size: 14px") still starts with the name the search index uses.
+      data-setting-row={typeof title === 'string' ? title : undefined}
+    >
+      {/* One grid so the glyph, the name and the control share the first
+          line's midline even when the control is taller than the name, and
+          the lines under the name keep to its column. */}
+      <div
+        className={`grid ${control ? 'grid-cols-[1.5rem_minmax(0,1fr)_auto]' : 'grid-cols-[1.5rem_minmax(0,1fr)]'} items-center gap-x-3`}
+      >
+        <GroupIcon className="col-start-1 row-start-1 text-textSecondary">
+          {/* An element, not a JSX tag: the glyph is looked up per row, and a
+              looked-up tag reads to the compiler as a component made in render. */}
+          {createElement(glyph, { size: GROUP_ICON, strokeWidth: GROUP_ICON_STROKE })}
+        </GroupIcon>
+        <div className="col-start-2 row-start-1 min-w-0 text-[15px] leading-6 text-textPrimary">
+          {/* Dropped 2px under the baseline so a 14px mark centers on the
+              title's capitals rather than riding above them. */}
+          {logo && (
+            <span className="mr-1.5 inline-flex" style={{ verticalAlign: '-2px' }} aria-hidden>
+              {logo}
+            </span>
+          )}
+          {title}
+          {titleBadge && <span className="ml-1.5 align-middle">{titleBadge}</span>}
+          {help && (
+            <button
+              type="button"
+              aria-expanded={helpOpen}
+              aria-label="More about this setting"
+              onClick={() => setHelpOpen((v) => !v)}
+              className={`ml-1.5 inline-flex align-middle transition-colors ${helpOpen ? 'text-accent' : 'text-textMuted'}`}
+            >
+              <CircleHelp size={14} />
+            </button>
+          )}
+          {onReset && <ResetArrow onReset={onReset} />}
+        </div>
+        {control && <div className="col-start-3 row-start-1 shrink-0">{control}</div>}
+        {description && (
+          <p className="col-start-2 mt-0.5 text-[13px] leading-[18px] text-textSecondary">{description}</p>
+        )}
+        {help && helpOpen && <p className="col-start-2 mt-1 text-[13px] leading-[18px] text-textMuted">{help}</p>}
+        {children && <div className={`col-start-2 mt-3 ${control ? 'col-span-2' : ''}`}>{children}</div>}
+      </div>
+    </div>
+  );
+};
+
+const DesktopSettingsRow = ({
+  title,
+  logo,
   titleBadge,
   description,
   help,
@@ -84,6 +242,13 @@ export const SettingsRow = ({
     <div className="flex items-start justify-between gap-4">
       <div className="min-w-0 flex-1">
         <div className="text-[13px] font-medium text-textPrimary">
+          {/* Dropped 2px under the baseline so a 14px mark centers on the
+              title's capitals rather than riding above them. */}
+          {logo && (
+            <span className="mr-1.5 inline-flex" style={{ verticalAlign: '-2px' }} aria-hidden>
+              {logo}
+            </span>
+          )}
           {title}
           {titleBadge && <span className="ml-1.5 align-middle">{titleBadge}</span>}
           {help && IS_MOBILE ? (
@@ -107,18 +272,7 @@ export const SettingsRow = ({
               </span>
             </Tooltip>
           ) : null}
-          {onReset && (
-            <Tooltip content="Reset to default">
-              <button
-                type="button"
-                onClick={onReset}
-                aria-label="Reset to default"
-                className="ml-1.5 inline-flex align-middle text-textMuted hover:text-textPrimary transition-colors"
-              >
-                <RotateCcw size={11} />
-              </button>
-            </Tooltip>
-          )}
+          {onReset && <ResetArrow onReset={onReset} />}
         </div>
         {description && (
           <p className="mt-0.5 text-[12px] leading-relaxed text-textSecondary">
@@ -141,7 +295,9 @@ export const SettingsRow = ({
  *  that setting's sub-settings instead of more top-level rows. The pl-4 exactly
  *  absorbs each row's -mx-4 bleed, so row separators start at the rule. */
 export const SettingsSubGroup = ({ children }: { children: ReactNode }) => (
-  <div className="ml-1 border-l border-borderSubtle pl-4">{children}</div>
+  // The marker lets a search result for a nested row find it: the group sits
+  // after its parent row, not inside it.
+  <div className="ml-1 border-l border-borderSubtle pl-4" data-setting-subgroup="">{children}</div>
 );
 
 interface SegmentedOption<T extends string> {
@@ -156,6 +312,10 @@ interface SegmentedSelectProps<T extends string> {
   /** Stretch to fill the row. Off by default so the control sizes to its labels
    *  instead of spanning the whole width as detached full-width buttons. */
   fullWidth?: boolean;
+  /** Called with the option under the pointer (or keyboard focus), and null
+   *  when it leaves, so a preview beside the control can show an option
+   *  before it is picked. */
+  onPreview?: (value: T | null) => void;
 }
 
 // A unified segmented control: one recessed track with the segments packed
@@ -167,6 +327,7 @@ export const SegmentedSelect = <T extends string>({
   options,
   onChange,
   fullWidth = false,
+  onPreview,
 }: SegmentedSelectProps<T>) => {
   const trackRef = useRef<HTMLDivElement>(null);
   const btnRefs = useRef<Record<string, HTMLButtonElement | null>>({});
@@ -202,6 +363,8 @@ export const SegmentedSelect = <T extends string>({
   return (
     <div
       ref={trackRef}
+      onMouseLeave={onPreview ? () => onPreview(null) : undefined}
+      onBlur={onPreview ? () => onPreview(null) : undefined}
       className={`${fullWidth ? 'flex w-full' : 'inline-flex'} relative gap-0.5 p-0.5 rounded-lg`}
       style={{
         background: 'rgba(151,177,185,0.06)',
@@ -234,6 +397,8 @@ export const SegmentedSelect = <T extends string>({
             key={opt.value}
             ref={(el) => { btnRefs.current[opt.value] = el; }}
             onClick={() => onChange(opt.value)}
+            onMouseEnter={onPreview ? () => onPreview(opt.value) : undefined}
+            onFocus={onPreview ? () => onPreview(opt.value) : undefined}
             className={`${fullWidth ? 'flex-1' : ''} relative z-[1] px-3 py-1 text-[13px] font-medium rounded-md transition-colors ${
               isActive ? 'text-textPrimary' : 'text-textMuted hover:text-textSecondary'
             }`}

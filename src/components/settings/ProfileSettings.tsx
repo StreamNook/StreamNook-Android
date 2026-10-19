@@ -9,7 +9,7 @@ import { MajorCologneChrome } from '../MajorCologneChrome';
 import { getPreviewEmotes, previewEmoteUrl, rollPreviewChat, type PreviewEmote } from '../../utils/previewChat';
 import { openBadgesWithPaintInMain, openBadgesOnStreamNookInMain } from '../../utils/openBadgesInMain';
 import streamNookLogo from '../../assets/streamnook-logo-128.webp';
-import { User, Link, Unlink, Image as ImageIcon, Film, Heart, Check, ExternalLink, Lock } from 'lucide-react';
+import { User, Link, Unlink, Image as ImageIcon, Film, Heart, Check, ExternalLink, Lock, MessageSquare } from 'lucide-react';
 import {
   computePaintStyle,
   getBadgeImageUrls,
@@ -45,7 +45,6 @@ import {
   patchProfileSnapshotTheme,
   setHiddenSections,
   setChatAtmosphere,
-  setIncludeTwitchRecap,
   getAccolades,
 } from '../../services/supabaseService';
 import type { CosmeticCatalogEntry } from '../../services/supabaseService';
@@ -57,6 +56,7 @@ import { resolveEntitlement } from '../../services/cosmetics/ownership';
 import { MAJOR_COLOGNE_THEME_ID, MAJOR_COLOGNE_ACCOLADE_ID, parseCologneTheme, buildCologneTheme, isCologneTheme } from '../../services/cologneEvent';
 import { getTier, getTierAccent, StreamNookBadge } from '../StreamNookBadge';
 import { resolveCosmeticAsset } from '../cosmeticAssets';
+import { CosmeticArt } from '../CosmeticArt';
 import {
   captureProfileCard,
   copyImageToClipboard,
@@ -68,6 +68,7 @@ import {
 } from '../../utils/shareProfile';
 import { clearCosmeticsMemoryCache, invalidateUserCosmetics, getCosmeticsWithFallback, applyLocalCosmeticSelection } from '../../services/cosmeticsCache';
 import { buildBttvProBadge, resolveBttvProUrl, withBttvPro } from '../../services/bttvProBadge';
+import { toggleLoadoutBadge, wearCategory, wearCategoryOfKey } from '../../utils/chatterBadges';
 import { invoke } from '@tauri-apps/api/core';
 import { Logger } from '../../utils/logger';
 import LinkedAccountsSection from './LinkedAccountsSection';
@@ -79,6 +80,7 @@ import {
   toggleStat,
   type ProfileStatKey,
 } from '../../services/profileVisibility';
+import { SevenTvAvatar } from '../SevenTvAvatar';
 
 export interface ChatIdentityCache {
   badges: ChatIdentityBadge[];
@@ -223,8 +225,6 @@ const ProfileSettings = () => {
   const [hiddenSecs, setHiddenSecs] = useState<string[]>(() => seededProfile?.hiddenSections ?? []);
   // Whether our atmosphere also paints behind our chat messages.
   const [chatAtmosphere, setChatAtmosphereState] = useState(true);
-  // Whether our Twitch Recap hours count toward the hours on our profile.
-  const [includeRecap, setIncludeRecap] = useState(true);
   const [loadoutLoaded, setLoadoutLoaded] = useState(false);
   const [subscribed, setSubscribed] = useState(false);
   // Accolades the member has earned (persisted in user_accolades). Used to
@@ -421,7 +421,6 @@ const ProfileSettings = () => {
           setProfileThemeState(p.profileTheme);
           setHiddenSecs(p.hiddenSections);
           setChatAtmosphereState(p.chatAtmosphere);
-          setIncludeRecap(p.includeTwitchRecap);
         }
       })
       .catch(() => {});
@@ -451,7 +450,7 @@ const ProfileSettings = () => {
     if (!currentUser?.user_id) return;
     if (!bypassTier && !tierMet(tier)) return; // locked until the required tier is met
     setProfileThemeState(id);
-    void setProfileTheme(currentUser.user_id, id);
+    void setProfileTheme(currentUser.user_id, id).catch((e) => Logger.warn('[ProfileSettings] theme write failed:', e));
     // Keep the cached profile snapshot's theme in sync so the profile CARD (ours
     // and anyone else's) reflects the change on the next open, instead of serving
     // the old atmosphere until the lazy stale-rewrite. Without this the stale
@@ -490,14 +489,6 @@ const ProfileSettings = () => {
       if (ok) return;
       setOwnThemeHiddenInChat(userId, next);
       if (mountedRef.current) setChatAtmosphereState(!next);
-    });
-  };
-
-  const toggleIncludeRecap = () => {
-    const next = !includeRecap;
-    setIncludeRecap(next);
-    void setIncludeTwitchRecap(next).then((ok) => {
-      if (!ok && mountedRef.current) setIncludeRecap(!next);
     });
   };
 
@@ -953,10 +944,14 @@ const ProfileSettings = () => {
   const shownThirdParty = allThirdParty.filter((b) => isThirdPartyShown(b));
   const toggleThirdParty = (b: { provider: string; id: string }) => {
     if (!currentUser?.user_id) return;
-    const key = tpKey(b);
-    const nextBadges = loadout.badges.includes(key)
-      ? loadout.badges.filter((k) => k !== key)
-      : [...loadout.badges, key];
+    // Chat shows one badge per category (Homies has three: custom, role,
+    // staff), so choosing one switches off the other badge of its category.
+    const categoryOf = new Map(allThirdParty.map((x) => [tpKey(x), wearCategory(x)]));
+    const nextBadges = toggleLoadoutBadge(
+      loadout.badges,
+      tpKey(b),
+      (k) => categoryOf.get(k) ?? wearCategoryOfKey(k),
+    );
     const next = { customized: true, badges: nextBadges };
     setLoadout(next);
     void setIdentity(currentUser.user_id, next.badges, null, true);
@@ -1153,7 +1148,10 @@ const ProfileSettings = () => {
         )}
 
       {/* Inner Profile tabs: Overview (stats showcase) vs Customize (identity
-          editor). The profile card below stays visible on both. */}
+          editor). The profile card below stays visible on both. Beside them,
+          your own channel: its offline room, which starts your stream itself
+          when you are live. */}
+      <div className="flex items-center gap-2">
       <div className="flex w-fit items-center gap-1 rounded-lg border border-white/[0.06] bg-white/[0.03] p-1">
         {(['overview', 'customize'] as const).map((t) => (
           <button
@@ -1170,6 +1168,19 @@ const ProfileSettings = () => {
           </button>
         ))}
       </div>
+        <button
+          type="button"
+          onClick={() => {
+            const store = useAppStore.getState();
+            store.closeSettings();
+            void store.openOwnChannel();
+          }}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.06] bg-white/[0.03] px-3 py-[10px] text-[13px] font-medium text-textSecondary transition-colors hover:text-textPrimary"
+        >
+          <MessageSquare size={14} />
+          My channel
+        </button>
+      </div>
 
       <div ref={profileCardRef} className="relative overflow-hidden flex items-center gap-8 p-6 glass-panel glaze-inset rounded-xl">
         {/* Tier aura backdrop — Ethereal gets violet, Mythic gets amber.
@@ -1177,7 +1188,14 @@ const ProfileSettings = () => {
         {tier?.auraClassName && <div className={tier.auraClassName} />}
         <div className="relative w-32 h-32 rounded-full bg-white/[0.04] flex-shrink-0 flex items-center justify-center overflow-hidden ring-1 ring-inset ring-white/10 shadow-[0_6px_20px_rgba(0,0,0,0.45)]">
           {currentUser.profile_image_url ? (
-            <img src={currentUser.profile_image_url} alt="Profile" className="w-full h-full object-cover" />
+            <SevenTvAvatar
+              cosmeticsId={currentUser.user_id}
+              px={128}
+              motion="animate"
+              src={currentUser.profile_image_url}
+              alt="Profile"
+              className="w-full h-full object-cover"
+            />
           ) : (
             <User size={56} className="text-textSecondary" />
           )}
@@ -1402,7 +1420,7 @@ const ProfileSettings = () => {
           <div className="flex items-center gap-1.5 mb-4">
             <Tooltip content="Open StreamNook badges" side="top">
               <button
-                onClick={openBadgesOnStreamNookInMain}
+                onClick={() => openBadgesOnStreamNookInMain()}
                 className="cursor-pointer hover:scale-110 transition-transform"
                 aria-label="Open StreamNook badges"
               >
@@ -1442,6 +1460,7 @@ const ProfileSettings = () => {
                 >
                   <div
                     onClick={() => { if (!isActive) void setActiveCosmetic(currentUser.user_id, cosmetic.slug); }}
+                    aria-label={cosmetic.name}
                     className={`
                       relative p-2 rounded-lg transition-all
                       ${isActive
@@ -1449,12 +1468,7 @@ const ProfileSettings = () => {
                         : 'border border-transparent cursor-pointer hover:bg-glass hover:border-borderLight'}
                     `}
                   >
-                    <img
-                      src={asset}
-                      alt={cosmetic.name}
-                      className="w-8 h-8 object-contain"
-                      draggable={false}
-                    />
+                    <CosmeticArt cosmetic={cosmetic} chatSize className="w-8 h-8 object-contain" />
                     {isActive && <CheckChip tone="accent" />}
                   </div>
                 </Tooltip>
@@ -1484,13 +1498,13 @@ const ProfileSettings = () => {
                 >
                   <div
                     aria-disabled
+                    aria-label={cosmetic.name}
                     className="relative cursor-default rounded-lg border border-dashed border-white/[0.08] p-2"
                   >
-                    <img
-                      src={asset}
-                      alt={cosmetic.name}
+                    <CosmeticArt
+                      cosmetic={cosmetic}
+                      chatSize
                       className="h-8 w-8 object-contain opacity-40 saturate-[0.35]"
-                      draggable={false}
                     />
                     <LockChip />
                   </div>
@@ -1503,7 +1517,7 @@ const ProfileSettings = () => {
               <span>Enjoy collecting badges or flexing status?</span>
               <button
                 type="button"
-                onClick={openBadgesOnStreamNookInMain}
+                onClick={() => openBadgesOnStreamNookInMain()}
                 className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium text-textPrimary bg-white/[0.06] hover:bg-white/[0.10] transition-colors cursor-pointer"
               >
                 <Heart size={10} className="text-rose-400/80" aria-hidden />
@@ -1861,30 +1875,6 @@ const ProfileSettings = () => {
             );
             }),
           ])}
-        </div>
-        <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/[0.06] px-1 pt-3">
-          <div className="min-w-0">
-            <div className="text-sm text-textPrimary">Add my Twitch Recap hours</div>
-            <div className="text-[12px] leading-relaxed text-textSecondary">
-              Counts the hours Twitch Recap recorded before you joined StreamNook toward your hours watched.
-            </div>
-          </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={includeRecap}
-            onClick={toggleIncludeRecap}
-            className={`relative inline-flex h-5 w-9 flex-shrink-0 items-center rounded-full transition-colors ${
-              includeRecap ? 'bg-accent' : 'bg-white/[0.12]'
-            }`}
-            aria-label={`${includeRecap ? 'Remove' : 'Add'} your Twitch Recap hours`}
-          >
-            <span
-              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                includeRecap ? 'translate-x-[18px]' : 'translate-x-0.5'
-              }`}
-            />
-          </button>
         </div>
       </div>
 

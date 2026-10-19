@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::{broadcast, Mutex};
+use crate::services::chat_bridge_route::{BridgeFrame, SocketRoute};
 use warp::Filter;
 
 pub struct IrcService;
@@ -33,9 +34,9 @@ static WS_SERVER_HANDLE: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = 
 // which leaves the frontend attached to a dead or message-less socket.
 static BRIDGE_BRINGUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CURRENT_CHANNELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static MESSAGE_BROADCASTER: OnceLock<Mutex<Option<Arc<broadcast::Sender<String>>>>> =
+static MESSAGE_BROADCASTER: OnceLock<Mutex<Option<Arc<broadcast::Sender<BridgeFrame>>>>> =
     OnceLock::new();
-static MESSAGE_QUEUE: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+static MESSAGE_QUEUE: OnceLock<Mutex<VecDeque<BridgeFrame>>> = OnceLock::new();
 static IRC_HANDLE: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
 // Abort handles for the keepalive tasks spawned INSIDE the IRC task (ping +
 // frontend heartbeat). Aborting IRC_HANDLE alone orphans them: the ping task's
@@ -114,21 +115,35 @@ static PROCESS_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
 pub static TIMESTAMP_24H: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LAST_IRC_READ_ELAPSED_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+// Wall-clock twin of the last read, used only to spot suspension: across a
+// sleep the wall clock jumps ahead of the monotonic one.
+static LAST_IRC_READ_WALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Ring of recent connection-lifecycle events, pullable from a packaged build
 // (which has no stderr) via the get_chat_lifecycle_log command.
 static LIFECYCLE_LOG: OnceLock<std::sync::Mutex<VecDeque<String>>> = OnceLock::new();
 const LIFECYCLE_LOG_CAP: usize = 100;
 
-// We PING every 30s and the server answers, so a healthy link never goes 75s
-// without a completed read. Reference clients ping every 5s, so Twitch has
-// ample tolerance for this cadence.
-const IRC_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-const IRC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+// We PING only when the link has been quiet for IRC_PING_IDLE_MS (a busy chat
+// proves itself), checked every IRC_PING_CHECK. The server answers, so a
+// healthy link never goes IRC_READ_TIMEOUT without a completed read, and a
+// network that silently cuts the connection costs about 30 s of chat, which
+// the reconnect backfill then fills. Reference clients ping every 5s, so
+// Twitch has ample tolerance for this cadence.
+const IRC_PING_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+const IRC_PING_IDLE_MS: u64 = 15_000;
+const IRC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const HANDSHAKE_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 // Read timeout plus slack: past this the frontend must be allowed to see
 // silence so its own watchdog can act.
-const HEARTBEAT_SUPPRESS_AFTER_MS: u64 = 90_000;
+const HEARTBEAT_SUPPRESS_AFTER_MS: u64 = 45_000;
+// A session that ends with nothing read for this long went silent before it
+// ended: at least one idle PING went unanswered. That is evidence against the
+// transport (see irc_transport's stall rule), unless the machine slept.
+const STALL_READ_AGE_MS: u64 = 20_000;
+// How far the read clock may lag the timer or the wall clock before the gap is
+// put down to suspension (laptop sleep, a phone freezing the app) instead.
+const SUSPEND_SLACK_MS: u64 = 5_000;
 // After a clean drop, reconnect almost immediately: a read-liveness timeout is
 // our own local detection (no server pressure, so zero wait; on a phone this
 // fires the moment the app resumes from suspension and the user is staring at
@@ -146,6 +161,66 @@ const SESSION_FLAP_THRESHOLD_MS: u64 = 10_000;
 // JOINs from user actions.
 const JOIN_BURST_BUDGET: usize = 15;
 const JOIN_PACE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12_500);
+// Every JOIN this process writes, whoever writes it (handshake burst, paced
+// batches, user-driven ensure_joined, the unconfirmed re-issue), counts against
+// one rolling window, a little inside Twitch's 20 per 10 s. Opening many chats
+// at once (a restored chat dock) used to write every JOIN immediately.
+const JOIN_WINDOW_MAX: usize = 18;
+const JOIN_WINDOW_MS: u64 = 10_500;
+
+/// The JOINs written in the last `JOIN_WINDOW_MS`, by send time.
+#[derive(Default)]
+struct JoinWindow {
+    sent: std::collections::VecDeque<u64>,
+}
+
+impl JoinWindow {
+    fn prune(&mut self, now: u64) {
+        while self.sent.front().is_some_and(|&t| now.saturating_sub(t) >= JOIN_WINDOW_MS) {
+            self.sent.pop_front();
+        }
+    }
+
+    /// Claim a slot at `now`, or say how long until one frees.
+    fn claim(&mut self, now: u64) -> Result<(), u64> {
+        self.prune(now);
+        if self.sent.len() < JOIN_WINDOW_MAX {
+            self.sent.push_back(now);
+            return Ok(());
+        }
+        let oldest = *self.sent.front().unwrap_or(&now);
+        Err((oldest + JOIN_WINDOW_MS).saturating_sub(now).max(1))
+    }
+
+    /// Count JOINs written by a path that paces itself.
+    fn note(&mut self, now: u64, n: usize) {
+        self.prune(now);
+        self.sent.extend(std::iter::repeat_n(now, n));
+    }
+}
+
+static JOIN_WINDOW: once_cell::sync::Lazy<std::sync::Mutex<JoinWindow>> =
+    once_cell::sync::Lazy::new(Default::default);
+
+/// Wait for room in the JOIN window, then claim it.
+async fn take_join_slot() {
+    loop {
+        let wait = match JOIN_WINDOW.lock() {
+            Ok(mut w) => match w.claim(mono_ms()) {
+                Ok(()) => return,
+                Err(ms) => ms,
+            },
+            Err(_) => return,
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+    }
+}
+
+fn note_joins_sent(n: usize) {
+    if let Ok(mut w) = JOIN_WINDOW.lock() {
+        w.note(mono_ms(), n);
+    }
+}
 // A JOIN Twitch never acknowledged (no ROOMSTATE/USERSTATE/JOIN echo, no channel
 // message) is re-issued after this window. Twitch can silently drop JOINs (rate
 // limits, room-server hiccups); before this tracker existed such a channel stayed
@@ -266,6 +341,8 @@ async fn confirm_join(key: &str) {
     let mut t = get_join_tracker().lock().await;
     if t.confirm(key) {
         record_lifecycle(&format!("JOIN #{} confirmed", key));
+        // A reward that asks for text reaches chat with only its id.
+        crate::services::channel_rewards::note_chat_joined(key);
     }
     refresh_join_hint(&t);
 }
@@ -464,12 +541,76 @@ fn mono_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn mark_irc_read() {
     LAST_IRC_READ_ELAPSED_MS.store(mono_ms(), std::sync::atomic::Ordering::Relaxed);
+    LAST_IRC_READ_WALL_MS.store(wall_ms(), std::sync::atomic::Ordering::Relaxed);
 }
 
 fn irc_read_age_ms() -> u64 {
     mono_ms().saturating_sub(LAST_IRC_READ_ELAPSED_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn irc_read_wall_age_ms() -> u64 {
+    wall_ms().saturating_sub(LAST_IRC_READ_WALL_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Did a signed-in session go silent before it ended, with the machine awake?
+/// `read_age_ms` is the monotonic time since the last read, `wall_age_ms` the
+/// wall-clock time. A timer can only see more silence than the read timeout if
+/// it fired late, and the wall clock only runs ahead of the monotonic one
+/// across a sleep: either way the gap is suspension, not the network.
+fn is_silent_session_end(reason: &str, read_age_ms: u64, wall_age_ms: u64) -> bool {
+    if matches!(reason, "server RECONNECT" | "handler stall") {
+        return false;
+    }
+    if read_age_ms < STALL_READ_AGE_MS {
+        return false;
+    }
+    let timeout_ms = IRC_READ_TIMEOUT.as_millis() as u64;
+    if read_age_ms > timeout_ms + SUSPEND_SLACK_MS {
+        return false;
+    }
+    wall_age_ms <= read_age_ms + SUSPEND_SLACK_MS
+}
+
+/// Development-only fault injection for the stall path:
+/// `STREAMNOOK_IRC_FAULT=deafen:<secs>[:irc|websocket]` makes every session
+/// (on that transport, or any) throw away everything it reads from `<secs>`
+/// after sign-in, the way a network that blackholes a connection would.
+/// Compiled out of release builds.
+fn fault_deafen_after(transport: IrcTransport) -> Option<std::time::Duration> {
+    #[cfg(debug_assertions)]
+    {
+        let spec = std::env::var("STREAMNOOK_IRC_FAULT").ok()?;
+        parse_deafen_fault(&spec, transport)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = transport;
+        None
+    }
+}
+
+#[cfg(debug_assertions)]
+fn parse_deafen_fault(spec: &str, transport: IrcTransport) -> Option<std::time::Duration> {
+    let mut parts = spec.trim().split(':');
+    if parts.next()? != "deafen" {
+        return None;
+    }
+    let secs: u64 = parts.next()?.parse().ok()?;
+    match parts.next() {
+        None => {}
+        Some(t) if t == transport.label() => {}
+        Some(_) => return None,
+    }
+    Some(std::time::Duration::from_secs(secs))
 }
 
 // 2s, 4s, 8s, 16s, 32s, 60s cap for transient failures; flat 300s when
@@ -535,6 +676,12 @@ enum SessionError {
     Transient(anyhow::Error),
 }
 
+/// How an established session ended.
+struct SessionEnd {
+    reason: &'static str,
+    transport: IrcTransport,
+}
+
 impl From<std::io::Error> for SessionError {
     fn from(e: std::io::Error) -> Self {
         SessionError::Transient(e.into())
@@ -549,15 +696,38 @@ fn get_bridge_bringup_lock() -> &'static Mutex<()> {
     BRIDGE_BRINGUP_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Moves on at every full stop. Aborting the bridge's server task stops it
+/// accepting, but each page socket already upgraded runs in a task of its own
+/// with its own handle on the old broadcaster, so it stayed open with nothing
+/// feeding it: the page saw a healthy socket, never reconnected, and its chat
+/// went silent until a watchdog noticed. Each socket watches this instead and
+/// closes when it moves past the value its server was built at.
+static BRIDGE_CLOSE: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+
+fn bridge_close() -> &'static tokio::sync::watch::Sender<u64> {
+    BRIDGE_CLOSE.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+/// The value a bridge server built now is born at.
+fn bridge_generation() -> u64 {
+    *bridge_close().borrow()
+}
+
+/// Closes every page socket the bridge serves now (code 1012, "service
+/// restart"), so each page reconnects at once to whatever bridge comes next.
+fn close_page_sockets() {
+    bridge_close().send_modify(|g| *g = g.wrapping_add(1));
+}
+
 fn get_current_channels() -> &'static Mutex<HashSet<String>> {
     CURRENT_CHANNELS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn get_message_broadcaster() -> &'static Mutex<Option<Arc<broadcast::Sender<String>>>> {
+fn get_message_broadcaster() -> &'static Mutex<Option<Arc<broadcast::Sender<BridgeFrame>>>> {
     MESSAGE_BROADCASTER.get_or_init(|| Mutex::new(None))
 }
 
-fn get_message_queue() -> &'static Mutex<VecDeque<String>> {
+fn get_message_queue() -> &'static Mutex<VecDeque<BridgeFrame>> {
     MESSAGE_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
@@ -598,7 +768,8 @@ async fn abort_keepalive_tasks() {
 /// `queue_on_fail` holds chat payloads for the next client attach. Status
 /// frames must pass `false`: replayed later, a status would misreport the
 /// current state to the frontend watchdog.
-async fn send_to_bridge(msg: String, queue_on_fail: bool) -> bool {
+async fn send_to_bridge(msg: impl Into<BridgeFrame>, queue_on_fail: bool) -> bool {
+    let msg: BridgeFrame = msg.into();
     let tx = get_message_broadcaster().lock().await.clone();
     let delivered = match tx {
         Some(tx) => tx.send(msg.clone()).is_ok(),
@@ -634,33 +805,91 @@ fn get_room_state_cache() -> &'static Mutex<HashMap<String, String>> {
     ROOM_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Send `channel`'s room again, worded for the account as it stands now, when
+/// something other than a ROOMSTATE changed what the modes mean for it (a new
+/// role, a follow). Also refreshes the replay cache for late-mounting panes.
+pub(crate) async fn reship_room_state(channel: &str) {
+    let Some(fields) = crate::services::chat_send_limiter::room_state_fields(channel) else {
+        return;
+    };
+    let mut frame = serde_json::Map::new();
+    frame.insert("type".into(), serde_json::json!("ROOMSTATE"));
+    frame.insert("channel".into(), serde_json::json!(channel));
+    frame.extend(fields);
+    let frame = serde_json::Value::Object(frame).to_string();
+    get_room_state_cache().lock().await.insert(channel.to_string(), frame.clone());
+    send_to_bridge(BridgeFrame::channel(channel, frame), false).await;
+}
+
+/// Send one chat-stream frame to `channel`'s rooms (a held AutoMod message,
+/// say), held for the next attach when no room is listening.
+pub(crate) async fn ship_channel_frame(channel: &str, frame: String) {
+    send_to_bridge(BridgeFrame::channel(channel, frame), true).await;
+}
+
+/// Look up the account's own follow of a followers-only room (one Helix call),
+/// word the room again with it, and keep a "you can chat in N minutes" line
+/// current until the wait is over.
+async fn learn_own_follow(channel: String, room_id: String) {
+    use crate::services::follow_lookup::{own_follow, FollowAnswer};
+    let answer = match own_follow(&room_id).await {
+        FollowAnswer::Following(at) => chrono::DateTime::parse_from_rfc3339(&at)
+            .ok()
+            .map(|t| Some(t.with_timezone(&chrono::Utc))),
+        FollowAnswer::NotFollowing => Some(None),
+        FollowAnswer::Unknown => None,
+    };
+    let gen = crate::services::chat_send_limiter::note_own_follow(&channel, answer);
+    reship_room_state(&channel).await;
+    run_follow_countdown(channel, gen).await;
+}
+
+/// Word the room again each time the followers-only wait crosses a minute,
+/// until it ends. Stops as soon as a newer follow answer, a role change or the
+/// mode going off makes it moot. Nothing runs when there is no wait.
+pub(crate) async fn run_follow_countdown(channel: String, gen: u64) {
+    while let Some(wait) = crate::services::chat_send_limiter::own_follow_tick(&channel, gen) {
+        tokio::time::sleep(wait).await;
+        reship_room_state(&channel).await;
+    }
+}
+
+/// The account followed or unfollowed `room_id` from inside the app: word every
+/// open room of that channel again.
+pub async fn own_follow_changed(room_id: &str, following: bool) {
+    for (channel, gen) in crate::services::chat_send_limiter::note_own_follow_by_room_id(room_id, following) {
+        reship_room_state(&channel).await;
+        tauri::async_runtime::spawn(run_follow_countdown(channel, gen));
+    }
+}
+
 /// Chat messages published while nothing was subscribed to the bus.
 ///
 /// `broadcast::send` discards when there are no receivers, and a provider's
 /// join backlog is published before the frontend WebSocket client attaches.
 /// Bounded, and drained by the first client to attach. The frontend dedupes
 /// by message id, so a replayed row cannot double up one that arrived live.
-static PENDING_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static PENDING_MESSAGES: OnceLock<Mutex<Vec<BridgeFrame>>> = OnceLock::new();
 /// Enough for a full join backlog with headroom; past this the oldest go, because
 /// a buffer that grows without a listener is a leak, not a feature.
 const PENDING_MESSAGES_MAX: usize = 200;
 
-fn get_pending_messages() -> &'static Mutex<Vec<String>> {
+fn get_pending_messages() -> &'static Mutex<Vec<BridgeFrame>> {
     PENDING_MESSAGES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 /// Hold a message that had no subscriber, for replay when one attaches.
-pub async fn hold_undelivered_message(json: String) {
+pub async fn hold_undelivered_message(frame: BridgeFrame) {
     let mut pending = get_pending_messages().lock().await;
     if pending.len() >= PENDING_MESSAGES_MAX {
         let overflow = pending.len() + 1 - PENDING_MESSAGES_MAX;
         pending.drain(0..overflow);
     }
-    pending.push(json);
+    pending.push(frame);
 }
 
 /// Take everything held, leaving the buffer empty.
-pub async fn take_undelivered_messages() -> Vec<String> {
+pub async fn take_undelivered_messages() -> Vec<BridgeFrame> {
     std::mem::take(&mut *get_pending_messages().lock().await)
 }
 
@@ -675,6 +904,18 @@ pub async fn cache_provider_room_state(channel_key: &str, frame: String) {
         .lock()
         .await
         .insert(channel_key.to_lowercase(), frame);
+}
+
+/// Hand a window that claims an already-JOINed channel the room as last known.
+/// Twitch sends ROOMSTATE only on the JOIN itself and on a change, so a chat
+/// opened on a channel the connection already holds (another window's, or one
+/// kept joined) would otherwise never learn its modes. A fresh JOIN has
+/// nothing cached yet; its ROOMSTATE comes from the server.
+async fn replay_room_state(key: &str) {
+    let frame = get_room_state_cache().lock().await.get(key).cloned();
+    if let Some(frame) = frame {
+        send_to_bridge(BridgeFrame::channel(key, frame), false).await;
+    }
 }
 
 /// Drop a provider's cached ROOMSTATE when its channel is released, mirroring the
@@ -778,37 +1019,37 @@ fn unescape_irc_tag(value: &str) -> String {
 /// third-party sets change; per-message parsing reads it through an Arc with
 /// no locks held and no data cloned. Personal emotes are deliberately NOT in
 /// here: they are per-sender (a separate map consulted first in the word
-/// tier), and the 7TV-override filter below must never match them.
+/// tier). Nothing in here ever replaces a span Twitch tagged as an emote.
 pub(crate) struct EmoteLookup {
     /// name -> emote, inserted bttv, ffz, seven_tv in order (later insert
     /// wins), preserving the word tier's 7TV > FFZ > BTTV priority.
     by_name: HashMap<String, Emote>,
+    /// The channel's own Twitch emotes. A live message never reads these (its
+    /// Twitch emotes come from the IRC tag's positions, and matching names
+    /// would turn a word into an emote its sender cannot use); they are for
+    /// text that arrives without positions, like a reply's quoted parent.
+    natives: Vec<Emote>,
 }
 
 impl EmoteLookup {
-    fn build(set: &EmoteSet) -> Arc<Self> {
+    pub(crate) fn build(set: &EmoteSet) -> Arc<Self> {
         let mut by_name =
             HashMap::with_capacity(set.bttv.len() + set.ffz.len() + set.seven_tv.len());
         for e in set.bttv.iter().chain(&set.ffz).chain(&set.seven_tv) {
             by_name.insert(e.name.clone(), e.clone());
         }
-        Arc::new(Self { by_name })
+        Arc::new(Self { by_name, natives: set.twitch.clone() })
     }
 
-    fn get(&self, name: &str) -> Option<&Emote> {
+    /// The third-party emote a word names. Only words Twitch did not tag reach
+    /// this: a tagged span is always the Twitch emote.
+    pub(crate) fn get(&self, name: &str) -> Option<&Emote> {
         self.by_name.get(name)
     }
 
-    /// 7TV art for a Twitch-native emote name. The map slot holds the 7TV
-    /// entry whenever the composed 7TV dictionary carries the name (7TV is
-    /// inserted last, so it beats FFZ and BTTV on a name collision). Within
-    /// 7TV there is nothing left to arbitrate: `compose_seventv` keys the
-    /// dictionary by name with channel rows first, so every consumer,
-    /// first-wins or last-wins, resolves a name to the same row.
-    fn seventv_override(&self, name: &str) -> Option<&Emote> {
-        self.by_name
-            .get(name)
-            .filter(|e| e.provider == crate::services::emote_service::EmoteProvider::SevenTV)
+    /// How many third-party names it knows.
+    pub(crate) fn len(&self) -> usize {
+        self.by_name.len()
     }
 }
 
@@ -817,6 +1058,29 @@ static CHANNEL_PARSE_LOOKUP: OnceLock<std::sync::RwLock<HashMap<String, Arc<Emot
 
 fn channel_parse_lookup() -> &'static std::sync::RwLock<HashMap<String, Arc<EmoteLookup>>> {
     CHANNEL_PARSE_LOOKUP.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Join each run of whitespace-only Text segments into one, keeping its exact
+/// text. The renderer attaches a zero-width emote to the emote before it by
+/// looking back past one spacer, so a doubled space (a composer autocomplete
+/// leaves a trailing one) split into two spacers orphaned the overlay.
+/// Chatterino and 7TV stack across any whitespace; one spacer per run matches
+/// them, and a run of spaces renders the same either way.
+fn merge_space_runs(segments: &mut Vec<MessageSegment>) {
+    let is_space = |s: &MessageSegment| matches!(s, MessageSegment::Text { content } if !content.is_empty() && content.trim().is_empty());
+    let mut out: Vec<MessageSegment> = Vec::with_capacity(segments.len());
+    for seg in segments.drain(..) {
+        if is_space(&seg) {
+            if let (Some(MessageSegment::Text { content: prev }), MessageSegment::Text { content }) = (out.last_mut(), &seg) {
+                if !prev.is_empty() && prev.trim().is_empty() {
+                    prev.push_str(content);
+                    continue;
+                }
+            }
+        }
+        out.push(seg);
+    }
+    *segments = out;
 }
 
 fn rebuild_parse_lookup(key: &str, set: &EmoteSet) {
@@ -830,12 +1094,190 @@ fn drop_parse_lookup(key: &str) {
     if let Ok(mut guard) = channel_parse_lookup().write() {
         guard.remove(key);
     }
+    crate::services::shared_chat_emotes::release_home(key);
+}
+
+/// What a CLEARMSG line says: one message deleted by a moderator.
+struct ClearMsg {
+    channel: Option<String>,
+    target_msg_id: String,
+    login: String,
+    text: Option<String>,
+}
+
+impl ClearMsg {
+    fn frame(&self) -> Value {
+        json!({
+            "type": "CLEARMSG",
+            "channel": self.channel,
+            "target_msg_id": self.target_msg_id,
+            "login": self.login,
+            "message": self.text
+        })
+    }
+}
+
+/// What a CLEARCHAT line says: a timeout or ban of one user, or a full clear.
+struct ClearChat {
+    channel: Option<String>,
+    target_user_id: Option<String>,
+    target_user: Option<String>,
+    ban_duration_secs: Option<u64>,
+}
+
+impl ClearChat {
+    fn frame(&self) -> Value {
+        json!({
+            "type": "CLEARCHAT",
+            "channel": self.channel,
+            "target_user_id": self.target_user_id,
+            "target_user": self.target_user,
+            "ban_duration": self.ban_duration_secs
+        })
+    }
+}
+
+impl IrcService {
+    /// Format: `@login=<user>;room-id=<room>;target-msg-id=<msg-id>;tmi-sent-ts=<ts> :tmi.twitch.tv CLEARMSG #<channel> :<message>`
+    fn parse_clearmsg(line: &str) -> Option<ClearMsg> {
+        let target_msg_id = Self::extract_tag_value(line, "target-msg-id")?;
+        Some(ClearMsg {
+            channel: extract_channel_from_irc_line(line),
+            target_msg_id,
+            login: Self::extract_tag_value(line, "login").unwrap_or_default(),
+            // The deleted message text is the trailing param after the last " :".
+            text: line.rfind(" :").map(|idx| line[idx + 2..].trim().to_string()),
+        })
+    }
+
+    /// Format: `@ban-duration=<sec>;room-id=<room>;target-user-id=<id>;tmi-sent-ts=<ts> :tmi.twitch.tv CLEARCHAT #<channel> :<user>`,
+    /// or `:tmi.twitch.tv CLEARCHAT #<channel>` for a full clear.
+    fn parse_clearchat(line: &str) -> ClearChat {
+        ClearChat {
+            channel: extract_channel_from_irc_line(line),
+            target_user_id: Self::extract_tag_value(line, "target-user-id"),
+            // The target username is the trailing param. A full clear has no
+            // trailing " :", so an earlier inline colon is never read as one.
+            target_user: line.rfind(" :").map(|idx| line[idx + 2..].trim().to_string()),
+            ban_duration_secs: Self::extract_tag_value(line, "ban-duration").map(|d| d.parse::<u64>().unwrap_or(0)),
+        }
+    }
+
+    /// The ROOMSTATE frame for a line, merged with what the room already said
+    /// so the page and the replay cache never hold a partial frame.
+    fn roomstate_frame(line: &str, channel: Option<&str>) -> String {
+        // Forward room state to frontend — only include tags actually present
+        // Twitch sends FULL roomstate on join, PARTIAL on setting changes
+        let mut room_state = serde_json::Map::new();
+        room_state.insert("type".into(), serde_json::json!("ROOMSTATE"));
+        if let Some(ch) = channel {
+            room_state.insert("channel".into(), serde_json::json!(ch));
+        }
+
+        if let Some(v) = Self::extract_tag_value(line, "followers-only") {
+            if let Ok(n) = v.parse::<i64>() {
+                room_state.insert("followers_only".into(), serde_json::json!(n));
+            }
+        }
+        if let Some(v) = Self::extract_tag_value(line, "slow") {
+            if let Ok(n) = v.parse::<u64>() {
+                room_state.insert("slow".into(), serde_json::json!(n));
+            }
+        }
+        if let Some(v) = Self::extract_tag_value(line, "subs-only") {
+            if let Ok(n) = v.parse::<u8>() {
+                room_state.insert("subs_only".into(), serde_json::json!(n == 1));
+                if let Some(ch) = channel {
+                    crate::services::channel_rewards::note_subs_only(ch, n == 1);
+                }
+            }
+        }
+        if let Some(v) = Self::extract_tag_value(line, "emote-only") {
+            if let Ok(n) = v.parse::<u8>() {
+                room_state.insert("emote_only".into(), serde_json::json!(n == 1));
+            }
+        }
+        if let Some(v) = Self::extract_tag_value(line, "r9k") {
+            if let Ok(n) = v.parse::<u8>() {
+                room_state.insert("r9k".into(), serde_json::json!(n == 1));
+            }
+        }
+
+        if let Some(ch) = channel {
+            let tag_u8 = |name: &str| {
+                Self::extract_tag_value(line, name)
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .map(|n| n == 1)
+            };
+            crate::services::chat_send_limiter::note_room_state(
+                ch,
+                crate::services::chat_send_limiter::RoomModes {
+                    slow_seconds: Self::extract_tag_value(line, "slow").and_then(|v| v.parse().ok()),
+                    followers_only_minutes: Self::extract_tag_value(line, "followers-only")
+                        .and_then(|v| v.parse().ok()),
+                    subs_only: tag_u8("subs-only"),
+                    emote_only: tag_u8("emote-only"),
+                    r9k: tag_u8("r9k"),
+                },
+            );
+            if let Some(room_id) = Self::extract_tag_value(line, "room-id") {
+                crate::services::chat_send_limiter::note_room_id(ch, &room_id);
+            }
+            // Ship the merged room, with its modes in words, so the page
+            // and the replay cache never hold a partial frame.
+            if let Some(fields) = crate::services::chat_send_limiter::room_state_fields(ch) {
+                room_state.extend(fields);
+            }
+            // A followers-only room: learn whether the account already
+            // follows long enough, then word the room again.
+            if let Some(room_id) = crate::services::chat_send_limiter::own_follow_wanted(ch) {
+                tauri::async_runtime::spawn(learn_own_follow(ch.to_string(), room_id));
+            }
+        }
+        serde_json::Value::Object(room_state).to_string()
+    }
+}
+
+/// An emote's size at 1x in CSS pixels, where it is known before the image
+/// loads: Twitch emotes are square at 28; a 7TV emote's 1x file size is in
+/// the room's table.
+pub(crate) fn emote_size_hint(channel: &str, code: &str, url: &str) -> Option<(u32, u32)> {
+    if url.contains("static-cdn.jtvnw.net/emoticons/") {
+        return Some((28, 28));
+    }
+    let lookup = channel_parse_lookup().read().ok()?.get(channel).cloned()?;
+    let emote = lookup.get(code)?;
+    let width = emote.width?;
+    match emote.provider {
+        crate::services::emote_service::EmoteProvider::SevenTV => Some((width, emote.height.unwrap_or(32))),
+        _ => None,
+    }
+}
+
+/// Sends one non-row frame to the windows reading `channel`.
+pub(crate) async fn post_channel_frame(channel: &str, frame: String) {
+    send_to_bridge(BridgeFrame::channel(channel, frame), false).await;
+}
+
+/// A non-row frame for every room (a member's look changing everywhere at once).
+pub(crate) async fn post_frame_to_all(frame: String) {
+    send_to_bridge(BridgeFrame::all(frame), false).await;
 }
 
 fn clear_parse_lookups() {
     if let Ok(mut guard) = channel_parse_lookup().write() {
         guard.clear();
     }
+    crate::services::shared_chat_emotes::release_all();
+}
+
+/// The message body of a `:prefix COMMAND #channel :text` line, or "". The
+/// colon is optional when the body is one word (Twitch and the history mirror
+/// both leave it out), which is how a one-emote message arrives.
+pub(crate) fn irc_trailing_text(raw: &str) -> &str {
+    let rest = if raw.starts_with('@') { raw.split_once(' ').map(|(_, r)| r).unwrap_or("") } else { raw };
+    let text = rest.splitn(4, ' ').nth(3).unwrap_or("");
+    text.strip_prefix(':').unwrap_or(text)
 }
 
 /// Owned Arc snapshots backing a ParseCtx. Gathered once per message; the
@@ -852,6 +1294,7 @@ impl ParseSnapshots {
             channel: self.channel.as_deref(),
             personal: self.personal.as_deref(),
             cheermotes: self.cheermotes.as_deref(),
+            no_cheermotes: false,
         }
     }
 }
@@ -864,14 +1307,61 @@ struct ParseCtx<'a> {
     channel: Option<&'a EmoteLookup>,
     personal: Option<&'a HashMap<String, Emote>>,
     cheermotes: Option<&'a CheermoteSet>,
+    /// Text nobody cheered with (a reward title) never turns a word like
+    /// `Cheer100` into bits; without a channel set the global prefixes
+    /// would still match.
+    no_cheermotes: bool,
 }
 
-/// One cheermote tier from Helix: bits threshold, hex color, animated dark art.
-#[derive(Debug, Clone)]
+/// One cheermote tier from Helix: bits threshold, hex color, animated dark art,
+/// plus what the bits picker needs about its cheermote.
+#[derive(Debug, Clone, Default)]
 pub struct CheermoteTier {
     pub min_bits: u32,
     pub color: String,
     pub url: String,
+    /// The cheermote's prefix as Twitch writes it ("Cheer", "Corgo"); the set
+    /// is keyed by the lowercase form.
+    pub prefix: String,
+    /// The signed-in viewer can cheer with this tier. False for a tier Twitch
+    /// marks `can_cheer: false` and for every tier of a `display_only`
+    /// cheermote: those still render when someone with access used them.
+    pub can_cheer: bool,
+    /// Twitch's display order for the cheermote.
+    pub order: u32,
+    /// The channel's own cheermote rather than a global one.
+    pub custom: bool,
+}
+
+/// The channel's cached cheermote set (`key` = lowercase login), if Helix has
+/// answered for it since the channel was joined.
+pub fn channel_cheermote_set(key: &str) -> Option<Arc<CheermoteSet>> {
+    get_channel_cheermotes().read().ok()?.get(key).cloned()
+}
+
+/// A word that is a cheer in `set`: the longest prefix followed only by
+/// digits, with a nonzero amount. Returns the matched tiers and the amount.
+pub fn match_cheermote<'a>(word: &str, set: &'a CheermoteSet) -> Option<(&'a str, u32, &'a [CheermoteTier])> {
+    if !word.ends_with(|c: char| c.is_ascii_digit()) || !word.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let word_lower = word.to_lowercase();
+    let mut best: Option<(&str, &Vec<CheermoteTier>)> = None;
+    for (prefix, tiers) in set {
+        if !word_lower.starts_with(prefix.as_str()) {
+            continue;
+        }
+        let rest = &word_lower[prefix.len()..];
+        if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if best.is_none_or(|(b, _)| prefix.len() > b.len()) {
+            best = Some((prefix, tiers));
+        }
+    }
+    let (prefix, tiers) = best?;
+    let bits: u32 = word_lower[prefix.len()..].parse().ok()?;
+    (bits > 0).then_some((prefix, bits, tiers.as_slice()))
 }
 
 /// Lowercase prefix -> tiers ascending by `min_bits`.
@@ -887,6 +1377,146 @@ fn get_ws_port() -> &'static Mutex<Option<u16>> {
 
 fn get_channel_consumers() -> &'static Mutex<HashMap<String, HashSet<String>>> {
     CHANNEL_CONSUMERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Channel -> labels of the windows holding it. A channel stays JOINed while
+/// any window holds it.
+type ChannelClaims = HashMap<String, HashSet<String>>;
+
+/// Records `window` as holding `channel`. True when it did not hold it yet.
+fn claim_channel(claims: &mut ChannelClaims, channel: &str, window: &str) -> bool {
+    claims
+        .entry(channel.to_string())
+        .or_default()
+        .insert(window.to_string())
+}
+
+/// Drops `window`'s hold on `channel` and returns how many windows still hold
+/// it. At zero no window holds the channel and it may PART.
+fn release_channel_claim(claims: &mut ChannelClaims, channel: &str, window: &str) -> usize {
+    let Some(holders) = claims.get_mut(channel) else {
+        return 0;
+    };
+    holders.remove(window);
+    let left = holders.len();
+    if left == 0 {
+        claims.remove(channel);
+    }
+    left
+}
+
+/// Drops every hold `window` has, except on `keep`, and returns the channels
+/// no window holds any more.
+fn release_window_holds(claims: &mut ChannelClaims, window: &str, keep: Option<&str>) -> Vec<String> {
+    let mut emptied = Vec::new();
+    claims.retain(|channel, holders| {
+        if keep == Some(channel.as_str()) {
+            return true;
+        }
+        holders.remove(window);
+        if holders.is_empty() {
+            emptied.push(channel.clone());
+            false
+        } else {
+            true
+        }
+    });
+    emptied
+}
+
+/// Whether any window other than `window` holds a channel.
+fn held_by_another_window(claims: &ChannelClaims, window: &str) -> bool {
+    claims
+        .values()
+        .any(|holders| holders.iter().any(|w| w != window))
+}
+
+/// Whether `window` holds any channel.
+fn held_by(claims: &ChannelClaims, window: &str) -> bool {
+    claims.values().any(|holders| holders.contains(window))
+}
+
+#[cfg(test)]
+mod channel_claim_tests {
+    use super::*;
+
+    #[test]
+    fn a_channel_stays_held_while_any_window_holds_it() {
+        let mut claims = ChannelClaims::new();
+        assert!(claim_channel(&mut claims, "caseoh_", "overlay-caseoh_"));
+        assert!(claim_channel(&mut claims, "caseoh_", "main"));
+        // Main lets go while the floating chat still shows it: no PART.
+        assert_eq!(release_channel_claim(&mut claims, "caseoh_", "main"), 1);
+        assert!(claims.contains_key("caseoh_"));
+        // The floating chat lets go: nobody holds it, so it PARTs.
+        assert_eq!(release_channel_claim(&mut claims, "caseoh_", "overlay-caseoh_"), 0);
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn a_window_holds_a_channel_once_however_often_it_claims() {
+        let mut claims = ChannelClaims::new();
+        assert!(claim_channel(&mut claims, "xqc", "multichat-a"));
+        assert!(!claim_channel(&mut claims, "xqc", "multichat-a"));
+        assert_eq!(release_channel_claim(&mut claims, "xqc", "multichat-a"), 0);
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn a_claim_after_a_release_holds_the_channel_again() {
+        // A remount: claim, release, claim again. The second claim holds the
+        // channel, so another window letting go does not PART it.
+        let mut claims = ChannelClaims::new();
+        claim_channel(&mut claims, "caseoh_", "overlay-caseoh_");
+        assert_eq!(release_channel_claim(&mut claims, "caseoh_", "overlay-caseoh_"), 0);
+        assert!(claim_channel(&mut claims, "caseoh_", "overlay-caseoh_"));
+        assert_eq!(release_channel_claim(&mut claims, "caseoh_", "main"), 1);
+    }
+
+    #[test]
+    fn releasing_a_channel_nobody_holds_is_zero() {
+        let mut claims = ChannelClaims::new();
+        assert_eq!(release_channel_claim(&mut claims, "shroud", "main"), 0);
+        assert!(claims.is_empty());
+    }
+
+    #[test]
+    fn a_closed_window_frees_only_what_no_other_window_holds() {
+        let mut claims = ChannelClaims::new();
+        claim_channel(&mut claims, "caseoh_", "main");
+        claim_channel(&mut claims, "xqc", "main");
+        claim_channel(&mut claims, "caseoh_", "overlay-caseoh_");
+        claim_channel(&mut claims, "shroud", "multichat-a");
+        let mut freed = release_window_holds(&mut claims, "main", None);
+        freed.sort();
+        assert_eq!(freed, vec!["xqc".to_string()]);
+        assert_eq!(claims.get("caseoh_").map(|h| h.len()), Some(1));
+        assert!(claims.contains_key("shroud"));
+    }
+
+    #[test]
+    fn a_window_sweep_keeps_the_channel_being_claimed() {
+        let mut claims = ChannelClaims::new();
+        claim_channel(&mut claims, "old", "overlay-x");
+        claim_channel(&mut claims, "new", "overlay-x");
+        assert_eq!(release_window_holds(&mut claims, "overlay-x", Some("new")), vec!["old".to_string()]);
+        assert!(claims.get("new").is_some_and(|h| h.contains("overlay-x")));
+    }
+
+    #[test]
+    fn stopping_chat_sees_other_windows_holds() {
+        let mut claims = ChannelClaims::new();
+        assert!(!held_by(&claims, "main"));
+        claim_channel(&mut claims, "xqc", "main");
+        assert!(held_by(&claims, "main"));
+        assert!(!held_by_another_window(&claims, "main"));
+        claim_channel(&mut claims, "caseoh_", "overlay-caseoh_");
+        assert!(held_by_another_window(&claims, "main"));
+        assert!(held_by_another_window(&claims, "overlay-caseoh_"));
+        release_channel_claim(&mut claims, "caseoh_", "overlay-caseoh_");
+        assert!(!held_by_another_window(&claims, "main"));
+        assert!(!held_by(&claims, "overlay-caseoh_"));
+    }
 }
 
 fn get_own_identity() -> &'static Mutex<Option<(String, String)>> {
@@ -935,6 +1565,238 @@ fn chat_event_params(msg: &ChatMessage) -> Value {
             "ts": ts,
         }
     })
+}
+
+/// The command of a raw IRC line (`PRIVMSG`, `USERNOTICE`, ...): the first
+/// token after the optional tags (`@...`) and prefix (`:...`). Read by token,
+/// so a tag value or message text naming a command never matches.
+fn irc_command(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    if rest.starts_with('@') {
+        rest = rest.split_once(' ')?.1.trim_start();
+    }
+    if rest.starts_with(':') {
+        rest = rest.split_once(' ')?.1.trim_start();
+    }
+    rest.split(' ').next().filter(|c| !c.is_empty())
+}
+
+/// A USERNOTICE with neither the chatter's text nor a system message renders
+/// as a blank row (an `onetapgiftredeemed` with no text, for one); live chat
+/// and history both leave it out.
+fn usernotice_has_visible_content(msg: &ChatMessage) -> bool {
+    !msg.content.is_empty() || msg.metadata.system_message.as_ref().is_some_and(|s| !s.is_empty())
+}
+
+/// One tag's raw value from an IRC line's tag block.
+fn line_tag<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let tags = line.strip_prefix('@')?.split_once(' ')?.0;
+    tags.split(';').find_map(|kv| kv.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// The trailing parameter of an IRC line (the text after the first " :" that
+/// follows the command), or None when the line has none.
+fn line_trailing(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    if rest.starts_with('@') {
+        rest = rest.split_once(' ')?.1.trim_start();
+    }
+    if rest.starts_with(':') {
+        rest = rest.split_once(' ')?.1;
+    }
+    rest.split_once(" :").map(|(_, t)| t.trim_end())
+}
+
+/// The NOTICEs a room sends everyone when a moderator changes a chat mode.
+/// Every other NOTICE answers one chatter's own action (a refused send, a
+/// command result), so a backlog never carries one worth showing.
+fn is_room_mode_notice(msg_id: &str) -> bool {
+    matches!(
+        msg_id,
+        "followers_on"
+            | "followers_on_zero"
+            | "followers_off"
+            | "slow_on"
+            | "slow_off"
+            | "subs_on"
+            | "subs_off"
+            | "emote_only_on"
+            | "emote_only_off"
+            | "r9k_on"
+            | "r9k_off"
+    )
+}
+
+/// A room-mode NOTICE from the backlog as the row live chat shows for it: a
+/// "System" row signed Twitch, carrying the notice text ("This room is now in
+/// followers-only mode."). None for any other NOTICE.
+fn history_notice_row(raw: &str) -> Option<ChatMessage> {
+    let msg_id = line_tag(raw, "msg-id")?;
+    if !is_room_mode_notice(msg_id) {
+        return None;
+    }
+    let text = line_trailing(raw).filter(|t| !t.is_empty())?.to_string();
+    let channel = extract_channel_from_irc_line(raw).unwrap_or_default();
+    let timestamp = line_tag(raw, "tmi-sent-ts")
+        .or_else(|| line_tag(raw, "rm-received-ts"))
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis().to_string());
+    let (formatted_timestamp, formatted_timestamp_with_seconds) = IrcService::format_timestamp(&timestamp);
+    // Stable across parses of the same line, so a later re-parse of the
+    // backlog names the same row.
+    let id = format!("notice-{channel}-{msg_id}-{timestamp}");
+    let tags: HashMap<String, String> = [
+        ("id", id.as_str()),
+        ("user-id", "tw-system"),
+        ("msg-id", msg_id),
+        ("historical", "1"),
+        ("tmi-sent-ts", timestamp.as_str()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    Some(ChatMessage {
+        id,
+        user_id: "tw-system".to_string(),
+        username: "System".to_string(),
+        display_name: "Twitch".to_string(),
+        color: Some("#9147ff".to_string()),
+        badges: vec![Badge {
+            name: "staff".to_string(),
+            version: "1".to_string(),
+            image_url_1x: None,
+            image_url_2x: None,
+            image_url_4x: None,
+            title: None,
+            description: None,
+        }],
+        timestamp,
+        content: text.clone(),
+        provider: "twitch".to_string(),
+        channel,
+        emotes: Vec::new(),
+        tags,
+        layout: LayoutResult::default(),
+        segments: vec![MessageSegment::Text { content: text }],
+        metadata: MessageMetadata {
+            formatted_timestamp,
+            formatted_timestamp_with_seconds,
+            ..Default::default()
+        },
+    })
+}
+
+/// A backlog CLEARMSG removes the one row it deleted, and a CLEARCHAT naming a
+/// user removes that user's rows before it. The mirror is asked to leave
+/// moderated rows out already (`hide_moderated_messages`); this keeps the
+/// result the same when a line slips through. A whole-chat CLEARCHAT removes
+/// nothing, as live chat marks nothing for one.
+fn apply_history_clear(rows: &mut Vec<ChatMessage>, raw: &str) {
+    match irc_command(raw) {
+        Some("CLEARMSG") => {
+            if let Some(target) = line_tag(raw, "target-msg-id").filter(|t| !t.is_empty()) {
+                rows.retain(|m| m.id != target);
+            }
+        }
+        Some("CLEARCHAT") => {
+            if let Some(user) = line_tag(raw, "target-user-id").filter(|t| !t.is_empty()) {
+                rows.retain(|m| m.user_id != user);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a backlog row looks like to a re-stamp: its segments and its quoted
+/// parent's, which are the parts an emote table changes.
+fn history_row_signature(msg: &ChatMessage) -> String {
+    serde_json::to_string(&(
+        &msg.segments,
+        msg.metadata.reply_info.as_ref().and_then(|r| r.parent_segments.as_ref()),
+    ))
+    .unwrap_or_default()
+}
+
+/// The rows of a second parse of a backlog whose segments differ from the
+/// first parse (`before`: id to signature), as the page patches them in
+/// place: `{ id, segments, parent_segments }`. Rows the first parse did not
+/// have are left out; the page never showed them.
+fn history_segment_updates(before: &HashMap<String, String>, again: &[ChatMessage]) -> Vec<Value> {
+    again
+        .iter()
+        .filter(|m| before.get(&m.id).is_some_and(|sig| *sig != history_row_signature(m)))
+        .map(|m| {
+            let mut row = json!({
+                "id": m.id,
+                "segments": m.segments,
+                "parent_segments": m.metadata.reply_info.as_ref().and_then(|r| r.parent_segments.as_ref()),
+            });
+            // A native renderer draws from the view, so the patch carries the new one.
+            if let Some(view) = &m.metadata.view {
+                row["view"] = json!(view);
+            }
+            row
+        })
+        .collect()
+}
+
+/// Announces each channel whose emote table was put in place (the saved
+/// dictionary or a provider refresh), for work waiting on one.
+static EMOTE_TABLE_INSTALLED: OnceLock<broadcast::Sender<String>> = OnceLock::new();
+
+fn emote_table_installed() -> &'static broadcast::Sender<String> {
+    EMOTE_TABLE_INSTALLED.get_or_init(|| broadcast::channel(64).0)
+}
+
+fn note_emote_table_installed(key: &str) {
+    let _ = emote_table_installed().send(key.to_string());
+}
+
+/// Wait until `channel`'s emote table is in place, up to `budget`. True when
+/// it is.
+pub async fn wait_for_channel_emotes(channel: &str, budget: std::time::Duration) -> bool {
+    let key = channel.to_lowercase();
+    // Subscribe before looking, so a table landing in between is still heard.
+    let mut installed = emote_table_installed().subscribe();
+    if with_channel_emotes(&key, |_| ()).await.is_some() {
+        return true;
+    }
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        match tokio::time::timeout_at(deadline, installed.recv()).await {
+            Ok(Ok(k)) if k == key => return true,
+            Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                if with_channel_emotes(&key, |_| ()).await.is_some() {
+                    return true;
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                return with_channel_emotes(&key, |_| ()).await.is_some();
+            }
+        }
+    }
+}
+
+/// How long a backlog parsed without its channel's emote table waits for the
+/// table before giving up on re-stamping. The channel document fetch has a
+/// 25 s budget.
+const HISTORY_RESTAMP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A reward that asks for text reaches chat as an ordinary message tagged only
+/// with its id. Name it: `sn-redeemed-title` and `sn-redeemed-cost` give the
+/// row "Redeemed <title>" and the cost. These are not the `sn-reward-*` tags of
+/// a no-text redemption row, which the stream overlay draws as an event card
+/// with no message.
+fn stamp_reward_name(tags: &mut HashMap<String, String>, raw: &str) {
+    let Some(reward_id) = tags.get("custom-reward-id").filter(|id| !id.is_empty()).cloned() else { return };
+    let Some(channel) = extract_channel_from_irc_line(raw) else { return };
+    let Some(name) = crate::services::channel_rewards::reward_name(&channel, &reward_id) else { return };
+    tags.insert("sn-redeemed-title".into(), name.title);
+    if name.cost > 0 {
+        tags.insert("sn-redeemed-cost".into(), name.cost.to_string());
+    }
 }
 
 // Extract the channel name (lowercase, no leading #) from a raw IRC line.
@@ -1081,6 +1943,7 @@ impl IrcService {
         // but be defensive in case start() is called without a preceding stop().
         get_user_badges_cache().lock().await.clear();
         get_room_state_cache().lock().await.clear();
+        crate::services::channel_rewards::forget_all_rooms();
         get_pending_messages().lock().await.clear();
         get_channel_emotes().lock().await.clear();
         clear_parse_lookups();
@@ -1170,6 +2033,7 @@ impl IrcService {
             let token = match TwitchService::get_token().await {
                 Ok(t) => t,
                 Err(e) => {
+                    irc_transport::note_connect_failed();
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     let d = reconnect_delay(consecutive_failures, false);
                     record_lifecycle(&format!(
@@ -1199,6 +2063,10 @@ impl IrcService {
             )
             .await;
             let session_lived_ms = mono_ms().saturating_sub(session_started);
+            // Read before any await below, while they still describe how the
+            // session ended.
+            let read_age_ms = irc_read_age_ms();
+            let read_wall_age_ms = irc_read_wall_age_ms();
 
             // Between sessions: fail sends/JOINs fast instead of writing into
             // a dead socket, retire this session's keepalive tasks, and drop
@@ -1209,12 +2077,13 @@ impl IrcService {
             tracker_clear().await;
 
             let delay = match outcome {
-                Ok(reason) => {
+                Ok(SessionEnd { reason, transport }) => {
                     // An Ok return proves IRC_CONNECTED went out this attempt
                     // (irc_session's contract), so this loss is a real one.
                     EVER_ESTABLISHED.store(true, std::sync::atomic::Ordering::Relaxed);
                     send_to_bridge("IRC_RECONNECTING".to_string(), false).await;
-                    if session_lived_ms < SESSION_FLAP_THRESHOLD_MS {
+                    crate::services::chat_outage::lost();
+                    let delay = if session_lived_ms < SESSION_FLAP_THRESHOLD_MS {
                         consecutive_failures = consecutive_failures.saturating_add(1);
                         let d = reconnect_delay(consecutive_failures, false);
                         record_lifecycle(&format!(
@@ -1232,14 +2101,20 @@ impl IrcService {
                             RECONNECT_DELAY_AFTER_DROP
                         };
                         record_lifecycle(&format!(
-                            "session ended: {}; reconnecting in {}s",
+                            "session ended: {} ({}s since the last read); reconnecting in {}s",
                             reason,
+                            read_age_ms / 1000,
                             d.as_secs()
                         ));
                         d
+                    };
+                    if is_silent_session_end(reason, read_age_ms, read_wall_age_ms) {
+                        irc_transport::note_session_deaf(transport);
                     }
+                    delay
                 }
                 Err(SessionError::Transient(e)) => {
+                    irc_transport::note_connect_failed();
                     consecutive_failures = consecutive_failures.saturating_add(1);
                     let d = reconnect_delay(consecutive_failures, false);
                     record_lifecycle(&format!(
@@ -1280,7 +2155,7 @@ impl IrcService {
         initial_channel: &str,
         layout_service: &Arc<LayoutService>,
         emote_service: &Arc<tokio::sync::RwLock<EmoteService>>,
-    ) -> std::result::Result<&'static str, SessionError> {
+    ) -> std::result::Result<SessionEnd, SessionError> {
         debug!("[IRC Chat] Connecting to Twitch IRC...");
 
         let connect_started = std::time::Instant::now();
@@ -1288,17 +2163,7 @@ impl IrcService {
             .await
             .map_err(|reason| SessionError::Transient(anyhow::anyhow!("{}", reason)))?;
         let transport = connected.transport;
-        if transport == IrcTransport::WebSocket {
-            record_lifecycle(&format!(
-                "connected via websocket in {}ms{}",
-                connect_started.elapsed().as_millis(),
-                connected
-                    .tcp_failed
-                    .as_deref()
-                    .map(|e| format!(" (tcp 6667 failed: {})", e))
-                    .unwrap_or_default()
-            ));
-        }
+        let other_failed = connected.other_failed;
         let mut reader = connected.reader;
         // The global IRC_WRITER is published only after auth succeeds, so
         // ensure_joined/send_message can never write into an unauthenticated
@@ -1400,7 +2265,16 @@ impl IrcService {
 
         *get_irc_writer().lock().await = Some(writer.clone());
         mark_irc_read();
-        record_lifecycle("authenticated");
+        record_lifecycle(&format!(
+            "authenticated via {} in {}ms{}",
+            transport.describe(),
+            connect_started.elapsed().as_millis(),
+            other_failed
+                .as_deref()
+                .map(|e| format!(" ({} failed: {})", transport.other().describe(), e))
+                .unwrap_or_default()
+        ));
+        let authenticated_at = tokio::time::Instant::now();
 
         // Re-JOIN every tracked channel, not just the initial one. `join_channel`
         // will not re-issue a JOIN while a channel's refcount is above zero, so
@@ -1431,6 +2305,7 @@ impl IrcService {
                     w.send_line(&format!("JOIN #{}\r\n", ch)).await?;
                 }
             }
+            note_joins_sent(channels.len());
             {
                 // Everything this session will JOIN goes into the ack tracker up
                 // front. Paced channels get their deadline pushed out by their
@@ -1468,6 +2343,7 @@ impl IrcService {
                                 return;
                             }
                         }
+                        note_joins_sent(chunk.len());
                         record_lifecycle(&format!("paced JOIN batch: {:?}", chunk));
                     }
                 });
@@ -1513,10 +2389,11 @@ impl IrcService {
 
         // Send connection success notification
         send_to_bridge("IRC_CONNECTED".to_string(), false).await;
+        crate::services::chat_outage::restored().await;
 
         // Flush queued messages (dropped if no receiver is attached yet; the
         // WS handshake also drains this queue when a client connects).
-        let queued: Vec<String> = {
+        let queued: Vec<BridgeFrame> = {
             let mut queue = get_message_queue().lock().await;
             queue.drain(..).collect()
         };
@@ -1527,14 +2404,22 @@ impl IrcService {
             }
         }
 
-        // Start ping task to keep IRC connection alive. The cadence also
-        // bounds dead-connection detection: every PING elicits a PONG read,
-        // so the read timeout can sit just above this interval.
+        // Start ping task to keep IRC connection alive. It PINGs only once the
+        // link has been quiet for IRC_PING_IDLE_MS, and every PING elicits a
+        // PONG read, so the read timeout bounds dead-connection detection.
         let writer_clone = writer.clone();
         let ping_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(IRC_PING_INTERVAL);
+            let mut interval = tokio::time::interval(IRC_PING_CHECK);
+            let mut last_ping_ms: Option<u64> = None;
             loop {
                 interval.tick().await;
+                let now = mono_ms();
+                let pinged_recently =
+                    last_ping_ms.is_some_and(|t| now.saturating_sub(t) < IRC_PING_IDLE_MS);
+                if irc_read_age_ms() < IRC_PING_IDLE_MS || pinged_recently {
+                    continue;
+                }
+                last_ping_ms = Some(now);
                 let mut w = writer_clone.lock().await;
                 if w.send_line("PING :tmi.twitch.tv\r\n").await.is_err() {
                     break;
@@ -1609,6 +2494,7 @@ impl IrcService {
                             key,
                             attempts + 1
                         ));
+                        take_join_slot().await;
                         {
                             let mut w = writer_watch.lock().await;
                             if w.send_line(&format!("JOIN #{}\r\n", key)).await.is_err() {
@@ -1629,13 +2515,20 @@ impl IrcService {
         *get_irc_heartbeat_abort().lock().await = Some(heartbeat_handle.abort_handle());
         *get_irc_joinwatch_abort().lock().await = Some(joinwatch_handle.abort_handle());
 
-        // Listen for messages. The timeout is the half-open detector: we PING
-        // every 30s and the server answers, so 75s without a completed read
-        // means the socket is dead even if the OS never reports it.
+        // Listen for messages. The deadline is the half-open detector: we PING
+        // a quiet link and the server answers, so IRC_READ_TIMEOUT without a
+        // completed read means the socket is dead even if the OS never reports
+        // it. It runs from the last ACCEPTED read, so the fault injection's
+        // discarded lines count as silence, exactly like a blackhole.
+        let deafen_after = fault_deafen_after(transport);
+        let mut deafened = false;
+        let mut last_accepted = tokio::time::Instant::now();
         loop {
             line.clear();
+            let deadline = last_accepted + IRC_READ_TIMEOUT;
+            let deaf = deafen_after.is_some_and(|d| authenticated_at.elapsed() >= d);
             let end_reason: Option<&'static str> =
-                match tokio::time::timeout(IRC_READ_TIMEOUT, reader.read_line(&mut line)).await {
+                match tokio::time::timeout_at(deadline, reader.read_line(&mut line)).await {
                     Err(_) => {
                         warn!(
                             "[IRC Chat] no IRC traffic for {}s, connection presumed dead",
@@ -1644,7 +2537,18 @@ impl IrcService {
                         Some("read liveness timeout")
                     }
                     Ok(Ok(0)) => Some("closed by server"),
+                    Ok(Ok(_)) if deaf => {
+                        if !deafened {
+                            deafened = true;
+                            record_lifecycle(&format!(
+                                "fault injection: discarding everything read on {} from now on",
+                                transport.describe()
+                            ));
+                        }
+                        None
+                    }
                     Ok(Ok(_)) => {
+                        last_accepted = tokio::time::Instant::now();
                         mark_irc_read();
                         if is_server_reconnect(&line) {
                             Some("server RECONNECT")
@@ -1690,7 +2594,7 @@ impl IrcService {
                 };
 
             if let Some(reason) = end_reason {
-                return Ok(reason);
+                return Ok(SessionEnd { reason, transport });
             }
         }
     }
@@ -1778,6 +2682,20 @@ impl IrcService {
                 // side-effect lane: the log is the record, not the display.
                 let rules = ChatRules::snapshot();
                 let verdict = ChatRules::evaluate(&mut chat_msg, &rules);
+                if !verdict.drop {
+                    crate::services::mention_ping::on_live_message(
+                        &chat_msg,
+                        verdict.mentioned,
+                        verdict.reply_to_me,
+                    );
+                    crate::services::chat_row_view::stamp(&mut chat_msg);
+                    #[cfg(desktop)]
+                    crate::services::mention_notify::on_live_message(
+                        &chat_msg,
+                        verdict.mentioned,
+                        verdict.reply_to_me,
+                    );
+                }
 
                 // Deliver to the frontend FIRST (wire order is the only order
                 // the UI needs), then hand the slow side effects (history LRU,
@@ -1785,7 +2703,15 @@ impl IrcService {
                 // block the read loop.
                 if !verdict.drop {
                     if let Ok(json_msg) = serde_json::to_string(&chat_msg) {
-                        send_to_bridge(json_msg, true).await;
+                        send_to_bridge(
+                            BridgeFrame::row(
+                                &chat_msg.channel,
+                                json_msg,
+                                chat_msg.metadata.is_mentioned || chat_msg.metadata.is_reply_to_me,
+                            ),
+                            true,
+                        )
+                        .await;
                     }
                     crate::services::reminder_service::on_message(&chat_msg);
                 }
@@ -1796,22 +2722,27 @@ impl IrcService {
                 });
             } else {
                 // Fallback to sending raw string if parsing fails
-                send_to_bridge(enhanced_message.to_string(), true).await;
+                let text = enhanced_message.to_string();
+                let ch = extract_channel_from_irc_line(&text);
+                send_to_bridge(BridgeFrame::maybe_channel(ch.as_deref(), text), true).await;
             }
         } else if trimmed.contains("USERNOTICE") {
             // Subscription, resub, gift sub, etc.
+            // The viewer's own sub, or a gift to them, shows in every chat menu at once.
+            if let Some((room, subscriber)) = crate::services::channel_relationship::sub_notice(trimmed) {
+                let mine = crate::services::account_store::AccountStore::primary()
+                    .is_some_and(|me| me.login.eq_ignore_ascii_case(&subscriber));
+                if mine {
+                    tauri::async_runtime::spawn(async move {
+                        crate::services::channel_state::own_sub_seen(&room).await;
+                    });
+                }
+            }
             // Parse USERNOTICE messages - layout will be measured by frontend
             if let Some(mut chat_msg) = Self::parse_usernotice(trimmed) {
                 // Skip USERNOTICE messages with no visible content
                 // These render as blank/ghost messages (e.g., "onetapgiftredeemed" with no text)
-                let has_content = !chat_msg.content.is_empty();
-                let has_system_msg = chat_msg
-                    .metadata
-                    .system_message
-                    .as_ref()
-                    .is_some_and(|s| !s.is_empty());
-
-                if !has_content && !has_system_msg {
+                if !usernotice_has_visible_content(&chat_msg) {
                     debug!(
                         "[IRC Chat] Skipping empty USERNOTICE: type={:?}",
                         chat_msg.metadata.msg_type
@@ -1843,12 +2774,23 @@ impl IrcService {
                 // Rule engine (raid tint, sub-message filters, ignores).
                 let rules = ChatRules::snapshot();
                 let verdict = ChatRules::evaluate(&mut chat_msg, &rules);
+                if !verdict.drop {
+                    crate::services::chat_row_view::stamp(&mut chat_msg);
+                }
 
                 // Frontend first, side effects on the ordered lane (no history:
                 // USERNOTICE never fed the profile-card history).
                 if !verdict.drop {
                     if let Ok(json_msg) = serde_json::to_string(&chat_msg) {
-                        send_to_bridge(json_msg, true).await;
+                        send_to_bridge(
+                            BridgeFrame::row(
+                                &chat_msg.channel,
+                                json_msg,
+                                chat_msg.metadata.is_mentioned || chat_msg.metadata.is_reply_to_me,
+                            ),
+                            true,
+                        )
+                        .await;
                     }
                 }
                 enqueue_side_effect(MessageSideEffects {
@@ -1858,7 +2800,11 @@ impl IrcService {
                 });
             } else {
                 // Fallback to raw string if parsing fails
-                send_to_bridge(trimmed.to_string(), true).await;
+                send_to_bridge(
+                    BridgeFrame::maybe_channel(extract_channel_from_irc_line(trimmed).as_deref(), trimmed.to_string()),
+                    true,
+                )
+                .await;
             }
         } else if trimmed.contains("ROOMSTATE") {
             // Room state updates (slow mode, sub-only, etc.)
@@ -1868,41 +2814,7 @@ impl IrcService {
             // is keyed per channel.
             let channel_name = extract_channel_from_irc_line(trimmed);
 
-            // Forward room state to frontend — only include tags actually present
-            // Twitch sends FULL roomstate on join, PARTIAL on setting changes
-            let mut room_state = serde_json::Map::new();
-            room_state.insert("type".into(), serde_json::json!("ROOMSTATE"));
-            if let Some(ref ch) = channel_name {
-                room_state.insert("channel".into(), serde_json::json!(ch));
-            }
-
-            if let Some(v) = Self::extract_tag_value(trimmed, "followers-only") {
-                if let Ok(n) = v.parse::<i64>() {
-                    room_state.insert("followers_only".into(), serde_json::json!(n));
-                }
-            }
-            if let Some(v) = Self::extract_tag_value(trimmed, "slow") {
-                if let Ok(n) = v.parse::<u64>() {
-                    room_state.insert("slow".into(), serde_json::json!(n));
-                }
-            }
-            if let Some(v) = Self::extract_tag_value(trimmed, "subs-only") {
-                if let Ok(n) = v.parse::<u8>() {
-                    room_state.insert("subs_only".into(), serde_json::json!(n == 1));
-                }
-            }
-            if let Some(v) = Self::extract_tag_value(trimmed, "emote-only") {
-                if let Ok(n) = v.parse::<u8>() {
-                    room_state.insert("emote_only".into(), serde_json::json!(n == 1));
-                }
-            }
-            if let Some(v) = Self::extract_tag_value(trimmed, "r9k") {
-                if let Ok(n) = v.parse::<u8>() {
-                    room_state.insert("r9k".into(), serde_json::json!(n == 1));
-                }
-            }
-
-            let room_state_str = serde_json::Value::Object(room_state).to_string();
+            let room_state_str = Self::roomstate_frame(trimmed, channel_name.as_deref());
 
             // Cache the room state per channel so late-mounting MultiChat tabs
             // for any subscribed channel get its current state on connect.
@@ -1916,7 +2828,7 @@ impl IrcService {
                 confirm_join(ch).await;
             }
 
-            send_to_bridge(room_state_str, false).await;
+            send_to_bridge(BridgeFrame::maybe_channel(channel_name.as_deref(), room_state_str), false).await;
 
             // Check for shared chat information. Spawned: this is a Helix HTTP
             // round-trip (pure cache refresh — enhance_message reads the cache
@@ -1951,6 +2863,12 @@ impl IrcService {
                     channel_name, badges
                 );
                 if let Some(ref ch) = channel_name {
+                    crate::services::channel_rewards::note_viewer_badges(ch, &badges);
+                    // A new role (or subscribing) changes what the room's
+                    // modes mean for the account: resend the room in words.
+                    if crate::services::chat_send_limiter::note_own_badges(ch, &badges) {
+                        reship_room_state(ch).await;
+                    }
                     get_user_badges_cache()
                         .lock()
                         .await
@@ -1966,7 +2884,7 @@ impl IrcService {
                 // only open channel and repainted the user's own rows without
                 // their channel badges, so it is not forwarded at all.
                 if let Some(ch) = &channel_name {
-                    send_to_bridge(format!("USER_BADGES:#{}:{}", ch, badges), false).await;
+                    send_to_bridge(BridgeFrame::channel(ch, format!("USER_BADGES:#{}:{}", ch, badges)), false).await;
                 }
             }
 
@@ -1985,7 +2903,7 @@ impl IrcService {
                         Some(ch) => format!("USER_COLOR:#{}:{}", ch, color),
                         None => format!("USER_COLOR:{}", color),
                     };
-                    send_to_bridge(color_message, false).await;
+                    send_to_bridge(BridgeFrame::maybe_channel(channel_name.as_deref(), color_message), false).await;
                 }
             }
 
@@ -2003,26 +2921,13 @@ impl IrcService {
             // Format: @login=<user>;room-id=<room>;target-msg-id=<msg-id>;tmi-sent-ts=<ts> :tmi.twitch.tv CLEARMSG #<channel> :<message>
             debug!("[IRC Chat] Message deleted: {}", trimmed);
 
-            if let Some(target_msg_id) = Self::extract_tag_value(trimmed, "target-msg-id") {
-                let channel_name = extract_channel_from_irc_line(trimmed);
-                // The deleted message text is the trailing param after the last " :".
-                let deleted_text = trimmed
-                    .rfind(" :")
-                    .map(|idx| trimmed[idx + 2..].trim().to_string());
-                let login = Self::extract_tag_value(trimmed, "login").unwrap_or_default();
-                if let Some(ch) = &channel_name {
-                    ChatLoggerService::log_deleted_message(ch, &login, deleted_text.as_deref());
-                    ChatHistory::mark_deleted(ch, &target_msg_id);
+            if let Some(clear) = Self::parse_clearmsg(trimmed) {
+                if let Some(ch) = &clear.channel {
+                    ChatLoggerService::log_deleted_message(ch, &clear.login, clear.text.as_deref());
+                    ChatHistory::mark_deleted(ch, &clear.target_msg_id);
                 }
                 // Send deletion event to frontend, tagged with channel for routing
-                let delete_event = json!({
-                    "type": "CLEARMSG",
-                    "channel": channel_name,
-                    "target_msg_id": target_msg_id,
-                    "login": login,
-                    "message": deleted_text
-                });
-                send_to_bridge(delete_event.to_string(), false).await;
+                send_to_bridge(BridgeFrame::maybe_channel(clear.channel.as_deref(), clear.frame().to_string()), false).await;
             }
         } else if trimmed.contains("CLEARCHAT") {
             // User timed out/banned (clear all their messages) or chat cleared
@@ -2030,38 +2935,17 @@ impl IrcService {
             // Or for full chat clear: :tmi.twitch.tv CLEARCHAT #<channel>
             debug!("[IRC Chat] Chat clear/timeout: {}", trimmed);
 
-            let target_user_id = Self::extract_tag_value(trimmed, "target-user-id");
-            let ban_duration = Self::extract_tag_value(trimmed, "ban-duration");
-            let channel_name = extract_channel_from_irc_line(trimmed);
-
-            // Extract target username from the message content (after the colon at the end).
-            // For full chat clears there's no trailing " :" so be careful not to misinterpret
-            // an earlier inline colon as the username delimiter.
-            let target_user = if let Some(idx) = trimmed.rfind(" :") {
-                Some(trimmed[idx + 2..].trim().to_string())
-            } else {
-                None
-            };
-
-            let ban_duration_secs = ban_duration.map(|d| d.parse::<u64>().unwrap_or(0));
-            if let Some(ch) = &channel_name {
-                match &target_user {
-                    Some(user) => ChatLoggerService::log_timeout(ch, user, ban_duration_secs),
+            let clear = Self::parse_clearchat(trimmed);
+            if let Some(ch) = &clear.channel {
+                match &clear.target_user {
+                    Some(user) => ChatLoggerService::log_timeout(ch, user, clear.ban_duration_secs),
                     None => ChatLoggerService::log_chat_cleared(ch),
                 }
-                if let Some(uid) = &target_user_id {
+                if let Some(uid) = &clear.target_user_id {
                     ChatHistory::mark_user_cleared(ch, uid);
                 }
             }
-
-            let clear_event = json!({
-                "type": "CLEARCHAT",
-                "channel": channel_name,
-                "target_user_id": target_user_id,
-                "target_user": target_user,
-                "ban_duration": ban_duration_secs
-            });
-            send_to_bridge(clear_event.to_string(), false).await;
+            send_to_bridge(BridgeFrame::maybe_channel(clear.channel.as_deref(), clear.frame().to_string()), false).await;
         } else if trimmed.contains("NOTICE") {
             // System notices — forward to frontend for user-facing handling
             debug!("[IRC Chat] Notice: {}", trimmed);
@@ -2069,6 +2953,18 @@ impl IrcService {
             // Extract the msg-id tag (e.g. "msg_followersonly", "msg_subsonly")
             // Present when twitch.tv/tags capability is active (requested at connect)
             let msg_id = Self::extract_tag_value(trimmed, "msg-id");
+
+            // A running /spam or /pyramid there hears refusals and bans.
+            if let (Some(id), Some(ch)) = (msg_id.as_deref(), extract_channel_from_irc_line(trimmed)) {
+                crate::services::chat_burst::note_notice(&ch, id);
+                // A send refused because of a warning locks the box behind
+                // its Acknowledge button.
+                if crate::services::chat_warning::is_warned_refusal(Some(id), None) {
+                    tokio::spawn(async move {
+                        crate::services::chat_warning::on_refusal(&ch, Some("msg_warned"), None).await;
+                    });
+                }
+            }
 
             // A suspended channel can never confirm its JOIN; forget it so the
             // JOIN watchdog doesn't drop sessions chasing it forever.
@@ -2091,7 +2987,11 @@ impl IrcService {
                 "msg_id": msg_id,
                 "message": notice_text,
             });
-            send_to_bridge(notice_event.to_string(), false).await;
+            send_to_bridge(
+                BridgeFrame::maybe_channel(extract_channel_from_irc_line(trimmed).as_deref(), notice_event.to_string()),
+                false,
+            )
+            .await;
         } else if let Some(join_ch) = parse_join_channel(trimmed) {
             // JOIN frame — ours or any member's (twitch.tv/membership relays
             // them only for channels we are in). Membership proof for the ack
@@ -2184,6 +3084,10 @@ impl IrcService {
                                                     true,
                                                     std::sync::atomic::Ordering::Relaxed,
                                                 );
+                                                // Who each partner is, ahead of their first row.
+                                                crate::services::shared_chat_source::warm(
+                                                    partner_ids.iter().filter(|id| id.as_str() != room_id).cloned().collect(),
+                                                );
                                             }
 
                                             debug!(
@@ -2209,7 +3113,7 @@ impl IrcService {
     /// prefixes) from Helix and cache it. Session-cached: a hit is a no-op, a
     /// PART evicts, so a re-JOIN refreshes. On any failure nothing is cached
     /// and parse_cheermote falls back to its static global list.
-    async fn fetch_and_store_cheermotes(key: String, broadcaster_id: String) {
+    pub(crate) async fn fetch_and_store_cheermotes(key: String, broadcaster_id: String) {
         if get_channel_cheermotes().read().is_ok_and(|g| g.contains_key(&key)) {
             return;
         }
@@ -2280,6 +3184,10 @@ impl IrcService {
             let Some(tiers) = entry.get("tiers").and_then(|t| t.as_array()) else {
                 continue;
             };
+            let kind = entry.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+            let display_only = kind == "display_only";
+            let custom = kind == "channel_custom";
+            let order = entry.get("order").and_then(|o| o.as_u64()).unwrap_or(u64::from(u32::MAX)) as u32;
             let mut parsed: Vec<CheermoteTier> = tiers
                 .iter()
                 .filter_map(|t| {
@@ -2290,10 +3198,15 @@ impl IrcService {
                         .iter()
                         .find_map(|(kind, size)| dark.get(kind)?.get(size)?.as_str())?
                         .to_string();
+                    let can_cheer = !display_only && t.get("can_cheer").and_then(|c| c.as_bool()).unwrap_or(false);
                     Some(CheermoteTier {
                         min_bits,
                         color,
                         url,
+                        prefix: prefix.to_string(),
+                        can_cheer,
+                        order,
+                        custom,
                     })
                 })
                 .collect();
@@ -2339,10 +3252,18 @@ impl IrcService {
 
     async fn handle_local_ws(
         local_socket: warp::ws::WebSocket,
-        tx: Arc<broadcast::Sender<String>>,
+        tx: Arc<broadcast::Sender<BridgeFrame>>,
+        born: u64,
     ) {
-        let (mut local_tx, _local_rx) = local_socket.split();
+        let (mut local_tx, mut local_rx) = local_socket.split();
         let mut rx = tx.subscribe();
+        // Resolves once a full stop has come after this socket's server was
+        // built, even one that landed before this task started.
+        let mut closing = bridge_close().subscribe();
+        let stopped = async move {
+            let _ = closing.wait_for(|g| *g != born).await;
+        };
+        tokio::pin!(stopped);
 
         debug!("[WS] New local WebSocket client connected");
 
@@ -2363,7 +3284,7 @@ impl IrcService {
         if !held.is_empty() {
             info!("[WS] replaying {} message(s) held for a late client", held.len());
             for msg in held {
-                let _ = local_tx.send(warp::ws::Message::text(msg)).await;
+                let _ = local_tx.send(warp::ws::Message::text(msg.text.to_string())).await;
             }
         }
 
@@ -2400,7 +3321,7 @@ impl IrcService {
                 queued_count
             );
             while let Some(msg) = queue.pop_front() {
-                if local_tx.send(warp::ws::Message::text(msg)).await.is_err() {
+                if local_tx.send(warp::ws::Message::text(msg.text.to_string())).await.is_err() {
                     debug!("[WS] Client disconnected while sending queued messages");
                     return;
                 }
@@ -2408,30 +3329,67 @@ impl IrcService {
         }
         drop(queue);
 
-        // Forward messages from the broadcast to the local client.
+        // Forward frames to this window by its route (services::chat_bridge_route):
+        // until the window says which channels it holds it gets everything; after
+        // that only its own channels, with the ones it holds back waiting here in
+        // order and a per-second count sent instead.
         //
-        // `while let Ok(..) = rx.recv()` is wrong here: it exits on
-        // `RecvError::Lagged`, which fires whenever a subscriber falls behind the
-        // channel capacity. Lagged is a recoverable miss, so log it and keep
-        // draining. Only `Closed` tears the handler down.
+        // A lagged receiver is a recoverable miss: log it and keep draining. Only
+        // `Closed`, a closed client, or a failed send ends the handler.
+        let mut route = SocketRoute::default();
+        let mut ticks = tokio::time::interval(std::time::Duration::from_secs(1));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            match rx.recv().await {
-                Ok(text) => {
-                    if local_tx.send(warp::ws::Message::text(text)).await.is_err() {
-                        debug!("[WS] Client disconnected");
+            tokio::select! {
+                _ = &mut stopped => {
+                    let _ = local_tx
+                        .send(warp::ws::Message::close_with(1012u16, "chat service stopped"))
+                        .await;
+                    debug!("[WS] Closed a page socket: the chat service stopped");
+                    break;
+                }
+                frame = rx.recv() => match frame {
+                    Ok(f) => {
+                        if let Some(text) = route.on_frame(&f) {
+                            if local_tx.send(warp::ws::Message::text(text.to_string())).await.is_err() {
+                                debug!("[WS] Client disconnected");
+                                break;
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "[WS] Subscriber lagged behind by {} messages; continuing",
+                            n
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("[WS] Broadcast channel closed");
                         break;
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    log::warn!(
-                        "[WS] Subscriber lagged behind by {} messages; continuing",
-                        n
-                    );
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    debug!("[WS] Broadcast channel closed");
-                    break;
+                },
+                line = local_rx.next() => match line {
+                    Some(Ok(m)) => {
+                        if m.is_close() {
+                            break;
+                        }
+                        if let Ok(text) = m.to_str() {
+                            for out in route.on_line(text) {
+                                if local_tx.send(warp::ws::Message::text(out.to_string())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => break,
+                },
+                _ = ticks.tick() => {
+                    for out in route.take_ticks() {
+                        if local_tx.send(warp::ws::Message::text(out.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -2517,6 +3475,7 @@ impl IrcService {
                 .map(|(login, _)| login.clone())
                 .unwrap_or_default();
             ChatLoggerService::log_own_message(&channel, &login, message);
+            Self::record_own_irc_line(&channel, message).await;
         }
         // Plugin delivery uses an empty id (no server-assigned id exists).
         if !is_command {
@@ -2584,13 +3543,7 @@ impl IrcService {
         // (a webview reload re-acquiring, a reconnect re-attach) is a no-op,
         // which is what keeps claims from inflating: the set can never hold a
         // window twice, so releases always balance.
-        let newly_claimed = {
-            let mut consumers = get_channel_consumers().lock().await;
-            consumers
-                .entry(key.clone())
-                .or_default()
-                .insert(window.to_string())
-        };
+        let newly_claimed = claim_channel(&mut *get_channel_consumers().lock().await, &key, window);
 
         if !newly_claimed {
             debug!(
@@ -2601,22 +3554,19 @@ impl IrcService {
             // two set lookups, but for a channel whose JOIN the server silently
             // dropped it re-issues the JOIN — which is what turns the user's
             // refresh into a real recovery instead of an IRC no-op.
-            return Self::ensure_joined(&key).await;
+            Self::ensure_joined(&key).await?;
+            replay_room_state(&key).await;
+            return Ok(());
         }
 
         // Make sure the channel is actually JOINed (no-op when another window
         // got there first). On failure, give back the claim so a later retry
         // can JOIN cleanly instead of seeing an existing consumer.
         if let Err(e) = Self::ensure_joined(&key).await {
-            let mut consumers = get_channel_consumers().lock().await;
-            if let Some(entry) = consumers.get_mut(&key) {
-                entry.remove(window);
-                if entry.is_empty() {
-                    consumers.remove(&key);
-                }
-            }
+            release_channel_claim(&mut *get_channel_consumers().lock().await, &key, window);
             return Err(e);
         }
+        replay_room_state(&key).await;
 
         Ok(())
     }
@@ -2653,6 +3603,7 @@ impl IrcService {
         );
         match Self::wait_for_irc_writer(100).await {
             Some(writer) => {
+                take_join_slot().await;
                 let write_result = async {
                     let mut w = writer.lock().await;
                     w.send_line(&format!("JOIN #{}\r\n", key)).await
@@ -2725,20 +3676,7 @@ impl IrcService {
         // usually lose to — the popout's start_chat, leaving the popout
         // subscribed to a channel nobody is JOINed to. Only the last
         // consumer's leave actually PARTs.
-        let remaining = {
-            let mut consumers = get_channel_consumers().lock().await;
-            match consumers.get_mut(&key) {
-                Some(entry) => {
-                    entry.remove(window);
-                    let n = entry.len();
-                    if n == 0 {
-                        consumers.remove(&key);
-                    }
-                    n
-                }
-                None => 0,
-            }
-        };
+        let remaining = release_channel_claim(&mut *get_channel_consumers().lock().await, &key, window);
 
         if remaining > 0 {
             debug!(
@@ -2748,8 +3686,10 @@ impl IrcService {
             return Ok(());
         }
 
+        // Named in the lifecycle log, so a chat that went quiet in one window
+        // shows which window's release took the channel away.
+        record_lifecycle(&format!("PART #{} (window {} let go, no window holds it)", key, window));
         Self::part_channel(&key).await?;
-        debug!("[IRC Chat] Left channel: #{} (last consumer)", key);
         Ok(())
     }
 
@@ -2761,33 +3701,44 @@ impl IrcService {
     /// and on a fresh-claim `start_chat`, where any claims still recorded for
     /// the window belong to a previous JS context of it.
     pub async fn release_window_claims(window: &str, keep: Option<&str>) {
-        let emptied: Vec<String> = {
-            let mut consumers = get_channel_consumers().lock().await;
-            let mut emptied = Vec::new();
-            consumers.retain(|channel, set| {
-                if keep == Some(channel.as_str()) {
-                    return true;
-                }
-                set.remove(window);
-                if set.is_empty() {
-                    emptied.push(channel.clone());
-                    false
-                } else {
-                    true
-                }
-            });
-            emptied
-        };
+        let emptied = release_window_holds(&mut *get_channel_consumers().lock().await, window, keep);
 
         for channel in emptied {
-            debug!(
-                "[IRC Chat] releasing stale claim on {} held by window {}",
+            record_lifecycle(&format!(
+                "PART #{} (window {} closed or restarted, no window holds it)",
                 channel, window
-            );
+            ));
             if let Err(e) = Self::part_channel(&channel).await {
                 log::warn!("[IRC Chat] stale-claim PART for {} failed: {}", channel, e);
             }
         }
+    }
+
+    /// Whether a window other than `window` holds a Twitch channel, so the
+    /// shared connection still carries someone else's chat.
+    pub async fn held_by_other_windows(window: &str) -> bool {
+        held_by_another_window(&*get_channel_consumers().lock().await, window)
+    }
+
+    /// Whether `window` itself holds a Twitch channel.
+    pub async fn held_by_window(window: &str) -> bool {
+        held_by(&*get_channel_consumers().lock().await, window)
+    }
+
+    /// Every Twitch channel the connection is in, sorted.
+    pub async fn current_channel_list() -> Vec<String> {
+        let mut list: Vec<String> = get_current_channels().lock().await.iter().cloned().collect();
+        list.sort();
+        list
+    }
+
+    /// The Twitch channels `window` holds, sorted.
+    pub async fn channels_held_by(window: &str) -> Vec<String> {
+        let claims = get_channel_consumers().lock().await;
+        let mut held: Vec<String> =
+            claims.iter().filter(|(_, holders)| holders.contains(window)).map(|(ch, _)| ch.clone()).collect();
+        held.sort();
+        held
     }
 
     /// PART any joined channel that no window claims, except `keep`. Joined-
@@ -2810,7 +3761,7 @@ impl IrcService {
                 .collect()
         };
         for channel in orphans {
-            debug!("[IRC Chat] PARTing unclaimed channel {}", channel);
+            record_lifecycle(&format!("PART #{} (warm-up reap, no window holds it)", channel));
             if let Err(e) = Self::part_channel(&channel).await {
                 log::warn!("[IRC Chat] unclaimed PART for {} failed: {}", channel, e);
             }
@@ -2842,6 +3793,7 @@ impl IrcService {
         get_user_badges_cache().lock().await.remove(key);
         get_user_color_cache().lock().await.remove(key);
         get_room_state_cache().lock().await.remove(key);
+        crate::services::channel_rewards::forget_room(key);
         // The search ring lives and dies with the channel's last consumer.
         ChatHistory::clear_channel(key);
         crate::services::automod_queue::AutomodQueue::clear_channel(key);
@@ -2935,6 +3887,7 @@ impl IrcService {
                         );
                         rebuild_parse_lookup(&key, &disk_set);
                         map.insert(key.clone(), disk_set);
+                        note_emote_table_installed(&key);
                         seeded = true;
                     }
                 }
@@ -3027,7 +3980,8 @@ impl IrcService {
                 if seven_tv_ok {
                     crate::services::emote_set_cache::save_force(&user_id, &emote_set);
                     rebuild_parse_lookup(&key, &emote_set);
-                    get_channel_emotes().lock().await.insert(key, emote_set);
+                    get_channel_emotes().lock().await.insert(key.clone(), emote_set);
+                    note_emote_table_installed(&key);
                 } else {
                     debug!(
                         "[IRC Chat] Keeping disk-seeded set for {}; 7TV channel fetch was deficient (7TV {})",
@@ -3201,18 +4155,43 @@ impl IrcService {
                 "user_id": twitch_id,
                 "message_ids": message_ids,
             });
-            send_to_bridge(frame.to_string(), false).await;
+            send_to_bridge(BridgeFrame::channel(&channel, frame.to_string()), false).await;
         }
     }
 
     /// The ids, per channel, of the rows whose text holds one of the set's
     /// names as a whole word (the same split the parser uses).
+    /// A reply's quoted parent as segments, tokenized with the channel's sets
+    /// like a row (its Twitch emotes matched by name, since the parent arrives
+    /// without positions). The parent's sender is not this message's, so no
+    /// personal emotes; and no cheermotes, a quote does not spend bits.
+    fn quoted_segments(body: &str, snapshots: &ParseSnapshots) -> Vec<MessageSegment> {
+        let natives = snapshots
+            .channel
+            .as_deref()
+            .map(|lookup| native_emote_positions(body, &lookup.natives))
+            .unwrap_or_default();
+        let ctx = ParseCtx {
+            channel: snapshots.channel.as_deref(),
+            no_cheermotes: true,
+            ..Default::default()
+        };
+        Self::parse_message_segments(body, &natives, &ctx)
+    }
+
     fn rows_naming_personal_emotes(
         rows: Vec<(String, String, String)>,
         set: &HashMap<String, Emote>,
     ) -> HashMap<String, Vec<String>> {
         let mut by_channel: HashMap<String, Vec<String>> = HashMap::new();
         for (channel, id, text) in rows {
+            // A personal set belongs to a TWITCH id. The history ring also holds
+            // other platforms' rows (keyed `provider:channel`), whose user ids are
+            // a different number space: a Kick chatter sharing the number would
+            // have been painted with a Twitch stranger's emotes.
+            if channel.contains(':') {
+                continue;
+            }
             if text.split(' ').any(|word| set.contains_key(word)) {
                 by_channel.entry(channel).or_default().push(id);
             }
@@ -3290,11 +4269,10 @@ impl IrcService {
     /// synchronously with no locks and no data clones - the block_in_place +
     /// block_on bridge this replaced was a runtime-wide scheduling event per
     /// chat message.
-    fn gather_parse_snapshots(channel: &str, sender_id: &str) -> ParseSnapshots {
-        let channel_lookup = channel_parse_lookup()
-            .read()
-            .ok()
-            .and_then(|g| g.get(channel).cloned());
+    /// `partner`: the table of the Shared Chat room the row was sent in, which
+    /// replaces the home channel's (see `shared_chat_emotes`).
+    fn gather_parse_snapshots(channel: &str, sender_id: &str, partner: Option<Arc<EmoteLookup>>) -> ParseSnapshots {
+        let channel_lookup = partner.or_else(|| channel_parse_lookup().read().ok().and_then(|g| g.get(channel).cloned()));
         let personal = if sender_id.is_empty()
             || !PERSONAL_EMOTES_PRESENT.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -3435,11 +4413,11 @@ impl IrcService {
                 }
             }
 
-            // Add Twitch emote (check for 7TV override) - bounds already validated above
+            // Add the Twitch emote - bounds already validated above
             let emote_name = &content[start_byte..end_byte_exclusive];
 
             // A Twitch chat GIF: the span is a bracketed description, not an
-            // emote code, so it takes no 7TV override and no text parsing.
+            // emote code, so it takes no text parsing.
             if emote.gif {
                 segments.push(MessageSegment::Gif {
                     content: emote_name.to_string(),
@@ -3450,30 +4428,20 @@ impl IrcService {
                 continue;
             }
 
-            // Check if 7TV has an emote with the same name (7TV takes priority)
-            let seventv_override = ctx.channel.and_then(|c| c.seventv_override(emote_name));
-
-            if let Some(seventv_emote) = seventv_override {
-                // Use 7TV version instead of Twitch
-                segments.push(MessageSegment::Emote {
-                    content: emote_name.to_string(),
-                    emote_id: Some(seventv_emote.id.clone()),
-                    emote_url: seventv_emote.url.clone(),
-                    is_zero_width: seventv_emote.is_zero_width,
-                    modifier_flags: None,
-                    is_personal: None,
-                });
-            } else {
-                // Use Twitch emote
-                segments.push(MessageSegment::Emote {
-                    content: emote_name.to_string(),
-                    emote_id: Some(emote.id.clone()),
-                    emote_url: emote.url.clone(),
-                    is_zero_width: None,
-                    modifier_flags: None,
-                    is_personal: None,
-                });
-            }
+            // A span Twitch marked is Twitch's emote, always. A third-party
+            // emote with the same name (a channel's 7TV `xqcL`) never replaces
+            // it; third-party names only match words Twitch left untagged, in
+            // parse_text_segment. Sub emotes are commonly re-uploaded to 7TV
+            // under their Twitch names, so an override here put someone else's
+            // art on a sub emote the sender actually used.
+            segments.push(MessageSegment::Emote {
+                content: emote_name.to_string(),
+                emote_id: Some(emote.id.clone()),
+                emote_url: emote.url.clone(),
+                is_zero_width: None,
+                modifier_flags: None,
+                is_personal: None,
+            });
 
             last_char_index = emote.end + 1;
         }
@@ -3537,9 +4505,11 @@ impl IrcService {
                         content: trailing.to_string(),
                     });
                 }
-            } else if let Some((prefix, bits, tier, color, cheermote_url)) =
+            } else if let Some((prefix, bits, tier, color, cheermote_url)) = if ctx.no_cheermotes {
+                None
+            } else {
                 Self::parse_cheermote(word, ctx.cheermotes)
-            {
+            } {
                 // Found a cheermote pattern (e.g., Cheer500, Party1000)
                 segments.push(MessageSegment::Cheermote {
                     content: word.to_string(),
@@ -3595,6 +4565,7 @@ impl IrcService {
             }
         }
 
+        merge_space_runs(&mut segments);
         segments
     }
 
@@ -3623,24 +4594,7 @@ impl IrcService {
         let word_lower = word.to_lowercase();
 
         if let Some(set) = channel_set {
-            let mut best: Option<(&str, &Vec<CheermoteTier>)> = None;
-            for (prefix, tiers) in set {
-                if !word_lower.starts_with(prefix.as_str()) {
-                    continue;
-                }
-                let rest = &word_lower[prefix.len()..];
-                if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
-                    continue;
-                }
-                if best.is_none_or(|(b, _)| prefix.len() > b.len()) {
-                    best = Some((prefix, tiers));
-                }
-            }
-            let (prefix, tiers) = best?;
-            let bits: u32 = word_lower[prefix.len()..].parse().ok()?;
-            if bits == 0 {
-                return None;
-            }
+            let (prefix, bits, tiers) = match_cheermote(word, set)?;
             // Highest tier whose threshold the amount clears; below the lowest
             // threshold (shouldn't happen: globals start at 1) use the first.
             let tier = tiers
@@ -3736,6 +4690,24 @@ impl IrcService {
         ))
     }
 
+    /// The login in a PRIVMSG's `:login!login@login.tmi.twitch.tv` prefix.
+    /// Read from the prefix itself, after the tags: tag values (a reply body,
+    /// a system message) may contain `!` too.
+    fn privmsg_prefix_login(raw: &str) -> Option<String> {
+        let after_tags = if raw.starts_with('@') {
+            &raw[raw.find(' ')? + 1..]
+        } else {
+            raw
+        };
+        let prefix = after_tags.strip_prefix(':')?.split(' ').next()?;
+        let login = prefix.split('!').next()?;
+        if login.is_empty() || login.contains('.') {
+            // A server prefix (`tmi.twitch.tv`) names no chatter.
+            return None;
+        }
+        Some(login.to_lowercase())
+    }
+
     fn parse_privmsg(raw: &str) -> Option<ChatMessage> {
         let tags = if raw.starts_with('@') {
             let tag_end = raw.find(' ')?;
@@ -3752,29 +4724,14 @@ impl IrcService {
             }
         }
 
-        // Parsing similar to frontend logic
-        let username = tag_map
-            .get("display-name")
-            .map(|s| s.to_string())
-            .or_else(|| {
-                // extract from :user!user@...
-                if let Some(idx) = raw.find(" PRIVMSG") {
-                    let prefix = &raw[..idx];
-                    if let Some(excl) = prefix.find('!') {
-                        // find start of prefix (after tags space)
-                        let start = raw.find(' ').map(|i| i + 1).unwrap_or(0);
-                        if start < excl {
-                            Some(prefix[start + 1..excl].to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
+        // `username` is the LOGIN, as on every other row type: rules, plugins,
+        // moderation and mentions all treat it as one. The display name (which
+        // can be localized and differ from the login beyond case) is its own
+        // field below. A PRIVMSG carries the login in its prefix.
+        let username = Self::privmsg_prefix_login(raw)
+            .or_else(|| tag_map.get("login").map(|s| s.to_string()))
+            .or_else(|| tag_map.get("display-name").map(|s| s.to_lowercase()))
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "unknown".to_string());
 
         // Content - check for ACTION message (/me command)
@@ -3810,10 +4767,11 @@ impl IrcService {
             .map(|s| s.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let tags_owned: HashMap<String, String> = tag_map
+        let mut tags_owned: HashMap<String, String> = tag_map
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        stamp_reward_name(&mut tags_owned, raw);
 
         let display_name = tag_map
             .get("display-name")
@@ -3872,6 +4830,13 @@ impl IrcService {
             .collect();
         crate::services::badge_service::add_ffz_bot_badge(&user_id, &mut badges);
         crate::models::chat_layout::order_twitch_badges(&mut badges);
+        // A Shared Chat partner row's channel badges are its own room's.
+        if let Some(room) = crate::services::shared_chat_emotes::partner_room(
+            tag_map.get("source-room-id").copied(),
+            tag_map.get("room-id").copied(),
+        ) {
+            crate::services::shared_chat_emotes::wear_room_badges(room, &mut badges);
+        }
 
         // Use EmotePos struct
         // emotes format: 25:0-4,12-16/1902:6-10 ...
@@ -3887,11 +4852,7 @@ impl IrcService {
                             if let (Ok(start), Ok(end)) =
                                 (start_s.parse::<usize>(), end_s.parse::<usize>())
                             {
-                                // url: https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/3.0
-                                let url = format!(
-                                    "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/3.0",
-                                    id
-                                );
+                                let url = native_emote_url(id);
                                 emotes.push(EmotePos {
                                     id: id.to_string(),
                                     start,
@@ -3919,6 +4880,8 @@ impl IrcService {
         let reply_info = tag_map
             .get("reply-parent-msg-id")
             .map(|parent_id| ReplyInfo {
+                // Filled once the channel's parse snapshot is in hand, below.
+                parent_segments: None,
                 parent_msg_id: parent_id.to_string(),
                 parent_display_name: tag_map
                     .get("reply-parent-display-name")
@@ -3933,6 +4896,7 @@ impl IrcService {
                     .map(|s| s.to_string())
                     .unwrap_or_default(),
                 parent_user_login: reply_parent_user_login.clone().unwrap_or_default(),
+                parent_shown_name: String::new(),
             });
 
         // Strip redundant @mention from reply messages BEFORE parsing segments.
@@ -4002,9 +4966,25 @@ impl IrcService {
 
         // Parse message content into segments (using stripped content).
         // Snapshots gathered once; parsing is fully synchronous.
-        let snapshots = Self::gather_parse_snapshots(&privmsg_channel, &user_id);
-        let segments =
-            Self::parse_message_segments(&content_for_segments, &emotes_adjusted, &snapshots.ctx());
+        // A row from a Shared Chat partner uses that room's emotes, not ours.
+        let partner = crate::services::shared_chat_emotes::partner_room(
+            tag_map.get("source-room-id").copied(),
+            tag_map.get("room-id").copied(),
+        )
+        .and_then(|room| crate::services::shared_chat_emotes::lookup_for(&privmsg_channel, room, raw));
+        let snapshots = Self::gather_parse_snapshots(&privmsg_channel, &user_id, partner);
+        // Cheermotes draw only in a message that carries bits, as on Twitch: a
+        // "Cheer100" that spent nothing (typed as text, or the composer's own
+        // copy before the echo) is plain text.
+        let mut ctx = snapshots.ctx();
+        ctx.no_cheermotes = !tag_map.get("bits").and_then(|b| b.parse::<u32>().ok()).is_some_and(|b| b > 0);
+        let segments = Self::parse_message_segments(&content_for_segments, &emotes_adjusted, &ctx);
+        let reply_info = reply_info.map(|mut reply| {
+            if !reply.parent_msg_body.is_empty() {
+                reply.parent_segments = Some(Self::quoted_segments(&reply.parent_msg_body, &snapshots));
+            }
+            reply
+        });
 
         // Shared chat detection
         let source_room_id = tag_map.get("source-room-id").map(|s| s.to_string());
@@ -4193,6 +5173,13 @@ impl IrcService {
             .collect();
         crate::services::badge_service::add_ffz_bot_badge(&user_id, &mut badges);
         crate::models::chat_layout::order_twitch_badges(&mut badges);
+        // A Shared Chat partner row's channel badges are its own room's.
+        if let Some(room) = crate::services::shared_chat_emotes::partner_room(
+            tag_map.get("source-room-id").copied(),
+            tag_map.get("room-id").copied(),
+        ) {
+            crate::services::shared_chat_emotes::wear_room_badges(room, &mut badges);
+        }
 
         // Parse emotes from user's message content (if any)
         let emotes_str = tag_map.get("emotes").unwrap_or(&"");
@@ -4207,10 +5194,7 @@ impl IrcService {
                             if let (Ok(start), Ok(end)) =
                                 (start_s.parse::<usize>(), end_s.parse::<usize>())
                             {
-                                let url = format!(
-                                    "https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/3.0",
-                                    id
-                                );
+                                let url = native_emote_url(id);
                                 emotes.push(EmotePos {
                                     id: id.to_string(),
                                     start,
@@ -4237,7 +5221,12 @@ impl IrcService {
 
         // Parse message content into segments (if there's user content)
         let segments = if !content.is_empty() {
-            let snapshots = Self::gather_parse_snapshots(&usernotice_channel, &user_id);
+            let partner = crate::services::shared_chat_emotes::partner_room(
+                tag_map.get("source-room-id").copied(),
+                tag_map.get("room-id").copied(),
+            )
+            .and_then(|room| crate::services::shared_chat_emotes::lookup_for(&usernotice_channel, room, raw));
+            let snapshots = Self::gather_parse_snapshots(&usernotice_channel, &user_id, partner);
             Self::parse_message_segments(&content, &emotes, &snapshots.ctx())
         } else {
             Vec::new()
@@ -4364,7 +5353,25 @@ impl IrcService {
         let rules = ChatRules::snapshot();
 
         for raw in raw_messages {
-            if let Some(mut chat_msg) = Self::parse_privmsg(&raw) {
+            // The backlog holds more than PRIVMSGs, and each command is read
+            // as the live path reads it. USERNOTICEs (announcements, subs,
+            // raids) have their own parser: the PRIVMSG one reads only text
+            // after "PRIVMSG", so an announcement came back with an empty
+            // body. A room-mode NOTICE is the "Twitch" row live chat shows.
+            // CLEARMSG / CLEARCHAT remove what they moderated. ROOMSTATE and
+            // anything else describe state, not rows (the JOIN brings the
+            // current state), and were showing as empty rows named "unknown".
+            let parsed = match irc_command(&raw) {
+                Some("PRIVMSG") => Self::parse_privmsg(&raw),
+                Some("USERNOTICE") => Self::parse_usernotice(&raw).filter(usernotice_has_visible_content),
+                Some("NOTICE") => history_notice_row(&raw),
+                Some("CLEARMSG") | Some("CLEARCHAT") => {
+                    apply_history_clear(&mut results, &raw);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(mut chat_msg) = parsed {
                 // Layout is handled by browser - just use placeholder values
                 chat_msg.layout = LayoutResult {
                     height: 0.0,
@@ -4379,11 +5386,86 @@ impl IrcService {
                     continue;
                 }
                 chat_msg.metadata.from_backfill = true;
+                crate::services::chat_row_view::stamp(&mut chat_msg);
                 results.push(chat_msg);
             }
         }
 
         results
+    }
+
+    /// A backlog parsed before its channel had an emote table (a first visit,
+    /// with no saved dictionary yet) shows the channel's 7TV/BTTV/FFZ emotes
+    /// as plain words, and a row parsed as text stays text. When the table
+    /// lands, the same lines are parsed again and the rows whose segments
+    /// changed go to every window showing the channel as one
+    /// `HISTORY_SEGMENTS` frame, which patches them in place. The backlog
+    /// itself never waits on the providers.
+    /// Rows from a Shared Chat partner parsed before its set landed, parsed
+    /// again with it; the ones whose emotes change are patched in place in each
+    /// home chat (`HISTORY_SEGMENTS`, segments and view), so nothing on screen
+    /// moves and nothing waited for the set.
+    pub(crate) async fn restamp_partner_rows(room_id: &str, partner: Option<&EmoteLookup>, rows: Vec<(String, String)>) {
+        let mut by_home: HashMap<String, Vec<Value>> = HashMap::new();
+        for (home, raw) in rows {
+            let home_lookup = channel_parse_lookup().read().ok().and_then(|g| g.get(&home).cloned());
+            let emotes_change = partner.is_some_and(|p| {
+                crate::services::shared_chat_emotes::words_change(irc_trailing_text(&raw), p, home_lookup.as_deref())
+            });
+            if !emotes_change && !crate::services::shared_chat_emotes::badges_change(&raw, room_id) {
+                continue;
+            }
+            let parsed = match irc_command(&raw) {
+                Some("PRIVMSG") => Self::parse_privmsg(&raw),
+                Some("USERNOTICE") => Self::parse_usernotice(&raw),
+                _ => None,
+            };
+            let Some(mut msg) = parsed else { continue };
+            crate::services::chat_row_view::stamp(&mut msg);
+            let mut row = json!({
+                "id": msg.id,
+                "segments": msg.segments,
+                "parent_segments": msg.metadata.reply_info.as_ref().and_then(|r| r.parent_segments.as_ref()),
+                "badges": msg.badges,
+            });
+            if let Some(view) = &msg.metadata.view {
+                row["view"] = json!(view);
+            }
+            by_home.entry(home).or_default().push(row);
+        }
+        for (home, rows) in by_home {
+            debug!("[SharedChat] {home}: {} partner rows now wear their room's emotes and badges", rows.len());
+            let frame = json!({ "type": "HISTORY_SEGMENTS", "channel": home, "rows": rows });
+            send_to_bridge(BridgeFrame::channel(&home, frame.to_string()), false).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_parse_lookup_for_test(key: &str, set: &EmoteSet) {
+        rebuild_parse_lookup(key, set);
+    }
+
+    pub fn spawn_history_restamp(channel: &str, raw: Vec<String>, first: &[ChatMessage]) {
+        if raw.is_empty() || first.is_empty() {
+            return;
+        }
+        let key = channel.trim().trim_start_matches('#').to_lowercase();
+        let before: HashMap<String, String> =
+            first.iter().map(|m| (m.id.clone(), history_row_signature(m))).collect();
+        tokio::spawn(async move {
+            if !wait_for_channel_emotes(&key, HISTORY_RESTAMP_WAIT).await {
+                debug!("[ChatHistory] {key}: emote table never landed, backlog left as parsed");
+                return;
+            }
+            let again = Self::parse_historical_messages(raw).await;
+            let rows = history_segment_updates(&before, &again);
+            if rows.is_empty() {
+                return;
+            }
+            debug!("[ChatHistory] {key}: re-stamped {} backlog rows with the channel's emotes", rows.len());
+            let frame = json!({ "type": "HISTORY_SEGMENTS", "channel": key, "rows": rows });
+            send_to_bridge(BridgeFrame::channel(&key, frame.to_string()), false).await;
+        });
     }
 
     pub async fn stop() -> Result<()> {
@@ -4399,7 +5481,8 @@ impl IrcService {
         // Clear IRC writer
         *get_irc_writer().lock().await = None;
 
-        // Stop WS server
+        // Stop WS server. This stops it accepting; the page sockets it already
+        // serves are closed at the end, once everything below is cleared.
         if let Some(handle) = get_ws_server_handle().lock().await.take() {
             handle.abort();
         }
@@ -4421,6 +5504,7 @@ impl IrcService {
         if let Ok(mut g) = get_channel_cheermotes().write() { g.clear(); }
         get_user_badges_cache().lock().await.clear();
         get_room_state_cache().lock().await.clear();
+        crate::services::channel_rewards::forget_all_rooms();
         get_pending_messages().lock().await.clear();
         get_channel_consumers().lock().await.clear();
 
@@ -4434,7 +5518,9 @@ impl IrcService {
         // bring-up rather than thinking a stale port is still serving.
         *get_ws_port().lock().await = None;
 
-        debug!("[IRC Chat] Chat service stopped");
+        // Last, so a page that reconnects at once finds everything cleared.
+        close_page_sockets();
+        record_lifecycle("chat service stopped: IRC and the bridge are down, page sockets closed");
 
         Ok(())
     }
@@ -4465,6 +5551,7 @@ impl IrcService {
         if let Ok(mut g) = get_channel_cheermotes().write() { g.clear(); }
         get_user_badges_cache().lock().await.clear();
         get_room_state_cache().lock().await.clear();
+        crate::services::channel_rewards::forget_all_rooms();
         get_pending_messages().lock().await.clear();
         get_channel_consumers().lock().await.clear();
         crate::services::seventv_eventapi::clear_all().await;
@@ -4516,13 +5603,14 @@ impl IrcService {
         }
 
         // Fresh bring-up: broadcast channel + local warp WS server.
-        let (tx, _rx) = broadcast::channel::<String>(1000);
+        let (tx, _rx) = broadcast::channel::<BridgeFrame>(1000);
         let tx = Arc::new(tx);
 
         let tx_for_warp = tx.clone();
+        let born = bridge_generation();
         let local_ws = warp::ws().map(move |ws: warp::ws::Ws| {
             let tx_clone = tx_for_warp.clone();
-            ws.on_upgrade(move |socket| Self::handle_local_ws(socket, tx_clone))
+            ws.on_upgrade(move |socket| Self::handle_local_ws(socket, tx_clone, born))
         });
         // Pick a free port via an ephemeral probe bind, then hand it to warp. (warp 0.4
         // exposes no ephemeral bind that returns the port, and a fixed random port in a
@@ -4558,10 +5646,52 @@ impl IrcService {
         Ok(port)
     }
 
+    /// Serve the bridge on a fresh listener, keeping its broadcaster. iOS can
+    /// reclaim a suspended app's listening socket while the server task keeps
+    /// running on it, so `ensure_local_ws_bridge` still reports it alive and
+    /// nothing answers. The broadcaster stays, so publishers and the IRC
+    /// session are untouched; the port is the old one when it is free again,
+    /// a new one otherwise, and the shell reconnects to whichever this returns.
+    pub async fn rebind_local_ws_bridge() -> Result<u16> {
+        let guard = get_bridge_bringup_lock().lock().await;
+        let Some(tx) = get_message_broadcaster().lock().await.clone() else {
+            drop(guard);
+            return Self::ensure_local_ws_bridge().await;
+        };
+        if let Some(old) = get_ws_server_handle().lock().await.take() {
+            old.abort();
+        }
+        let previous = *get_ws_port().lock().await;
+        let tx_for_warp = tx.clone();
+        let born = bridge_generation();
+        let local_ws = warp::ws().map(move |ws: warp::ws::Ws| {
+            let tx_clone = tx_for_warp.clone();
+            ws.on_upgrade(move |socket| Self::handle_local_ws(socket, tx_clone, born))
+        });
+        let probe = match previous {
+            Some(p) => match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+                Ok(listener) => listener,
+                Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+            },
+            None => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+        };
+        let port = probe.local_addr()?.port();
+        drop(probe);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let handle = tokio::spawn(async move {
+            warp::serve(local_ws).run(addr).await;
+        });
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        *get_ws_server_handle().lock().await = Some(handle);
+        *get_ws_port().lock().await = Some(port);
+        record_lifecycle("WS bridge listener re-bound after a resume");
+        Ok(port)
+    }
+
     /// The shared broadcast sender for the local WS bridge, if it is up. Provider
     /// adapters serialize a `ChatMessage`/`ActivityEvent` frame and `send` it here
     /// to reach the frontend over the same socket the Twitch path uses.
-    pub async fn broadcaster() -> Option<Arc<broadcast::Sender<String>>> {
+    pub async fn broadcaster() -> Option<Arc<broadcast::Sender<BridgeFrame>>> {
         get_message_broadcaster().lock().await.clone()
     }
 
@@ -4575,6 +5705,20 @@ impl IrcService {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no IRC connection"))?;
         writer.lock().await.shutdown().await?;
+        Ok(())
+    }
+
+    /// Write one line, as typed, to the primary account's IRC connection
+    /// (`/raw`). The caller has already checked it is a single, safe line.
+    pub async fn send_raw_line(line: &str) -> Result<()> {
+        let writer = get_irc_writer()
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Chat is not connected"))?;
+        let mut w = writer.lock().await;
+        w.send_line(&format!("{}\r\n", line)).await?;
+        record_lifecycle(&format!("raw line sent: {}", line.split_whitespace().next().unwrap_or("")));
         Ok(())
     }
 
@@ -4710,32 +5854,174 @@ fn escape_tag_value(value: &str) -> String {
     out
 }
 
-/// The `emotes` tag Twitch would attach to `text`: each word that names one of
-/// the channel's Twitch emotes, by inclusive codepoint range, grouped by emote
-/// id in first-seen order. Twitch emotes resolve from this tag, never by name,
-/// so a row built without it would show them as text until the echo arrives.
-fn own_emotes_tag(text: &str, twitch: &[Emote]) -> String {
+/// The CDN art for a Twitch-native emote id, as every received row carries it.
+fn native_emote_url(id: &str) -> String {
+    format!("https://static-cdn.jtvnw.net/emoticons/v2/{}/default/dark/3.0", id)
+}
+
+/// Each word of `text` that names one of the channel's Twitch emotes, by
+/// inclusive codepoint range in text order: the positions Twitch would send in
+/// the `emotes` tag. Twitch emotes resolve from positions, never by name.
+fn native_emote_positions(text: &str, twitch: &[Emote]) -> Vec<EmotePos> {
     let by_name: HashMap<&str, &str> = twitch.iter().map(|e| (e.name.as_str(), e.id.as_str())).collect();
-    let mut order: Vec<&str> = Vec::new();
-    let mut ranges: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut out = Vec::new();
     let mut pos = 0usize;
     for word in text.split(' ') {
         let len = word.chars().count();
         if let Some(id) = by_name.get(word).copied() {
             if len > 0 {
-                if !ranges.contains_key(id) {
-                    order.push(id);
-                }
-                ranges.entry(id).or_default().push(format!("{}-{}", pos, pos + len - 1));
+                out.push(EmotePos {
+                    id: id.to_string(),
+                    start: pos,
+                    end: pos + len - 1,
+                    url: native_emote_url(id),
+                    gif: false,
+                });
             }
         }
         pos += len + 1;
+    }
+    out
+}
+
+/// The `emotes` tag Twitch would attach to `text`: the native emote positions
+/// grouped by emote id in first-seen order. A sent row built without it would
+/// show its Twitch emotes as text until the echo arrives.
+/// `text` wrapped as the IRC ACTION a `/me` becomes.
+fn irc_action(text: &str) -> String {
+    format!("\u{1}ACTION {text}\u{1}")
+}
+
+fn own_emotes_tag(text: &str, twitch: &[Emote]) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut ranges: HashMap<&str, Vec<String>> = HashMap::new();
+    let positions = native_emote_positions(text, twitch);
+    for p in &positions {
+        if !ranges.contains_key(p.id.as_str()) {
+            order.push(&p.id);
+        }
+        ranges.entry(&p.id).or_default().push(format!("{}-{}", p.start, p.end));
     }
     order
         .iter()
         .map(|id| format!("{}:{}", id, ranges[id].join(",")))
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// A channel-points redemption that posts nothing to chat on its own (a reward
+/// with no text input), shown as a chat row authored by the redeemer whose
+/// body is the reward title.
+pub struct RedemptionRow {
+    /// The channel's bare login.
+    pub channel: String,
+    /// The channel's Twitch id. It rides the row as `room-id`, which every
+    /// renderer reads to draw badges from the channel's own set: without it a
+    /// subscriber badge falls back to Twitch's global art (the default star)
+    /// instead of the channel's custom one.
+    pub room_id: String,
+    /// Twitch's redemption id; the row id derives from it so the same
+    /// redemption reported twice is one row.
+    pub redemption_id: String,
+    pub user_id: String,
+    pub user_login: String,
+    pub user_name: String,
+    pub reward_id: String,
+    pub reward_title: String,
+    pub reward_cost: i64,
+    pub image_url: String,
+    pub background_color: String,
+    /// The channel's own points icon, when it has one.
+    pub points_icon_url: Option<String>,
+    /// `name/version,...` the redeemer last showed in this chat.
+    pub badges: String,
+    pub color: String,
+}
+
+/// The row for a redemption, in the shape every received row has. The tags
+/// drive the renderers: `custom-reward-id` gives the chat row its redemption
+/// highlight, `sn-reward-*` and `sn-points-icon` its reward name, art and
+/// cost, and the stream overlay draws any row with `sn-reward-title` as a
+/// channel points event.
+fn redemption_message(r: &RedemptionRow, segments: Vec<MessageSegment>, timestamp_ms: i64) -> ChatMessage {
+    let id = if r.redemption_id.is_empty() {
+        format!("redeem-{}", uuid::Uuid::new_v4())
+    } else {
+        format!("redeem-{}", r.redemption_id)
+    };
+    let login = if r.user_login.is_empty() { &r.user_name } else { &r.user_login };
+    let name = if r.user_name.is_empty() { login } else { &r.user_name };
+    let reward_id = if r.reward_id.is_empty() { "sn-redemption" } else { &r.reward_id };
+
+    let mut tags: HashMap<String, String> = HashMap::new();
+    tags.insert("user-id".into(), r.user_id.clone());
+    if !r.room_id.is_empty() {
+        tags.insert("room-id".into(), r.room_id.clone());
+    }
+    tags.insert("id".into(), id.clone());
+    tags.insert("display-name".into(), name.clone());
+    tags.insert("custom-reward-id".into(), reward_id.to_string());
+    tags.insert("sn-reward-title".into(), r.reward_title.clone());
+    if !r.image_url.is_empty() {
+        tags.insert("sn-reward-image".into(), r.image_url.clone());
+    }
+    if !r.background_color.is_empty() {
+        tags.insert("sn-reward-bg".into(), r.background_color.clone());
+    }
+    if r.reward_cost > 0 {
+        tags.insert("sn-reward-cost".into(), r.reward_cost.to_string());
+    }
+    if let Some(icon) = r.points_icon_url.as_deref().filter(|s| !s.is_empty()) {
+        tags.insert("sn-points-icon".into(), icon.to_string());
+    }
+
+    let mut badges: Vec<Badge> = r
+        .badges
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|b| {
+            let mut p = b.split('/');
+            Badge {
+                name: p.next().unwrap_or("").to_string(),
+                version: p.next().unwrap_or("").to_string(),
+                image_url_1x: None,
+                image_url_2x: None,
+                image_url_4x: None,
+                title: None,
+                description: None,
+            }
+        })
+        .collect();
+    crate::models::chat_layout::order_twitch_badges(&mut badges);
+
+    let timestamp = timestamp_ms.to_string();
+    let (formatted_timestamp, formatted_timestamp_with_seconds) =
+        IrcService::format_timestamp(&timestamp);
+
+    let mut msg = ChatMessage {
+        id,
+        user_id: r.user_id.clone(),
+        username: login.clone(),
+        display_name: name.clone(),
+        color: Some(if r.color.is_empty() { "#9147ff".to_string() } else { r.color.clone() }),
+        badges,
+        timestamp,
+        content: r.reward_title.clone(),
+        provider: "twitch".to_string(),
+        channel: r.channel.clone(),
+        emotes: Vec::new(),
+        tags,
+        layout: LayoutResult::default(),
+        segments,
+        metadata: MessageMetadata {
+            formatted_timestamp,
+            formatted_timestamp_with_seconds,
+            ..Default::default()
+        },
+    };
+    // Redemption rows skip the rule engine, so they settle their name here.
+    crate::services::chatter_name::stamp(&mut msg);
+    msg
 }
 
 /// The badges a sent row carries: the channel's USERSTATE badges from the
@@ -4791,6 +6077,9 @@ impl IrcService {
     /// is recorded: the echo is what goes into history.
     pub async fn build_own_message(mut m: OwnMessage) -> Option<ChatMessage> {
         let key = m.channel.trim_start_matches('#').to_lowercase();
+        // A reply to a row still carrying its local id is sent as a plain
+        // message (ChatService::send_message), so the row shows none either.
+        m.reply_to = m.reply_to.filter(|r| !r.id.starts_with("local-"));
         // The IRC-connected account's badges for this channel, as USERSTATE
         // reported them on JOIN. Messages go out over Helix, which triggers no
         // USERSTATE, so a page that missed the JOIN one (its slice did not exist
@@ -4804,10 +6093,17 @@ impl IrcService {
             .unwrap_or(false);
         let cached = get_user_badges_cache().lock().await.get(&key).cloned();
         m.badges = own_row_badges(&m.badges, cached.as_deref(), is_primary);
+        // A `/me` goes out as an IRC ACTION, so the row is one too. Emote
+        // positions count from the action's own words, as Twitch's do.
+        let action_body = m.text.strip_prefix("/me ").map(str::to_string);
         let emotes_tag = {
             let map = get_channel_emotes().lock().await;
-            map.get(&key).map(|set| own_emotes_tag(&m.text, &set.twitch)).unwrap_or_default()
+            let body = action_body.as_deref().unwrap_or(&m.text);
+            map.get(&key).map(|set| own_emotes_tag(body, &set.twitch)).unwrap_or_default()
         };
+        if let Some(body) = action_body {
+            m.text = irc_action(&body);
+        }
         let line = own_message_line(&m, &emotes_tag, chrono::Utc::now().timestamp_millis());
         let mut msg = Self::parse_privmsg(&line)?;
         msg.layout = LayoutResult {
@@ -4816,10 +6112,89 @@ impl IrcService {
             has_reply: msg.metadata.reply_info.is_some(),
             is_first_message: false,
         };
-        // Stamps only (mentions, highlights); your own message is never dropped.
+        // Stamps only (mentions, highlights); your own message is never dropped,
+        // and never recorded: the echo is the record.
         let rules = ChatRules::snapshot();
-        let _ = ChatRules::evaluate(&mut msg, &rules);
+        let _ = ChatRules::evaluate_unrecorded(&mut msg, &rules);
+        crate::services::chat_row_view::stamp(&mut msg);
         Some(msg)
+    }
+
+    /// A line sent over this IRC connection gets no echo, so it goes into the
+    /// history ring from here (`/logs`, search). A Helix send is recorded when
+    /// its echo arrives, and the composer's own copy never is.
+    async fn record_own_irc_line(channel: &str, message: &str) {
+        let Some((login, user_id)) = get_own_identity().lock().await.clone() else {
+            return;
+        };
+        let key = channel.trim_start_matches('#').to_lowercase();
+        let badges = get_user_badges_cache().lock().await.get(&key).cloned().unwrap_or_default();
+        let text = match message.strip_prefix("/me ") {
+            Some(rest) => irc_action(rest),
+            None => message.to_string(),
+        };
+        let own = OwnMessage {
+            channel: key,
+            text,
+            local_id: format!("irc-{}", uuid::Uuid::new_v4().simple()),
+            sender_id: user_id,
+            sender_login: login.clone(),
+            sender_display_name: login,
+            color: String::new(),
+            badges,
+            room_id: String::new(),
+            reply_to: None,
+        };
+        let line = own_message_line(&own, "", chrono::Utc::now().timestamp_millis());
+        if let Some(mut msg) = Self::parse_privmsg(&line) {
+            let rules = ChatRules::snapshot();
+            let _ = ChatRules::evaluate(&mut msg, &rules);
+        }
+    }
+
+    /// Deliver a redemption row to the windows holding its channel, over the
+    /// bridge every received row takes, so it is routed, held for a parked
+    /// chat and deduped by id like any other. The title tokenizes against the
+    /// channel's emote table here, which a hidden chat keeps while its page
+    /// lets its own copy go. Nothing is delivered for a chat that is not open.
+    pub async fn publish_redemption_row(mut r: RedemptionRow) {
+        let key = r.channel.trim_start_matches('#').to_lowercase();
+        if key.is_empty() || r.reward_title.is_empty() || !Self::is_joined(&key).await {
+            return;
+        }
+        r.channel = key;
+        // Your own redemption before you have chatted here has no remembered
+        // look; wear the badges USERSTATE reported for the channel, which the
+        // page also takes from any row you author.
+        if r.badges.is_empty() {
+            let is_primary = ChatRules::own_identity()
+                .map(|(_, id)| !id.is_empty() && id == r.user_id)
+                .unwrap_or(false);
+            if is_primary {
+                if let Some(cached) = get_user_badges_cache().lock().await.get(&r.channel) {
+                    r.badges = cached.clone();
+                }
+            }
+        }
+        let natives = {
+            let map = get_channel_emotes().lock().await;
+            map.get(&r.channel)
+                .map(|set| native_emote_positions(&r.reward_title, &set.twitch))
+                .unwrap_or_default()
+        };
+        // The broadcaster wrote the title, so the redeemer's personal emotes
+        // and cheermotes have no part in it.
+        let snapshots = Self::gather_parse_snapshots(&r.channel, "", None);
+        let ctx = ParseCtx {
+            channel: snapshots.channel.as_deref(),
+            no_cheermotes: true,
+            ..Default::default()
+        };
+        let segments = Self::parse_message_segments(&r.reward_title, &natives, &ctx);
+        let msg = redemption_message(&r, segments, chrono::Utc::now().timestamp_millis());
+        if let Ok(json_msg) = serde_json::to_string(&msg) {
+            send_to_bridge(BridgeFrame::row(&msg.channel, json_msg, false), true).await;
+        }
     }
 }
 
@@ -4894,6 +6269,140 @@ mod own_message_tests {
         assert!(line.contains("display-name=Me\\sMe;"));
         assert!(line.ends_with("PRIVMSG #chan :hi"));
     }
+
+    const LOCALIZED_PRIVMSG: &str = "@badge-info=;badges=subscriber/3;color=#FF69B4;display-name=もちパンダ;emotes=;id=a1;reply-parent-msg-body=wow!\\sok;room-id=1;tmi-sent-ts=1000;user-id=700700 :mochi_panda!mochi_panda@mochi_panda.tmi.twitch.tv PRIVMSG #chan :こんにちは";
+    const LOGIN_ONLY_WATCH_STREAK: &str = "@badge-info=;badges=subscriber/3;color=#FF69B4;display-name=mochi_panda;emotes=;id=a2;login=mochi_panda;msg-id=viewermilestone;msg-param-category=watch-streak;msg-param-copoReward=350;msg-param-value=3;room-id=1;system-msg=mochi_panda\\swatched\\s3\\sconsecutive\\sstreams\\sand\\ssparked\\sa\\swatch\\sstreak!;tmi-sent-ts=2000;user-id=700700 :tmi.twitch.tv USERNOTICE #chan :yay";
+
+    #[test]
+    fn a_text_reward_message_is_named_from_the_channels_rewards() {
+        crate::services::channel_rewards::note_reward_name("rewardnamechan", "rw-1", "Билет на Розыгрыш Ножа", 4999);
+        let line = |reward: &str| {
+            format!("@badges=;color=;display-name=Bob;emotes=;id=r{reward};custom-reward-id={reward};room-id=1;tmi-sent-ts=1;user-id=2 :bob!bob@bob.tmi.twitch.tv PRIVMSG #rewardnamechan :https://example.com/trade")
+        };
+        let named = IrcService::parse_privmsg(&line("rw-1")).expect("parses");
+        assert_eq!(named.tags["sn-redeemed-title"], "Билет на Розыгрыш Ножа");
+        assert_eq!(named.tags["sn-redeemed-cost"], "4999");
+        assert!(!named.tags.contains_key("sn-reward-title"), "not drawn as a no-text redemption");
+        let unknown = IrcService::parse_privmsg(&line("rw-unknown")).expect("parses");
+        assert!(!unknown.tags.contains_key("sn-redeemed-title"));
+        let plain = IrcService::parse_privmsg(LOCALIZED_PRIVMSG).expect("parses");
+        assert!(!plain.tags.contains_key("sn-redeemed-title"));
+    }
+
+    #[test]
+    fn a_privmsg_username_is_the_login_not_the_display_name() {
+        let msg = IrcService::parse_privmsg(LOCALIZED_PRIVMSG).expect("parses");
+        assert_eq!(msg.username, "mochi_panda");
+        assert_eq!(msg.display_name, "もちパンダ");
+        assert_eq!(IrcService::privmsg_prefix_login(":tmi.twitch.tv USERNOTICE #c"), None);
+    }
+
+    #[test]
+    fn a_localized_chatter_shows_one_name_on_message_and_watch_streak_rows() {
+        let rules = ChatRules::snapshot();
+        let mut privmsg = IrcService::parse_privmsg(LOCALIZED_PRIVMSG).expect("parses");
+        let _ = ChatRules::evaluate(&mut privmsg, &rules);
+        let mut streak = IrcService::parse_usernotice(LOGIN_ONLY_WATCH_STREAK).expect("parses");
+        let _ = ChatRules::evaluate(&mut streak, &rules);
+        assert_eq!(privmsg.metadata.shown_name, "もちパンダ (mochi_panda)");
+        assert_eq!(streak.metadata.shown_name, privmsg.metadata.shown_name);
+        assert_eq!(streak.username, privmsg.username);
+    }
+
+    fn redemption(title: &str) -> RedemptionRow {
+        RedemptionRow {
+            channel: "chan".into(),
+            room_id: "7".into(),
+            redemption_id: "r-1".into(),
+            user_id: "42".into(),
+            user_login: "viewer".into(),
+            user_name: "Viewer".into(),
+            reward_id: "reward-9".into(),
+            reward_title: title.into(),
+            reward_cost: 5000,
+            image_url: "https://img/4x.png".into(),
+            background_color: "#00C7AC".into(),
+            points_icon_url: Some("https://img/points.png".into()),
+            badges: "vip/1,subscriber/12".into(),
+            color: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_redemption_title_tokenizes_against_the_channel_table() {
+        let mut set = EmoteSet::new();
+        set.twitch.push(twitch_emote("25", "Kappa"));
+        set.seven_tv.push(
+            serde_json::from_value(json!({ "id": "7a", "name": "COPIUM", "url": "https://7tv/1x", "provider": "7tv" }))
+                .expect("minimal emote"),
+        );
+        let lookup = EmoteLookup::build(&set);
+        let ctx = ParseCtx { channel: Some(&lookup), no_cheermotes: true, ..Default::default() };
+        let title = "COPIUM Kappa copium Cheer100";
+        let natives = native_emote_positions(title, &set.twitch);
+        let segs = IrcService::parse_message_segments(title, &natives, &ctx);
+        let kinds: Vec<String> = segs
+            .iter()
+            .map(|s| match s {
+                MessageSegment::Emote { content, emote_id, .. } => format!("emote:{content}:{}", emote_id.as_deref().unwrap_or("")),
+                MessageSegment::Text { content } => format!("text:{content}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        // Exact case, as in chat; and no word becomes bits.
+        assert_eq!(
+            kinds,
+            ["emote:COPIUM:7a", "text: ", "emote:Kappa:25", "text: ", "text:copium", "text: ", "text:Cheer100"]
+        );
+    }
+
+    #[test]
+    fn a_redemption_row_carries_the_reward_tags_and_a_stable_id() {
+        let msg = redemption_message(&redemption("Hydrate"), Vec::new(), 1000);
+        assert_eq!(msg.id, "redeem-r-1");
+        assert_eq!(msg.tags["id"], "redeem-r-1");
+        assert_eq!(msg.tags["custom-reward-id"], "reward-9");
+        assert_eq!(msg.tags["sn-reward-title"], "Hydrate");
+        assert_eq!(msg.tags["sn-reward-image"], "https://img/4x.png");
+        assert_eq!(msg.tags["sn-reward-bg"], "#00C7AC");
+        assert_eq!(msg.tags["sn-reward-cost"], "5000");
+        assert_eq!(msg.tags["sn-points-icon"], "https://img/points.png");
+        assert_eq!(msg.username, "viewer");
+        assert_eq!(msg.display_name, "Viewer");
+        assert_eq!(msg.content, "Hydrate");
+        assert_eq!(msg.color.as_deref(), Some("#9147ff"));
+        assert_eq!(msg.provider, "twitch");
+        let badges: Vec<&str> = msg.badges.iter().map(|b| b.name.as_str()).collect();
+        assert!(badges.contains(&"vip") && badges.contains(&"subscriber"));
+
+        let mut bare = redemption("Hydrate");
+        bare.room_id.clear();
+        assert!(!redemption_message(&bare, Vec::new(), 1000).tags.contains_key("room-id"));
+        let mut bare = redemption("Hydrate");
+        bare.reward_id.clear();
+        bare.reward_cost = 0;
+        bare.points_icon_url = None;
+        bare.image_url.clear();
+        let msg = redemption_message(&bare, Vec::new(), 1000);
+        assert_eq!(msg.tags["custom-reward-id"], "sn-redemption");
+        for absent in ["sn-reward-cost", "sn-points-icon", "sn-reward-image"] {
+            assert!(!msg.tags.contains_key(absent), "{absent}");
+        }
+    }
+
+    #[test]
+    fn a_redemption_row_names_its_channel_so_badges_resolve_against_the_channel_set() {
+        // The renderers look a Twitch badge up in the set of the row's
+        // `room-id`; a row without one draws a subscriber badge from the global
+        // set, the default star, instead of the channel's custom art.
+        let msg = redemption_message(&redemption("Hydrate"), Vec::new(), 1000);
+        assert_eq!(msg.tags.get("room-id").map(String::as_str), Some("7"));
+        let sub = msg.badges.iter().find(|b| b.name == "subscriber").expect("subscriber badge");
+        assert_eq!(sub.version, "12");
+        // The page reads the row's tags as a plain object, so the id must survive JSON.
+        let json: Value = serde_json::to_value(&msg).expect("serializes");
+        assert_eq!(json["tags"]["room-id"], "7");
+    }
 }
 
 #[cfg(test)]
@@ -4911,14 +6420,45 @@ mod personal_emote_tests {
             emote_type: None,
             owner_id: None,
             owner_name: None,
+            original_name: None,
+            owner_ref: None,
             width: None,
+            height: None,
             modifier_flags: None,
             ffz_sub_only: None,
+            animated: None,
         }
     }
 
     fn text(s: &str) -> MessageSegment {
         MessageSegment::Text { content: s.to_string() }
+    }
+
+    #[test]
+    fn a_quoted_parent_gets_the_channels_emotes() {
+        // A reply's parent arrives as plain text with no positions: its Twitch
+        // emotes are matched by name against the channel's own, its 7TV words
+        // against the channel's set, like the parent's own row.
+        let mut native = emote("25", "Kappa");
+        native.provider = crate::services::emote_service::EmoteProvider::Twitch;
+        let mut set = EmoteSet::new();
+        set.twitch = vec![native];
+        set.seven_tv = vec![emote("7a", "catJAM")];
+        let snapshots = ParseSnapshots { channel: Some(EmoteLookup::build(&set)), personal: None, cheermotes: None };
+        let segs = IrcService::quoted_segments("hi Kappa catJAM", &snapshots);
+        let emotes: Vec<(&str, Option<&str>)> = segs
+            .iter()
+            .filter_map(|s| match s {
+                MessageSegment::Emote { content, emote_id, .. } => Some((content.as_str(), emote_id.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(emotes, vec![("Kappa", Some("25")), ("catJAM", Some("7a"))]);
+        // No channel table yet: the quote reads as words, never as nothing.
+        let empty = ParseSnapshots { channel: None, personal: None, cheermotes: None };
+        assert!(IrcService::quoted_segments("hi Kappa", &empty)
+            .iter()
+            .all(|s| matches!(s, MessageSegment::Text { .. })));
     }
 
     #[test]
@@ -4928,10 +6468,13 @@ mod personal_emote_tests {
             ("xqc".to_string(), "m1".to_string(), "hello cuh".to_string()),
             ("xqc".to_string(), "m2".to_string(), "cuhh not it".to_string()),
             ("forsen".to_string(), "m3".to_string(), "cuh".to_string()),
+            // Another platform's row: its user id is not a Twitch id.
+            ("kick:xqc".to_string(), "m4".to_string(), "cuh".to_string()),
         ];
         let named = IrcService::rows_naming_personal_emotes(rows, &set);
         assert_eq!(named.get("xqc"), Some(&vec!["m1".to_string()]));
         assert_eq!(named.get("forsen"), Some(&vec!["m3".to_string()]));
+        assert!(named.get("kick:xqc").is_none());
     }
 
     #[test]
@@ -4956,6 +6499,31 @@ mod personal_emote_tests {
         assert!(IrcService::apply_personal_emotes(owner, &[text("hello")]).is_none());
         assert!(IrcService::apply_personal_emotes("someone-else", &segments).is_none());
         get_personal_emotes().write().unwrap().pop(owner);
+    }
+}
+
+#[cfg(test)]
+mod join_window_tests {
+    use super::{JoinWindow, JOIN_WINDOW_MAX, JOIN_WINDOW_MS};
+
+    #[test]
+    fn a_full_window_waits_for_its_oldest_join() {
+        let mut w = JoinWindow::default();
+        for i in 0..JOIN_WINDOW_MAX as u64 {
+            assert!(w.claim(1_000 + i).is_ok());
+        }
+        assert_eq!(w.claim(2_000), Err(1_000 + JOIN_WINDOW_MS - 2_000));
+        assert!(w.claim(1_000 + JOIN_WINDOW_MS).is_ok(), "the oldest has aged out");
+    }
+
+    #[test]
+    fn self_paced_joins_count_too() {
+        let mut w = JoinWindow::default();
+        w.note(0, 15);
+        for _ in 0..(JOIN_WINDOW_MAX - 15) {
+            assert!(w.claim(10).is_ok());
+        }
+        assert!(w.claim(10).is_err());
     }
 }
 
@@ -4988,11 +6556,7 @@ mod tests {
     fn gif_position_becomes_a_gif_segment_and_the_placeholder_never_renders_as_text() {
         let content = "[Y A Y Yes GIF by Djemilah Birnie] nice";
         let pos = parse_gifs_tag(TWITCH_GIFS_TAG);
-        let ctx = ParseCtx {
-            channel: None,
-            personal: None,
-            cheermotes: None,
-        };
+        let ctx = ParseCtx::default();
         let segments = IrcService::parse_message_segments(content, &pos, &ctx);
         match &segments[0] {
             MessageSegment::Gif {
@@ -5020,6 +6584,52 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn silent_session_end_needs_real_silence_while_awake() {
+        // A network that cuts the connection mid-session: it ends by our read
+        // timeout (or a server FIN) about 30 s after the last read.
+        let timeout = "read liveness timeout";
+        assert!(is_silent_session_end(timeout, 30_000, 30_200));
+        assert!(is_silent_session_end("closed by server", 25_000, 25_000));
+        assert!(is_silent_session_end("read error", 20_000, 20_000));
+        // A healthy idle link never gets this far without an answered PING.
+        assert!(!is_silent_session_end("closed by server", 12_000, 12_000));
+        // Twitch asked us to reconnect, or our own handler stalled: not the
+        // transport's fault however long the silence.
+        assert!(!is_silent_session_end("server RECONNECT", 30_000, 30_000));
+        assert!(!is_silent_session_end("handler stall", 30_000, 30_000));
+        // The timer fired late: the process was frozen or the machine slept.
+        assert!(!is_silent_session_end(timeout, 600_000, 600_000));
+        // The wall clock ran ahead of the monotonic one: a sleep the monotonic
+        // clock did not count.
+        assert!(!is_silent_session_end("read error", 21_000, 900_000));
+    }
+
+    #[test]
+    fn liveness_constants_keep_their_order() {
+        let timeout = IRC_READ_TIMEOUT.as_millis() as u64;
+        // An idle PING goes out (worst case one check tick late) with time
+        // left for the PONG before the read deadline.
+        assert!(IRC_PING_IDLE_MS + IRC_PING_CHECK.as_millis() as u64 + 5_000 <= timeout);
+        // A session counted silent has missed at least one PING.
+        assert!(STALL_READ_AGE_MS > IRC_PING_IDLE_MS && STALL_READ_AGE_MS < timeout);
+        // The heartbeat must never vouch past the read deadline.
+        assert!(HEARTBEAT_SUPPRESS_AFTER_MS > timeout);
+    }
+
+    #[test]
+    fn deafen_fault_spec_parses() {
+        use IrcTransport::{Irc, WebSocket as Ws};
+        let s = std::time::Duration::from_secs;
+        assert_eq!(parse_deafen_fault("deafen:40", Irc), Some(s(40)));
+        assert_eq!(parse_deafen_fault("deafen:40:websocket", Ws), Some(s(40)));
+        assert_eq!(parse_deafen_fault("deafen:40:websocket", Irc), None);
+        assert_eq!(parse_deafen_fault("deafen:soon", Irc), None);
+        assert_eq!(parse_deafen_fault("mute:40", Irc), None);
+        assert_eq!(parse_deafen_fault("", Irc), None);
+        assert_eq!(parse_deafen_fault("deafen:40:irc", Irc), Some(s(40)));
+    }
 
     #[test]
     fn outage_frame_picks_lost_vs_pre() {
@@ -5148,8 +6758,9 @@ mod tests {
                 assert!(!content.is_empty(), "empty Text segment emitted");
             }
         }
-        // "a  b" -> a, space, space, b
-        assert_eq!(segs.len(), 4);
+        // "a  b" -> a, one spacer holding both spaces, b
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[1], MessageSegment::Text { content } if content == "  "));
     }
 
     #[test]
@@ -5169,7 +6780,7 @@ mod tests {
     }
 
     #[test]
-    fn emote_lookup_priority_and_override() {
+    fn emote_lookup_priority() {
         use crate::services::emote_service::EmoteProvider;
         let mk = |id: &str, name: &str, provider: EmoteProvider| Emote {
             id: id.to_string(),
@@ -5181,9 +6792,13 @@ mod tests {
             emote_type: None,
             owner_id: None,
             owner_name: None,
+            original_name: None,
+            owner_ref: None,
             width: None,
+            height: None,
             modifier_flags: None,
             ffz_sub_only: None,
+            animated: None,
         };
         let set = EmoteSet {
             twitch: Vec::new(),
@@ -5196,10 +6811,8 @@ mod tests {
         let lookup = EmoteLookup::build(&set);
         // Word tier: 7TV wins name collisions (inserted last).
         assert_eq!(lookup.get("Clash").unwrap().id, "s1");
-        // Override tier: only a 7TV winner overrides a Twitch-native emote.
-        assert_eq!(lookup.seventv_override("Clash").unwrap().id, "s1");
-        assert!(lookup.seventv_override("BttvOnly").is_none());
-        assert!(lookup.seventv_override("Missing").is_none());
+        assert_eq!(lookup.get("BttvOnly").unwrap().id, "b2");
+        assert!(lookup.get("Missing").is_none());
     }
 
     fn tiers(spec: &[(u32, &str)]) -> Vec<CheermoteTier> {
@@ -5208,6 +6821,7 @@ mod tests {
                 min_bits: *min_bits,
                 color: color.to_string(),
                 url: format!("https://example.test/{}.gif", min_bits),
+                ..Default::default()
             })
             .collect()
     }
@@ -5339,6 +6953,7 @@ mod tests {
                     min_bits: t["minBits"].as_u64().unwrap() as u32,
                     color: t["color"].as_str().unwrap().to_string(),
                     url: t["url"].as_str().unwrap().to_string(),
+                    ..Default::default()
                 })
                 .collect();
             set.insert(prefix.clone(), parsed);
@@ -5472,5 +7087,543 @@ impl Drop for EmoteRefreshGuard {
                 guard.remove(&self.0);
             }
         }
+    }
+}
+
+/// A span Twitch tagged as an emote is Twitch's emote, whatever a third-party
+/// set calls the same name; third-party names only match untagged words.
+#[cfg(test)]
+mod native_emote_priority_tests {
+    use super::*;
+
+    const XQCL: &str = "1035663";
+    /// A 7TV upload named `xqcL` (someone else's art under the sub emote's name).
+    const SEVENTV_XQCL: &str = "01F1136BTG0008S1RA006Y72TN";
+
+    /// A real Fossabot line from xQc's chat, tags trimmed to the ones parsing
+    /// reads. Its `emotes` tag marks all four `xqcL` as Twitch emote 1035663.
+    const FOSSABOT_XQCL: &str = "@badges=moderator/1,subscriber/3090,bot-badge/1;color=#1976D2;display-name=Fossabot;emotes=1035663:0-3,57-60,92-95,135-138;id=420c56bf-3fca-4bcd-949f-06227180a962;room-id=71092938;tmi-sent-ts=1791703315881;user-id=237719657 :fossabot!fossabot@fossabot.tmi.twitch.tv PRIVMSG #{CHAN} :xqcL boxtoasterpog is staying in the jungle using Prime! xqcL Thanks so much for re-subbing xqcL And continuing to support the stream! xqcL";
+
+    fn seventv(id: &str, name: &str, zero_width: bool) -> Emote {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": name,
+            "url": format!("https://cdn.7tv.app/emote/{id}/1x.avif"),
+            "provider": "7tv",
+            "is_zero_width": zero_width,
+        }))
+        .expect("minimal emote")
+    }
+
+    /// A channel whose 7TV set holds an `xqcL` and a zero-width `RainTime`,
+    /// registered under its own key so no other test's channel is touched.
+    fn channel_with_seventv_xqcl(chan: &str) {
+        let mut set = EmoteSet::new();
+        set.seven_tv.push(seventv(SEVENTV_XQCL, "xqcL", false));
+        set.seven_tv.push(seventv("01GB2S3ZQ8000BNRXQQ0VKQ0E3", "RainTime", true));
+        rebuild_parse_lookup(chan, &set);
+    }
+
+    fn line(chan: &str, tags: &str, body: &str) -> String {
+        format!("@{tags};id=x;room-id=71092938;tmi-sent-ts=1;user-id=237719657 :fossabot!fossabot@fossabot.tmi.twitch.tv PRIVMSG #{chan} :{body}")
+    }
+
+    /// Emote segments as (text, id, zero-width).
+    fn emotes(segments: &[MessageSegment]) -> Vec<(String, String, bool)> {
+        segments
+            .iter()
+            .filter_map(|s| match s {
+                MessageSegment::Emote { content, emote_id, is_zero_width, .. } => Some((
+                    content.clone(),
+                    emote_id.clone().unwrap_or_default(),
+                    is_zero_width.unwrap_or(false),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn twitch_history_rows_get_twitch_and_seventv_emotes() {
+        let chan = "twitch_history_7tv";
+        channel_with_seventv_xqcl(chan);
+        let answer = serde_json::json!({ "data": { "channel": { "id": "71092938", "recentChatMessages": [{
+            "id": "h1", "deletedAt": null, "sentAt": "2026-10-13T17:45:08Z",
+            "content": { "text": "xqcL RainTime gg", "fragments": [
+                { "text": "xqcL", "content": { "emoteID": "1035663" } },
+                { "text": " RainTime gg", "content": null }
+            ] },
+            "parentMessage": null,
+            "sender": { "id": "237719657", "login": "fossabot", "displayName": "Fossabot" },
+            "senderBadges": [], "senderChatColor": null, "sourceChannel": null
+        }] } } });
+        let lines = crate::services::twitch_chat_history::lines_from(&answer, chan).unwrap();
+        let rows = IrcService::parse_historical_messages(lines).await;
+        assert_eq!(rows.len(), 1);
+        let found = emotes(&rows[0].segments);
+        assert_eq!(found.len(), 2, "{:?}", rows[0].segments);
+        assert_eq!(found[0], ("xqcL".to_string(), "1035663".to_string(), false), "Twitch's emote from its fragment");
+        assert_eq!(found[1].0, "RainTime", "the 7TV word from the channel's table");
+    }
+
+    #[test]
+    fn a_tagged_sub_emote_beats_a_same_name_seventv_channel_emote() {
+        let chan = "native_priority_fossabot";
+        channel_with_seventv_xqcl(chan);
+        let msg = IrcService::parse_privmsg(&FOSSABOT_XQCL.replace("{CHAN}", chan)).expect("parses");
+        let found = emotes(&msg.segments);
+        assert_eq!(found.len(), 4, "{:?}", msg.segments);
+        for (content, id, _) in &found {
+            assert_eq!(content, "xqcL");
+            assert_eq!(id, XQCL);
+        }
+        for seg in &msg.segments {
+            if let MessageSegment::Emote { emote_url, .. } = seg {
+                assert!(emote_url.contains("static-cdn.jtvnw.net/emoticons/v2/1035663/"), "{emote_url}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_untagged_word_still_matches_seventv() {
+        let chan = "native_priority_untagged";
+        channel_with_seventv_xqcl(chan);
+        // Only the first xqcL is tagged; a sender without the sub types the second.
+        let msg = IrcService::parse_privmsg(&line(chan, "emotes=1035663:0-3", "xqcL hi xqcL")).expect("parses");
+        assert_eq!(
+            emotes(&msg.segments),
+            [("xqcL".to_string(), XQCL.to_string(), false), ("xqcL".to_string(), SEVENTV_XQCL.to_string(), false)]
+        );
+        // No tag at all: the word is the 7TV emote.
+        let msg = IrcService::parse_privmsg(&line(chan, "emotes=", "xqcL")).expect("parses");
+        assert_eq!(emotes(&msg.segments), [("xqcL".to_string(), SEVENTV_XQCL.to_string(), false)]);
+    }
+
+    #[test]
+    fn multibyte_text_before_the_emote_keeps_the_codepoint_offsets() {
+        let chan = "native_priority_multibyte";
+        channel_with_seventv_xqcl(chan);
+        // Twitch counts code points: "héllo" is 5, the emoji 1 (2 in UTF-16,
+        // 4 in UTF-8), "日本" 2, plus three spaces, so xqcL sits at 11-14.
+        let body = "héllo 😀 日本 xqcL ok";
+        assert_eq!(body.chars().position(|c| c == 'x'), Some(11));
+        let msg = IrcService::parse_privmsg(&line(chan, "emotes=1035663:11-14", body)).expect("parses");
+        assert_eq!(emotes(&msg.segments), [("xqcL".to_string(), XQCL.to_string(), false)]);
+        let text: String = msg
+            .segments
+            .iter()
+            .map(|s| match s {
+                MessageSegment::Text { content } => content.clone(),
+                MessageSegment::Emoji { content, .. } => content.clone(),
+                MessageSegment::Emote { content, .. } => content.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(text, body);
+    }
+
+    #[test]
+    fn a_zero_width_seventv_emote_still_overlays_a_native_emote() {
+        let chan = "native_priority_zero_width";
+        channel_with_seventv_xqcl(chan);
+        for body in ["xqcL RainTime", "xqcL  RainTime"] {
+            let msg = IrcService::parse_privmsg(&line(chan, "emotes=1035663:0-3", body)).expect("parses");
+            let segs = &msg.segments;
+            assert_eq!(segs.len(), 3, "{body:?}: {segs:?}");
+            assert!(matches!(&segs[0], MessageSegment::Emote { emote_id: Some(id), .. } if id == XQCL));
+            // One spacer between them, which is what the renderer looks back past.
+            assert!(matches!(&segs[1], MessageSegment::Text { content } if content.trim().is_empty()));
+            assert!(matches!(
+                &segs[2],
+                MessageSegment::Emote { content, is_zero_width: Some(true), .. } if content == "RainTime"
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_usernotice_tests {
+    use super::*;
+
+    // Lines as the recent-messages mirror returns them (tags trimmed).
+    const ANNOUNCEMENT: &str = "@badge-info=;badges=moderator/1;color=#1E90FF;display-name=ModUser;emotes=;flags=;historical=1;id=hist-ann-1;login=moduser;mod=1;msg-id=announcement;msg-param-color=PRIMARY;rm-received-ts=1700000000100;room-id=11;subscriber=0;system-msg=;tmi-sent-ts=1700000000000;user-id=42;user-type=mod :tmi.twitch.tv USERNOTICE #chan :drops are live now";
+    const RESUB: &str = "@badge-info=subscriber/14;badges=subscriber/12;color=;display-name=Fan;emotes=;flags=;historical=1;id=hist-resub-1;login=fan;msg-id=resub;msg-param-cumulative-months=14;msg-param-sub-plan=1000;room-id=11;system-msg=Fan\\ssubscribed\\sat\\sTier\\s1.\\sThey've\\ssubscribed\\sfor\\s14\\smonths!;tmi-sent-ts=1700000001000;user-id=43 :tmi.twitch.tv USERNOTICE #chan :still here";
+    const RAID: &str = "@badge-info=;badges=;color=;display-name=Raider;emotes=;flags=;historical=1;id=hist-raid-1;login=raider;msg-id=raid;msg-param-viewerCount=25;room-id=11;system-msg=25\\sraiders\\sfrom\\sRaider\\shave\\sjoined!;tmi-sent-ts=1700000002000;user-id=44 :tmi.twitch.tv USERNOTICE #chan";
+    const BLANK: &str = "@badge-info=;badges=;display-name=Ghost;emotes=;historical=1;id=hist-blank-1;login=ghost;msg-id=onetapgiftredeemed;room-id=11;tmi-sent-ts=1700000003000;user-id=45 :tmi.twitch.tv USERNOTICE #chan";
+    const PRIVMSG: &str = "@badge-info=;badges=;color=;display-name=Bob;emotes=;historical=1;id=hist-msg-1;room-id=11;tmi-sent-ts=1700000004000;user-id=46 :bob!bob@bob.tmi.twitch.tv PRIVMSG #chan :USERNOTICE is just a word here";
+
+    #[test]
+    fn the_command_is_read_by_token() {
+        assert_eq!(irc_command(ANNOUNCEMENT), Some("USERNOTICE"));
+        assert_eq!(irc_command(RAID), Some("USERNOTICE"));
+        assert_eq!(irc_command(PRIVMSG), Some("PRIVMSG"));
+        assert_eq!(irc_command(":tmi.twitch.tv CLEARCHAT #chan"), Some("CLEARCHAT"));
+        assert_eq!(irc_command("PING :tmi.twitch.tv"), Some("PING"));
+        assert_eq!(irc_command(""), None);
+    }
+
+    #[tokio::test]
+    async fn history_usernotices_keep_their_text_like_live_ones() {
+        let rows = IrcService::parse_historical_messages(
+            [ANNOUNCEMENT, RESUB, RAID, BLANK, PRIVMSG].iter().map(|s| s.to_string()).collect(),
+        )
+        .await;
+        let row = |id: &str| rows.iter().find(|m| m.id == id).unwrap_or_else(|| panic!("{id} missing"));
+
+        let ann = row("hist-ann-1");
+        assert_eq!(ann.content, "drops are live now", "the announcement keeps its body");
+        assert_eq!(ann.metadata.msg_type.as_deref(), Some("announcement"));
+        assert_eq!(ann.username, "moduser");
+        assert!(ann.metadata.from_backfill);
+
+        let resub = row("hist-resub-1");
+        assert_eq!(resub.content, "still here");
+        assert_eq!(resub.metadata.msg_type.as_deref(), Some("resub"));
+        assert!(resub.metadata.system_message.as_deref().is_some_and(|s| s.contains("14 months")));
+
+        let raid = row("hist-raid-1");
+        assert!(raid.content.is_empty());
+        assert_eq!(raid.metadata.system_message.as_deref(), Some("25 raiders from Raider have joined!"));
+
+        // Nothing to show: left out, as live chat leaves it out.
+        assert!(rows.iter().all(|m| m.id != "hist-blank-1"));
+
+        // A PRIVMSG that merely mentions the word is still a PRIVMSG.
+        assert_eq!(row("hist-msg-1").content, "USERNOTICE is just a word here");
+    }
+}
+
+/// The backlog after a moderator toggled followers-only and slow mode, plus a
+/// deletion and a timeout, as the recent-messages mirror hands it over.
+#[cfg(test)]
+mod history_notice_tests {
+    use super::*;
+
+    const HELLO: &str = "@badge-info=;badges=;color=;display-name=Bob;emotes=;historical=1;id=hist-msg-1;room-id=11;tmi-sent-ts=1700000004000;user-id=46 :bob!bob@bob.tmi.twitch.tv PRIVMSG #chan :hello";
+    const FOLLOWERS_ON: &str = "@historical=1;msg-id=followers_on;rm-received-ts=1700000005000;room-id=11 :tmi.twitch.tv NOTICE #chan :This room is now in followers-only mode.";
+    const ROOMSTATE_FOLLOWERS: &str = "@emote-only=0;followers-only=0;historical=1;r9k=0;rm-received-ts=1700000005001;room-id=11;slow=0;subs-only=0 :tmi.twitch.tv ROOMSTATE #chan";
+    const SLOW_ON: &str = "@historical=1;msg-id=slow_on;rm-received-ts=1700000006000;room-id=11 :tmi.twitch.tv NOTICE #chan :This room is now in slow mode. You may send messages every 30 seconds.";
+    const ROOMSTATE_SLOW: &str = "@historical=1;rm-received-ts=1700000006001;room-id=11;slow=30 :tmi.twitch.tv ROOMSTATE #chan";
+    const FOLLOWERS_OFF: &str = "@historical=1;msg-id=followers_off;rm-received-ts=1700000007000;room-id=11 :tmi.twitch.tv NOTICE #chan :This room is no longer in followers-only mode.";
+    const RATELIMIT: &str = "@historical=1;msg-id=msg_ratelimit;rm-received-ts=1700000007500 :tmi.twitch.tv NOTICE #chan :Your message was not sent because you are sending messages too quickly.";
+    const DELETED: &str = "@badge-info=;badges=;color=;display-name=Bob;emotes=;historical=1;id=hist-msg-2;room-id=11;tmi-sent-ts=1700000008000;user-id=46 :bob!bob@bob.tmi.twitch.tv PRIVMSG #chan :bad words";
+    const CLEARMSG: &str = "@historical=1;login=bob;room-id=;target-msg-id=hist-msg-2;tmi-sent-ts=1700000008500 :tmi.twitch.tv CLEARMSG #chan :bad words";
+    const CARL_BEFORE: &str = "@badge-info=;badges=;color=;display-name=Carl;emotes=;historical=1;id=hist-msg-3;room-id=11;tmi-sent-ts=1700000009000;user-id=47 :carl!carl@carl.tmi.twitch.tv PRIVMSG #chan :spam";
+    const CLEARCHAT: &str = "@ban-duration=600;historical=1;room-id=11;target-user-id=47;tmi-sent-ts=1700000009500 :tmi.twitch.tv CLEARCHAT #chan :carl";
+    const CARL_AFTER: &str = "@badge-info=;badges=;color=;display-name=Carl;emotes=;historical=1;id=hist-msg-4;room-id=11;tmi-sent-ts=1700000010000;user-id=47 :carl!carl@carl.tmi.twitch.tv PRIVMSG #chan :sorry";
+    const CLEAR_ALL: &str = "@historical=1;room-id=11;tmi-sent-ts=1700000010500 :tmi.twitch.tv CLEARCHAT #chan";
+
+    #[tokio::test]
+    async fn mode_changes_show_as_the_live_twitch_row_and_state_lines_do_not_show() {
+        let rows = IrcService::parse_historical_messages(
+            [
+                HELLO,
+                FOLLOWERS_ON,
+                ROOMSTATE_FOLLOWERS,
+                SLOW_ON,
+                ROOMSTATE_SLOW,
+                FOLLOWERS_OFF,
+                RATELIMIT,
+                DELETED,
+                CLEARMSG,
+                CARL_BEFORE,
+                CLEARCHAT,
+                CARL_AFTER,
+                CLEAR_ALL,
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        )
+        .await;
+
+        // The bug: every NOTICE and ROOMSTATE came back as a nameless row.
+        assert!(rows.iter().all(|m| m.username != "unknown"), "{rows:?}");
+
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "hist-msg-1",
+                "notice-chan-followers_on-1700000005000",
+                "notice-chan-slow_on-1700000006000",
+                "notice-chan-followers_off-1700000007000",
+                // hist-msg-2 went with its CLEARMSG, hist-msg-3 with Carl's
+                // timeout; what Carl said after it stays, and a whole-chat
+                // clear removes nothing (live chat marks nothing for one).
+                "hist-msg-4",
+            ]
+        );
+
+        let notice = &rows[1];
+        assert_eq!(notice.content, "This room is now in followers-only mode.");
+        assert_eq!(notice.username, "System");
+        assert_eq!(notice.display_name, "Twitch");
+        assert_eq!(notice.user_id, "tw-system");
+        assert_eq!(notice.channel, "chan");
+        assert_eq!(notice.timestamp, "1700000005000");
+        assert!(notice.metadata.from_backfill);
+        assert!(matches!(
+            notice.segments.as_slice(),
+            [MessageSegment::Text { content }] if content == "This room is now in followers-only mode."
+        ));
+        assert_eq!(rows[2].content, "This room is now in slow mode. You may send messages every 30 seconds.");
+    }
+
+    #[test]
+    fn notice_rows_keep_their_id_across_parses() {
+        let a = history_notice_row(FOLLOWERS_ON).unwrap();
+        let b = history_notice_row(FOLLOWERS_ON).unwrap();
+        assert_eq!(a.id, b.id);
+        assert!(history_notice_row(RATELIMIT).is_none());
+        assert!(history_notice_row(ROOMSTATE_SLOW).is_none());
+    }
+
+    #[test]
+    fn a_reparse_with_the_table_names_only_the_rows_it_changed() {
+        let chan = "history_restamp_chan";
+        let line = |id: &str, body: &str| {
+            format!("@display-name=Dee;emotes=;historical=1;id={id};room-id=12;tmi-sent-ts=1700000000000;user-id=48 :dee!dee@dee.tmi.twitch.tv PRIVMSG #{chan} :{body}")
+        };
+        let lines = vec![line("r-1", "catJAM vibes"), line("r-2", "no emotes here")];
+        let parse = |lines: &[String]| -> Vec<ChatMessage> {
+            lines.iter().filter_map(|l| IrcService::parse_privmsg(l)).collect()
+        };
+
+        // First visit: no table yet, so the emote is a word.
+        let first = parse(&lines);
+        let before: HashMap<String, String> =
+            first.iter().map(|m| (m.id.clone(), history_row_signature(m))).collect();
+        assert!(history_segment_updates(&before, &first).is_empty());
+
+        // The channel's table lands.
+        let mut set = EmoteSet::new();
+        set.seven_tv.push(
+            serde_json::from_value(json!({
+                "id": "01GB2S3ZQ8000BNRXQQ0VKQ0E4",
+                "name": "catJAM",
+                "url": "https://cdn.7tv.app/emote/01GB2S3ZQ8000BNRXQQ0VKQ0E4/1x.avif",
+                "provider": "7tv",
+            }))
+            .expect("minimal emote"),
+        );
+        rebuild_parse_lookup(chan, &set);
+
+        let again = parse(&lines);
+        let updates = history_segment_updates(&before, &again);
+        assert_eq!(updates.len(), 1, "{updates:?}");
+        assert_eq!(updates[0]["id"], "r-1");
+        let first_segment = &updates[0]["segments"][0];
+        assert_eq!(first_segment["type"], "emote");
+        assert_eq!(first_segment["content"], "catJAM");
+        drop_parse_lookup(chan);
+    }
+
+    #[tokio::test]
+    async fn a_waiter_hears_the_table_land_and_gives_up_without_one() {
+        let key = "history_wait_chan";
+        let waiter = tokio::spawn(wait_for_channel_emotes(key, std::time::Duration::from_secs(5)));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        get_channel_emotes().lock().await.insert(key.to_string(), EmoteSet::new());
+        note_emote_table_installed(key);
+        assert!(waiter.await.unwrap());
+        // Already in place: answered at once.
+        assert!(wait_for_channel_emotes(key, std::time::Duration::from_millis(1)).await);
+        get_channel_emotes().lock().await.remove(key);
+
+        assert!(!wait_for_channel_emotes("history_wait_none", std::time::Duration::from_millis(30)).await);
+    }
+}
+
+/// Chat frames for the iPhone app's replay fixtures, made by the same parse and
+/// stamp path the socket uses, from real emote, badge and paint data and raw
+/// IRC lines in `ios/Tests/Fixtures/chat-inputs.json`. Always checks the frames;
+/// with `SN_WRITE_CHAT_FIXTURES=<path>` it also writes them there.
+#[cfg(test)]
+mod chat_fixture_tests {
+    use super::*;
+    use crate::models::chat_layout::ViewSpan;
+
+    const INPUTS: &str = include_str!("../../../ios/Tests/Fixtures/chat-inputs.json");
+
+    fn frames() -> (Value, Vec<String>) {
+        let inputs: Value = serde_json::from_str(INPUTS).expect("chat inputs parse");
+        let channel = inputs["channel"].as_str().unwrap().to_string();
+        let set: EmoteSet = serde_json::from_value(inputs["emotes"].clone()).expect("emote set");
+        rebuild_parse_lookup(&channel, &set);
+        // The invite's card as Discord's public invite read answers it.
+        crate::services::link_preview_cache::remember_for_test(
+            "https://discord.gg/discord-developers",
+            crate::commands::link_preview::LinkPreview {
+                url: "https://discord.gg/discord-developers".into(),
+                kind: "discord".into(),
+                title: Some("Discord Developers".into()),
+                image: Some(
+                    "https://cdn.discordapp.com/icons/613425648685547541/a_1d18823294be0ccfbcdec090c8ffcc0d.gif?size=128".into(),
+                ),
+                site_name: Some("Discord".into()),
+                author: Some("discord.gg/discord-developers".into()),
+                online_count: Some(70761),
+                member_count: Some(308559),
+                ..Default::default()
+            },
+        );
+        crate::services::chat_row_view::note_twitch_badges(
+            None,
+            inputs["twitch_badges"].as_array().unwrap().iter().map(|b| {
+                (
+                    b["set_id"].as_str().unwrap(),
+                    b["version"].as_str().unwrap(),
+                    b["url"].as_str().unwrap(),
+                    b["title"].as_str().unwrap(),
+                )
+            }),
+        );
+        for (user_id, worn) in inputs["cosmetics"].as_object().unwrap() {
+            let mark = |v: &Value| {
+                let mut v = v.clone();
+                v["selected"] = json!(true);
+                v
+            };
+            crate::services::seventv_cosmetics_resolver::remember_for_test(
+                user_id,
+                crate::services::seventv_cosmetics_resolver::UserCosmetics {
+                    paints: worn["paint"].as_object().map(|_| vec![mark(&worn["paint"])]).unwrap_or_default(),
+                    badges: worn["badge"].as_object().map(|_| vec![mark(&worn["badge"])]).unwrap_or_default(),
+                    ..Default::default()
+                },
+            );
+        }
+        ChatRules::set_own_identity(
+            inputs["own"]["login"].as_str().unwrap(),
+            inputs["own"]["user_id"].as_str().unwrap(),
+        );
+        let rules = crate::services::chat_rules::CompiledRules::defaults_for_test();
+
+        let mut out = vec!["IRC_CONNECTED".to_string()];
+        for line in inputs["lines"].as_array().unwrap() {
+            let line = line.as_str().unwrap();
+            let frame = match irc_command(line) {
+                Some("PRIVMSG") | Some("USERNOTICE") => {
+                    let parsed = if irc_command(line) == Some("PRIVMSG") {
+                        IrcService::parse_privmsg(line)
+                    } else {
+                        IrcService::parse_usernotice(line).filter(usernotice_has_visible_content)
+                    };
+                    let mut msg = parsed.unwrap_or_else(|| panic!("line did not parse: {line}"));
+                    assert!(!ChatRules::evaluate_unrecorded(&mut msg, &rules).drop);
+                    crate::services::chat_row_view::stamp_view(&mut msg);
+                    serde_json::to_string(&msg).unwrap()
+                }
+                Some("ROOMSTATE") => IrcService::roomstate_frame(line, Some(&channel)),
+                Some("CLEARMSG") => IrcService::parse_clearmsg(line).unwrap().frame().to_string(),
+                Some("CLEARCHAT") => IrcService::parse_clearchat(line).frame().to_string(),
+                other => panic!("no fixture path for {other:?}"),
+            };
+            out.push(frame);
+        }
+        out.push("HEARTBEAT".to_string());
+        (inputs, out)
+    }
+
+    fn row<'a>(frames: &'a [Value], id: &str) -> &'a Value {
+        frames.iter().find(|f| f["id"] == id).unwrap_or_else(|| panic!("no row {id}"))
+    }
+
+    #[test]
+    fn fixture_frames_carry_the_native_view() {
+        let (inputs, frames) = frames();
+        let parsed: Vec<Value> = frames.iter().filter_map(|f| serde_json::from_str(f).ok()).collect();
+        assert_eq!(frames.len(), inputs["lines"].as_array().unwrap().len() + 2);
+
+        // Overlays ride their base emote.
+        let pet = row(&parsed, "fx-0003");
+        let spans: Vec<ViewSpan> = serde_json::from_value(pet["metadata"]["view"]["spans"].clone()).unwrap();
+        assert!(matches!(&spans[0], ViewSpan::Emote { emote, overlays, .. }
+            if emote.code == "PepePls" && overlays.len() == 1 && overlays[0].code == "PETPET" && emote.width == Some(22)));
+
+        // A mention of the viewer is stamped by the rule engine.
+        assert_eq!(row(&parsed, "fx-0007")["metadata"]["is_mentioned"], json!(true));
+
+        // A Discord invite carries its server card, read before the row was sent.
+        let invite = &row(&parsed, "fx-discord")["metadata"]["view"]["previews"][0];
+        assert_eq!(invite["url"], json!("https://discord.gg/discord-developers"));
+        assert_eq!(invite["preview"]["kind"], json!("discord"));
+        assert_eq!(invite["preview"]["member_count"], json!(308559));
+
+        // Paints, Twitch badge art and the 7TV badge for a chatter the cache knows.
+        let owl = row(&parsed, "fx-0001");
+        assert_eq!(owl["metadata"]["view"]["paint"]["kind"], json!("linear"));
+        let badges = owl["metadata"]["view"]["badges"].as_array().unwrap();
+        assert_eq!(badges.len(), 3);
+        assert_eq!(badges[2]["provider"], json!("7tv"));
+
+        // A navy name reads light on the dark theme.
+        let navy = row(&parsed, "fx-clap")["metadata"]["view"]["name_color"].as_str().unwrap().to_string();
+        assert_ne!(navy.to_lowercase(), "#000080");
+
+        // Room state, deletions and timeouts are frames of their own.
+        assert!(frames.iter().any(|f| f.contains("\"type\":\"ROOMSTATE\"") && f.contains("\"modes\"")));
+        assert!(frames.iter().any(|f| f.contains("\"type\":\"CLEARMSG\"")));
+        assert!(frames.iter().any(|f| f.contains("\"type\":\"CLEARCHAT\"") && f.contains("\"ban_duration\":600")));
+
+        if let Ok(path) = std::env::var("SN_WRITE_CHAT_FIXTURES") {
+            let mut design = serde_json::to_value(crate::models::settings::ChatDesignSettings::first_run()).unwrap();
+            // The phone's first-run text size and spacing (this test runs on a desktop build).
+            design["font_size"] = json!(14);
+            design["message_spacing"] = json!(8);
+            let fixture = json!({
+                "channel": inputs["channel"],
+                "room_id": inputs["room_id"],
+                "own": inputs["own"],
+                "chat_design": design,
+                "emotes": inputs["emotes"],
+                // What `command_catalog` answers a viewer on a phone.
+                "commands": crate::services::command_catalog::catalog(true, false, false, &[], ""),
+                "frames": frames,
+            });
+            std::fs::write(&path, serde_json::to_string_pretty(&fixture).unwrap() + "\n").expect("write fixtures");
+        }
+    }
+}
+
+#[cfg(test)]
+mod bridge_close_tests {
+    use super::{bridge_generation, close_page_sockets, IrcService};
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// The close code a page socket ends with, or `None` when it ended without one.
+    async fn close_code(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    ) -> Option<u16> {
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(Message::Close(c)) => return c.map(|f| u16::from(f.code)),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    // Drives the same close `IrcService::stop` ends with, without the rest of
+    // its teardown: that clears process-wide caches other tests here read.
+    #[tokio::test]
+    async fn a_full_stop_closes_the_page_socket_it_left_open() {
+        let port = IrcService::ensure_local_ws_bridge().await.expect("bridge up");
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("page socket connects");
+
+        let before = bridge_generation();
+        close_page_sockets();
+        assert_ne!(bridge_generation(), before);
+
+        let code = tokio::time::timeout(Duration::from_secs(5), close_code(&mut socket))
+            .await
+            .expect("the page socket closes within five seconds");
+        assert_eq!(code, Some(1012), "a service-restart close, so the page reconnects");
     }
 }

@@ -1,12 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef, useState } from 'react';
 import { Check, ChevronDown, User } from 'lucide-react';
 import { useSendAccountStore } from '../stores/sendAccountStore';
 import { Tooltip } from './ui/Tooltip';
+import { SevenTvAvatar } from './SevenTvAvatar';
+import { useOutsidePress } from '../hooks/useOutsidePress';
 
-function Avatar({ url, size }: { url: string | null; size: number }) {
+/** A linked Twitch account's face; its Twitch id draws its 7TV picture. */
+function Avatar({ url, size, userId }: { url: string | null; size: number; userId: string }) {
   if (url) {
     return (
-      <img
+      <SevenTvAvatar
+        cosmeticsId={userId}
+        px={size}
         src={url}
         alt=""
         className="rounded-full object-cover flex-shrink-0"
@@ -36,14 +41,7 @@ export default function SendAsPicker() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
-  }, [open]);
+  const markInside = useOutsidePress(open, [ref], () => setOpen(false));
 
   if (accounts.length < 2) return null;
 
@@ -52,7 +50,7 @@ export default function SendAsPicker() {
   const isAlt = !selected.is_primary;
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} onPointerDownCapture={markInside} className="relative">
       <Tooltip content={`Sending as @${selected.login}`} side="top">
         <button
           type="button"
@@ -62,7 +60,7 @@ export default function SendAsPicker() {
             isAlt ? 'ring-1 ring-accent' : 'hover:bg-white/10'
           }`}
         >
-          <Avatar url={selected.avatar_url} size={20} />
+          <Avatar url={selected.avatar_url} size={20} userId={selected.user_id} />
           <ChevronDown size={11} className="text-textMuted" />
         </button>
       </Tooltip>
@@ -86,7 +84,7 @@ export default function SendAsPicker() {
                   active ? 'bg-white/[0.06]' : 'hover:bg-white/[0.04]'
                 }`}
               >
-                <Avatar url={account.avatar_url} size={26} />
+                <Avatar url={account.avatar_url} size={26} userId={account.user_id} />
                 <div className="min-w-0 flex-1">
                   <div className="text-sm text-textPrimary truncate">
                     {account.display_name || account.login}

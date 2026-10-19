@@ -1,12 +1,21 @@
 import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { Eye, EyeOff, Columns, X, Sparkles, Gauge, Zap } from 'lucide-react';
 import CompactViewSettings from './CompactViewSettings';
+import { ProviderLogo } from '../ProviderLogo';
+import type { ProviderId } from '../../types/providers';
 import { SettingsSection, SettingsRow, SegmentedSelect } from './_primitives';
+import { SubControl, SubControls } from '../plugins/settingsPageKit';
 import { GlassMultiSelect } from '../ui/GlassMultiSelect';
-import { DISCOVERY_LANGUAGES } from '../../utils/discoveryLanguages';
+import {
+    DEVICE_LANGUAGE_LABEL,
+    DISCOVERY_LANGUAGE_OPTIONS,
+    nextDiscoveryLanguages,
+} from '../../utils/discoveryLanguages';
 import { useAppStore } from '../../stores/AppStore';
 import { IS_MAC } from '../../utils/platform';
-import type { MotionMode, CloseToTrayMode } from '../../types';
+import type { MotionMode, CloseToTrayMode, HiddenRealms } from '../../types';
+import { useSettingReset } from './settingReset';
 
 export type SidebarMode = 'expanded' | 'compact' | 'hidden' | 'disabled';
 
@@ -31,6 +40,20 @@ export const saveSidebarSettings = (mode: SidebarMode, expandOnHover: boolean, s
         detail: { mode, expandOnHover, showRecommended }
     }));
 };
+
+/** The places a hidden channel can be hidden besides browsing, in Rust's words. */
+const HIDDEN_REALMS: { key: keyof HiddenRealms; label: string; short: string }[] = [
+    { key: 'chat', label: 'Their chat messages', short: 'Chat' },
+    { key: 'search', label: 'Search results', short: 'Search' },
+    { key: 'follows', label: 'Follows, favorites and live alerts', short: 'Follows' },
+];
+
+/** A saved entry's realms; a field Rust has not written yet reads as hidden. */
+const realmsOf = (c: Partial<HiddenRealms>): HiddenRealms => ({
+    chat: c.chat ?? true,
+    search: c.search ?? true,
+    follows: c.follows ?? true,
+});
 
 const Toggle = ({ enabled, onChange }: { enabled: boolean; onChange: () => void }) => (
     <button
@@ -60,6 +83,8 @@ const MOTION_MODE_OPTIONS: { value: MotionMode; label: string; hint: string; Ico
 
 const InterfaceSettings = () => {
     const { settings, updateSettings } = useAppStore();
+    const resetFor = useSettingReset();
+    const hiddenDefaults = realmsOf(settings.hidden_channel_defaults ?? {});
     const [sidebarMode, setSidebarMode] = useState<SidebarMode>('compact');
     const [expandOnHover, setExpandOnHover] = useState(true);
     const [showRecommended, setShowRecommended] = useState(true);
@@ -133,7 +158,8 @@ const InterfaceSettings = () => {
         // updateSettings commits to the store only after the save completes,
         // and the reload below reads the filter back out of the store.
         const current = useAppStore.getState().settings;
-        await updateSettings({ ...current, discovery_languages: languages });
+        const next = nextDiscoveryLanguages(current.discovery_languages ?? [], languages);
+        await updateSettings({ ...current, discovery_languages: next });
         void useAppStore.getState().loadRecommendedStreams();
     };
 
@@ -159,13 +185,139 @@ const InterfaceSettings = () => {
     return (
         <div className="space-y-8">
             <SettingsSection
+                id="settings-section-hidden-channels"
+                label="Hidden channels"
+                description="A channel you hide never shows in Discover, categories or Recommended. Right-click any stream and pick Hide channel."
+            >
+                <SettingsRow
+                    title="Also hide from"
+                    onReset={resetFor(['hidden_channel_defaults', { chat: true, search: true, follows: true }])}
+                    description="Where a channel you hide next is hidden too. Each channel below can be changed on its own."
+                >
+                    <SubControls>
+                        {HIDDEN_REALMS.map(({ key, label }) => (
+                            <SubControl
+                                key={key}
+                                title={label}
+                                control={
+                                    <Toggle
+                                        enabled={hiddenDefaults[key]}
+                                        onChange={() =>
+                                            void updateSettings({
+                                                ...settings,
+                                                hidden_channel_defaults: { ...hiddenDefaults, [key]: !hiddenDefaults[key] },
+                                            })
+                                        }
+                                    />
+                                }
+                            />
+                        ))}
+                    </SubControls>
+                </SettingsRow>
+                <SettingsRow
+                    title="Channels"
+                    description={
+                        (settings.hidden_channels?.length ?? 0) > 0
+                            ? 'Show brings a channel back everywhere. Block also blocks a Twitch channel on Twitch, so it cannot chat with or whisper to you.'
+                            : 'No hidden channels.'
+                    }
+                >
+                    {(settings.hidden_channels?.length ?? 0) > 0 && (
+                        <div className="flex flex-col gap-1.5">
+                            {settings.hidden_channels!.map((c) => {
+                                const realms = realmsOf(c);
+                                return (
+                                    <div key={c.id} className="flex flex-col gap-1 rounded-lg px-1 py-1">
+                                        <div className="flex items-center gap-2.5">
+                                            {c.avatar ? (
+                                                <img src={c.avatar} alt="" className="h-6 w-6 flex-shrink-0 rounded-full object-cover" />
+                                            ) : (
+                                                <span className="h-6 w-6 flex-shrink-0 rounded-full bg-glass" aria-hidden />
+                                            )}
+                                            <span className="min-w-0 flex-1 truncate text-sm text-textPrimary">{c.display_name || c.channel}</span>
+                                            {c.blocked && (
+                                                <span className="flex flex-shrink-0 items-center gap-1.5 text-xs text-textSecondary">
+                                                    <span className="h-1.5 w-1.5 rounded-full bg-error" aria-hidden />
+                                                    Blocked on Twitch
+                                                </span>
+                                            )}
+                                            {/* Platform marks only where platforms mix. */}
+                                            {new Set(settings.hidden_channels!.map((h) => h.provider)).size > 1 && (
+                                                <ProviderLogo provider={c.provider as ProviderId} size={12} />
+                                            )}
+                                            {c.provider === 'twitch' && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() =>
+                                                        void invoke('set_hidden_channel_blocked', { id: c.id, blocked: !c.blocked }).catch((err) =>
+                                                            useAppStore.getState().addToast(typeof err === 'string' ? err : 'Twitch did not take that change', 'error'),
+                                                        )
+                                                    }
+                                                    className="glass-button flex-shrink-0 px-2.5 py-1 text-xs text-textSecondary hover:text-textPrimary"
+                                                    aria-label={`${c.blocked ? 'Unblock' : 'Block'} ${c.display_name || c.channel} on Twitch`}
+                                                >
+                                                    {c.blocked ? 'Unblock' : 'Block'}
+                                                </button>
+                                            )}
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    // Showing undoes the hide, and the block StreamNook added.
+                                                    const unblock = c.blocked
+                                                        ? invoke('set_hidden_channel_blocked', { id: c.id, blocked: false })
+                                                        : Promise.resolve();
+                                                    void unblock
+                                                        .then(() => invoke('set_channel_hidden', { channel: c, hidden: false }))
+                                                        .catch((err) =>
+                                                            useAppStore.getState().addToast(typeof err === 'string' ? err : 'Could not show that channel again', 'error'),
+                                                        );
+                                                }}
+                                                className="glass-button flex-shrink-0 px-2.5 py-1 text-xs text-textSecondary hover:text-textPrimary"
+                                                aria-label={`Show ${c.display_name || c.channel} again`}
+                                            >
+                                                Show
+                                            </button>
+                                        </div>
+                                        {/* Where else it is hidden: tap to change this one channel. */}
+                                        <div className="flex flex-wrap items-center gap-1 pl-[34px]">
+                                            {HIDDEN_REALMS.map(({ key, short }) => (
+                                                <button
+                                                    key={key}
+                                                    type="button"
+                                                    aria-pressed={realms[key]}
+                                                    onClick={() =>
+                                                        void invoke('set_hidden_channel_realms', {
+                                                            id: c.id,
+                                                            realms: { ...realms, [key]: !realms[key] },
+                                                        })
+                                                    }
+                                                    className={`rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                                                        realms[key]
+                                                            ? 'bg-accent/15 text-accent'
+                                                            : 'text-textMuted hover:text-textSecondary'
+                                                    }`}
+                                                >
+                                                    {short}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </SettingsRow>
+            </SettingsSection>
+
+            <SettingsSection
                 id="settings-section-sidebar"
                 label="Sidebar"
                 description="How much of the streams list stays on screen while you watch."
             >
                 <SettingsRow
-                    title="How the sidebar appears"
+                    title="Style"
                     description={modeDescription}
+                    help="Hover expand (Compact only) opens the sidebar fully while your cursor is over it, and folds it back when you leave."
                 >
                     <div className="grid grid-cols-4 gap-2">
                         {SIDEBAR_MODE_OPTIONS.map(({ value, label, hint, Icon }) => {
@@ -187,24 +339,24 @@ const InterfaceSettings = () => {
                             );
                         })}
                     </div>
+                    {sidebarMode === 'compact' && (
+                        <SubControls>
+                            <SubControl
+                                title="Hover expand"
+                                control={
+                                    <Toggle
+                                        enabled={expandOnHover}
+                                        onChange={() => handleExpandOnHoverChange(!expandOnHover)}
+                                    />
+                                }
+                            />
+                        </SubControls>
+                    )}
                 </SettingsRow>
 
-                {sidebarMode === 'compact' && (
-                    <SettingsRow
-                        title="Expand when you hover"
-                        description="Move your cursor over the compact sidebar to open it fully, and it folds back when you leave."
-                        control={
-                            <Toggle
-                                enabled={expandOnHover}
-                                onChange={() => handleExpandOnHoverChange(!expandOnHover)}
-                            />
-                        }
-                    />
-                )}
-
                 <SettingsRow
-                    title="Show recommended streams"
-                    description="Show the Recommended section in the sidebar. Turn this off to keep only your followed channels and favorites."
+                    title="Recommended"
+                    description="Shows the Recommended section in the sidebar. Turn this off to keep only your followed channels and favorites."
                     control={
                         <Toggle
                             enabled={showRecommended}
@@ -216,11 +368,12 @@ const InterfaceSettings = () => {
 
             <SettingsSection
                 id="settings-section-discover"
-                label="Discover Feed"
+                label="Discover"
                 description="What the Discover tab and the sidebar's Recommended section show."
             >
                 <SettingsRow
-                    title="Personalized recommendations"
+                    title="Personalized"
+                    onReset={resetFor(['discovery_personalized', false]) && (() => void applyDiscoveryPersonalized(false))}
                     description="Use your Twitch account to tailor Discover to what you watch. When off, recommendations are anonymous and based only on your region."
                     control={
                         <Toggle
@@ -232,17 +385,18 @@ const InterfaceSettings = () => {
 
                 <SettingsRow
                     title="Languages"
-                    description="Only show recommended streams in these languages. Empty means any language."
-                    onReset={(settings.discovery_languages?.length ?? 0) > 0 ? () => void applyDiscoveryLanguages([]) : undefined}
+                    description="Streams in Discover and Kick browse. Your device language until you pick some."
+                    onReset={resetFor(['discovery_languages', []]) && (() => void applyDiscoveryLanguages([]))}
                     control={
                         <GlassMultiSelect
                             values={settings.discovery_languages ?? []}
                             onChange={(v) => void applyDiscoveryLanguages(v)}
-                            options={DISCOVERY_LANGUAGES}
-                            emptyLabel="Any language"
+                            options={DISCOVERY_LANGUAGE_OPTIONS}
+                            emptyLabel={DEVICE_LANGUAGE_LABEL}
                         />
                     }
                 />
+
             </SettingsSection>
 
             <SettingsSection
@@ -251,7 +405,8 @@ const InterfaceSettings = () => {
                 description="How much the interface moves, from full animation to instant."
             >
                 <SettingsRow
-                    title="How much the interface animates"
+                    title="Amount"
+                    onReset={resetFor(['motion_mode', 'full'])}
                     description={motionDescription}
                     help="Off is the best choice on a low-end PC, since the frosted-glass blur is expensive to animate."
                 >
@@ -279,12 +434,13 @@ const InterfaceSettings = () => {
             </SettingsSection>
 
             <SettingsSection
-                id="settings-section-window-close"
-                label="Closing the Window"
-                description="Whether the close button quits StreamNook or tucks it into the system tray."
+                id="settings-section-window"
+                label="Window"
+                description="What the close button does, how settings open, and what full screen hides."
             >
                 <SettingsRow
-                    title="What the close button does"
+                    title="Close button"
+                    onReset={resetFor(['close_to_tray', 'with-popouts'])}
                     description={closeToTrayDescription}
                 >
                     <SegmentedSelect<CloseToTrayMode>
@@ -297,15 +453,10 @@ const InterfaceSettings = () => {
                         ]}
                     />
                 </SettingsRow>
-            </SettingsSection>
 
-            <SettingsSection
-                id="settings-section-settings-window"
-                label="Settings Window"
-                description="How much room this settings screen takes up."
-            >
                 <SettingsRow
-                    title="Keep settings in a centered window"
+                    title="Centered settings"
+                    onReset={resetFor(['compact_settings_window', true])}
                     description="Settings open in a centered window; turn this off to open them as a full page that fills the app."
                     help="The full page gives long tabs more room, so you see more options at once with less scrolling."
                     control={
@@ -315,16 +466,11 @@ const InterfaceSettings = () => {
                         />
                     }
                 />
-            </SettingsSection>
 
-            <SettingsSection
-                id="settings-section-window-fullscreen"
-                label="Full Screen"
-                description={`What stays on screen when you go full screen (${IS_MAC ? 'Ctrl+Cmd+F' : 'F11'}) while watching.`}
-            >
                 <SettingsRow
-                    title="Show only the stream and chat"
-                    description="The title bar and sidebar tuck away while you watch in full screen. Move your cursor to the top edge to bring the title bar back, or to the side edge for the sidebar."
+                    title="Full screen"
+                    onReset={resetFor(['fullscreen_stream_only', true])}
+                    description={`Shows only the stream and chat in full screen (${IS_MAC ? 'Ctrl+Cmd+F' : 'F11'}): the title bar and sidebar tuck away while you watch. Move your cursor to the top edge to bring the title bar back, or to the side edge for the sidebar.`}
                     help="Home keeps its title bar in full screen, since its tabs and search live there."
                     control={
                         <Toggle
@@ -335,26 +481,21 @@ const InterfaceSettings = () => {
                 />
             </SettingsSection>
 
-            <SettingsSection
-                id="settings-section-window-on-top"
-                label="Keep on Top"
-                description="Keep the small Compact View player visible over whatever else you are doing."
-            >
-                <SettingsRow
-                    title="Keep on top in Compact View"
-                    description="While Compact View is active, the small player floats above other apps so clicking your browser does not bury it."
-                    help="The window drops back to normal as soon as you leave Compact View."
-                    control={
-                        <Toggle
-                            enabled={keepOnTopInCompact}
-                            onChange={() => void updateSettings({ ...settings, keep_on_top_in_compact: !keepOnTopInCompact })}
-                        />
-                    }
-                />
-            </SettingsSection>
-
             <div id="settings-section-compact">
-                <CompactViewSettings />
+                <CompactViewSettings>
+                    <SettingsRow
+                        title="Keep on top"
+                        onReset={resetFor(['keep_on_top_in_compact', false])}
+                        description="While Compact View is active, the small player floats above other apps so clicking your browser does not bury it."
+                        help="The window drops back to normal as soon as you leave Compact View."
+                        control={
+                            <Toggle
+                                enabled={keepOnTopInCompact}
+                                onChange={() => void updateSettings({ ...settings, keep_on_top_in_compact: !keepOnTopInCompact })}
+                            />
+                        }
+                    />
+                </CompactViewSettings>
             </div>
         </div>
     );

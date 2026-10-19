@@ -1,10 +1,12 @@
 import { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } from 'react';
-import { MessageCircle, UserPlus, UserMinus, Loader2, ChevronDown, ChevronUp, Pencil, X, Gift, Share2, Link2, Check, EyeOff, History } from 'lucide-react';
+import { ExternalAnchor } from './ui/ExternalAnchor';
+import { MessageCircle, UserPlus, UserMinus, Loader2, ChevronLeft, ChevronUp, Pencil, X, Share2, Link2, Check, EyeOff, History } from 'lucide-react';
 import { filterChannelKey, isHiddenInScope } from '../utils/chatFilters';
-import { buildShareUrl, buildProfileUrl } from '../utils/shareLink';
+import { shareLinkFor, buildProfileUrl } from '../utils/shareLink';
 import { providerLabel, type ProviderId } from '../types/providers';
 import { motion, AnimatePresence, useScroll, useTransform, useReducedMotion, useMotionValue, animate } from 'framer-motion';
 import { setUserNickname, setUserColor } from '../utils/userChatOverrides';
+import { overrideKey } from '../utils/chatterName';
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../stores/AppStore';
@@ -14,7 +16,12 @@ import { computePaintStyle, getBadgeImageUrls, getBadgeFallbackUrls, pickPaintLa
 import { withBttvPro } from '../services/bttvProBadge';
 import { useNameColorAdjust } from '../hooks/useNameColor';
 import { FallbackImage } from './FallbackImage';
-import { formatIVRDate, formatSubTenure } from '../utils/ivrFormat';
+import { SevenTvAvatar } from './SevenTvAvatar';
+import { primeSevenTvPicture, type SevenTvPicture } from '../services/sevenTvPictures';
+import { formatIVRDate } from '../utils/ivrFormat';
+import { SubStandingRow } from './profile/SubStandingRow';
+import { wornSubBadgeArt } from '../utils/wornSubBadge';
+import type { SubStanding } from '../types';
 import { Logger } from '../utils/logger';
 import {
   getProfileFromMemoryCache,
@@ -37,6 +44,7 @@ import {
   subscribeCosmeticsVersion,
 } from '../services/supabaseService';
 import { resolveCosmeticAsset, DEFAULT_COSMETIC_SLUG } from './cosmeticAssets';
+import { CosmeticArt } from './CosmeticArt';
 import { SLOT_FOR_TYPE, type CosmeticType } from '../services/cosmetics/types';
 import { useMemberProfile, type MemberProfilePreview } from './profile/memberProfile';
 import { MemberProfileBackdrop } from './profile/MemberProfileBackdrop';
@@ -56,6 +64,10 @@ import { useChannelEmotes } from '../stores/chatConnectionStore';
 import { historyKey } from '../utils/chatterIdentity';
 import { isChannelScopedTwitchBadge } from '../utils/badgeOrder';
 import { usePlatformAccountStore } from '../stores/platformAccountStore';
+import { isImeComposing } from '../utils/imeComposing';
+import { openBadgeSpotlight } from '../stores/badgeSpotlightStore';
+import { thirdPartyBadgeRef } from '../utils/badgeSpotlight';
+import { moderateChatter, moderateWithToast } from '../services/moderation';
 
 // messageHistory arrives from two sources:
 //   1. The frontend's in-session userMessageHistory Map (full ParsedMessage shape
@@ -169,6 +181,8 @@ interface UserProfileComplete {
   badges: BadgeData;
   seventv_cosmetics: SevenTVCosmetics | null;
   ivr_data: IVRData;
+  /** This room's sub standing, with its words (services/sub_standing.rs). */
+  sub_standing?: SubStanding | null;
 }
 
 interface TwitchUserProfile {
@@ -216,8 +230,9 @@ interface ThirdPartyBadge {
 interface SevenTVCosmetics {
   paints: SevenTVPaint[];
   badges: SevenTVBadge[];
-  /** 7TV animated avatar URL, if the user has set one. 7TV has no banner. */
-  avatar_url: string | null;
+  /** The profile picture the user set on 7TV (still and animated renditions).
+   *  7TV has no banner. */
+  profile_picture?: SevenTvPicture | null;
 }
 
 // v4 API Paint structure with layers
@@ -352,11 +367,10 @@ const RelativeSuffix = ({ iso, show }: { iso: string | null | undefined; show: b
 interface IVRData {
   created_at: string | null;
   following_since: string | null;
+  /** False when no source could say (Twitch only shares a channel's followers
+   *  with its moderators), so a missing date is not "not following". */
+  follow_known?: boolean;
   status_hidden: boolean;
-  is_subscribed: boolean;
-  sub_streak: number | null;
-  sub_cumulative: number | null;
-  is_founder: boolean;
   is_mod: boolean;
   mod_since: string | null;
   is_vip: boolean;
@@ -366,10 +380,6 @@ interface IVRData {
   follows_count: number | null;
   banned: boolean;
   chatter_count: number | null;
-  sub_tier: string | null;
-  sub_type: string | null;
-  sub_gifter_login: string | null;
-  sub_gifter_display_name: string | null;
   error: string | null;
 }
 
@@ -431,34 +441,48 @@ const providerGroupKey = (provider: unknown): string =>
   typeof provider === 'string' ? provider.toLowerCase() : '';
 
 // Inline editor for the nickname + color overrides we expose on each user.
-// Reads the current override from the settings store on mount (lazy init)
-// and on userId change. Nickname saves on blur or Enter; color saves on the
-// native color picker's change event.
+// Follows the stored override, so a popout card that is still loading settings
+// shows the saved nickname once they arrive, and an edit made in another window
+// shows up here. Nickname saves on blur or Enter; color saves on the native
+// color picker's change event.
 const NicknameEditor: React.FC<NicknameEditorProps> = ({ userId, username, displayName, twitchColor }) => {
-  const readCurrentNickname = () =>
-    useAppStore.getState().settings.chat_customization?.user_overrides?.[userId]?.nickname ?? '';
-  const readCurrentColor = () =>
-    useAppStore.getState().settings.chat_customization?.user_overrides?.[userId]?.color ?? '';
+  const storedNickname = useAppStore(
+    (s) => s.settings.chat_customization?.user_overrides?.[userId]?.nickname ?? '',
+  );
+  const storedColor = useAppStore(
+    (s) => s.settings.chat_customization?.user_overrides?.[userId]?.color ?? '',
+  );
 
-  const [draft, setDraft] = useState<string>(readCurrentNickname);
-  const [savedNickname, setSavedNickname] = useState<string>(readCurrentNickname);
+  const [draft, setDraft] = useState<string>(storedNickname);
+  const [savedNickname, setSavedNickname] = useState<string>(storedNickname);
   const [isEditing, setIsEditing] = useState<boolean>(false);
-  const [savedColor, setSavedColor] = useState<string>(readCurrentColor);
+  const [savedColor, setSavedColor] = useState<string>(storedColor);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   const fallbackColor = normalizeHex(twitchColor);
   const pickerValue = normalizeHex(savedColor || twitchColor);
   const hasColorOverride = savedColor.trim().length > 0;
 
+  // A different chatter starts fresh from what is stored for them.
   useEffect(() => {
-    const nextNickname = readCurrentNickname();
-    const nextColor = readCurrentColor();
-    setDraft(nextNickname);
-    setSavedNickname(nextNickname);
-    setSavedColor(nextColor);
     setIsEditing(false);
+    setDraft(storedNickname);
+    setSavedNickname(storedNickname);
+    setSavedColor(storedColor);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId]);
+
+  // A stored change (settings finished loading, another window edited) lands
+  // here too. An open edit keeps the viewer's draft.
+  useEffect(() => {
+    setSavedNickname(storedNickname);
+    if (!isEditing) setDraft(storedNickname);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storedNickname]);
+
+  useEffect(() => {
+    setSavedColor(storedColor);
+  }, [storedColor]);
 
   useEffect(() => {
     if (isEditing) {
@@ -546,6 +570,7 @@ const NicknameEditor: React.FC<NicknameEditorProps> = ({ userId, username, displ
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commitNickname}
             onKeyDown={(e) => {
+              if (isImeComposing(e)) return;
               if (e.key === 'Enter') {
                 e.preventDefault();
                 commitNickname();
@@ -789,6 +814,10 @@ const UserProfileCard = ({
   // moderator case is blocked here; nothing the broadcaster could legitimately
   // do is taken away.
   const blockedTarget = !viewerIsBroadcaster && (targetIsModerator || targetIsBroadcaster);
+  // The same badges, as a string so the profile fetch re-runs only when they
+  // change, not whenever the caller hands over a fresh array.
+  const wornBadgeKeys = (messageBadges ?? []).map((b) => String(b.key ?? '')).filter(Boolean).join(' ');
+  const subBadgeArt = wornSubBadgeArt(messageBadges);
 
   // The provider zones need the same protection. Without it, a moderator's own
   // card offers "Ban" pointed at themselves — one click from being banned from a
@@ -1100,6 +1129,12 @@ const UserProfileCard = ({
       channelId,
       channelName,
       onPart,
+      // The badges this card was opened with: a worn sub badge is the live
+      // answer to "subscribed right now", which Rust folds into the standing.
+      wornBadges: wornBadgeKeys ? wornBadgeKeys.split(' ') : [],
+      // Helix shows a channel's followers to its broadcaster and moderators
+      // only; Rust asks it, and says "unknown" for everyone else.
+      viewerModerates: isModerator || viewerIsBroadcaster,
     })
       .then((profile) => {
         if (alive) setProfileData(profile);
@@ -1116,7 +1151,7 @@ const UserProfileCard = ({
     return () => {
       alive = false;
     };
-  }, [userId, username, getChannelContext]);
+  }, [userId, username, getChannelContext, wornBadgeKeys, isModerator, viewerIsBroadcaster]);
 
   // Resolve the BetterTTV Pro loyalty badge in parallel (non-blocking). Pops
   // into the BetterTTV badge group when/if it resolves; silent for non-Pro users.
@@ -1369,15 +1404,9 @@ const UserProfileCard = ({
       await invoke(command, { targetUserId: userId });
 
       const nowFollowing = !isFollowing;
+      // A followers-only room you are in rewords itself from Rust once the
+      // follow lands (follow_channel / unfollow_channel).
       setIsFollowing(nowFollowing);
-      // Announce it. A chat composer blocked on "Follow to send a message"
-      // listens for this and unblocks the moment you follow, rather than staying
-      // locked until something happens to remount it.
-      window.dispatchEvent(
-        new CustomEvent('sn:follow-changed', {
-          detail: { userId, following: nowFollowing },
-        }),
-      );
       Logger.debug(`[UserProfileCard] Successfully ${action}ed ${username}`);
     } catch (err: any) {
       Logger.error(`[UserProfileCard] ${action} error:`, err);
@@ -1472,7 +1501,10 @@ const UserProfileCard = ({
         ? `${b.image1x} 1x, ${b.image2x} 2x, ${b.image4x} 4x`
         : undefined,
       title: b.title,
-      provider: b.provider
+      provider: b.provider,
+      // For the badge spotlight card.
+      description: b.description,
+      link: b.link,
     }));
 
     // BTTV Pro loyalty badge (resolved over the BTTV socket, not the cached
@@ -1485,6 +1517,8 @@ const UserProfileCard = ({
           srcSet: undefined,
           title: 'BTTV Pro',
           provider: 'BTTV',
+          description: undefined,
+          link: undefined,
         })
       : thirdPartyBadges;
 
@@ -1528,18 +1562,24 @@ const UserProfileCard = ({
   // commands, whisper). Falls back to the passed value while the profile loads.
   const login = twitchProfile?.login || username;
 
-  // Prefer the user's 7TV animated avatar when they have one; otherwise the
-  // platform's own profile image. 7TV exposes no banner, only this avatar.
+  // The platform's own profile image. A 7TV profile picture is drawn over it
+  // by SevenTvAvatar below, and this stays its fallback.
   //
   // `twitchProfile` is null on a provider card by design (the Helix fetch is
   // skipped), so reading only from it left every Kick and YouTube card with a
   // blank avatar and banner even though both are fetched and parsed.
   const avatarUrl =
-    profileData?.seventv_cosmetics?.avatar_url ||
     twitchProfile?.profile_image_url ||
     kickProfile?.avatar_url ||
     youtubeProfile?.avatar_url ||
     undefined;
+
+  // The card's own 7TV lookup already names the picture; hand it to the avatar
+  // so it draws without a lookup of its own.
+  const cardSeventv = profileData?.seventv_cosmetics ?? earlySeventv;
+  useEffect(() => {
+    if (cardSeventv) primeSevenTvPicture(cardChatKey, cardSeventv.profile_picture ?? null);
+  }, [cardChatKey, cardSeventv]);
 
   const bannerStyle = useMemo(() => {
     const bannerUrl =
@@ -1671,13 +1711,13 @@ const UserProfileCard = ({
       >
         Join chat
       </button>
-      <a href={`https://www.twitch.tv/${login}`} target="_blank" rel="noopener noreferrer" className={memberActionBtn}>
+      <ExternalAnchor href={`https://www.twitch.tv/${login}`} className={memberActionBtn}>
         Twitch
-      </a>
+      </ExternalAnchor>
       <button
         onClick={async () => {
           try {
-            await navigator.clipboard.writeText(buildShareUrl(login));
+            await navigator.clipboard.writeText(await shareLinkFor({ user_login: login }));
             setShareCopied(true);
             window.setTimeout(() => setShareCopied(false), 1400);
           } catch (err) {
@@ -1776,14 +1816,17 @@ const UserProfileCard = ({
                         src={b.src}
                         alt={b.title}
                         className="w-5 h-5 cursor-pointer hover:scale-110 transition-transform"
-                        onClick={() => openBadgesWithTargetInMain(
-                          // Case-insensitive for the same reason the groups are:
-                          // contributor badges come from Rust as 'bttv', while the
-                          // Pro badge is tagged 'BTTV' to match its loadout key.
-                          providerGroupKey(b.provider) === 'bttv'
-                            ? { tab: 'bttv', query: b.title }
-                            : { tab: 'chat-clients', query: b.title },
-                        )}
+                        // The badge's spotlight card, in this window. Rust
+                        // normalises the provider case ('bttv' contributor
+                        // badges, 'BTTV' Pro) and the loadout id space.
+                        onClick={() => openBadgeSpotlight(thirdPartyBadgeRef({
+                          id: b.id,
+                          title: b.title,
+                          provider: b.provider,
+                          description: b.description,
+                          image4x: b.src,
+                          link: b.link,
+                        }))}
                         onError={e => { e.currentTarget.style.display = 'none'; }}
                       />
                     </Tooltip>
@@ -1815,16 +1858,15 @@ const UserProfileCard = ({
                     </p>
                     <div className="flex items-center gap-1.5 flex-wrap">
                       {streamNookUserNumber !== null && (
-                        <StreamNookBadge userId={cardMemberId} />
+                        <StreamNookBadge userId={cardMemberId} className="w-5 h-5 inline-block object-contain" />
                       )}
-                      {inactiveOwnedSlugs.map(({ slug, cosmetic, asset }) => (
+                      {inactiveOwnedSlugs.map(({ slug, cosmetic }) => (
                         <Tooltip key={`sn-${slug}`} content={cosmetic.name} side="top">
-                          <img
-                            src={asset}
-                            alt={cosmetic.name}
-                            className="w-6 h-6 inline-block object-contain cursor-pointer hover:scale-110 transition-transform"
-                            draggable={false}
-                            onClick={openBadgesOnStreamNookInMain}
+                          <CosmeticArt
+                            cosmetic={cosmetic}
+                            chatSize
+                            className="w-5 h-5 inline-block object-contain cursor-pointer hover:scale-110 transition-transform"
+                            onClick={() => openBadgesOnStreamNookInMain()}
                           />
                         </Tooltip>
                       ))}
@@ -1888,20 +1930,18 @@ const UserProfileCard = ({
               >
                 Join Chat
               </button>
-              <a
+              <ExternalAnchor
                 href={`https://www.twitch.tv/${login}`}
-                target="_blank"
-                rel="noopener noreferrer"
                 className="glass-button text-white text-xs py-2.5 px-3 rounded-md text-center hover:bg-accent/20 transition-colors flex items-center justify-center w-full"
               >
                 Open on Twitch
-              </a>
+              </ExternalAnchor>
               {/* Share. Copies the streamnook.app/w/<channel> link; icon and label
                   pop to a check on copy. Full width under the action grid. */}
               <button
                 onClick={async () => {
                   try {
-                    await navigator.clipboard.writeText(buildShareUrl(login));
+                    await navigator.clipboard.writeText(await shareLinkFor({ user_login: login }));
                     setShareCopied(true);
                     window.setTimeout(() => setShareCopied(false), 1400);
                   } catch (err) {
@@ -1944,7 +1984,7 @@ const UserProfileCard = ({
       <div
         ref={cardRef}
         className={`${isStandaloneWindow ? 'relative w-full h-full' : `fixed z-50 ${isMemberCard ? 'w-[760px]' : 'w-[440px]'} max-h-[88vh]`} sn-light-off user-profile-card backdrop-blur-xl shadow-2xl ${framed ? '' : 'border border-borderSubtle rounded-lg'} overflow-hidden flex flex-col`}
-        style={isStandaloneWindow ? { backgroundColor: 'rgba(0, 0, 0, 0.75)' } : cardStyle}
+        style={isStandaloneWindow ? { backgroundColor: 'color-mix(in srgb, #000 calc(75% + (1 - var(--glass-strength, 1)) * 25%), transparent)' } : cardStyle}
         onMouseDown={isStandaloneWindow ? undefined : handleMouseDown}
       >
         {framed && <ProfileFrame url={frameUrl} />}
@@ -1967,12 +2007,15 @@ const UserProfileCard = ({
             )}
           </motion.div>
           <motion.div
-            className="absolute -bottom-10 left-4 w-20 h-20 rounded-full border-2 border-secondary bg-secondary overflow-hidden shadow-lg"
+            className="absolute -bottom-10 left-4 w-20 h-20 rounded-full border-2 border-secondary bg-tertiary overflow-hidden shadow-lg"
             style={prefersReducedMotion ? undefined : { scale: avatarScale, y: avatarLift, transformOrigin: 'left bottom' }}
           >
             {avatarUrl ? (
-              <img
+              <SevenTvAvatar
+                cosmeticsId={cardChatKey}
                 src={avatarUrl}
+                px={80}
+                motion="animate"
                 alt={displayName}
                 className={`w-full h-full object-cover ${isBanned ? 'grayscale' : ''}`}
               />
@@ -2023,8 +2066,47 @@ const UserProfileCard = ({
         </>
         )}
 
+        {/* The history view's bar sits between the header and the scroll body,
+            outside the scroller, so "Back to profile" stays reachable once the
+            timeline auto-scrolls to the newest message without any message ever
+            passing under it. A sticky bar inside the body needed its own fill and
+            blur to hide the rows behind it, and that fill read as a dark box cut
+            out of whatever light shows through the card (the Prism theme's, for
+            one): the card is the backdrop root, so the bar's blur could never
+            sample the light behind the card, only darken the card a second time. */}
+        <AnimatePresence initial={false}>
+          {showMessages && (
+            <motion.div
+              key="messages-bar"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ type: 'tween', duration: 0.18, ease: 'easeOut' }}
+              className="relative z-[2] flex flex-shrink-0 items-center justify-between px-4 pt-2"
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setShowMessages(false);
+                  // The history leaves the body scrolled to its newest
+                  // message; the profile reads from the top.
+                  scrollBodyRef.current?.scrollTo({ top: 0 });
+                }}
+                className="glass-button inline-flex items-center gap-1 rounded-full py-0.5 pl-1.5 pr-2.5 text-[11px] font-medium text-textSecondary hover:text-textPrimary transition-colors"
+              >
+                <ChevronLeft size={13} />
+                Back to profile
+              </button>
+              <span className="text-[10px] text-textSecondary uppercase tracking-wider font-semibold">
+                Chat history{(historicalLoading || deepLoading) ? ' · loading…' : ''}
+              </span>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Single scroll body. One padded container, vertical rhythm via space-y, no section dividers. */}
         <div
+          // glass-exempt: the atmosphere card body; an atmosphere keeps its own glass.
           ref={scrollBodyRef}
           className={`relative z-[1] flex-1 overflow-y-auto min-h-0 scrollbar-thin ${isMemberCard && memberView.hasAtmosphere ? 'bg-[rgba(10,10,14,0.58)] backdrop-blur-[44px]' : ''}`}
           style={isMemberCard && memberView.hasAtmosphere ? ({ '--glass-strength': '0.45' } as React.CSSProperties) : undefined}
@@ -2040,10 +2122,11 @@ const UserProfileCard = ({
                 body (identity + stats + badges + actions) slides UP and out and
                 the messages view slides in — a "curtain reveal" feel.
                 AnimatePresence with `mode="wait"` ensures the exit completes
-                before the enter starts. The wrapper has `overflow-hidden` so the
-                slide stays clipped to the body instead of leaking under the
-                header, where the collapsed compact name carries the identity. */}
-            <div className="relative overflow-hidden">
+                before the enter starts. The wrapper clips so the slide stays
+                inside the body instead of leaking under the header, where the
+                collapsed compact name carries the identity. `clip`, not
+                `hidden`: a hidden overflow is a scroll container. */}
+            <div className="relative overflow-clip">
               <AnimatePresence mode="wait" initial={false}>
                 {showMessages ? (
                   <motion.div
@@ -2054,21 +2137,6 @@ const UserProfileCard = ({
                     transition={{ type: 'tween', duration: 0.22, ease: 'easeOut' }}
                     className="-mx-2"
                   >
-                    {/* Sticky so "Back to profile" stays reachable once the
-                        timeline auto-scrolls to the newest message. */}
-                    <div className="sticky top-0 z-20 flex items-center justify-between px-2 py-2 -mt-2 bg-secondary/95 backdrop-blur-sm">
-                      <button
-                        type="button"
-                        onClick={() => setShowMessages(false)}
-                        className="inline-flex items-center gap-1 text-[11px] text-textSecondary hover:text-textPrimary transition-colors"
-                      >
-                        <ChevronDown size={14} />
-                        Back to profile
-                      </button>
-                      <span className="text-[10px] text-textSecondary uppercase tracking-wider font-semibold">
-                        Chat history{(historicalLoading || deepLoading) ? ' · loading…' : ''}
-                      </span>
-                    </div>
                     {(() => {
                       // Unified message timeline. Historical (Twitch GQL +
                       // Justlog + Robotty, merged in Rust) AND in-session
@@ -2354,38 +2422,18 @@ const UserProfileCard = ({
                 organically without empty cells. */}
             <div className="space-y-2">
               {(() => {
-                // Current-channel context for "Gift a sub" target. Hidden when we're
-                // viewing this user's own channel (you'd be gifting them a sub to
-                // themselves, which is awkward) or when there's no active stream.
-                const { channelName: viewedChannel } = (propChannelId && propChannelName)
-                  ? { channelName: propChannelName }
-                  : { channelName: useAppStore.getState().currentStream?.user_login };
-                const canGiftSub = !!viewedChannel
-                  && !!login
-                  && viewedChannel.toLowerCase() !== login.toLowerCase()
-                  && !ivrData?.is_subscribed;
-                const handleGiftSub = async () => {
-                  try {
-                    const { open } = await import('@tauri-apps/plugin-shell');
-                    // ?giftrecipient= is a best-guess query param. If Twitch ignores
-                    // it the user lands on the subs page and types the name manually,
-                    // which is still a one-click improvement over leaving the app.
-                    await open(`https://www.twitch.tv/subs/${viewedChannel}?giftrecipient=${login}`);
-                  } catch (err) {
-                    Logger.error('Failed to open gift sub URL:', err);
-                  }
-                };
+                // The sub standing in this room, and its gift action, live on one
+                // row below (SubStandingRow), so the stats panel carries no sub row.
+                const subStanding = provider === 'twitch' ? profileData?.sub_standing ?? null : null;
                 // Every row defaults to on, so a user who never opens the
                 // visibility settings sees the card exactly as before.
                 const rows = {
                   joinDate: cardPrefs?.show_join_date !== false && !!twitchProfile,
                   followage: cardPrefs?.show_followage !== false
                     && !!ivrData
-                    && (!!ivrData.following_since || ivrData.status_hidden || !profileLoading),
+                    && (!!ivrData.following_since || ivrData.status_hidden || !!ivrData.follow_known),
                   followsCount: cardPrefs?.show_follows_count !== false && (ivrData?.follows_count ?? 0) > 0,
                   chatterCount: cardPrefs?.show_chatter_count !== false && (ivrData?.chatter_count ?? 0) > 0,
-                  pastSub: cardPrefs?.show_past_subscriber !== false
-                    && !!ivrData && !ivrData.is_subscribed && (ivrData.sub_cumulative ?? 0) > 0,
                   lastLive: cardPrefs?.show_last_live !== false && !!ivrData?.last_broadcast_at,
                 };
                 const hasAnyStat = Object.values(rows).some(Boolean);
@@ -2424,7 +2472,7 @@ const UserProfileCard = ({
                               </span>
                             )}
                           </div>
-                        ) : rows.followage && !profileLoading && (
+                        ) : rows.followage && (
                           <div className="flex items-baseline justify-between gap-3 text-[11px]">
                             <span className="text-textSecondary">Following</span>
                             <span className="text-textSecondary italic">Not following</span>
@@ -2444,14 +2492,6 @@ const UserProfileCard = ({
                             </div>
                           </Tooltip>
                         )}
-                        {rows.pastSub && (
-                          <div className="flex items-baseline justify-between gap-3 text-[11px]">
-                            <span className="text-textSecondary">Past subscriber</span>
-                            <span className="text-textPrimary font-medium tabular-nums">
-                              {ivrData!.sub_cumulative === 1 ? '1mo total' : `${ivrData!.sub_cumulative}mo total`}
-                            </span>
-                          </div>
-                        )}
                         {rows.lastLive && (
                           <Tooltip content={ivrData!.last_broadcast_title ?? formatDate(ivrData!.last_broadcast_at!)} side="top">
                             <div className="flex items-baseline justify-between gap-3 text-[11px] cursor-default">
@@ -2461,6 +2501,14 @@ const UserProfileCard = ({
                           </Tooltip>
                         )}
                       </div>
+                    )}
+
+                    {subStanding && (
+                      <SubStandingRow
+                        standing={subStanding}
+                        badgeArt={subBadgeArt}
+                        showPast={cardPrefs?.show_past_subscriber !== false}
+                      />
                     )}
 
                     {cardPrefs?.show_notes !== false && (
@@ -2483,21 +2531,8 @@ const UserProfileCard = ({
                         />
                       </div>
                     )}
-                    {(ivrData?.is_subscribed || ivrData?.is_mod || ivrData?.is_vip) && (
+                    {(ivrData?.is_mod || ivrData?.is_vip) && (
                       <div className="flex flex-wrap gap-1.5">
-                        {ivrData?.is_subscribed && (
-                          <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-accent/10 border border-accent/20 text-[11px] text-accent">
-                            <span className="font-semibold">
-                              {ivrData.sub_tier === 'Prime' ? 'Prime' : ivrData.sub_tier ? `Tier ${ivrData.sub_tier}` : ''}
-                              {ivrData.sub_tier ? ' ' : ''}Subscriber
-                            </span>
-                            <span className="text-accent/70">{formatSubTenure(ivrData.sub_streak, ivrData.sub_cumulative)}</span>
-                            {ivrData.sub_type === 'gift' && ivrData.sub_gifter_display_name && (
-                              <span className="text-accent/70">gift from {ivrData.sub_gifter_display_name}</span>
-                            )}
-                            {ivrData.is_founder && <span className="px-1 py-px rounded bg-accent/20 text-[9px] font-bold tracking-wider">FOUNDER</span>}
-                          </span>
-                        )}
                         {ivrData?.is_mod && (
                           <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md bg-success/10 border border-success/20 text-[11px] text-success">
                             <span className="font-semibold">Moderator</span>
@@ -2522,23 +2557,6 @@ const UserProfileCard = ({
                         )}
                       </div>
                     )}
-
-                    {/* Gift-sub action. Text link, not a chip — keeps the
-                        visual weight light and matches the "View Full Changelog"
-                        / "Open Settings →" pattern. Hover state adds underline +
-                        a small arrow nudge so it reads as clickable without
-                        becoming a border-pill. */}
-                    {canGiftSub && (
-                      <button
-                        type="button"
-                        onClick={handleGiftSub}
-                        className="group inline-flex items-center gap-1.5 text-[11px] text-accent hover:text-accent/90 hover:underline underline-offset-[3px] decoration-accent/60 transition-colors"
-                      >
-                        <Gift size={12} />
-                        <span>Gift {displayName} a sub to {viewedChannel}</span>
-                        <span aria-hidden="true" className="transition-transform group-hover:translate-x-0.5">→</span>
-                      </button>
-                    )}
                   </>
                 );
               })()}
@@ -2553,12 +2571,16 @@ const UserProfileCard = ({
                 is the namespaced cosmetics key for a provider chatter and the bare
                 id for Twitch. Writing a bare Kick/YouTube id here would save an
                 override that could never be found again. */}
-            <NicknameEditor
-              userId={provider && provider !== 'twitch' ? `${provider}:${userId}` : userId}
-              username={username}
-              displayName={displayName}
-              twitchColor={color}
-            />
+            {/* No id, no key: a nickname typed here could never be saved, yet the
+                editor would show it as set until the card closed. */}
+            {userId && (
+              <NicknameEditor
+                userId={overrideKey(userId, provider || 'twitch')}
+                username={username}
+                displayName={displayName}
+                twitchColor={color}
+              />
+            )}
 
             {!isMemberCard && actionsBlock}
 
@@ -2595,34 +2617,19 @@ const UserProfileCard = ({
                     <Tooltip key={action.label} content={action.title} side="top">
                       <button
                         onClick={async () => {
-                          try {
-                            const { invoke } = await import('@tauri-apps/api/core');
-                            const args = { channel: propChannelName, targetChannelId: userId };
-                            if (action.kind === 'unban') {
-                              await invoke('youtube_unban_user', args);
-                            } else {
-                              await invoke('youtube_ban_user', {
-                                ...args,
-                                durationSeconds: action.kind === 'timeout' ? 300 : null,
-                              });
-                            }
-                            useAppStore
-                              .getState()
-                              .addToast(
-                                action.kind === 'unban'
-                                  ? `${displayName || login} can chat again`
-                                  : action.kind === 'timeout'
-                                    ? `Timed out ${displayName || login}`
-                                    : `Hid ${displayName || login} from chat`,
-                                'success',
-                              );
-                            onClose();
-                          } catch (err) {
-                            Logger.error('[UserProfileCard] YouTube mod action failed:', err);
-                            useAppStore
-                              .getState()
-                              .addToast(`Couldn't ${action.label.toLowerCase()} ${displayName || login}`, 'error');
-                          }
+                          const done = await moderateWithToast({
+                            provider: 'youtube',
+                            channel: propChannelName,
+                            targetUserId: userId,
+                            targetName: displayName || login,
+                            action:
+                              action.kind === 'timeout'
+                                ? { kind: 'timeout', seconds: 300 }
+                                : action.kind === 'ban'
+                                  ? { kind: 'ban' }
+                                  : { kind: 'unban' },
+                          });
+                          if (done) onClose();
                         }}
                         className={`w-full py-1.5 glass-button text-xs font-semibold text-white/70 hover:text-white rounded flex items-center justify-center transition-colors border ${
                           action.kind === 'ban'
@@ -2658,39 +2665,19 @@ const UserProfileCard = ({
                     <Tooltip key={action.label} content={action.title} side="top">
                       <button
                         onClick={async () => {
-                          try {
-                            const { invoke } = await import('@tauri-apps/api/core');
-                            const ids = {
-                              broadcasterUserId: Number(broadcasterId),
-                              targetUserId: Number(userId),
-                            };
-                            if (!Number.isFinite(ids.broadcasterUserId) || !Number.isFinite(ids.targetUserId)) {
-                              useAppStore.getState().addToast('Kick did not give us an id for that user', 'error');
-                              return;
-                            }
-                            if (action.minutes === undefined) {
-                              await invoke('kick_unban_user', ids);
-                              useAppStore.getState().addToast(`Lifted the ban on ${login}`, 'success');
-                            } else {
-                              await invoke('kick_ban_user', {
-                                ...ids,
-                                durationMinutes: action.minutes,
-                                reason: null,
-                              });
-                              useAppStore
-                                .getState()
-                                .addToast(
-                                  action.minutes === null
-                                    ? `Banned ${login}`
-                                    : `Timed out ${login} for ${action.label}`,
-                                  'success',
-                                );
-                            }
-                            onClose();
-                          } catch (err) {
-                            Logger.error('[UserProfileCard] Kick mod action failed:', err);
-                            useAppStore.getState().addToast(`Couldn't ${action.label.toLowerCase()} ${login}`, 'error');
-                          }
+                          const done = await moderateWithToast({
+                            provider: 'kick',
+                            broadcasterId,
+                            targetUserId: userId,
+                            targetName: login,
+                            action:
+                              action.minutes === undefined
+                                ? { kind: 'unban' }
+                                : action.minutes === null
+                                  ? { kind: 'ban' }
+                                  : { kind: 'timeout', seconds: action.minutes * 60 },
+                          });
+                          if (done) onClose();
                         }}
                         className={`w-full py-1.5 glass-button text-xs font-semibold text-white/70 hover:text-white rounded flex items-center justify-center transition-colors border ${
                           action.danger
@@ -2726,13 +2713,20 @@ const UserProfileCard = ({
                     <button
                       onClick={async () => {
                         if (onPreFillCommand) { onPreFillCommand(`/timeout ${login} 1 Purge`); onClose(); return; }
+                        // A 1-second timeout is how Twitch clears someone's
+                        // messages, so the words say purge rather than timeout.
                         try {
-                          const { invoke } = await import('@tauri-apps/api/core');
-                          await invoke('ban_user', { broadcasterId, targetUserId: userId, duration: 1, reason: 'Purge' });
+                          await moderateChatter({
+                            broadcasterId,
+                            targetUserId: userId,
+                            targetName: login,
+                            action: { kind: 'timeout', seconds: 1 },
+                            reason: 'Purge',
+                          });
                           useAppStore.getState().addToast(`Purged messages for ${login}`, 'success');
                         } catch (err) {
                           Logger.error('[UserProfileCard] Failed to purge:', err);
-                          useAppStore.getState().addToast('Failed to purge user', 'error');
+                          useAppStore.getState().addToast(String(err), 'error');
                         }
                       }}
                       className="py-1.5 glass-button text-xs font-semibold text-white/70 hover:text-white hover:bg-warning/20 border hover:border-warning/30 rounded flex items-center justify-center transition-colors"
@@ -2744,14 +2738,12 @@ const UserProfileCard = ({
                     <button
                       onClick={async () => {
                         if (onPreFillCommand) { onPreFillCommand(`/timeout ${login} 600 ${defaultBanReason}`); onClose(); return; }
-                        try {
-                          const { invoke } = await import('@tauri-apps/api/core');
-                          await invoke('ban_user', { broadcasterId, targetUserId: userId, duration: 600, reason: null });
-                          useAppStore.getState().addToast(`Timed out ${login} for 10m`, 'success');
-                        } catch (err) {
-                          Logger.error('[UserProfileCard] Failed to timeout:', err);
-                          useAppStore.getState().addToast('Failed to timeout user', 'error');
-                        }
+                        await moderateWithToast({
+                          broadcasterId,
+                          targetUserId: userId,
+                          targetName: login,
+                          action: { kind: 'timeout', seconds: 600 },
+                        });
                       }}
                       className="py-1.5 glass-button text-xs font-semibold text-white/70 hover:text-white hover:bg-warning/20 border hover:border-yellow-500/30 rounded flex items-center justify-center transition-colors"
                     >
@@ -2762,14 +2754,12 @@ const UserProfileCard = ({
                     <button
                       onClick={async () => {
                         if (onPreFillCommand) { onPreFillCommand(`/timeout ${login} 86400 ${defaultBanReason}`); onClose(); return; }
-                        try {
-                          const { invoke } = await import('@tauri-apps/api/core');
-                          await invoke('ban_user', { broadcasterId, targetUserId: userId, duration: 86400, reason: null });
-                          useAppStore.getState().addToast(`Timed out ${login} for 24h`, 'success');
-                        } catch (err) {
-                          Logger.error('[UserProfileCard] Failed to timeout:', err);
-                          useAppStore.getState().addToast('Failed to timeout user', 'error');
-                        }
+                        await moderateWithToast({
+                          broadcasterId,
+                          targetUserId: userId,
+                          targetName: login,
+                          action: { kind: 'timeout', seconds: 86400 },
+                        });
                       }}
                       className="py-1.5 glass-button text-xs font-semibold text-white/70 hover:text-white hover:bg-warning/25 border hover:border-warning/35 rounded flex items-center justify-center transition-colors"
                     >
@@ -2781,15 +2771,13 @@ const UserProfileCard = ({
                       onClick={async () => {
                         if (onPreFillCommand) { onPreFillCommand(`/ban ${login} ${defaultBanReason}`); onClose(); return; }
                         if (window.confirm(`Are you sure you want to permanently ban ${login}?`)) {
-                          try {
-                            const { invoke } = await import('@tauri-apps/api/core');
-                            await invoke('ban_user', { broadcasterId, targetUserId: userId, duration: null, reason: null });
-                            useAppStore.getState().addToast(`Banned ${login}`, 'success');
-                            onClose();
-                          } catch (err) {
-                            Logger.error('[UserProfileCard] Failed to ban:', err);
-                            useAppStore.getState().addToast('Failed to ban user', 'error');
-                          }
+                          const done = await moderateWithToast({
+                            broadcasterId,
+                            targetUserId: userId,
+                            targetName: login,
+                            action: { kind: 'ban' },
+                          });
+                          if (done) onClose();
                         }
                       }}
                       className="py-1.5 text-xs font-semibold text-red-200 bg-red-900/50 hover:bg-red-600 border border-red-500/30 rounded flex items-center justify-center transition-colors shadow-lg"
@@ -2826,14 +2814,12 @@ const UserProfileCard = ({
                   <button
                     onClick={async () => {
                       if (window.confirm(`Unban ${login}?`)) {
-                        try {
-                          const { invoke } = await import('@tauri-apps/api/core');
-                          await invoke('unban_user', { broadcasterId, targetUserId: userId });
-                          useAppStore.getState().addToast(`Unbanned ${login}`, 'success');
-                        } catch (err) {
-                          Logger.error('[UserProfileCard] Failed to unban:', err);
-                          useAppStore.getState().addToast('Failed to unban user', 'error');
-                        }
+                        await moderateWithToast({
+                          broadcasterId,
+                          targetUserId: userId,
+                          targetName: login,
+                          action: { kind: 'unban' },
+                        });
                       }
                     }}
                     className="text-[10px] font-medium text-textSecondary hover:text-white hover:underline cursor-pointer"

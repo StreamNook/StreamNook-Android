@@ -9,14 +9,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use crate::rt::AppHandle;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 
+use crate::models::settings::AppState;
 use crate::services::drops_auth_service::DropsAuthService;
+use crate::services::irc_service::{IrcService, RedemptionRow};
 use crate::services::twitch_limits::{
     PUBSUB_LISTEN_TOPICS_PER_FRAME, PUBSUB_MAX_TOPICS_PER_CONNECTION,
 };
@@ -162,6 +164,12 @@ impl ChannelPointsWebSocketService {
             "Registered active watching channel for predictions: {}",
             channel_id
         );
+    }
+
+    /// Whether the viewer is actively watching this channel (the solo stream
+    /// or a MultiNook tile).
+    pub async fn is_active_channel(&self, channel_id: &str) -> bool {
+        self.active_viewing_channels.read().await.contains(channel_id)
     }
 
     /// Unregister a channel that is no longer being watched
@@ -315,6 +323,9 @@ impl ChannelPointsWebSocketService {
 
         // User predictions results
         topics.push(format!("predictions-user-v1.{}", user_id));
+
+        // A moderator's warning to the viewer, and its acknowledgement.
+        topics.push(format!("chatrooms-user-v1.{}", user_id));
 
         // Note: Removed raid topics to reduce count per channel
         // This allows 24 channels per connection: 24*2 + 2 global = 50 topics exactly
@@ -537,6 +548,12 @@ impl ChannelPointsWebSocketService {
                             "predictions-user-v1" => {
                                 Self::handle_self_prediction_event(message_data, app_handle).await;
                             }
+                            "chatrooms-user-v1" => {
+                                // Every connection carries the user topics, so
+                                // a warning can arrive more than once; applying
+                                // it again changes nothing.
+                                crate::services::chat_warning::on_pubsub(message_data).await;
+                            }
                             "predictions-channel-v1" => {
                                 Self::handle_prediction_event(
                                     message_data,
@@ -557,10 +574,19 @@ impl ChannelPointsWebSocketService {
                                 .await;
                             }
                             "community-points-channel-v1" => {
+                                // A reward turned on or off, paused, restocked,
+                                // made, deleted or redeemed: an open points menu
+                                // follows from Rust's kept list.
+                                if let Some(cid) = channel_id.as_deref() {
+                                    if let Some(login) = channel_mappings.read().await.get(cid).map(|m| m.login.clone()) {
+                                        crate::services::channel_rewards::apply_feed(&login, &message_data);
+                                    }
+                                }
                                 Self::handle_channel_redemption_event(
                                     message_data,
                                     app_handle,
                                     channel_id,
+                                    channel_mappings,
                                     active_viewing_channels,
                                 )
                                 .await;
@@ -698,6 +724,13 @@ impl ChannelPointsWebSocketService {
                         channel_login_str
                     );
 
+                    // The wallet's "+N" for every gain, not only the chest. Rust
+                    // keeps one record per channel; a rise already applied (the
+                    // claim's own answer) is not counted again.
+                    if let Some(cid) = channel_id.as_deref() {
+                        crate::services::channel_state::points_gained(cid, points, reason, Some(balance)).await;
+                    }
+
                     // The watched channel's chest claim also arrives through
                     // claim_channel_points, which emits this same event after its
                     // GQL mutation; whichever lands second is the duplicate.
@@ -740,6 +773,9 @@ impl ChannelPointsWebSocketService {
                             "claim_id": claim_id
                         }),
                     );
+                    if let Some(cid) = claim_channel_id {
+                        crate::services::watched_chest::offer(app_handle, cid, claim_id.to_string());
+                    }
                 }
                 "points-spent" => {
                     let points = message_data["data"]["point_cost"]["cost"]
@@ -753,6 +789,9 @@ impl ChannelPointsWebSocketService {
                         .map(|s| s.to_string());
 
                     debug!("Points spent: -{} - New balance: {}", points, balance);
+                    if let Some(cid) = spent_channel_id.as_deref() {
+                        crate::services::channel_state::points_spent(cid, balance).await;
+                    }
 
                     let _ = app_handle.emit(
                         "channel-points-spent",
@@ -811,6 +850,29 @@ impl ChannelPointsWebSocketService {
                 .unwrap_or_default()
         );
 
+        crate::services::predictions::note_self(
+            &channel_id,
+            &event_id,
+            &outcome_id,
+            points,
+            result_type.as_deref(),
+            points_won,
+        );
+
+        // A settled prediction gets its own notification (won, lost, refunded).
+        #[cfg(desktop)]
+        if let Some(result) = result_type.clone() {
+            tauri::async_runtime::spawn(crate::services::points_notify::prediction_result(
+                app_handle.clone(),
+                channel_id.clone(),
+                event_id.clone(),
+                outcome_id.clone(),
+                result,
+                points,
+                points_won,
+            ));
+        }
+
         let _ = app_handle.emit(
             "prediction-self-updated",
             json!({
@@ -841,31 +903,15 @@ impl ChannelPointsWebSocketService {
             }
         }
         // Resolve channel name from mapping or API
-        let channel_name = if let Some(ref cid) = channel_id {
-            let mapping = channel_mappings.read().await;
-            if let Some(channel_info) = mapping.get(cid) {
-                Some(channel_info.login.clone())
-            } else {
-                drop(mapping);
-                // Try API lookup
-                if let Ok(Some((login, display_name))) = Self::lookup_channel_by_id(cid).await {
-                    // Cache for future use
-                    let mut mapping_write = channel_mappings.write().await;
-                    mapping_write.insert(
-                        cid.clone(),
-                        ChannelMapping {
-                            login: login.clone(),
-                            display_name: display_name.clone(),
-                        },
-                    );
-                    Some(login)
-                } else {
-                    None
-                }
-            }
-        } else {
-            None
+        let channel_name = match channel_id {
+            Some(ref cid) => Self::resolve_channel_login(cid, channel_mappings).await,
+            None => None,
         };
+
+        // Rust keeps the prediction and pushes the card every shell draws.
+        if let Some(ref cid) = channel_id {
+            crate::services::predictions::note_channel_event(cid, channel_name.as_deref(), &message_data);
+        }
 
         // Format display string: "channel_name (ID)" or just "ID"
         let channel_display = match (&channel_name, &channel_id) {
@@ -958,6 +1004,15 @@ impl ChannelPointsWebSocketService {
                             "Emitted prediction-created event to frontend: {:?}",
                             emit_result.is_ok()
                         );
+                        #[cfg(desktop)]
+                        if let Some(cid) = channel_id.as_deref() {
+                            crate::services::points_notify::note_prediction(cid, &message_data["data"]["event"]);
+                            tauri::async_runtime::spawn(crate::services::points_notify::prediction_started(
+                                app_handle.clone(),
+                                cid.to_string(),
+                                prediction_id.to_string(),
+                            ));
+                        }
                     }
                 }
                 "event-updated" => {
@@ -1013,6 +1068,10 @@ impl ChannelPointsWebSocketService {
                             "Prediction updated on {}: {} - Status: {} - Winner: {:?}",
                             channel_display, title, status, winning_outcome_id
                         );
+                        #[cfg(desktop)]
+                        if let Some(cid) = channel_id.as_deref() {
+                            crate::services::points_notify::note_prediction(cid, &message_data["data"]["event"]);
+                        }
 
                         // Emit update to frontend
                         let _ = app_handle.emit(
@@ -1035,6 +1094,8 @@ impl ChannelPointsWebSocketService {
                         let title = event.get("title").and_then(|v| v.as_str()).unwrap_or("");
 
                         debug!("Prediction locked on {}: {}", channel_display, title);
+                        #[cfg(desktop)]
+                        crate::services::points_notify::prediction_closed(app_handle, prediction_id);
 
                         let _ = app_handle.emit(
                             "prediction-locked",
@@ -1054,6 +1115,13 @@ impl ChannelPointsWebSocketService {
                         let winning_outcome_id =
                             event.get("winning_outcome_id").and_then(|v| v.as_str());
 
+                        #[cfg(desktop)]
+                        {
+                            if let Some(cid) = channel_id.as_deref() {
+                                crate::services::points_notify::note_prediction(cid, &message_data["data"]["event"]);
+                            }
+                            crate::services::points_notify::prediction_closed(app_handle, prediction_id);
+                        }
                         let winner_display = winning_outcome_id.unwrap_or("cancelled");
                         debug!(
                             "Prediction ended on {}: {} - Winner: {}",
@@ -1156,7 +1224,7 @@ impl ChannelPointsWebSocketService {
             }
         }
 
-        let payload = json!({
+        let mut payload = json!({
             "channel_id": channel_id,
             "poll_id": poll_id,
             "title": title,
@@ -1171,20 +1239,41 @@ impl ChannelPointsWebSocketService {
             "choices": choices
         });
 
-        // Map Twitch's event type to a frontend event. TERMINATE/ARCHIVE aren't
-        // in the captured set but are handled defensively as an end-of-poll.
+        // Map Twitch's event type to a frontend event. All three ends close
+        // the poll; `end_reason` tells the banner which: a finished or ended
+        // poll shows its result, a cancelled (archived) one just goes away.
         let emit_event = match event_type {
             "POLL_CREATE" => "poll-created",
             "POLL_UPDATE" => "poll-updated",
             "POLL_COMPLETE" | "POLL_ARCHIVE" | "POLL_TERMINATE" => "poll-completed",
             _ => return,
         };
+        if emit_event == "poll-completed" {
+            payload["end_reason"] =
+                json!(crate::services::slash_commands::poll_end_reason(Some(event_type), status));
+        }
+        // A poll StreamNook ended was announced the moment Twitch accepted the
+        // end. A frame that was still on its way must not bring the banner back
+        // or say the same end twice; a different end (an ended poll deleted
+        // afterwards) still goes through.
+        if let Some(done) = crate::services::slash_commands::ended_poll_reason(poll_id) {
+            let same_end = emit_event == "poll-completed" && payload["end_reason"].as_str() == Some(done);
+            if emit_event != "poll-completed" || same_end {
+                return;
+            }
+        }
+        // This viewer's own vote, so a banner that mounts mid-poll marks it.
+        crate::services::slash_commands::stamp_my_vote(&mut payload);
 
         debug!(
             "Poll {} on channel {:?}: {} ({} voters, {} votes, status {})",
             emit_event, channel_id, title, total_voters, total_votes, status
         );
 
+        if let Some(ref cid) = channel_id {
+            crate::services::slash_commands::note_poll(cid, &payload, emit_event);
+        }
+        crate::services::poll_view::publish(&payload);
         let _ = app_handle.emit(emit_event, payload);
     }
 
@@ -1192,20 +1281,21 @@ impl ChannelPointsWebSocketService {
     ///
     /// This is broadcast to every viewer with no broadcaster auth, so it's how we
     /// surface OTHER viewers' reward redemptions on a channel we're only watching.
-    /// We forward every `reward-redeemed` event with an `is_input_required` flag;
-    /// the frontend shows the no-input ones (input rewards' text isn't public, and
-    /// message-style rewards already appear in chat on their own).
+    /// A no-input redemption becomes a chat row built and delivered like any
+    /// received one (`IrcService::publish_redemption_row`). Input rewards are
+    /// skipped: their text is not public, and their chat message already shows
+    /// the redemption, as message-style rewards do.
     async fn handle_channel_redemption_event(
         message_data: Value,
         app_handle: &AppHandle,
         channel_id: Option<String>,
+        channel_mappings: &Arc<RwLock<HashMap<String, ChannelMapping>>>,
         active_viewing_channels: &Arc<RwLock<HashSet<String>>>,
     ) {
         // Only for channels we're actively watching (skip background farming channels).
-        if let Some(ref cid) = channel_id {
-            if !active_viewing_channels.read().await.contains(cid) {
-                return;
-            }
+        let Some(cid) = channel_id else { return };
+        if !active_viewing_channels.read().await.contains(&cid) {
+            return;
         }
 
         if message_data["type"].as_str() != Some("reward-redeemed") {
@@ -1219,8 +1309,8 @@ impl ChannelPointsWebSocketService {
         let user = redemption.get("user");
         let reward = redemption.get("reward");
 
-        // Twitch's redemption id — a stable dedupe key so the same redemption
-        // injected by more than one open chat view collapses to one row.
+        // Twitch's redemption id: the row id derives from it, so a redemption
+        // delivered twice (a reconnect overlap) is still one row.
         let redemption_id = redemption.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let user_id = user.and_then(|u| u["id"].as_str()).unwrap_or("");
         let user_login = user.and_then(|u| u["login"].as_str()).unwrap_or("");
@@ -1232,21 +1322,21 @@ impl ChannelPointsWebSocketService {
         let reward_id = reward.and_then(|r| r["id"].as_str()).unwrap_or("");
         let reward_title = reward.and_then(|r| r["title"].as_str()).unwrap_or("");
         let reward_cost = reward.and_then(|r| r["cost"].as_i64()).unwrap_or(0);
-        let reward_prompt = reward.and_then(|r| r["prompt"].as_str()).unwrap_or("");
         let is_input_required = reward
             .and_then(|r| r["is_user_input_required"].as_bool())
             .unwrap_or(false);
-        let user_input = redemption
-            .get("user_input")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
         let background_color = reward
             .and_then(|r| r["background_color"].as_str())
             .unwrap_or("");
 
-        // Reward image (image / default_image can be null); prefer the largest.
+        // Reward art, largest first. A reward without custom art sends
+        // `image: null` beside its `default_image`.
         let image_url = reward
-            .and_then(|r| r.get("image").or_else(|| r.get("default_image")))
+            .and_then(|r| {
+                ["image", "default_image"]
+                    .into_iter()
+                    .find_map(|k| r.get(k).filter(|v| v.is_object()))
+            })
             .and_then(|img| {
                 img["url_4x"]
                     .as_str()
@@ -1258,40 +1348,66 @@ impl ChannelPointsWebSocketService {
         if reward_title.is_empty() {
             return;
         }
+        // A reward that asks for text: its chat message is the row, and it
+        // carries only the reward's id. Remember the name so the row can say it.
+        if is_input_required {
+            if let Some(login) = Self::resolve_channel_login(&cid, channel_mappings).await {
+                crate::services::channel_rewards::note_reward_name(&login, reward_id, reward_title, reward_cost);
+            }
+            return;
+        }
+
+        let shown = app_handle
+            .state::<AppState>()
+            .settings
+            .lock()
+            .ok()
+            .and_then(|s| s.extra.get("show_channel_point_redemptions").and_then(|v| v.as_bool()))
+            .unwrap_or(true);
+        if !shown {
+            return;
+        }
+
+        let Some(channel_login) = Self::resolve_channel_login(&cid, channel_mappings).await else {
+            debug!("Community redemption on {}: channel login unknown, row skipped", cid);
+            return;
+        };
 
         debug!(
-            "Community redemption on {:?}: {} redeemed '{}' ({} pts)",
-            channel_id, user_name, reward_title, reward_cost
+            "Community redemption on {}: {} redeemed '{}' ({} pts)",
+            channel_login, user_name, reward_title, reward_cost
         );
 
         // The event names the redeemer but carries no chat badges; wear the
         // ones they last showed in this channel's chat, and their name colour.
-        let (badges, color) = channel_id
-            .as_deref()
-            .and_then(|cid| crate::services::chat_history::ChatHistory::last_look(cid, user_id))
+        let (badges, color) = crate::services::chat_history::ChatHistory::last_look(&cid, user_id)
             .map(|(badges, color)| (badges.join(","), color.unwrap_or_default()))
             .unwrap_or_default();
 
-        let _ = app_handle.emit(
-            "channel-points-community-redemption",
-            json!({
-                "channel_id": channel_id,
-                "redemption_id": redemption_id,
-                "user_id": user_id,
-                "user_login": user_login,
-                "user_name": user_name,
-                "reward_id": reward_id,
-                "reward_title": reward_title,
-                "reward_cost": reward_cost,
-                "reward_prompt": reward_prompt,
-                "is_input_required": is_input_required,
-                "user_input": user_input,
-                "background_color": background_color,
-                "image_url": image_url,
-                "badges": badges,
-                "color": color,
-            }),
-        );
+        // The channel's own points icon, as its chat header shows it.
+        let points_icon_url = crate::services::channel_state::get(&channel_login)
+            .await
+            .and_then(|s| s.points)
+            .filter(|p| p.enabled)
+            .and_then(|p| p.icon_url);
+
+        IrcService::publish_redemption_row(RedemptionRow {
+            channel: channel_login,
+            room_id: cid,
+            redemption_id: redemption_id.to_string(),
+            user_id: user_id.to_string(),
+            user_login: user_login.to_string(),
+            user_name: user_name.to_string(),
+            reward_id: reward_id.to_string(),
+            reward_title: reward_title.to_string(),
+            reward_cost,
+            image_url: image_url.to_string(),
+            background_color: background_color.to_string(),
+            points_icon_url,
+            badges,
+            color,
+        })
+        .await;
     }
 
     /// Start ping keeper to maintain connections. Idempotent — if a keeper is
@@ -1364,6 +1480,23 @@ impl ChannelPointsWebSocketService {
         self.channel_mappings.write().await.clear();
 
         debug!("All WebSocket connections closed (reader + ping tasks aborted)");
+    }
+
+    /// A channel's login from its id: the registered mapping, else the Twitch
+    /// API, whose answer is cached in the mapping.
+    async fn resolve_channel_login(
+        channel_id: &str,
+        channel_mappings: &Arc<RwLock<HashMap<String, ChannelMapping>>>,
+    ) -> Option<String> {
+        if let Some(info) = channel_mappings.read().await.get(channel_id) {
+            return Some(info.login.clone());
+        }
+        let (login, display_name) = Self::lookup_channel_by_id(channel_id).await.ok().flatten()?;
+        channel_mappings.write().await.insert(
+            channel_id.to_string(),
+            ChannelMapping { login: login.clone(), display_name },
+        );
+        Some(login)
     }
 
     /// Look up channel info by ID via Twitch API (fallback for unknown channels)

@@ -40,6 +40,46 @@ pub struct DropCampaign {
     pub category_ids: Vec<String>,
 }
 
+impl DropCampaign {
+    /// A stream in this category credits the campaign: one of its categories
+    /// by id when the stream carries one, else its game by name.
+    pub fn counts_in(&self, game_id: &str, game_name: &str) -> bool {
+        if !game_id.is_empty() {
+            if self.category_ids.iter().any(|c| c == game_id) {
+                return true;
+            }
+            if self.has_category && self.game_id == game_id {
+                return true;
+            }
+        }
+        !game_name.is_empty() && self.game_name.to_lowercase() == game_name.to_lowercase()
+    }
+
+    /// Watching this channel can earn the campaign, its category aside. An
+    /// unrestricted campaign earns on any channel; a restricted one (the ACL
+    /// flag, or any allow-list) only on a listed channel, matched by id or
+    /// login. A restricted campaign that parsed to no channels earns nowhere,
+    /// and neither does an unknown channel.
+    pub fn earnable_on(&self, channel_id: &str, login: &str) -> bool {
+        if !self.is_acl_based && self.allowed_channels.is_empty() {
+            return true;
+        }
+        let login = login.to_lowercase();
+        self.allowed_channels.iter().any(|c| {
+            (!channel_id.is_empty() && c.id == channel_id) || (!login.is_empty() && c.name.to_lowercase() == login)
+        })
+    }
+}
+
+/// You can earn drops by watching this channel in this category right now:
+/// some active campaign counts in the category AND is earnable on the channel.
+/// Never "this game has drops", which promises what the channel cannot keep.
+pub fn earnable_here(campaigns: &[DropCampaign], channel_id: &str, login: &str, game_id: &str, game_name: &str) -> bool {
+    campaigns
+        .iter()
+        .any(|c| c.counts_in(game_id, game_name) && c.earnable_on(channel_id, login))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AllowedChannel {
     pub id: String,
@@ -211,6 +251,124 @@ pub struct ChannelReward {
     pub max_per_stream: Option<i32>,
     pub max_per_user_per_stream: Option<i32>,
     pub global_cooldown_seconds: Option<i32>,
+    /// Built-in reward type (`SEND_HIGHLIGHTED_MESSAGE`, ...); None for a
+    /// streamer-defined reward.
+    #[serde(default)]
+    pub reward_type: Option<String>,
+    /// Channel-wide redemptions this stream. Twitch reports no per-viewer
+    /// count, so only the per-stream cap can be judged ahead of a redeem.
+    #[serde(default)]
+    pub redemptions_redeemed_current_stream: Option<i32>,
+    /// Only subscribers may redeem it (a custom reward's `isSubOnly`).
+    #[serde(default)]
+    pub is_sub_only: bool,
+    /// Twitch hides it from subscribers (a built-in reward's
+    /// `isHiddenForSubs`, e.g. the sub-only bypass and the emote unlocks).
+    #[serde(default)]
+    pub is_hidden_for_subs: bool,
+    /// What a built-in reward does. Twitch sends no prompt for those, so this
+    /// is ours; custom rewards carry the streamer's `prompt` instead.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Whether the viewer can redeem this reward right now. Re-judged in Rust
+    /// when the room or the stream changes; the menu shows it as-is.
+    #[serde(default)]
+    pub availability: RewardAvailability,
+    /// What redeeming it involves and the words for it
+    /// (services/reward_redeem.rs), stamped with the verdict.
+    #[serde(default)]
+    pub view: RewardView,
+}
+
+/// How a reward is redeemed and what its controls say, for every shell.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct RewardView {
+    /// `highlight`, `sub_message`, `random_emote`, `choose_emote`,
+    /// `modify_emote`, `input` or `standard`.
+    pub kind: String,
+    /// The redeem carries the viewer's typed text.
+    pub takes_text: bool,
+    /// The cost for a narrow pill: "950", "3k", "2.5k", "1.2M".
+    pub cost_label: String,
+    /// The action button: "Redeem", "Send highlighted", "Send", "Choose emote".
+    pub action: String,
+    /// The action button while it works: "Redeeming...", "Sending...".
+    pub busy: String,
+    /// The text box's placeholder, for a reward that takes text.
+    pub placeholder: Option<String>,
+    /// "Can't be undone", for a reward redeemed with one press.
+    pub hint: Option<String>,
+}
+
+/// Why a reward cannot be redeemed right now. Earlier variants win when
+/// several apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewardBlock {
+    Disabled,
+    Paused,
+    OutOfStock,
+    MaxPerStreamReached,
+    OnCooldown,
+    NotEnoughPoints,
+    /// The sub-only bypass message while chat is not in sub-only mode.
+    NeedsSubOnlyMode,
+    /// The sub-only bypass message for the broadcaster, a moderator or a VIP,
+    /// who chat in sub-only mode without it.
+    AlreadyCanChat,
+    /// The sub-only bypass message while chat's room state is unknown (chat
+    /// reconnecting), so whether it would work cannot be judged.
+    ChatReconnecting,
+    /// A subscriber-only reward and a viewer who is not subscribed.
+    SubscribersOnly,
+    /// A reward with a per-stream limit while the channel is offline.
+    OnlyWhileLive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewardAvailability {
+    pub redeemable: bool,
+    pub reason: Option<RewardBlock>,
+    /// Unix ms when a running cooldown ends; None when none is running.
+    pub cooldown_until_ms: Option<i64>,
+    /// False only when the viewer's balance is known and below the cost.
+    pub affordable: bool,
+    /// A few words for the list row ("Sub-only mode only"); None when
+    /// redeemable. A running cooldown's countdown is appended by the view.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// The full sentence for the reward's detail view.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl Default for RewardAvailability {
+    fn default() -> Self {
+        Self {
+            redeemable: true,
+            reason: None,
+            cooldown_until_ms: None,
+            affordable: true,
+            label: None,
+            detail: None,
+        }
+    }
+}
+
+/// The reward list for one channel plus the viewer's balance it was judged
+/// against. Also the payload of the `channel-rewards` event, sent when Rust
+/// re-judges the list (sub-only mode toggled, the stream went live or off).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelRewardsSnapshot {
+    /// The channel's Twitch login, lowercase.
+    #[serde(default)]
+    pub login: String,
+    pub rewards: Vec<ChannelReward>,
+    /// The viewer's points on this channel; None when Twitch did not report
+    /// one (points off, or the account cannot earn here).
+    pub balance: Option<i64>,
+    /// Unix ms the verdicts were computed at.
+    pub fetched_at_ms: i64,
 }
 
 /// Result of attempting to redeem a channel reward
@@ -817,4 +975,46 @@ pub struct CompletedDrop {
     pub required_account_link: Option<String>,
     pub last_awarded_at: DateTime<Utc>,
     pub total_count: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn campaign(game_id: &str, game: &str, acl: bool, allowed: &[(&str, &str)], categories: &[&str]) -> DropCampaign {
+        serde_json::from_value(serde_json::json!({
+            "id": "c", "name": "c", "game_id": game_id, "game_name": game, "description": "",
+            "image_url": "", "start_at": "2026-01-01T00:00:00Z", "end_at": "2027-01-01T00:00:00Z",
+            "time_based_drops": [], "is_acl_based": acl,
+            "allowed_channels": allowed.iter().map(|(id, name)| serde_json::json!({"id": id, "name": name})).collect::<Vec<_>>(),
+            "category_ids": categories,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn unrestricted_campaigns_earn_on_any_channel_in_their_game() {
+        let c = campaign("1", "Rust", false, &[], &[]);
+        assert!(earnable_here(&[c.clone()], "9", "anyone", "1", "Rust"));
+        assert!(earnable_here(&[c.clone()], "9", "anyone", "", "rust"));
+        assert!(!earnable_here(&[c], "9", "anyone", "2", "Other"));
+    }
+
+    #[test]
+    fn restricted_campaigns_earn_only_on_listed_channels() {
+        let c = campaign("1", "Rust", false, &[("42", "Streamer")], &[]);
+        assert!(c.earnable_on("42", ""));
+        assert!(c.earnable_on("", "streamer"));
+        assert!(!c.earnable_on("9", "someone"));
+        assert!(!c.earnable_on("", ""));
+        let empty_acl = campaign("1", "Rust", true, &[], &[]);
+        assert!(!empty_acl.earnable_on("42", "streamer"));
+    }
+
+    #[test]
+    fn a_campaign_over_several_categories_counts_in_each() {
+        let c = campaign("1", "Pokemon", false, &[], &["5", "6"]);
+        assert!(c.counts_in("6", "Some Other Game"));
+        assert!(!c.counts_in("7", "Some Other Game"));
+    }
 }

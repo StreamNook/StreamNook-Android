@@ -1,47 +1,57 @@
-// Custom highlight sounds: pick any audio file on disk; it becomes a choice in
-// every highlight sound dropdown (phrases, users, badges) under the id
-// `file:<random>`. The path is stored in settings; playback goes through the
-// asset protocol, so nothing is copied or uploaded anywhere.
+// Custom sounds: pick an audio file and it becomes a choice in every sound
+// picker (highlights, mentions, notifications) under the id `file:<id>`. Rust
+// copies the file into the app's own sounds folder and adds the entry in one
+// step, so moving or deleting the original never breaks it; playback goes
+// through the asset protocol and nothing is uploaded anywhere. Sounds added
+// before imports existed keep pointing at the user's own file.
 
+import { EntryInput } from './entryInput';
+import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { FolderOpen, Play, Trash2 } from 'lucide-react';
 import { useAppStore } from '../../stores/AppStore';
 import { playSound } from '../../utils/notificationSound';
+import { Logger } from '../../utils/logger';
 import { SettingsSection } from './_primitives';
 import { Tooltip } from '../ui/Tooltip';
 import type { CustomSound } from '../../types';
 
-function newId(): string {
-  const rand =
-    typeof crypto !== 'undefined' && 'randomUUID' in crypto
-      ? crypto.randomUUID().slice(0, 8)
-      : Math.random().toString(36).slice(2, 10);
-  return `file:${rand}`;
-}
-
 const CustomSoundsSettings = () => {
-  const { settings, updateSettings } = useAppStore();
-  const sounds = settings.chat_highlights?.custom_sounds ?? [];
-
-  const write = (next: CustomSound[]) =>
-    updateSettings({
-      ...settings,
-      chat_highlights: { ...settings.chat_highlights, phrases: settings.chat_highlights?.phrases ?? [], custom_sounds: next },
-    });
+  const sounds = useAppStore((s) => s.settings.chat_highlights?.custom_sounds) ?? [];
 
   const add = async () => {
     try {
       const picked = await open({
         multiple: false,
         directory: false,
-        filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'webm'] }],
+        filters: [{ name: 'Audio', extensions: ['mp3', 'wav', 'ogg', 'oga', 'opus', 'flac', 'm4a', 'aac', 'webm'] }],
       });
       const path = typeof picked === 'string' ? picked : null;
       if (!path) return;
-      const name = path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, '') || 'Sound';
-      write([...sounds, { id: newId(), name, path }]);
-    } catch {
-      /* dialog cancelled or unavailable */
+      await invoke<CustomSound>('add_custom_sound', { path });
+    } catch (err) {
+      // A cancelled dialog resolves to null above; anything here is a refusal
+      // from the import (type, size) or a dialog that could not open.
+      useAppStore.getState().addToast(typeof err === 'string' ? err : 'Could not add that sound.', 'error');
+    }
+  };
+
+  const remove = (sound: CustomSound) => {
+    void invoke('delete_custom_sound', { id: sound.id }).catch((err) =>
+      Logger.warn('[CustomSounds] remove failed:', err),
+    );
+  };
+
+  const rename = async (id: string, name: string): Promise<string | undefined> => {
+    try {
+      const stored = await invoke<CustomSound[]>('edit_settings_list', {
+        path: 'chat_highlights.custom_sounds',
+        edit: { op: 'update', id, patch: { name } },
+      });
+      return stored.find((s) => s.id === id)?.name;
+    } catch (err) {
+      Logger.warn('[CustomSounds] rename failed:', err);
+      return undefined;
     }
   };
 
@@ -49,17 +59,17 @@ const CustomSoundsSettings = () => {
     <SettingsSection
       id="settings-section-custom-sounds"
       label="Custom Sounds"
-      description="Your own audio files as highlight sounds. Once added, they appear in every highlight sound picker next to the built-in tones. Files stay where they are; nothing is copied."
+      description="Your own audio files, up to 2 MB each. Once added, they appear in every sound picker next to the built-in tones: highlights, mentions and notifications. StreamNook keeps its own copy, so moving the original never breaks it."
       bare
     >
       <div className="space-y-2">
         {sounds.map((s) => (
           <div key={s.id} className="glass-tile flex items-center gap-2 px-3 py-2">
             <div className="min-w-0 flex-1">
-              <input
+              <EntryInput
                 type="text"
                 value={s.name}
-                onChange={(e) => write(sounds.map((x) => (x.id === s.id ? { ...x, name: e.target.value } : x)))}
+                save={(name) => rename(s.id, name)}
                 className="w-full bg-transparent text-sm font-medium text-textPrimary outline-none"
                 spellCheck={false}
                 aria-label="Sound name"
@@ -81,7 +91,7 @@ const CustomSoundsSettings = () => {
             <Tooltip content="Remove" side="top">
               <button
                 type="button"
-                onClick={() => write(sounds.filter((x) => x.id !== s.id))}
+                onClick={() => remove(s)}
                 className="glass-button grid h-7 w-7 place-items-center text-textSecondary hover:text-error"
                 aria-label="Remove sound"
               >

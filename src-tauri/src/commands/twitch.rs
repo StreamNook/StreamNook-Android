@@ -31,6 +31,42 @@ pub async fn twitch_login(
     Ok((verification_uri, user_code))
 }
 
+/// Where a web sign-in starts, and the redirect it ends on.
+#[derive(serde::Serialize)]
+pub struct WebLogin {
+    /// Twitch's authorize page, which asks for the password first when the
+    /// page holds no twitch.tv session.
+    pub url: String,
+    /// The page Twitch redirects to with `code` and `state` (or `error`). The
+    /// sheet stops there and hands them to `finish_twitch_web_login`.
+    pub redirect: String,
+}
+
+/// Primary sign-in on Twitch's own login and Authorize pages, for a shell that
+/// shows them in its own web view (the iPhone app). Completes through
+/// `finish_twitch_web_login`, which emits the same `twitch-login-complete` /
+/// `twitch-login-error` the device-code login does.
+#[tauri::command]
+pub async fn begin_twitch_web_login() -> Result<WebLogin, String> {
+    Ok(WebLogin {
+        url: TwitchService::begin_web_login().map_err(|e| e.to_string())?,
+        redirect: TwitchService::web_login_redirect().to_string(),
+    })
+}
+
+/// The redirect of a web sign-in began with `begin_twitch_web_login`.
+#[tauri::command]
+pub async fn finish_twitch_web_login(
+    app: AppHandle,
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    TwitchService::finish_web_login(&app, code, state, error)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(serde::Serialize)]
 pub struct CreateClipResult {
     pub id: String,
@@ -363,6 +399,209 @@ async fn delete_clip_inner(slug: &str) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+// --- Quick clip (phones) ------------------------------------------------------
+// One call makes a clip of the last 30 seconds: of a live stream (its uptime is
+// the offset) or of a VOD (the playhead). It uses the editor's raw-media flow
+// with the editor's default selection, the window's last 30 seconds, records the
+// clip in "Your clips", and fills in its thumbnail once Twitch has rendered it.
+
+/// A clip covers the 30 seconds before this point, so a point earlier has nothing to grab.
+const QUICK_CLIP_SECONDS: f64 = 30.0;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MadeClip {
+    pub slug: String,
+    pub url: String,
+    pub title: String,
+    pub channel_name: String,
+}
+
+/// The words a phone shows when a clip cannot be made, from the core's error codes.
+fn clip_failure_words(code: &str, live: bool) -> String {
+    if code.contains("OFFLINE") {
+        "You can only clip a live stream".to_string()
+    } else if code.contains("REAUTH") {
+        "Sign in to Twitch again to make clips".to_string()
+    } else if code.contains("EARLY") && live {
+        "This stream just started. Give it 30 seconds before clipping.".to_string()
+    } else if code.contains("EARLY") {
+        "Play at least 30 seconds of the video first".to_string()
+    } else if code.contains("THROTTLED") {
+        "Twitch is busy making clips. Try again in a minute.".to_string()
+    } else {
+        "Could not make a clip".to_string()
+    }
+}
+
+/// Where the clip ends: the VOD playhead, or how long the broadcast has run.
+fn quick_clip_offset(vod_offset: Option<f64>, started_at: Option<&str>, now_ms: i64) -> Option<f64> {
+    if let Some(offset) = vod_offset {
+        return Some(offset.max(0.0));
+    }
+    let started = chrono::DateTime::parse_from_rfc3339(started_at?).ok()?;
+    Some(((now_ms - started.timestamp_millis()) as f64 / 1000.0).max(0.0))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn clip_create(
+    app: AppHandle,
+    channel_id: String,
+    login: String,
+    name: Option<String>,
+    title: Option<String>,
+    vod_id: Option<String>,
+    vod_offset: Option<f64>,
+) -> Result<MadeClip, String> {
+    let live = vod_id.is_none();
+    let name = name.filter(|n| !n.trim().is_empty()).unwrap_or_else(|| login.clone());
+    let made = quick_clip(&channel_id, vod_id.as_deref(), vod_offset, title.clone()).await;
+    let (raw_title, slug, duration) = match made {
+        Ok(made) => made,
+        Err(e) => {
+            let code = e.to_string();
+            warn!("[Clip] {login}: {code}");
+            return Err(clip_failure_words(&code, live));
+        }
+    };
+    let clip = crate::services::my_clips::MyClip {
+        slug: slug.clone(),
+        title: raw_title.clone(),
+        channel_id,
+        channel_login: login.to_lowercase(),
+        channel_name: name.clone(),
+        made_at: chrono::Utc::now().timestamp_millis(),
+        duration_seconds: duration,
+        source: if live { "live" } else { "vod" }.to_string(),
+        thumbnail_url: None,
+    };
+    let url = clip.url();
+    if let Err(e) = crate::services::my_clips::record(clip) {
+        warn!("[Clip] could not record {slug}: {e}");
+    }
+    notify_my_clips(&app);
+    // The render takes a few seconds; the thumbnail joins the list when it is done.
+    let poll_app = app.clone();
+    let poll_slug = slug.clone();
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            if let Ok(status) = get_clip_render_status_inner(&poll_slug).await {
+                if let Some(thumb) = status.thumbnail.filter(|_| status.ready) {
+                    let _ = crate::services::my_clips::set_thumbnail(&poll_slug, &thumb);
+                    notify_my_clips(&poll_app);
+                    return;
+                }
+            }
+        }
+    });
+    Ok(MadeClip {
+        slug,
+        url,
+        title: raw_title,
+        channel_name: name,
+    })
+}
+
+fn notify_my_clips(app: &AppHandle) {
+    use tauri::Emitter;
+    let _ = app.emit("my-clips://changed", ());
+}
+
+/// (title, slug, seconds) of a fresh 30 second clip ending at the live edge or the playhead.
+async fn quick_clip(
+    channel_id: &str,
+    vod_id: Option<&str>,
+    vod_offset: Option<f64>,
+    title: Option<String>,
+) -> Result<(String, String, f64)> {
+    let (broadcast_id, offset) = match vod_id {
+        Some(_) => (None, quick_clip_offset(vod_offset, None, 0)),
+        None => {
+            let (broadcast_id, started_at) = TwitchService::get_live_broadcast(channel_id).await?;
+            let offset = quick_clip_offset(None, Some(&started_at), chrono::Utc::now().timestamp_millis());
+            (Some(broadcast_id), offset)
+        }
+    };
+    let offset = offset.ok_or_else(|| anyhow::anyhow!("NO_OFFSET"))?;
+    if offset < QUICK_CLIP_SECONDS {
+        return Err(anyhow::anyhow!("EARLY"));
+    }
+    let session = begin_clip_edit_inner(vod_id, broadcast_id.as_deref(), offset).await?;
+    let length = QUICK_CLIP_SECONDS.min(session.duration_seconds.max(5.0));
+    let start = (session.duration_seconds - length).max(0.0);
+    let title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "Clip".to_string());
+    let made = finalize_clip_inner(&session.raw_media_id, start, length, Some(title.clone())).await?;
+    Ok((title, made.id, length))
+}
+
+/// "Your clips", newest first.
+#[tauri::command]
+pub async fn my_clips_list() -> Result<Vec<MyClipRow>, String> {
+    Ok(tokio::task::spawn_blocking(crate::services::my_clips::list)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(MyClipRow::from)
+        .collect())
+}
+
+/// Take a clip off "Your clips" (the clip stays on Twitch).
+#[tauri::command]
+pub async fn my_clips_forget(app: AppHandle, slug: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::services::my_clips::forget(&slug))
+        .await
+        .map_err(|e| e.to_string())??;
+    notify_my_clips(&app);
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MyClipRow {
+    #[serde(flatten)]
+    pub clip: crate::services::my_clips::MyClip,
+    pub url: String,
+    pub age_label: String,
+    pub length_label: String,
+}
+
+impl From<crate::services::my_clips::MyClip> for MyClipRow {
+    fn from(clip: crate::services::my_clips::MyClip) -> Self {
+        use crate::services::channel_media::{age_ms, clip_length};
+        let url = clip.url();
+        let age_label = age_ms(clip.made_at, chrono::Utc::now().timestamp_millis());
+        let length_label = clip_length(clip.duration_seconds);
+        MyClipRow { clip, url, age_label, length_label }
+    }
+}
+
+#[cfg(test)]
+mod quick_clip_tests {
+    use super::*;
+
+    #[test]
+    fn the_offset_is_the_playhead_or_the_uptime() {
+        assert_eq!(quick_clip_offset(Some(95.5), None, 0), Some(95.5));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-18T10:01:00Z").unwrap().timestamp_millis();
+        assert_eq!(quick_clip_offset(None, Some("2026-10-18T10:00:00Z"), now), Some(60.0));
+        assert_eq!(quick_clip_offset(None, Some("not a date"), now), None);
+    }
+
+    #[test]
+    fn failures_read_as_words() {
+        assert_eq!(clip_failure_words("OFFLINE", true), "You can only clip a live stream");
+        assert_eq!(clip_failure_words("EARLY", true), "This stream just started. Give it 30 seconds before clipping.");
+        assert_eq!(clip_failure_words("EARLY", false), "Play at least 30 seconds of the video first");
+        assert_eq!(clip_failure_words("REAUTH", true), "Sign in to Twitch again to make clips");
+        assert_eq!(clip_failure_words("boom", true), "Could not make a clip");
+    }
 }
 
 // --- Clip trim editor (raw-media flow) --------------------------------------
@@ -1147,6 +1386,10 @@ pub fn dismiss_login_overlay(app: &AppHandle, label: &str) {
         }
     }
     crate::services::ui_hang_watchdog::set_active_overlay(None);
+    // Back from Twitch's bits page: a purchase changed the balance.
+    if label.starts_with("bits-") {
+        crate::commands::bits::refresh_balance_after_purchase(app);
+    }
     let _ = app.emit("twitch-overlay-close", serde_json::json!({ "label": label }));
 }
 
@@ -1319,13 +1562,14 @@ pub fn open_subscribe_window(
     Ok(label)
 }
 
-/// The phone's Subscribe: the platform's own checkout in the login overlay.
-/// The overlay shares the app's one cookie jar, which already holds the Twitch
-/// session from the activation page and the Kick session from Kick sign-in, so
-/// the checkout opens as the signed-in account. Async so the plugin call stays
-/// off the main thread. Returns a label for parity with desktop; the phone
-/// closes the overlay with `close_mobile_login`.
-#[cfg(target_os = "android")]
+/// The phone's Subscribe: the platform's own checkout in the login overlay
+/// (Android) or sheet (iPhone). Either shares the app's one cookie jar, which
+/// already holds the Twitch session from sign-in and the Kick session from
+/// Kick sign-in, so the checkout opens as the signed-in account. Async so the
+/// plugin call stays off the main thread. Returns a label for parity with
+/// desktop; Android closes the overlay with `close_mobile_login`, the iPhone
+/// sheet is closed by the person.
+#[cfg(mobile)]
 #[tauri::command]
 pub async fn open_subscribe_window(
     app: AppHandle,
@@ -1335,7 +1579,10 @@ pub async fn open_subscribe_window(
 ) -> Result<String, String> {
     let (url, _) = subscribe_target(provider.as_deref(), &channel_login)?;
     let title = title.unwrap_or_else(|| format!("Subscribe to {}", channel_login));
+    #[cfg(target_os = "android")]
     crate::twitch_login_plugin::open_overlay(&app, &url, &title)?;
+    #[cfg(target_os = "ios")]
+    crate::services::ios_sheet::open_overlay(&app, &url, &title)?;
     Ok(format!("subscribe-{}", channel_login))
 }
 
@@ -1433,9 +1680,11 @@ pub async fn get_user_info(_state: State<'_, AppState>) -> Result<UserInfo, Stri
 pub async fn get_recommended_streams(
     state: State<'_, AppState>,
 ) -> Result<Vec<TwitchStream>, String> {
-    TwitchService::get_recommended_streams(&state)
+    let mut streams = TwitchService::get_recommended_streams(&state)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    Ok(streams)
 }
 
 #[tauri::command]
@@ -1446,17 +1695,22 @@ pub async fn get_recommended_streams_paginated(
     languages: Option<Vec<String>>,
     personalized: Option<bool>,
 ) -> Result<(Vec<TwitchStream>, Option<String>), String> {
-    TwitchService::get_recommended_streams_paginated(
+    let (mut streams, next) = TwitchService::get_recommended_streams_paginated(
         &state,
         cursor,
         limit,
-        languages.unwrap_or_default(),
+        crate::services::browse_languages::resolve_stored(
+            &languages.unwrap_or_else(|| crate::services::browse_languages::stored(&state)),
+        ),
         personalized.unwrap_or(false),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    Ok((streams, next))
 }
 
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 pub async fn open_browser_url(app: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -1464,6 +1718,12 @@ pub async fn open_browser_url(app: AppHandle, url: String) -> Result<(), String>
     app.opener()
         .open_url(url, None::<String>)
         .map_err(|e| format!("Failed to open browser: {}", e))
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub async fn open_browser_url(_app: AppHandle, url: String) -> Result<(), String> {
+    crate::ios_ffi::open_url(&url)
 }
 
 #[cfg(desktop)]
@@ -1493,7 +1753,7 @@ pub async fn focus_window(app: AppHandle) -> Result<(), String> {
 pub async fn get_top_games(
     state: State<'_, AppState>,
     limit: u32,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<crate::services::twitch_service::CategoryRow>, String> {
     TwitchService::get_top_games(&state, limit)
         .await
         .map_err(|e| e.to_string())
@@ -1504,7 +1764,7 @@ pub async fn get_top_games_paginated(
     state: State<'_, AppState>,
     cursor: Option<String>,
     limit: u32,
-) -> Result<(Vec<serde_json::Value>, Option<String>), String> {
+) -> Result<(Vec<crate::services::twitch_service::CategoryRow>, Option<String>), String> {
     TwitchService::get_top_games_paginated(&state, cursor, limit)
         .await
         .map_err(|e| e.to_string())
@@ -1517,9 +1777,12 @@ pub async fn get_streams_by_game(
     cursor: Option<String>,
     limit: u32,
 ) -> Result<(Vec<TwitchStream>, Option<String>), String> {
-    TwitchService::get_streams_by_game(&state, &game_id, cursor, limit)
+    let (mut streams, next) = TwitchService::get_streams_by_game(&state, &game_id, cursor, limit)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    crate::services::home_snapshot::stamp_drops(&mut streams).await;
+    Ok((streams, next))
 }
 
 #[tauri::command]
@@ -1527,9 +1790,12 @@ pub async fn search_channels(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<TwitchStream>, String> {
-    TwitchService::search_channels(&state, &query)
+    let mut streams = TwitchService::search_channels(&state, &query)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Search);
+    crate::services::home_snapshot::stamp_drops(&mut streams).await;
+    Ok(streams)
 }
 
 /// Live streams in a category filtered by freeform tags (server-side via GQL).
@@ -1540,9 +1806,11 @@ pub async fn get_streams_by_game_with_tags(
     cursor: Option<String>,
     limit: u32,
 ) -> Result<(Vec<TwitchStream>, Option<String>), String> {
-    TwitchService::get_streams_by_game_with_tags(&game_name, tags, cursor, limit)
+    let (mut streams, next) = TwitchService::get_streams_by_game_with_tags(&game_name, tags, cursor, limit)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    Ok((streams, next))
 }
 
 #[tauri::command]
@@ -1563,14 +1831,31 @@ pub async fn get_user_by_login(login: String) -> Result<UserInfo, String> {
 pub async fn follow_channel(target_user_id: String) -> Result<(), String> {
     TwitchService::follow_channel(&target_user_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // A followers-only room you are in now words itself for the new follow.
+    crate::services::irc_service::own_follow_changed(&target_user_id, true).await;
+    crate::services::channel_state::own_follow_changed(&target_user_id, true).await;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn unfollow_channel(target_user_id: String) -> Result<(), String> {
     TwitchService::unfollow_channel(&target_user_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::irc_service::own_follow_changed(&target_user_id, false).await;
+    crate::services::channel_state::own_follow_changed(&target_user_id, false).await;
+    Ok(())
+}
+
+/// The viewer's follow and subscription state for a Twitch channel, for the
+/// follow and subscribe controls (`following` is null while unknown).
+#[tauri::command]
+pub async fn channel_relationship(
+    channel_id: String,
+    channel_login: String,
+) -> Result<crate::services::channel_relationship::Relationship, String> {
+    Ok(crate::services::channel_relationship::twitch(&channel_id, &channel_login.to_lowercase()).await)
 }
 
 #[tauri::command]
@@ -1689,7 +1974,7 @@ pub async fn get_streams_by_game_name(
     cursor: Option<String>,
     limit: u32,
 ) -> Result<(Vec<TwitchStream>, Option<String>), String> {
-    TwitchService::get_streams_by_game_name(
+    let (mut streams, next) = TwitchService::get_streams_by_game_name(
         &state,
         &game_name,
         exclude_user_login.as_deref(),
@@ -1697,7 +1982,9 @@ pub async fn get_streams_by_game_name(
         limit,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    Ok((streams, next))
 }
 
 /// Get streams by category id directly (no name→id resolution)
@@ -1710,7 +1997,7 @@ pub async fn get_streams_by_game_id(
     cursor: Option<String>,
     limit: u32,
 ) -> Result<(Vec<TwitchStream>, Option<String>), String> {
-    TwitchService::get_streams_by_game_id(
+    let (mut streams, next) = TwitchService::get_streams_by_game_id(
         &state,
         &game_id,
         exclude_user_login.as_deref(),
@@ -1718,7 +2005,9 @@ pub async fn get_streams_by_game_id(
         limit,
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    Ok((streams, next))
 }
 
 /// Send a whisper message to another user
@@ -1737,19 +2026,15 @@ pub async fn start_whisper_listener(
     app: AppHandle,
     whisper_service: State<'_, Arc<TokioMutex<WhisperService>>>,
 ) -> Result<(), String> {
-    // Get the current user's ID and token
+    // Get the current user's ID; the listener fetches a fresh token per connect.
     let user_info = TwitchService::get_user_info()
         .await
         .map_err(|e| format!("Failed to get user info: {}", e))?;
 
-    let token = TwitchService::get_token()
-        .await
-        .map_err(|e| format!("Failed to get token: {}", e))?;
-
     // Start the whisper listener
     let service = whisper_service.lock().await;
     service
-        .start_listening(user_info.id, token, app)
+        .start_listening(user_info.id, app)
         .await
         .map_err(|e| format!("Failed to start whisper listener: {}", e))?;
 
@@ -1857,13 +2142,13 @@ pub async fn refresh_whisper_history(
     Ok(out)
 }
 
-/// Search for categories by name (uses Twitch search API for fuzzy matching)
-/// Returns a list of matching categories with id, name, and box_art_url
+/// Categories matching `query`: the exact name first, then names starting with
+/// it, then the rest, each tier by live viewers (see `rank_category_results`).
 #[tauri::command]
 pub async fn search_categories(
     query: String,
     limit: u32,
-) -> Result<Vec<serde_json::Value>, String> {
+) -> Result<Vec<crate::services::twitch_service::CategoryRow>, String> {
     TwitchService::search_categories(&query, limit)
         .await
         .map_err(|e| e.to_string())
@@ -1971,6 +2256,21 @@ pub async fn get_user_videos(
     Ok((videos, cursor))
 }
 
+/// A channel's videos or clips for the phones' Channel sheet, labels worded (see
+/// `services::channel_media`).
+#[tauri::command]
+pub async fn channel_media(
+    channel_id: String,
+    kind: String,
+    filter: Option<String>,
+    sort: Option<String>,
+    cursor: Option<String>,
+) -> Result<crate::services::channel_media::MediaPage, String> {
+    crate::services::channel_media::page(&channel_id, &kind, filter.as_deref(), sort.as_deref(), cursor.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // --- VOD chat replay (synced historical comments) ---------------------------
 // VODs expose no Helix chat endpoint; Twitch's own web player reads historical
 // chat via the GQL VideoCommentsByOffsetOrCursor persisted query. We page by
@@ -1989,6 +2289,37 @@ const H_VIDEO_COMMENTS: &str =
 fn vod_comments_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Start replaying a VOD's chat from `position` (the player's clock). A clip replays its
+/// window of the source VOD: `startOffset` and `endOffset` are seconds into that VOD.
+#[tauri::command]
+pub async fn vod_replay_begin(
+    app: AppHandle,
+    video_id: String,
+    login: String,
+    position: f64,
+    start_offset: Option<f64>,
+    end_offset: Option<f64>,
+) -> Result<(), String> {
+    crate::services::vod_replay::begin(&app, &video_id, &login, start_offset.unwrap_or(0.0), end_offset, position);
+    Ok(())
+}
+
+/// The replay rows to add with the player at `position` (about once a second).
+#[tauri::command]
+pub async fn vod_replay_tick(
+    app: AppHandle,
+    video_id: String,
+    position: f64,
+) -> Result<crate::services::vod_replay::ReplayStep, String> {
+    Ok(crate::services::vod_replay::tick(&app, &video_id, position))
+}
+
+#[tauri::command]
+pub async fn vod_replay_stop() -> Result<(), String> {
+    crate::services::vod_replay::stop();
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
@@ -2184,6 +2515,16 @@ pub async fn get_vod_comments(
     offset_seconds: f64,
     state: State<'_, AppState>,
 ) -> Result<Vec<VodComment>, String> {
+    vod_comments_at(&video_id, &channel_login, offset_seconds, state.emote_service.clone()).await
+}
+
+/// One page of a VOD's recorded chat from `offset_seconds`, parsed like live rows.
+pub(crate) async fn vod_comments_at(
+    video_id: &str,
+    channel_login: &str,
+    offset_seconds: f64,
+    emote_service: Arc<tokio::sync::RwLock<crate::services::emote_service::EmoteService>>,
+) -> Result<Vec<VodComment>, String> {
     let offset_int = offset_seconds.max(0.0).floor() as i64;
     let body = serde_json::json!({
         "operationName": "VideoCommentsByOffsetOrCursor",
@@ -2225,10 +2566,7 @@ pub async fn get_vod_comments(
     // without this third-party emotes would fall back to plain text. Guarded to
     // fetch at most once per channel per session.
     if !chan.is_empty() {
-        crate::services::irc_service::IrcService::ensure_channel_emotes_for_parse(
-            &chan,
-            state.emote_service.clone(),
-        )
+        crate::services::irc_service::IrcService::ensure_channel_emotes_for_parse(&chan, emote_service)
         .await;
     }
 
@@ -2292,14 +2630,21 @@ pub async fn pin_chat_message(
 ) -> Result<(), String> {
     TwitchService::pin_chat_message(&broadcaster_id, &message_id, duration_seconds)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::channel_state::settle_pin(&broadcaster_id, crate::services::channel_state::PinChange::Pinned(message_id));
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn unpin_chat_message(broadcaster_id: String, message_id: String) -> Result<(), String> {
-    TwitchService::unpin_chat_message(&broadcaster_id, &message_id)
+pub async fn unpin_chat_message(
+    broadcaster_id: String,
+    message_id: Option<String>,
+) -> Result<(), String> {
+    let unpinned = TwitchService::unpin_chat_message(&broadcaster_id, message_id.as_deref())
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::services::channel_state::settle_pin(&broadcaster_id, crate::services::channel_state::PinChange::Unpinned(Some(unpinned)));
+    Ok(())
 }
 
 #[tauri::command]
@@ -2374,6 +2719,49 @@ pub async fn update_suspicious_user_status(
         .map_err(|e| e.to_string())
 }
 
+/// A user's Twitch bio; empty when they have none.
+#[tauri::command]
+pub async fn get_twitch_bio(user_id: String) -> Result<String, String> {
+    TwitchService::get_user_bio(&user_id).await.map_err(|e| e.to_string())
+}
+
+/// Sets the signed-in account's Twitch bio (at most 300 characters) through
+/// the twitch.tv web session; answers what Twitch stored.
+#[tauri::command]
+pub async fn update_twitch_bio(
+    state: tauri::State<'_, crate::models::settings::AppState>,
+    description: String,
+) -> Result<String, String> {
+    let me = TwitchService::get_user_info().await.map_err(|e| e.to_string())?;
+    crate::services::twitch_profile_edit::update_bio(&state.twitch_auth, &me.id, &description)
+        .await
+        .map(|stored| stored.description)
+}
+
+/// Changes the capitalization of the signed-in account's Twitch display name
+/// through the twitch.tv web session; answers what Twitch stored.
+#[tauri::command]
+pub async fn update_twitch_display_name(
+    state: tauri::State<'_, crate::models::settings::AppState>,
+    display_name: String,
+) -> Result<crate::services::twitch_profile_edit::ProfileEditResult, String> {
+    let me = TwitchService::get_user_info().await.map_err(|e| e.to_string())?;
+    crate::services::twitch_profile_edit::update_display_name(&state.twitch_auth, &me.id, &me.login, &display_name).await
+}
+
+/// Uploads a new Twitch profile picture or banner (`kind` `picture` or
+/// `banner`, the file as base64; PNG, JPG or GIF up to 10 MB) through the
+/// twitch.tv web session. Twitch shows it a few seconds later.
+#[tauri::command]
+pub async fn upload_twitch_profile_image(
+    state: tauri::State<'_, crate::models::settings::AppState>,
+    kind: crate::services::twitch_profile_edit::ProfileImageKind,
+    data_base64: String,
+) -> Result<(), String> {
+    let me = TwitchService::get_user_info().await.map_err(|e| e.to_string())?;
+    crate::services::twitch_profile_edit::upload_image(&state.twitch_auth, &me.id, kind, &data_base64).await
+}
+
 #[tauri::command]
 pub async fn update_user_chat_color(target_user_id: String, color: String) -> Result<(), String> {
     TwitchService::update_user_chat_color(&target_user_id, &color)
@@ -2421,21 +2809,175 @@ pub async fn get_channel_vips(broadcaster_id: String) -> Result<Vec<serde_json::
         .map_err(|e| e.to_string())
 }
 
+/// A channel's moderators and VIPs, read signed in (the web session, then the
+/// rewards sign-in, then anonymous). `/mods` and `/vips` print theirs through
+/// `slash_role_list`, which the slash dispatcher calls on every platform.
 #[tauri::command]
-pub async fn get_chatters_by_role(channel_login: String) -> Result<serde_json::Value, String> {
-    TwitchService::get_chatters_by_role(&channel_login)
+pub async fn get_chatters_by_role(
+    state: State<'_, AppState>,
+    channel_login: String,
+) -> Result<serde_json::Value, String> {
+    TwitchService::get_chatters_by_role(&channel_login, Some(&state.twitch_auth))
         .await
         .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn get_channel_chatters(
+    state: State<'_, AppState>,
     broadcaster_id: String,
     channel_login: String,
 ) -> Result<serde_json::Value, String> {
-    TwitchService::get_channel_chatters(&broadcaster_id, &channel_login)
+    let mut chatters = TwitchService::get_channel_chatters(&broadcaster_id, &channel_login, Some(&state.twitch_auth))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Twitch leaves the broadcaster out whenever they are not connected to
+    // their own chat (streaming from software that never joins it), but the
+    // list is "who is here", and the channel owner always is.
+    if needs_broadcaster(&chatters) {
+        let display = TwitchService::get_user_by_login(&channel_login)
+            .await
+            .map(|u| u.display_name)
+            .unwrap_or_default();
+        add_broadcaster(&mut chatters, &broadcaster_id, &channel_login, &display);
+    }
+    if let Some(obj) = chatters.as_object_mut() {
+        obj.insert("role_badges".into(), role_badge_art().await);
+    }
+    Ok(chatters)
+}
+
+fn needs_broadcaster(chatters: &serde_json::Value) -> bool {
+    chatters
+        .get("broadcaster")
+        .and_then(|b| b.as_array())
+        .is_none_or(|b| b.is_empty())
+}
+
+/// Put the channel owner in the broadcaster group, out of any other group a
+/// role lookup miss left them in.
+fn add_broadcaster(chatters: &mut serde_json::Value, id: &str, login: &str, display: &str) {
+    let Some(obj) = chatters.as_object_mut() else { return };
+    let login = login.to_lowercase();
+    let mut found: Option<serde_json::Value> = None;
+    for group in ["moderators", "vips", "viewers"] {
+        if let Some(list) = obj.get_mut(group).and_then(|g| g.as_array_mut()) {
+            if let Some(i) = list.iter().position(|c| {
+                c.get("user_login").and_then(|l| l.as_str()).is_some_and(|l| l.eq_ignore_ascii_case(&login))
+            }) {
+                found = Some(list.remove(i));
+            }
+        }
+    }
+    let entry = found.unwrap_or_else(|| {
+        let name = if display.trim().is_empty() { login.as_str() } else { display };
+        serde_json::json!({ "user_id": id, "user_login": login, "user_name": name })
+    });
+    obj.insert("broadcaster".into(), serde_json::json!([entry]));
+    // Not in chat means not in Twitch's count either.
+    let listed: usize = ["broadcaster", "moderators", "vips", "viewers"]
+        .iter()
+        .filter_map(|g| obj.get(*g).and_then(|v| v.as_array()).map(|a| a.len()))
+        .sum();
+    let total = obj.get("total").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+    obj.insert("total".into(), serde_json::json!(total.max(listed)));
+}
+
+#[cfg(test)]
+mod broadcaster_tests {
+    use super::{add_broadcaster, needs_broadcaster};
+
+    #[test]
+    fn an_absent_broadcaster_is_added() {
+        let mut c = serde_json::json!({ "broadcaster": [], "moderators": [], "vips": [], "viewers": [
+            { "user_id": "2", "user_login": "someone", "user_name": "someone" }
+        ], "total": 1, "truncated": false });
+        assert!(needs_broadcaster(&c));
+        add_broadcaster(&mut c, "1", "Caedrel", "Caedrel");
+        assert_eq!(c["broadcaster"][0]["user_login"], "caedrel");
+        assert_eq!(c["broadcaster"][0]["user_name"], "Caedrel");
+        assert_eq!(c["total"], 2);
+    }
+
+    #[test]
+    fn a_broadcaster_filed_elsewhere_moves_up() {
+        let mut c = serde_json::json!({ "broadcaster": [], "moderators": [], "vips": [], "viewers": [
+            { "user_id": "1", "user_login": "caedrel", "user_name": "Caedrel" }
+        ], "total": 1, "truncated": false });
+        add_broadcaster(&mut c, "1", "caedrel", "");
+        assert_eq!(c["viewers"].as_array().unwrap().len(), 0);
+        assert_eq!(c["broadcaster"][0]["user_id"], "1");
+        assert_eq!(c["total"], 1);
+    }
+
+    #[test]
+    fn a_listed_broadcaster_is_left_alone() {
+        let c = serde_json::json!({ "broadcaster": [{ "user_login": "caedrel" }] });
+        assert!(!needs_broadcaster(&c));
+    }
+}
+
+/// The real Twitch badge art for each viewers-list group header (broadcaster,
+/// moderator, VIP), from the global badge set. A role whose art cannot be
+/// read is null and the list keeps its generic icon.
+async fn role_badge_art() -> serde_json::Value {
+    let badges = match crate::commands::badges::get_cached_global_badges().await {
+        Ok(Some(b)) => Some(b),
+        _ => crate::commands::badges::fetch_global_badges().await.ok(),
+    };
+    role_badge_art_from(badges.as_ref())
+}
+
+fn role_badge_art_from(badges: Option<&crate::commands::badges::HelixBadgesResponse>) -> serde_json::Value {
+    let art = |set_id: &str| -> Option<String> {
+        let set = badges?.data.iter().find(|s| s.set_id == set_id)?;
+        let version = set.versions.iter().find(|v| v.id == "1").or(set.versions.first())?;
+        Some(version.image_url_2x.clone()).filter(|u| !u.is_empty())
+    };
+    serde_json::json!({
+        "broadcaster": art("broadcaster"),
+        "moderators": art("moderator"),
+        "vips": art("vip"),
+    })
+}
+
+#[cfg(test)]
+mod role_badge_art_tests {
+    use super::role_badge_art_from;
+    use crate::commands::badges::{HelixBadgeSet, HelixBadgeVersion, HelixBadgesResponse};
+
+    fn set(id: &str, url: &str) -> HelixBadgeSet {
+        HelixBadgeSet {
+            set_id: id.into(),
+            versions: vec![HelixBadgeVersion {
+                id: "1".into(),
+                image_url_1x: String::new(),
+                image_url_2x: url.into(),
+                image_url_4x: String::new(),
+                title: id.into(),
+                description: String::new(),
+                click_action: None,
+                click_url: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn maps_role_sets_to_group_keys() {
+        let badges = HelixBadgesResponse {
+            data: vec![set("moderator", "m.png"), set("vip", "v.png"), set("broadcaster", "b.png")],
+        };
+        let out = role_badge_art_from(Some(&badges));
+        assert_eq!(out["moderators"], "m.png");
+        assert_eq!(out["vips"], "v.png");
+        assert_eq!(out["broadcaster"], "b.png");
+    }
+
+    #[test]
+    fn missing_art_is_null() {
+        let out = role_badge_art_from(None);
+        assert!(out["moderators"].is_null());
+    }
 }
 
 #[tauri::command]
@@ -2471,9 +3013,22 @@ pub async fn create_poll(
     duration: u32,
     points_per_vote: Option<u32>,
 ) -> Result<serde_json::Value, String> {
-    TwitchService::create_poll(&broadcaster_id, &title, &choices, duration, points_per_vote)
+    let created = TwitchService::create_poll(&broadcaster_id, &title, &choices, duration, points_per_vote)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Show it in this chat right away and follow it, whether or not PubSub
+    // covers this channel. Twitch can take a moment to show a new poll.
+    tauri::async_runtime::spawn(async move {
+        for _ in 0..4 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            if let Ok(Some(_)) =
+                crate::services::slash_commands::watch_poll_now(&broadcaster_id, Some("poll-created")).await
+            {
+                break;
+            }
+        }
+    });
+    Ok(created)
 }
 
 #[tauri::command]
@@ -2506,9 +3061,13 @@ pub async fn end_poll(
     poll_id: String,
     status: String,
 ) -> Result<serde_json::Value, String> {
-    TwitchService::end_poll(&broadcaster_id, &poll_id, &status)
+    let ended = TwitchService::end_poll(&broadcaster_id, &poll_id, &status)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Twitch accepted it: every banner on this poll closes (or shows its
+    // result) now, not at the next poll read with a guessed reason.
+    crate::services::slash_commands::announce_poll_ended(&broadcaster_id, &poll_id, &status, &ended);
+    Ok(ended)
 }
 
 #[tauri::command]
@@ -2523,21 +3082,25 @@ pub async fn create_prediction(
         .map_err(|e| e.to_string())
 }
 
+/// The channel's prediction while it can still be locked, cancelled or paid
+/// out (ACTIVE or LOCKED), or null.
 #[tauri::command]
-pub async fn end_prediction(
+pub async fn get_open_prediction(broadcaster_id: String) -> Result<Option<serde_json::Value>, String> {
+    TwitchService::get_open_prediction(&broadcaster_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Lock, cancel or pay out the channel's open prediction, found fresh. A
+/// payout names its winner by position (1-based) or title. Answers the line
+/// to show the user.
+#[tauri::command]
+pub async fn finish_prediction(
     broadcaster_id: String,
-    prediction_id: String,
-    status: String,
-    winning_outcome_id: Option<String>,
-) -> Result<serde_json::Value, String> {
-    TwitchService::end_prediction(
-        &broadcaster_id,
-        &prediction_id,
-        &status,
-        winning_outcome_id.as_deref(),
-    )
-    .await
-    .map_err(|e| e.to_string())
+    action: crate::services::twitch_service::PredictionEnd,
+    outcome: Option<String>,
+) -> Result<String, String> {
+    TwitchService::finish_open_prediction(&broadcaster_id, action, outcome.as_deref()).await
 }
 
 #[tauri::command]

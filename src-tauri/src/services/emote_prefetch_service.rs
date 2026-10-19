@@ -36,8 +36,10 @@ use crate::services::universal_cache_service::{
 };
 
 /// How many channels' emote lists to fetch at once during planning. Each fetch
-/// internally fans out to 4 providers, so keep this modest.
-const SCAN_CONCURRENCY: usize = 8;
+/// internally fans out to 4 providers, and at 8 a scan of a hundred follows
+/// drew 429s from Twitch's user-emotes endpoint. The scan runs while the viewer
+/// is away, so finishing sooner buys nothing.
+const SCAN_CONCURRENCY: usize = 4;
 /// How many emote image downloads to keep in flight. AFK, so aggressive, but
 /// capped to stay a decent citizen to the provider CDNs.
 const DOWNLOAD_CONCURRENCY: usize = 16;
@@ -48,6 +50,9 @@ const PROGRESS_EMIT_EVERY: usize = 25;
 /// Rough average on-disk size of one cached emote (AVIF/webp at 1x-2x), used
 /// only to show an estimated total in the UI before anything is downloaded.
 const AVG_EMOTE_BYTES: u64 = 10 * 1024;
+/// Rough average size of one 7TV 4x AVIF hover preview (measured on 7TV's
+/// global set: 22 KB at 4x against 11 KB at 2x).
+const AVG_PREVIEW_BYTES: u64 = 22 * 1024;
 /// Disk-cache lifetime for prefetched files (matches the app's default).
 const EXPIRY_DAYS: u32 = 7;
 
@@ -200,6 +205,18 @@ fn emote_cache_target(emote: &Emote, tier: &str) -> (String, String) {
     }
 }
 
+/// The 4x copy a 7TV emote's hover preview draws, as (cache-key, url), under the
+/// same `id@4x` key `getCachedEmoteUrl(id, '7tv', '4x')` reads. Other providers'
+/// previews use their single canonical file, which the chat-size entry covers.
+fn emote_preview_target(emote: &Emote) -> Option<(String, String)> {
+    matches!(emote.provider, EmoteProvider::SevenTV).then(|| {
+        (
+            emote_cache_key(&emote.provider, &emote.id, "4x"),
+            format!("https://cdn.7tv.app/emote/{}/4x.avif", emote.id),
+        )
+    })
+}
+
 /// The disk-cache id of one emote. 7TV files are per size tier; the others are
 /// provider-namespaced so a Twitch and an FFZ emote that share a numeric id
 /// can't collide. Must match emoteCacheKey() in services/emoteService.ts.
@@ -289,6 +306,8 @@ async fn run_plan(
 
     // Discovered emotes deduped by cache key -> url.
     let mut discovered: HashMap<String, String> = HashMap::new();
+    // 7TV hover previews (4x), kept apart so `total_emotes` still counts emotes.
+    let mut previews: HashMap<String, String> = HashMap::new();
 
     let mut iter = channels.into_iter();
     let mut join_set: JoinSet<(String, String, anyhow::Result<EmoteSet>)> = JoinSet::new();
@@ -317,6 +336,9 @@ async fn run_plan(
                     for emote in set_emotes(&set) {
                         let (key, url) = emote_cache_target(emote, &tier);
                         discovered.entry(key).or_insert(url);
+                        if let Some((key, url)) = emote_preview_target(emote) {
+                            previews.entry(key).or_insert(url);
+                        }
                     }
                 }
                 Err(e) => {
@@ -366,6 +388,18 @@ async fn run_plan(
         }
     }
 
+    let emote_downloads = to_download.len();
+    // Then the hover previews (skipped where the chat-size file already is 4x).
+    for (key, url) in previews.iter() {
+        if !discovered.contains_key(key) && !cached.contains_key(key) {
+            to_download.push(PrefetchItem {
+                key: key.clone(),
+                url: url.clone(),
+            });
+        }
+    }
+    let preview_downloads = to_download.len() - emote_downloads;
+
     let to_download_count = to_download.len();
     *plan.write().await = to_download;
 
@@ -379,7 +413,8 @@ async fn run_plan(
         p.total_emotes = discovered.len();
         p.already_cached = already_cached;
         p.to_download = to_download_count;
-        p.estimated_bytes = to_download_count as u64 * AVG_EMOTE_BYTES;
+        p.estimated_bytes =
+            emote_downloads as u64 * AVG_EMOTE_BYTES + preview_downloads as u64 * AVG_PREVIEW_BYTES;
         p.seventv_unavailable = seventv_failed;
         if seventv_failed && p.warning.is_none() {
             p.warning = Some(

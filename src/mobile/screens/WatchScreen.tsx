@@ -18,10 +18,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { X } from 'phosphor-react';
-import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../../stores/AppStore';
 import { useMobileNavStore } from '../navStore';
-import { usePinStore } from '../../stores/pinStore';
+import { useRoomPins } from '../chat/useRoomPins';
+import { useChatTabsStore } from '../chat/chatTabsStore';
 import { useWindowShape } from '../ui/useWindowShape';
 import {
   readWatchLayout,
@@ -32,6 +32,12 @@ import {
 } from '../watch/watchLayout';
 import { SplitHandle } from '../watch/SplitHandle';
 import { MobilePlayer } from '../player/MobilePlayer';
+import { CastCard, CastEndedCard, TvCard } from '../cast/CastCard';
+import { castOwnsStream, isCastable, useCastState } from '../cast/castState';
+import { useTvScreenState } from '../cast/tvScreenState';
+import { MobileOfflineChin } from '../player/MobileOfflineRoom';
+import { useLiveVideoPaused } from '../player/liveVideo';
+import { keepsAudioAfterPip } from '../player/lockScreenAudio';
 import { MobileChatPane } from '../chat/MobileChatPane';
 import {
   CHAT_TAB_STRIP_H,
@@ -44,13 +50,15 @@ import { PinnedBanner } from '../watch/PinnedBanner';
 import HypeTrainBanner from '../../components/HypeTrainBanner';
 import PollOverlay from '../../components/PollOverlay';
 import PredictionOverlay from '../../components/PredictionOverlay';
+import { ChatOverlayStack } from '../../components/chat/ChatOverlayStack';
+import { useChatTopStack } from '../../components/chat/chatTopStack';
 import {
   consumePipClosed,
   getMediaVolume,
   getScreenBrightness,
   isInPip,
   setImmersive,
-  setKeepScreenOn,
+  holdScreenOn,
   setMediaVolume,
   setPipEligible,
   setPipSourceRect,
@@ -62,23 +70,20 @@ import { ChatOverlayChrome } from '../watch/ChatOverlayChrome';
 import type { FullscreenChatSettings } from '../../types';
 import { hapticStep } from '../ui/haptics';
 import { readInsets, type ResolvedInsets } from '../nativeInsets';
-import { Logger } from '../../utils/logger';
-import { isBackgrounded } from '../backgroundGate';
 import { isTwitchStream } from '../../utils/streamProvider';
-
-interface PinnedMessage {
-  id: string;
-  message_id: string;
-  message_text: string;
-  sender_name: string;
-  sender_color: string;
-}
 
 const MINI_W = 200;
 const MINI_H = Math.round((MINI_W * 9) / 16);
 const EDGE_GAP = 12;
-// Clearance so the resting mini player never sits under the floating pill bar.
+// The mini box's side gutter: the pages' own 16 px, so its edge lines up with
+// the cards under it. Used by the clamp, the resting spot and the snap alike.
+const MINI_GUTTER = 16;
+// Clearance so the resting mini player never sits under the floating pill bar
+// (56 px, icons only, riding 14 px above the gesture strip).
 const BOTTOM_GAP = 104;
+// Chats has no tab bar: its composer sits at the bottom edge instead, lower
+// than the bar, so the box rests that much lower to keep the same gap above it.
+const CHATS_COMPOSER_GAP = 0;
 
 // Where the mini player is ALLOWED to be.
 //
@@ -107,14 +112,15 @@ function clampMini(
   vw: number,
   vh: number,
   ins: ResolvedInsets,
+  floor: number = BOTTOM_GAP,
 ): { x: number; y: number } {
   // Clear of the BACK strips at the sides, and of the status bar plus the home /
   // quick-switch strips top and bottom. An app cannot opt out of the home
   // gesture at all, so simply not overlapping it is the only thing that works.
-  const left = EDGE_GAP + Math.max(ins.left, ins.gestureLeft);
-  const right = EDGE_GAP + Math.max(ins.right, ins.gestureRight);
+  const left = MINI_GUTTER + Math.max(ins.left, ins.gestureLeft);
+  const right = MINI_GUTTER + Math.max(ins.right, ins.gestureRight);
   const top = EDGE_GAP + Math.max(ins.top, ins.gestureTop);
-  const bottom = Math.max(BOTTOM_GAP, ins.bottom + ins.gestureBottom + EDGE_GAP);
+  const bottom = Math.max(floor, ins.bottom + ins.gestureBottom + EDGE_GAP);
 
   // Math.max applied LAST, so that on a viewport too small to satisfy both
   // bounds the box lands at the top-left edge rather than off-screen. Getting
@@ -141,11 +147,11 @@ export const WatchScreen: React.FC = () => {
   const isLoading = useAppStore((s) => s.isLoading);
   const streamUrl = useAppStore((s) => s.streamUrl);
   const currentStream = useAppStore((s) => s.currentStream);
+  const restartStream = useAppStore((s) => s.restartStream);
   const currentHypeTrain = useAppStore((s) => s.currentHypeTrain);
   const exitStream = useAppStore((s) => s.exitStream);
   const playerMode = useMobileNavStore((s) => s.playerMode);
   const setPlayerMode = useMobileNavStore((s) => s.setPlayerMode);
-  const refreshNonce = usePinStore((s) => s.refreshNonce);
   const shape = useWindowShape();
   const [landscapeChat, setLandscapeChat] = useState(false);
   // A large screen shows chat by default (beside or under the video), so its
@@ -154,24 +160,45 @@ export const WatchScreen: React.FC = () => {
   const [watchLayout, setWatchLayout] = useState<WatchLayout>(readWatchLayout);
   const [chatSplit, setChatSplit] = useState<number | null>(readWatchSplit);
   const [pip, setPip] = useState(false);
-  const [pinnedFor, setPinnedFor] = useState<{
-    channel: string | null;
-    items: PinnedMessage[];
-  }>({ channel: null, items: [] });
   const [pinsOpen, setPinsOpen] = useState(false);
-  const [dropActive, setDropActive] = useState(false);
+  // The poll, prediction and drop cards: one stack in the chat column's flow,
+  // laid out by Rust against the column's height. Opened together on a short
+  // column (a foldable's side-docked chat) they used to leave no room to read
+  // or type, and the drop card painted over the poll's fold control.
+  const [chatColumnEl, setChatColumnEl] = useState<HTMLDivElement | null>(null);
+  const topStack = useChatTopStack(chatColumnEl);
   const chatTabsVisible = useChatTabsVisible();
+  // The hype train and pinned message float over chat just under the stack:
+  // where the stack ends inside the chat column (its offset parent), or null
+  // while it is empty. Re-read when the tab strip above it comes or goes,
+  // which moves it without resizing it.
+  const [topStackEl, setTopStackEl] = useState<HTMLDivElement | null>(null);
+  const [topStackBottom, setTopStackBottom] = useState<number | null>(null);
+  useEffect(() => {
+    if (!topStackEl) return;
+    const read = () =>
+      setTopStackBottom(topStackEl.offsetHeight > 0 ? topStackEl.offsetTop + topStackEl.offsetHeight : null);
+    read();
+    const ro = new ResizeObserver(read);
+    ro.observe(topStackEl);
+    return () => ro.disconnect();
+  }, [topStackEl, chatTabsVisible]);
+  const chatTabsOpen = useChatTabsStore((s) => s.tabs.length > 0);
   const viewingStreamChat = useViewingStreamChat();
   // Hype train, drops, polls and predictions are Twitch contracts keyed by a
   // numeric user_id; a Kick id would name an unrelated Twitch channel.
   const streamScoped = viewingStreamChat && isTwitchStream(currentStream);
   const chatChannelId = useActiveChatChannelId();
-  // Only surface pins that belong to the room currently on screen.
-  const pinned = pinnedFor.channel === chatChannelId ? pinnedFor.items : [];
-  const backgroundMode = useAppStore((s) => s.settings.video_player?.background_mode) ?? 'pip';
+  // The viewer picked the audio-only rendition: there is no picture to float.
+  const audioOnly = useAppStore((s) => s.activeQuality === 'audio_only');
   // The landscape chat overlay shares its knobs with the desktop overlay:
   // opacity, width and side are one preference however big the screen is.
   const fsChat = useAppStore((s) => s.settings.fullscreen_chat);
+  // The poll and prediction cards follow the same settings as desktop chat:
+  // each can be turned off, and the user picks which one sits on top (read by
+  // the stack's layout).
+  const showPolls = useAppStore((s) => s.settings.show_polls) !== false;
+  const showPredictions = useAppStore((s) => s.settings.show_predictions) !== false;
   // The dial being turned right now (brightness or volume), for the readout.
   const [dial, setDial] = useState<DialReading | null>(null);
   const dialHide = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -186,7 +213,7 @@ export const WatchScreen: React.FC = () => {
   // the gesture strips on a device whose insets differ from the hardcoded gaps.
   const [miniPos, setMiniPos] = useState(() =>
     clampMini(
-      window.innerWidth - MINI_W - EDGE_GAP,
+      window.innerWidth - MINI_W - MINI_GUTTER,
       window.innerHeight - MINI_H - BOTTOM_GAP,
       window.innerWidth,
       window.innerHeight,
@@ -260,6 +287,34 @@ export const WatchScreen: React.FC = () => {
 
   const mini = !forceFull && playerMode === 'mini';
   const watching = !!streamUrl && streamUrl !== 'offline';
+
+  // A Cast device playing this stream takes the player's place; the phone is
+  // the remote and chat carries on. Rust decides everything (cast_session.rs);
+  // this only picks which card to draw.
+  const cast = useCastState();
+  const castOwns = castOwnsStream(cast, currentStream);
+  // When a session ends with this stream on the TV, the stream the phone holds
+  // is either a cast placeholder or a relay Rust stopped. Until the viewer
+  // picks something else the band offers "Watch on this phone" rather than
+  // starting the phone's player by itself (the session may have ended in a
+  // pocket). Keyed on the session ending, not on castOwns falling: opening a
+  // stream the TV cannot take (YouTube) also drops castOwns, and that one must
+  // simply play here.
+  const castConnected = cast.phase === 'casting';
+  const [castEndedUrl, setCastEndedUrl] = useState<string | null>(null);
+  const [prevCastConnected, setPrevCastConnected] = useState(castConnected);
+  if (castConnected !== prevCastConnected) {
+    setPrevCastConnected(castConnected);
+    setCastEndedUrl(!castConnected && isCastable(currentStream) ? streamUrl : null);
+  }
+  const castEnded =
+    !castOwns && !!streamUrl && (streamUrl === castEndedUrl || streamUrl.startsWith('cast://'));
+  // Playing on THIS screen: what keeps it awake, at 60 Hz, and PiP-eligible.
+  // TV screen mode: while the phone mirrors to a TV, Rust plays the stream
+  // full-frame there (TvScreen.kt) and the band shows the remote card.
+  const tv = useTvScreenState();
+  const tvOwns = watching && tv.active && !castOwns;
+  const playingHere = watching && !castOwns && !castEnded && !tvOwns;
   const channelId = currentStream?.user_id;
 
   // Side by side is decided by AVAILABLE WIDTH, not by orientation. An unfolded
@@ -324,6 +379,9 @@ export const WatchScreen: React.FC = () => {
   const sideBySide = !tabletop && shape.twoPane && !mini && !pip && (twoColumns || immersiveLandscape);
   const chatBeside = sideBySide && twoColumns;
   const chatOverlay = sideBySide && immersiveLandscape && landscapeChat && phoneOverlayChat;
+  // Only the stacked portrait band has room below it for the offline card;
+  // everywhere else the card stays over the art.
+  const offlineChin = !sideBySide && !tabletop && !mini && !pip;
   // A phone's "Beside the video" is the overlay column taken out of the
   // picture: same edge, same width and the same drag handle, still immersive,
   // but the video gets the rest of the screen to itself instead of sitting
@@ -398,9 +456,20 @@ export const WatchScreen: React.FC = () => {
   // getComputedStyle forces a style resolve, so the insets are read inside this
   // memo rather than every render: they can only have changed when the viewport
   // did, and the viewport is already a dependency of the clamp itself.
+  // Shown higher over the Chats tab while a chat is open there, so the box
+  // never covers its composer; the stored spot is kept for the other tabs.
+  const overChatsComposer = useMobileNavStore((s) => s.activeTab === 'chats') && chatTabsOpen;
   const miniClamped = useMemo(
-    () => clampMini(miniPos.x, miniPos.y, viewport.w, viewport.h, readInsets()),
-    [miniPos.x, miniPos.y, viewport.w, viewport.h],
+    () =>
+      clampMini(
+        miniPos.x,
+        miniPos.y,
+        viewport.w,
+        viewport.h,
+        readInsets(),
+        overChatsComposer ? BOTTOM_GAP + CHATS_COMPOSER_GAP : BOTTOM_GAP,
+      ),
+    [miniPos.x, miniPos.y, viewport.w, viewport.h, overChatsComposer],
   );
 
   // System PiP strip-down flag from MainActivity. Also mirrored onto <html> so
@@ -421,14 +490,23 @@ export const WatchScreen: React.FC = () => {
     //   1. Reconcile the flag, or a `pip` left at true renders the stripped
     //      black player full screen in an app that is not pipped at all.
     //   2. Tear the stream down if the window was dismissed rather than
-    //      expanded, since otherwise it is still loaded and playing.
+    //      expanded, since otherwise it is still loaded and playing. With
+    //      Background play on it is meant to be playing: the audio carried on
+    //      (lockScreenAudio dropped it to the audio rendition), so it stays.
     const onVisible = () => {
       if (document.visibilityState !== 'visible') return;
       const native = isInPip();
       if (native !== null) apply(native);
-      if (consumePipClosed()) void exitStream();
+      if (consumePipClosed() && !keepsAudioAfterPip()) void exitStream();
     };
-    const onPipClosed = () => void exitStream();
+    const onPipClosed = () => {
+      if (!keepsAudioAfterPip()) {
+        void exitStream();
+        return;
+      }
+      // Handled: clear the native flag so the next open does not end the stream.
+      consumePipClosed();
+    };
 
     window.addEventListener('sn:pip', onPip);
     window.addEventListener('sn:pip-closed', onPipClosed);
@@ -441,27 +519,38 @@ export const WatchScreen: React.FC = () => {
     };
   }, [exitStream]);
 
-  // Native playback affordances: stay awake + PiP eligibility while playing,
-  // immersive bars only for full landscape playback.
+  // Keep-awake follows playback, not the open layer: a paused stream lets the
+  // screen sleep like any other paused video, and pressing play keeps it on
+  // again. Its own effect, so a pause never touches PiP or the refresh rate.
+  // TV screen mode needs the screen on too: Android only shows the TV picture
+  // while the app is visible, and most phones stop mirroring when it sleeps.
+  const videoPaused = useLiveVideoPaused();
+  const keepAwake = (playingHere && !videoPaused) || tvOwns;
   useEffect(() => {
-    setKeepScreenOn(watching);
+    holdScreenOn('player', keepAwake);
+    return () => holdScreenOn('player', false);
+  }, [keepAwake]);
+
+  // Native playback affordances: PiP eligibility while playing, immersive bars
+  // only for full landscape playback.
+  useEffect(() => {
     // A 60 Hz window while a stream plays. The panel's 90 Hz mode was drawing
     // every frame at 90 for a picture that is 60 at most, and frame
     // presentation (RenderThread + GPU process + compositor) was the biggest
     // share of the app's CPU while watching. Restored when playback ends.
-    setPreferredRefreshRate(watching ? 60 : 0);
+    setPreferredRefreshRate(playingHere ? 60 : 0);
     // PiP eligibility is what makes leaving the app auto-enter a floating
-    // window. Gated on the setting, because with it always on there was no way
-    // to simply MINIMISE a stream: every exit became PiP. In 'audio' mode the
-    // app just goes to the background, the stream drops to its audio-only
-    // rendition, and the media notification is what brings it back.
-    setPipEligible(watching && backgroundMode !== 'audio');
+    // window, and it comes first whatever Background play says: that setting
+    // only decides what happens when the video cannot float (the system's PiP
+    // permission is off, the window was closed, the screen went off), where the
+    // stream drops to its audio rendition behind the media notification. The
+    // audio-only rendition has no picture, so it never floats.
+    setPipEligible(playingHere && !audioOnly);
     return () => {
-      setKeepScreenOn(false);
       setPreferredRefreshRate(0);
       setPipEligible(false);
     };
-  }, [watching, backgroundMode]);
+  }, [playingHere, audioOnly]);
 
   // Landscape is a viewing posture, never a browsing one: while the full watch
   // layer is up on a screen wider than it is tall, the status bar and the
@@ -512,45 +601,8 @@ export const WatchScreen: React.FC = () => {
     if (channelId) setPlayerMode('full');
   }, [channelId, setPlayerMode]);
 
-  // Pinned messages: 30s poll + instant refresh on pin/unpin actions.
-  //
-  // Keyed to the CHAT on screen, not to the stream. A pinned message is a
-  // property of the room you are reading, so with several tabs open, fetching
-  // against `currentStream` left one channel's pin sitting above another
-  // channel's messages and appearing to jump between them as you switched.
-  //
-  // The result is stamped with the channel it describes and compared on read, so
-  // a slow response cannot land under the wrong room and nothing has to clear
-  // state from inside the effect.
-  useEffect(() => {
-    if (!chatChannelId || !watching) return;
-    let cancelled = false;
-    const fetchPins = async () => {
-      try {
-        const messages = await invoke<PinnedMessage[]>('get_pinned_chat_messages', {
-          channelId: chatChannelId,
-        });
-        if (cancelled) return;
-        setPinnedFor({ channel: chatChannelId, items: messages || [] });
-        usePinStore
-          .getState()
-          .setPinnedIds((messages || []).map((m) => m.message_id).filter(Boolean));
-      } catch (err) {
-        Logger.warn('[Watch] pinned fetch failed:', err);
-      }
-    };
-    void fetchPins();
-    // Skipped while backgrounded: a pinned message is chat chrome nobody can
-    // see, and the next tick after resuming picks up whatever is current.
-    const t = setInterval(() => {
-      if (isBackgrounded()) return;
-      void fetchPins();
-    }, 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-  }, [chatChannelId, watching, refreshNonce]);
+  // Pinned messages for the room on screen (shared with the Chats screen).
+  const pinned = useRoomPins(watching);
 
   // ONE gesture on the band, serving both drags, bound UNCONDITIONALLY.
   //
@@ -633,6 +685,15 @@ export const WatchScreen: React.FC = () => {
       const dx = e.clientX - g.x;
       const dy = e.clientY - g.y;
       if (!g.moved && (Math.abs(dx) > TAP_SLOP_PX || Math.abs(dy) > TAP_SLOP_PX)) {
+        // A dial is a mostly vertical swipe. One that leaves the slop sideways
+        // (a stray swipe across the picture, a thumb resting while the phone
+        // is held) is not a dial and not a tap: the gesture ends here, touching
+        // neither brightness nor volume, and its trailing click is swallowed.
+        if (g.kind === 'dial' && Math.abs(dy) <= Math.abs(dx)) {
+          gesture.current = null;
+          suppressClick.current = true;
+          return;
+        }
         g.moved = true;
         // Captured on first MOVE, not on pointerdown. Capturing straight away
         // would retarget pointerup to the band and rob the overlay's own
@@ -726,9 +787,9 @@ export const WatchScreen: React.FC = () => {
         if (isInPip() === true) return;
         setMiniPos((pos) => {
           const ins = readInsets();
-          const leftBound = EDGE_GAP + Math.max(ins.left, ins.gestureLeft);
+          const leftBound = MINI_GUTTER + Math.max(ins.left, ins.gestureLeft);
           const rightBound =
-            viewport.w - MINI_W - EDGE_GAP - Math.max(ins.right, ins.gestureRight);
+            viewport.w - MINI_W - MINI_GUTTER - Math.max(ins.right, ins.gestureRight);
           const snappedX = pos.x + MINI_W / 2 < viewport.w / 2 ? leftBound : rightBound;
           return clampMini(snappedX, pos.y, viewport.w, viewport.h, ins);
         });
@@ -986,36 +1047,45 @@ export const WatchScreen: React.FC = () => {
             }
           }}
         >
-          <MobilePlayer
-            immersive={sideBySide || pip}
-            compact={mini || pip}
-            onMinimize={mini || pip ? undefined : () => setPlayerMode('mini')}
-            onToggleFullscreen={
-              largeToggle && !mini && !pip
-                ? () => setLargeChatHidden((v) => !v)
-                : sideBySide
-                  ? () => setLandscapeChat((v) => !v)
+          {castOwns ? (
+            <CastCard cast={cast} compact={mini || pip} />
+          ) : tvOwns ? (
+            <TvCard tv={tv} compact={mini || pip} />
+          ) : castEnded ? (
+            <CastEndedCard compact={mini || pip} onWatchHere={() => void restartStream()} />
+          ) : (
+            <MobilePlayer
+              immersive={sideBySide || pip}
+              compact={mini || pip}
+              onMinimize={mini || pip ? undefined : () => setPlayerMode('mini')}
+              onToggleFullscreen={
+                largeToggle && !mini && !pip
+                  ? () => setLargeChatHidden((v) => !v)
+                  : sideBySide
+                    ? () => setLandscapeChat((v) => !v)
+                    : undefined
+              }
+              chatOpen={largeToggle ? !largeChatHidden : chatOverlay || chatBeside}
+              // With chat floating over one edge, the controls keep to the
+              // picture that is still visible: otherwise the chat toggle sat
+              // under the very column it was meant to dismiss.
+              controlsInset={chatOverlay ? { side: overlaySide, px: overlayWidth } : undefined}
+              layoutMode={twoColumns ? 'columns' : 'stacked'}
+              offlineCardBelow={offlineChin}
+              onToggleLayout={
+                // Nothing to arrange while chat is hidden.
+                canChooseLayout && !mini && !pip && !(largeToggle && largeChatHidden)
+                  ? () => {
+                      // Writes an explicit choice, so it stops tracking `auto` and
+                      // survives a restart.
+                      const next: WatchLayout = twoColumns ? 'stacked' : 'columns';
+                      setWatchLayout(next);
+                      writeWatchLayout(next);
+                    }
                   : undefined
-            }
-            chatOpen={largeToggle ? !largeChatHidden : chatOverlay || chatBeside}
-            // With chat floating over one edge, the controls keep to the
-            // picture that is still visible: otherwise the chat toggle sat
-            // under the very column it was meant to dismiss.
-            controlsInset={chatOverlay ? { side: overlaySide, px: overlayWidth } : undefined}
-            layoutMode={twoColumns ? 'columns' : 'stacked'}
-            onToggleLayout={
-              // Nothing to arrange while chat is hidden.
-              canChooseLayout && !mini && !pip && !(largeToggle && largeChatHidden)
-                ? () => {
-                    // Writes an explicit choice, so it stops tracking `auto` and
-                    // survives a restart.
-                    const next: WatchLayout = twoColumns ? 'stacked' : 'columns';
-                    setWatchLayout(next);
-                    writeWatchLayout(next);
-                  }
-                : undefined
-            }
-          />
+              }
+            />
+          )}
           <DialIndicator dial={dial} />
           {/* IN-APP mini only. In system PiP the OS draws its own close and
               expand buttons over the window, so rendering ours too gave two
@@ -1060,6 +1130,9 @@ export const WatchScreen: React.FC = () => {
           )}
         </div>
 
+        {/* The offline room's card sits under the band, never over the art. */}
+        {offlineChin && <MobileOfflineChin />}
+
         {/* Between the panes, so its parent rect is the container the drag
             measures against. Hidden in mini/PiP and on phones. */}
         {resizable && (sideBySide ? chatBeside : true) && (
@@ -1083,6 +1156,7 @@ export const WatchScreen: React.FC = () => {
         )}
 
         <div
+          ref={setChatColumnEl}
           className={chatClass}
           style={
             // Side by side, the row deliberately carries no top padding so the
@@ -1111,19 +1185,16 @@ export const WatchScreen: React.FC = () => {
         >
           {/* Chat header carries only live, transient signal now: the hype
               train and the pinned message. The persistent stream info lives in
-              the player overlay, so chat keeps its full height. */}
-          {/* Always mounted, hidden when empty. DropProgressBar has to run to
-              discover whether there is a drop to show, and gating the wrapper on
-              its answer would mean it never mounts to give one. `hidden` still
-              mounts children and runs their effects, so this breaks that cycle
-              without painting an empty strip. */}
+              the player overlay, so chat keeps its full height. The poll,
+              prediction and drop cards are not in here: they are the stack in
+              the chat pane's flow below, and this header starts under it, so
+              nothing paints over a card's fold control. */}
             <div
               className={
                 // The floating landscape column is for reading the room, so
-                // the stream's own banners (pins, drops, hype train) stay out
-                // of it; they are all still one rotation away. hidden keeps
-                // the drop bar mounted and polling.
-                !chatOverlay && ((streamScoped && (currentHypeTrain || dropActive)) || pinned.length > 0)
+                // the stream's own banners (pins, hype train) stay out of it;
+                // they are all still one rotation away.
+                !chatOverlay && ((streamScoped && currentHypeTrain) || pinned.length > 0)
                   ? // Pure layout now: no background, no border, no blur, no
                     // shadow. Each child already carries its own container
                     // (PinnedBanner is an sn-popover, the hype train draws its
@@ -1137,52 +1208,62 @@ export const WatchScreen: React.FC = () => {
                   : 'hidden'
               }
               style={{
-                // Sits BELOW the chat tab strip when several rooms are open.
-                // This header is absolutely positioned over the top of the chat
-                // column, so at top:0 it covered the tabs completely.
-                top: chatTabsVisible ? CHAT_TAB_STRIP_H : 0,
+                // Sits BELOW the chat tab strip when several rooms are open,
+                // and below the card stack under it. This header is absolutely
+                // positioned over the top of the chat column, so at top:0 it
+                // covered the tabs completely.
+                top: topStackBottom ?? (chatTabsVisible ? CHAT_TAB_STRIP_H : 0),
               }}
             >
-              {/* Hype train and drop progress belong to the STREAM, not to
-                  whichever chat tab you are reading. Showing them over another
-                  room's chat credits them to the wrong channel. */}
+              {/* The hype train belongs to the STREAM, not to whichever chat
+                  tab you are reading. Showing it over another room's chat
+                  credits it to the wrong channel. */}
               {streamScoped && currentHypeTrain && (
                 <HypeTrainBanner
                   train={currentHypeTrain}
                   onExpire={() => useAppStore.getState().setCurrentHypeTrain(null)}
                 />
               )}
-              {/* flex-col-reverse means DOM order here renders ABOVE the pinned
-                  strip and below the info row. Kept mounted even on another tab
-                  so its poll keeps running; it just does not render there. */}
-              <DropProgressBar
-                onActiveChange={setDropActive}
-                visible={streamScoped}
-              />
               <PinnedBanner
                 pins={pinned}
+                channelId={chatChannelId ?? undefined}
                 expanded={pinsOpen}
                 onToggle={() => setPinsOpen((v) => !v)}
               />
             </div>
 
-          {/* Poll + prediction cards, exactly the desktop components: they
-              self-fetch off the channel and anchor under the header. Stream
-              scoped, so same rule as the hype train above. */}
-          {currentStream && streamScoped && !chatOverlay && (
-            <>
-              <PredictionOverlay
-                channelId={currentStream.user_id}
-                channelLogin={currentStream.user_login}
-              />
-              <PollOverlay
-                channelId={currentStream.user_id}
-                channelLogin={currentStream.user_login}
-              />
-            </>
-          )}
-
-          <MobileChatPane readOnly={chatOverlay} />
+          <MobileChatPane
+            readOnly={chatOverlay}
+            top={
+              // Poll + prediction cards are exactly the desktop components:
+              // they self-fetch off the channel. Either can be turned off.
+              // Rust orders the stack (the user's order, votes before the
+              // drop), keeps one card open and caps its height. Stream scoped,
+              // like the hype train; the drop card stays mounted on another tab
+              // so its poll keeps running, it just draws nothing there.
+              <ChatOverlayStack
+                maxHeight={topStack.maxHeight}
+                stackRef={setTopStackEl}
+                className="px-2.5 pt-1.5 pb-1 transition-[padding] duration-200 empty:py-0"
+              >
+                {currentStream && streamScoped && !chatOverlay && showPredictions && (
+                  <PredictionOverlay
+                    channelId={currentStream.user_id}
+                    channelLogin={currentStream.user_login}
+                    stack={topStack.control.prediction}
+                  />
+                )}
+                {currentStream && streamScoped && !chatOverlay && showPolls && (
+                  <PollOverlay
+                    channelId={currentStream.user_id}
+                    channelLogin={currentStream.user_login}
+                    stack={topStack.control.poll}
+                  />
+                )}
+                <DropProgressBar stack={topStack.control.drop} visible={streamScoped && !chatOverlay} />
+              </ChatOverlayStack>
+            }
+          />
           {chatOverlay && (
             <ChatOverlayChrome
               side={overlaySide}
@@ -1214,6 +1295,21 @@ export const WatchScreen: React.FC = () => {
         </div>
       </div>
 
+      {/* A hairline edge on the floating box, so it reads over any thumbnail
+          under it; on a dark card the shadow alone does not. It fades in with
+          the shrink, so the full-screen player shows none. Above the content,
+          and never in the way of a touch. */}
+      {(mini || shrink > 0) && !pip && (
+        <div
+          aria-hidden
+          className="absolute inset-0 z-[35] pointer-events-none"
+          style={{
+            borderRadius: 'inherit',
+            boxShadow: `inset 0 0 0 1px rgba(255, 255, 255, ${(0.12 * (mini ? 1 : shrink)).toFixed(3)})`,
+            transition: dragging ? undefined : 'box-shadow 200ms ease-out',
+          }}
+        />
+      )}
     </motion.div>
     )}
     </AnimatePresence>

@@ -70,7 +70,10 @@ pub fn write_settings_to_disk_sync(settings: &Settings) -> Result<(), String> {
     let settings_path = get_settings_path()?;
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-    fs::write(&settings_path, json).map_err(|e| format!("Failed to write settings file: {}", e))
+    fs::write(&settings_path, json).map_err(|e| format!("Failed to write settings file: {}", e))?;
+    // Today's copy, which a settings.json that later fails to load is rebuilt from.
+    crate::services::settings_backups::snapshot_if_due(settings);
+    Ok(())
 }
 
 /// Persist settings to settings.json, debounced. Callers have already updated
@@ -141,18 +144,126 @@ pub async fn patch_settings(
     if patch.is_empty() {
         return Ok(());
     }
-    let keys: Vec<String> = patch.keys().cloned().collect();
-    let (settings, favorites_changed) = {
+    commit_settings_patch(&app, &state, source, |_| Ok(patch))
+}
+
+/// Apply a top-level patch built from the canonical settings (under its lock,
+/// so the build reads what Rust holds right now), then run every save's side
+/// effects, write it and tell every window which keys changed.
+pub(crate) fn commit_settings_patch(
+    app: &AppHandle,
+    state: &AppState,
+    source: Option<String>,
+    build: impl FnOnce(&Settings) -> Result<serde_json::Map<String, serde_json::Value>, String>,
+) -> Result<(), String> {
+    let (settings, keys, favorites_changed, role_art_changed, source) = {
         let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let patch = build(&state_settings)?;
+        if patch.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<String> = patch.keys().cloned().collect();
+        let sent_themes = patch.get("custom_themes").filter(|v| !v.is_null()).cloned();
         let next = apply_settings_patch(&state_settings, patch)?;
+        // Custom themes come back with their muted text lifted to the contrast
+        // floor; when that changed what the window sent, it has to re-read too.
+        let source = match sent_themes {
+            Some(sent) if next.extra.get("custom_themes") != Some(&sent) => None,
+            _ => source,
+        };
         let favorites_changed = state_settings.favorite_streamers != next.favorite_streamers;
+        let role_art_changed = state_settings.chat_design.ffz_custom_role_badges
+            != next.chat_design.ffz_custom_role_badges;
         *state_settings = next.clone();
-        (next, favorites_changed)
+        (next, keys, favorites_changed, role_art_changed, source)
     };
     after_settings_change(&settings, favorites_changed);
+    state.layout_service.set_gif_scale(settings.chat_design.gif_scale);
     write_settings_to_disk(&settings)?;
     let _ = app.emit(SETTINGS_UPDATED_EVENT, SettingsUpdated { source, keys });
+    if role_art_changed {
+        // Every window's channel badge sets were built with the old choice.
+        crate::services::ffz_room_badges::announce(None);
+    }
     Ok(())
+}
+
+/// What a shell needs before it draws its first screen, in one answer.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BootState {
+    /// The first-run setup has not been finished on this install.
+    pub needs_setup: bool,
+    /// A Twitch sign-in is stored.
+    pub signed_in: bool,
+    /// Why StreamNook signed the viewer out of Twitch, when it did so itself.
+    pub sign_in_reason: Option<crate::services::twitch_signin::SignInReason>,
+    /// That reason worded for the viewer, or `None` when none is owed.
+    pub sign_in_text: Option<SignInText>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SignInText {
+    /// A full sentence, for a signed-out screen.
+    pub sentence: &'static str,
+    /// A short line, for a row that already says "Twitch".
+    pub short: &'static str,
+}
+
+fn boot_state(settings: &Settings, signed_in: bool) -> BootState {
+    let reason = crate::services::twitch_signin::current();
+    BootState {
+        needs_setup: !settings.setup_complete,
+        signed_in,
+        sign_in_reason: reason,
+        sign_in_text: reason.map(|r| SignInText { sentence: r.sentence(), short: r.short() }),
+    }
+}
+
+/// The boot answer: whether the first-run setup is owed, whether Twitch is
+/// signed in and, when StreamNook signed the viewer out itself, why.
+#[tauri::command]
+pub async fn get_boot_state(state: State<'_, AppState>) -> Result<BootState, String> {
+    let signed_in = crate::services::twitch_service::TwitchService::has_stored_credentials().await;
+    let settings = state.settings.lock().map_err(|e| e.to_string())?;
+    Ok(boot_state(&settings, signed_in))
+}
+
+/// What finishing the first-run setup changed.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct SetupCompleted {
+    /// Setup was finished for the first time on this install (not a re-run),
+    /// so notices meant for existing users should be marked seen rather than
+    /// shown.
+    pub baseline_announcements: bool,
+}
+
+/// Finish the first-run setup: records `setup_complete` and writes it to disk
+/// at once, so closing the app right after cannot bring the wizard back.
+#[tauri::command]
+pub async fn complete_setup(app: AppHandle, state: State<'_, AppState>) -> Result<SetupCompleted, String> {
+    let (settings, first_time) = {
+        let mut current = state.settings.lock().map_err(|e| e.to_string())?;
+        let first_time = !current.setup_complete;
+        current.setup_complete = true;
+        (current.clone(), first_time)
+    };
+    write_settings_to_disk(&settings)?;
+    flush_settings_now()?;
+    let _ = app.emit(
+        SETTINGS_UPDATED_EVENT,
+        SettingsUpdated { source: None, keys: vec!["setup_complete".to_string()] },
+    );
+    Ok(SetupCompleted { baseline_announcements: first_time })
+}
+
+/// What a fresh install starts with: the values the settings page's reset
+/// arrows compare against and restore. `Settings::default()` carries the
+/// first-run look and, on a phone build, the phone's own values; the groups
+/// the frontend owns carry the defaults `frontend_owned_defaults` declares.
+#[tauri::command]
+pub fn get_default_settings() -> Settings {
+    serde_json::from_value(crate::commands::settings_fields::default_settings_value())
+        .unwrap_or_default()
 }
 
 /// Hide (or unhide) one chatter's messages, everywhere (`channel_key` None) or
@@ -189,6 +300,120 @@ pub async fn set_chat_user_hidden(
     let _ = app.emit(
         SETTINGS_UPDATED_EVENT,
         SettingsUpdated { source: None, keys: vec!["chat_filters".to_string()] },
+    );
+    Ok(())
+}
+
+/// Star (`favorite`) or unstar one Twitch category, edited in place so a
+/// window holding an older copy of the list cannot drop another's star. The
+/// Categories tab's favorites row updates at once.
+#[tauri::command]
+pub async fn set_favorite_category(
+    app: AppHandle,
+    category: crate::models::settings::FavoriteCategory,
+    favorite: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        if !crate::services::favorite_categories::apply(&mut state_settings.favorite_categories, category, favorite) {
+            return Ok(());
+        }
+        state_settings.clone()
+    };
+    after_settings_change(&settings, false);
+    write_settings_to_disk(&settings)?;
+    let _ = app.emit(
+        SETTINGS_UPDATED_EVENT,
+        SettingsUpdated { source: None, keys: vec!["favorite_categories".to_string()] },
+    );
+    crate::services::home_snapshot::note_favorite_categories_changed();
+    Ok(())
+}
+
+/// Hide (`hidden`) or show again one channel in every browse list, edited in
+/// place so a window with an older copy of the list cannot drop another's.
+#[tauri::command]
+pub async fn set_channel_hidden(
+    app: AppHandle,
+    channel: crate::models::settings::FavoriteChannel,
+    hidden: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let realms = state_settings.hidden_channel_defaults;
+        if !crate::services::hidden_channels::apply(&mut state_settings.hidden_channels, channel, hidden, realms) {
+            return Ok(());
+        }
+        state_settings.clone()
+    };
+    after_settings_change(&settings, false);
+    write_settings_to_disk(&settings)?;
+    let _ = app.emit(
+        SETTINGS_UPDATED_EVENT,
+        SettingsUpdated { source: None, keys: vec!["hidden_channels".to_string()] },
+    );
+    crate::services::home_snapshot::note_hidden_channels_changed();
+    Ok(())
+}
+
+/// Change where one hidden channel is hidden besides browsing.
+#[tauri::command]
+pub async fn set_hidden_channel_realms(
+    app: AppHandle,
+    id: String,
+    realms: crate::models::settings::HiddenRealms,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        if !crate::services::hidden_channels::set_realms(&mut state_settings.hidden_channels, &id, realms) {
+            return Ok(());
+        }
+        state_settings.clone()
+    };
+    after_settings_change(&settings, false);
+    write_settings_to_disk(&settings)?;
+    let _ = app.emit(
+        SETTINGS_UPDATED_EVENT,
+        SettingsUpdated { source: None, keys: vec!["hidden_channels".to_string()] },
+    );
+    crate::services::home_snapshot::note_hidden_channels_changed();
+    Ok(())
+}
+
+/// Block (`blocked`) or unblock a hidden Twitch channel on Twitch itself, and
+/// remember it beside the hide so the list in Settings can say so and undo it.
+#[tauri::command]
+pub async fn set_hidden_channel_blocked(
+    app: AppHandle,
+    id: String,
+    blocked: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let target = {
+        let s = state.settings.lock().map_err(|e| e.to_string())?;
+        crate::services::hidden_channels::twitch_target(&s.hidden_channels, &id)
+    }
+    .ok_or_else(|| "Only a hidden Twitch channel can be blocked here".to_string())?;
+    if blocked {
+        crate::services::twitch_service::TwitchService::block_user(&target).await
+    } else {
+        crate::services::twitch_service::TwitchService::unblock_user(&target).await
+    }
+    .map_err(|e| e.to_string())?;
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        if !crate::services::hidden_channels::mark_blocked(&mut state_settings.hidden_channels, &id, blocked) {
+            return Ok(());
+        }
+        state_settings.clone()
+    };
+    write_settings_to_disk(&settings)?;
+    let _ = app.emit(
+        SETTINGS_UPDATED_EVENT,
+        SettingsUpdated { source: None, keys: vec!["hidden_channels".to_string()] },
     );
     Ok(())
 }
@@ -261,6 +486,111 @@ fn with_chat_user_hidden(
     changed
 }
 
+/// Set or clear one chatter's nickname or color override, or (`field` None)
+/// drop their whole entry.
+///
+/// A read-modify-write on the canonical settings, for the same reason as
+/// `set_chat_user_hidden`: a patch from the page sends the whole
+/// `chat_customization` group from that window's copy, so a profile card popout
+/// that had not finished loading settings replaced every saved override with
+/// its one, and two quick edits (a nickname, then a color reset) each started
+/// from the same copy, so the second dropped the first.
+#[tauri::command]
+pub async fn set_chat_user_override(
+    app: AppHandle,
+    user_id: String,
+    username: Option<String>,
+    field: Option<String>,
+    value: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let field = match field.as_deref() {
+        None => None,
+        Some(f @ ("nickname" | "color")) => Some(f),
+        Some(other) => return Err(format!("Unknown chat override field: {other}")),
+    };
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let mut group = state_settings
+            .extra
+            .get("chat_customization")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !with_chat_user_override(&mut group, &user_id, username.as_deref(), field, value.as_deref()) {
+            return Ok(());
+        }
+        state_settings.extra.insert("chat_customization".to_string(), group);
+        state_settings.clone()
+    };
+    after_settings_change(&settings, false);
+    write_settings_to_disk(&settings)?;
+    let _ = app.emit(
+        SETTINGS_UPDATED_EVENT,
+        SettingsUpdated { source: None, keys: vec!["chat_customization".to_string()] },
+    );
+    Ok(())
+}
+
+/// Apply one override change to a `chat_customization` JSON group in place.
+/// A blank value clears the field, and an entry left with neither a nickname
+/// nor a color is removed. Returns false when there was nothing to change.
+fn with_chat_user_override(
+    group: &mut serde_json::Value,
+    user_id: &str,
+    username: Option<&str>,
+    field: Option<&str>,
+    value: Option<&str>,
+) -> bool {
+    if user_id.is_empty() {
+        return false;
+    }
+    if !group.is_object() {
+        *group = serde_json::json!({});
+    }
+    let overrides = group
+        .as_object_mut()
+        .expect("an object")
+        .entry("user_overrides")
+        .or_insert_with(|| serde_json::json!({}));
+    if !overrides.is_object() {
+        *overrides = serde_json::json!({});
+    }
+    let overrides = overrides.as_object_mut().expect("an object");
+
+    let Some(field) = field else {
+        return overrides.remove(user_id).is_some();
+    };
+    let value = value.map(str::trim).filter(|v| !v.is_empty());
+
+    let before = overrides.get(user_id).cloned();
+    let mut entry = match before.clone() {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    entry.insert("user_id".to_string(), serde_json::Value::String(user_id.to_string()));
+    if let Some(name) = username.filter(|n| !n.is_empty()) {
+        entry.insert("username".to_string(), serde_json::Value::String(name.to_string()));
+    }
+    match value {
+        Some(v) => {
+            entry.insert(field.to_string(), serde_json::Value::String(v.to_string()));
+        }
+        None => {
+            entry.remove(field);
+        }
+    }
+    let has = |key: &str| entry.get(key).and_then(|v| v.as_str()).is_some_and(|s| !s.trim().is_empty());
+    if !has("nickname") && !has("color") {
+        return overrides.remove(user_id).is_some();
+    }
+    let next = serde_json::Value::Object(entry);
+    if before.as_ref() == Some(&next) {
+        return false;
+    }
+    overrides.insert(user_id.to_string(), next);
+    true
+}
+
 fn apply_settings_patch(
     current: &Settings,
     patch: serde_json::Map<String, serde_json::Value>,
@@ -282,18 +612,33 @@ fn apply_settings_patch(
     // is written by the follow commands, `drops` by the drops service, and
     // `channel_links` by the link service. A patch never overrides them.
     next.adopt_backend_owned(current);
+    next.lift_custom_theme_muted();
     Ok(next)
 }
 
 /// What every settings change has to refresh, whichever path wrote it.
 fn after_settings_change(settings: &Settings, favorites_changed: bool) {
+    // Detailed logging, from whichever window saved it. Applied only when the
+    // saved value changes, so a save of anything else never resets the level.
+    crate::services::diagnostic_logger::apply_setting(settings.error_reporting_enabled);
+    // The low-latency engine's switch, so no shell has to call it after a save.
+    crate::services::ll_origin::set_disabled(!settings.video_player.experimental_low_latency);
+    crate::services::ll_origin::set_target_gap(settings.video_player.ll_target_latency);
     // Recompile chat rules if their groups changed (hash-gated, cheap).
     crate::services::chat_rules::ChatRules::refresh(settings);
     crate::services::streamer_mode::StreamerMode::refresh(settings);
+    crate::services::mention_ping::refresh(settings);
+    #[cfg(desktop)]
+    crate::services::mention_notify::refresh(settings);
     // Spawns or aborts the gift-sub poll, so the toggle takes effect without a
     // restart and "off" costs no task at all.
     crate::services::onsite_notifications::refresh(settings);
+    // Spawns or aborts the gifted-membership poll with the master switch.
+    crate::services::membership_gifts::refresh(settings);
     crate::services::reminder_service::refresh(settings);
+    #[cfg(target_os = "ios")]
+    crate::services::twitch_resolver::refresh_device_codecs(settings);
+    crate::services::hidden_channels::refresh(settings);
     // Home's unified Discover list leaves out live favourites, so a heart
     // toggled anywhere changes it. Unhearting in particular is announced by
     // nothing else: the favourites sweep only notices on its next pass.
@@ -307,7 +652,7 @@ fn after_settings_change(settings: &Settings, favorites_changed: bool) {
 /// the active account, the onboarding flag, and the last-seen version. Everything
 /// else (theme, chat design, keybindings, highlights, custom commands, custom
 /// themes, ...) is a portable preference and is included.
-const NON_PORTABLE_KEYS: &[&str] = &[
+pub(crate) const NON_PORTABLE_KEYS: &[&str] = &[
     "accounts",
     "current_account",
     "setup_complete",
@@ -325,6 +670,7 @@ pub async fn get_settings_dir() -> Result<String, String> {
 
 /// Open the settings folder in the OS file browser. Routed through the opener
 /// plugin from Rust (so it needs no extra JS-side capability).
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 pub async fn open_settings_folder(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -333,6 +679,12 @@ pub async fn open_settings_folder(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(dir.to_string_lossy().to_string(), None::<String>)
         .map_err(|e| format!("Failed to open settings folder: {}", e))
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub async fn open_settings_folder(_app: AppHandle) -> Result<(), String> {
+    Err(crate::ios_ffi::not_wired("Opening the settings folder"))
 }
 
 /// Write the user's portable preferences to `path` (chosen via a save dialog on
@@ -362,20 +714,31 @@ pub async fn export_settings(path: String, state: State<'_, AppState>) -> Result
 /// settings. On success the in-memory state and settings.json are both updated;
 /// the frontend reloads to re-apply everything.
 #[tauri::command]
-pub async fn import_settings(path: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn import_settings(app: AppHandle, path: String, state: State<'_, AppState>) -> Result<(), String> {
     let contents =
         fs::read_to_string(&path).map_err(|e| format!("Couldn't read that file: {}", e))?;
     let incoming: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|_| "That file isn't a valid StreamNook settings backup.".to_string())?;
+    apply_imported_settings(&app, &state, &incoming)
+}
+
+/// Put every portable key of a backup over the live settings (session and
+/// login keys stay), then save, refresh and tell every window.
+pub(crate) fn apply_imported_settings(
+    app: &AppHandle,
+    state: &AppState,
+    incoming: &serde_json::Value,
+) -> Result<(), String> {
     let incoming_obj = incoming
         .as_object()
         .ok_or_else(|| "That file isn't a valid StreamNook settings backup.".to_string())?;
 
     // Start from the live settings so session/login keys survive, then overlay
     // every portable key the backup provides.
-    let current = { state.settings.lock().unwrap().clone() };
+    let current = { state.settings.lock().map_err(|e| e.to_string())?.clone() };
     let mut merged = serde_json::to_value(&current)
         .map_err(|e| format!("Failed to read current settings: {}", e))?;
+    let mut keys = Vec::new();
     {
         let merged_obj = merged
             .as_object_mut()
@@ -385,22 +748,27 @@ pub async fn import_settings(path: String, state: State<'_, AppState>) -> Result
                 continue;
             }
             merged_obj.insert(key.clone(), val.clone());
+            keys.push(key.clone());
         }
     }
 
-    let imported: Settings = serde_json::from_value(merged)
+    let mut imported: Settings = serde_json::from_value(merged)
         .map_err(|e| format!("That backup isn't compatible with this version: {}", e))?;
+    imported.lift_custom_theme_muted();
 
+    let favorites_changed = current.favorite_streamers != imported.favorite_streamers;
     {
-        let mut state_settings = state.settings.lock().unwrap();
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
         *state_settings = imported.clone();
     }
-    crate::services::chat_rules::ChatRules::refresh(&imported);
-    crate::services::streamer_mode::StreamerMode::refresh(&imported);
+    // The same refresh set as every other write path, so imported reminders,
+    // chat rules and the notification polls apply without waiting for a save.
+    after_settings_change(&imported, favorites_changed);
+    state.layout_service.set_gif_scale(imported.chat_design.gif_scale);
     // Immediate direct write, deliberately not debounced: the frontend reloads
     // right after this returns and must find the imported file on disk.
     write_settings_to_disk_sync(&imported)?;
-
+    let _ = app.emit(SETTINGS_UPDATED_EVENT, SettingsUpdated { source: None, keys });
     Ok(())
 }
 
@@ -540,6 +908,7 @@ pub async fn send_test_notification(
         stream_url: format!("https://twitch.tv/{}", mock_streamer_login),
         is_test: true,
         source: None,
+        seventv_id: None,
     };
 
     // Emit the notification event to the frontend (for in-app notification)
@@ -580,8 +949,7 @@ pub async fn get_latest_app_version() -> Result<String, String> {
 
 #[tauri::command]
 pub fn get_current_app_version() -> Result<String, String> {
-    // Get the version from Cargo.toml at compile time
-    Ok(env!("CARGO_PKG_VERSION").to_string())
+    Ok(crate::services::client_identity::build_version().to_string())
 }
 
 #[derive(serde::Serialize)]
@@ -700,113 +1068,6 @@ pub async fn get_release_notes(version: Option<String>) -> Result<ReleaseNotes, 
     })
 }
 
-#[tauri::command]
-pub async fn download_and_install_app_update(
-    app_handle: crate::rt::AppHandle,
-) -> Result<String, String> {
-    // First, get the latest version. Follow the full redirect chain so this
-    // survives a repo rename/transfer (old URLs 301 to the new home first)
-    let client = crate::services::http::client().clone();
-
-    let response = client
-        .get("https://github.com/StreamNook/StreamNook/releases/latest")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch latest release: {}", e))?;
-
-    let final_url = response.url().to_string();
-
-    // Extract version from the final URL
-    let version_regex = Regex::new(r"/tag/v?([0-9]+\.[0-9]+\.[0-9]+)")
-        .map_err(|e| format!("Failed to create regex: {}", e))?;
-
-    let version = version_regex
-        .captures(&final_url)
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str())
-        .ok_or("Failed to extract version from final release URL")?;
-
-    // Construct the download URL for the executable
-    // Pattern: https://github.com/StreamNook/StreamNook/releases/download/v{version}/StreamNook.exe
-    let download_url = format!(
-        "https://github.com/StreamNook/StreamNook/releases/download/v{}/StreamNook.exe",
-        version
-    );
-
-    // Download the file
-    let client = crate::services::http::client().clone();
-    let response = client
-        .get(&download_url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download update: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "Download failed with status: {}",
-            response.status()
-        ));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed to read update bytes: {}", e))?;
-
-    // Get the current executable path
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Failed to get current exe path: {}", e))?;
-
-    let current_exe_dir = current_exe.parent().ok_or("Failed to get exe directory")?;
-
-    // Save the new exe to a temporary location in the same directory
-    let temp_new_exe = current_exe_dir.join("StreamNook_new.exe");
-    std::fs::write(&temp_new_exe, bytes)
-        .map_err(|e| format!("Failed to write new executable: {}", e))?;
-
-    // Create a batch script to replace the exe and restart
-    let batch_script = format!(
-        r#"@echo off
-timeout /t 3 /nobreak > nul
-:retry_delete
-del /f /q "{}" 2>nul
-if exist "{}" (
-    timeout /t 1 /nobreak > nul
-    goto retry_delete
-)
-move /y "{}" "{}"
-if exist "{}" del /f /q "{}"
-start "" "{}"
-(goto) 2>nul & del /f /q "%~f0"
-"#,
-        current_exe.display(),
-        current_exe.display(),
-        temp_new_exe.display(),
-        current_exe.display(),
-        temp_new_exe.display(),
-        temp_new_exe.display(),
-        current_exe.display()
-    );
-
-    let batch_path = current_exe_dir.join("update_streamnook.bat");
-    std::fs::write(&batch_path, batch_script)
-        .map_err(|e| format!("Failed to write update script: {}", e))?;
-
-    // Launch the batch script hidden
-    std::process::Command::new("cmd")
-        .args(&["/C", "start", "/min", "/b", batch_path.to_str().unwrap()])
-        .spawn()
-        .map_err(|e| format!("Failed to launch update script: {}", e))?;
-
-    // Exit the application after a short delay to allow the script to start
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        app_handle.exit(0);
-    });
-
-    Ok(version.to_string())
-}
-
 #[cfg(test)]
 mod patch_tests {
     use super::*;
@@ -837,6 +1098,56 @@ mod patch_tests {
         assert!(with_chat_user_hidden(&mut filters, "BOB", None, true));
         assert_eq!(filters["hidden_users"], serde_json::json!(["alice", "bob"]));
         assert!(!with_chat_user_hidden(&mut filters, "carol", None, false));
+    }
+
+    #[test]
+    fn one_override_edit_keeps_every_other_override() {
+        let mut group = json!({
+            "user_overrides": {
+                "1": { "user_id": "1", "username": "alice", "nickname": "Al" },
+                "kick:2": { "user_id": "kick:2", "username": "bob", "color": "#ff0000" }
+            }
+        });
+        assert!(with_chat_user_override(&mut group, "3", Some("carol"), Some("nickname"), Some("  Caz ")));
+        assert_eq!(group["user_overrides"]["3"]["nickname"], "Caz");
+        assert_eq!(group["user_overrides"]["1"]["nickname"], "Al");
+        assert_eq!(group["user_overrides"]["kick:2"]["color"], "#ff0000");
+
+        // A color on top of a nickname keeps the nickname; the same value again is a no-op.
+        assert!(with_chat_user_override(&mut group, "3", Some("carol"), Some("color"), Some("#00ff00")));
+        assert!(!with_chat_user_override(&mut group, "3", Some("carol"), Some("color"), Some("#00ff00")));
+        assert_eq!(group["user_overrides"]["3"]["nickname"], "Caz");
+
+        // Clearing one field keeps the other; clearing the last one drops the entry.
+        assert!(with_chat_user_override(&mut group, "3", None, Some("nickname"), Some("")));
+        assert!(group["user_overrides"]["3"].get("nickname").is_none());
+        assert!(with_chat_user_override(&mut group, "3", None, Some("color"), None));
+        assert!(group["user_overrides"].get("3").is_none());
+
+        // Dropping a whole entry, and dropping one that is not there.
+        assert!(with_chat_user_override(&mut group, "kick:2", None, None, None));
+        assert!(!with_chat_user_override(&mut group, "kick:2", None, None, None));
+        assert_eq!(group["user_overrides"]["1"]["nickname"], "Al");
+    }
+
+    #[test]
+    fn a_localized_chatters_override_is_keyed_by_id_not_name() {
+        let mut group = json!({});
+        assert!(with_chat_user_override(&mut group, "700700", Some("もちパンダ"), Some("nickname"), Some("Cake")));
+        let overrides = group["user_overrides"].as_object().unwrap();
+        assert_eq!(overrides.keys().collect::<Vec<_>>(), ["700700"]);
+        assert_eq!(group["user_overrides"]["700700"]["nickname"], "Cake");
+        // Saving again with the login as the remembered name edits the same entry.
+        assert!(with_chat_user_override(&mut group, "700700", Some("mochi_panda"), Some("color"), Some("#ff69b4")));
+        assert_eq!(group["user_overrides"].as_object().unwrap().len(), 1);
+        assert_eq!(group["user_overrides"]["700700"]["nickname"], "Cake");
+    }
+
+    #[test]
+    fn an_override_starts_a_missing_group() {
+        let mut group = serde_json::Value::Null;
+        assert!(with_chat_user_override(&mut group, "9", Some("dave"), Some("nickname"), Some("D")));
+        assert_eq!(group["user_overrides"]["9"]["username"], "dave");
     }
 
     fn patch(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
@@ -872,8 +1183,34 @@ mod patch_tests {
     }
 
     #[test]
+    fn a_saved_custom_theme_keeps_muted_text_at_the_floor() {
+        let current = Settings::default();
+        let dim = json!([{ "id": "custom-dim", "name": "Dim", "palette": {
+            "background": { "value": "#0c0c0d", "opacity": 100 },
+            "textMuted": { "value": "#97b1b9", "opacity": 40 },
+        }}]);
+        let next = apply_settings_patch(&current, patch(json!({ "custom_themes": dim }))).unwrap();
+        assert_eq!(next.extra["custom_themes"][0]["palette"]["textMuted"]["opacity"], 68);
+    }
+
+    #[test]
     fn a_malformed_value_is_refused_not_half_applied() {
         let current = Settings::default();
         assert!(apply_settings_patch(&current, patch(json!({ "favorite_streamers": "nope" }))).is_err());
+    }
+
+    #[test]
+    fn boot_state_owes_setup_until_it_is_finished() {
+        let mut settings = Settings::default();
+        settings.setup_complete = false;
+        assert!(boot_state(&settings, false).needs_setup);
+        settings.setup_complete = true;
+        let state = boot_state(&settings, true);
+        assert!(!state.needs_setup);
+        assert!(state.signed_in);
+        let json = serde_json::to_value(&state).unwrap();
+        for key in ["needs_setup", "signed_in", "sign_in_reason", "sign_in_text"] {
+            assert!(json.get(key).is_some(), "{key} reaches the shell");
+        }
     }
 }

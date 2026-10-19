@@ -27,12 +27,14 @@ import {
 import type { CosmeticCatalogEntry } from '../services/supabaseService';
 import { StreamNookTierCard } from './StreamNookBadge';
 import { resolveCosmeticAsset } from './cosmeticAssets';
+import { CosmeticArt } from './CosmeticArt';
 import { listAtmospheres, getAtmosphereUnlock } from '../services/atmospheres';
 import { AtmosphereBackground } from './AtmosphereBackground';
 import streamNookLogo from '../assets/streamnook-logo-128.webp';
 import chatterinoLogo from '../assets/chatterino-logo.svg';
 import betterttvLogo from '../assets/betterttv-logo.png';
 import { ChatClientsGallery } from './ChatClientsGallery';
+import { BreakableName } from './badge/BreakableName';
 import type { ChatClientBadge } from './ChatClientsGallery';
 
 import { Logger } from '../utils/logger';
@@ -126,10 +128,11 @@ interface BadgesOverlayProps {
   onBadgeClick: (badge: BadgeVersion, setId: string) => void;
   initialPaintId?: string | null;
   initialBadgeId?: string | null;
-  /** When true, open with the StreamNook tab active. Set by the AppStore
-      action `openBadgesOnStreamNook()`. Fired by the StreamNook badge in chat
-      rows + UserProfileCard. */
-  initialStreamNook?: boolean;
+  /** When set, open with the StreamNook tab active; a cosmetic slug also
+      opens that badge's card. Set by the AppStore action
+      `openBadgesOnStreamNook()`, fired by the StreamNook badge in chat rows
+      (with the slug it wears) and UserProfileCard. */
+  initialStreamNook?: boolean | string;
   /** Generic deep-link: open `tab` and filter to `query` (a badge title).
       Used for tabs without a detail modal (Twitch, BetterTTV, Chat Clients)
       clicked from the profile card. */
@@ -301,6 +304,18 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
   );
   const activeCosmeticSlug = currentUser?.user_id ? getActiveCosmeticSlug(currentUser.user_id) : null;
   const [selectedCosmetic, setSelectedCosmetic] = useState<CosmeticCatalogEntry | null>(null);
+
+  // A StreamNook badge clicked in chat names the cosmetic it wears: open that
+  // badge's card once the catalog holds it. Once per slug, so closing the card
+  // does not reopen it on the next render.
+  const openedCosmeticSlugRef = useRef<string | null>(null);
+  const wantedCosmeticSlug = typeof initialStreamNook === 'string' ? initialStreamNook : null;
+  const wantedCosmetic = wantedCosmeticSlug ? cosmeticsCatalog.find((c) => c.slug === wantedCosmeticSlug) : undefined;
+  useEffect(() => {
+    if (!wantedCosmetic || openedCosmeticSlugRef.current === wantedCosmetic.slug) return;
+    openedCosmeticSlugRef.current = wantedCosmetic.slug;
+    setSelectedCosmetic(wantedCosmetic);
+  }, [wantedCosmetic]);
 
   // Handle deep link to specific paint
   useEffect(() => {
@@ -1654,6 +1669,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                   return (
                     <Tooltip key={`${badge.set_id}-${badge.id}-${index}`} content={hasCollected ? `${badge.title} (Collected!)` : badge.title} side="bottom">
                       <button
+                        // glass-exempt: a badge tile in the overlay's solid grid; its gradient is the fill.
                         onClick={() => onBadgeClick(badge, badge.set_id)}
                         className={`flex flex-col items-center gap-2 p-3 transition-all duration-300 group relative ${
                           hasCollected ? 'rounded-xl bg-gradient-to-br from-[#d4a84b]/15 to-[#b8860b]/5 border border-[#d4a84b]/30 shadow-[inset_0_1px_1px_rgba(255,255,255,0.1),0_4px_20px_rgba(212,168,75,0.15)] backdrop-blur-md hover:bg-[#d4a84b]/20 hover:border-[#d4a84b]/50' :
@@ -1675,7 +1691,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                       </div>
                       {/* Collected indicator - takes priority over other indicators */}
                       {hasCollected && (
-                        <div className="absolute -top-1 -right-1 w-6 h-6 rounded-full flex items-center justify-center bg-black/40 backdrop-blur-md border border-[#d4a84b]/60 shadow-[0_0_15px_rgba(212,168,75,0.4)] overflow-hidden">
+                        <div className="absolute -top-1 -right-1 w-6 h-6 rounded-full flex items-center justify-center bg-glass-ink/40 backdrop-blur-md border border-[#d4a84b]/60 shadow-[0_0_15px_rgba(212,168,75,0.4)] overflow-hidden">
                           <div className="absolute inset-0 bg-gradient-to-br from-[#d4a84b]/30 to-transparent pointer-events-none" />
                           <Check size={13} className="text-[#f0d78c] drop-shadow-[0_0_3px_rgba(212,168,75,0.8)] z-10" strokeWidth={2.5} />
                         </div>
@@ -1687,10 +1703,10 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                       {!hasCollected && isComingSoon && (
                         <span className="absolute top-1 right-1 w-2 h-2 bg-blue-500 rounded-full animate-pulse"></span>
                       )}
-                      <span className={`text-xs text-center line-clamp-2 transition-all duration-300 font-medium ${
+                      <span className={`w-full text-xs text-center line-clamp-2 [overflow-wrap:anywhere] transition-all duration-300 font-medium ${
                         hasCollected ? 'text-[#f0d78c] drop-shadow-[0_0_8px_rgba(212,168,75,0.3)]' : 'text-textSecondary group-hover:text-textPrimary'
                       }`}>
-                        {badge.title}
+                        <BreakableName name={badge.title} />
                       </span>
                     </button>
                     </Tooltip>
@@ -1802,10 +1818,10 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                             loading="lazy"
                           />
                         </div>
-                        <span className={`text-xs text-center line-clamp-2 transition-colors font-medium ${
+                        <span className={`w-full text-xs text-center line-clamp-2 [overflow-wrap:anywhere] transition-colors font-medium ${
                           isOwned ? 'text-[#29b6f6]' : 'text-textSecondary group-hover:text-textPrimary'
                         }`}>
-                          {badge.name}
+                          <BreakableName name={badge.name} />
                         </span>
 
                       </button>
@@ -1986,10 +2002,10 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                               {paint.name}
                             </span>
                           </div>
-                          <span className={`text-xs text-center line-clamp-2 transition-colors font-medium ${
+                          <span className={`w-full text-xs text-center line-clamp-2 [overflow-wrap:anywhere] transition-colors font-medium ${
                             isOwned ? 'text-[#29b6f6]' : 'text-textSecondary group-hover:text-textPrimary'
                           }`}>
-                            {paint.name}
+                            <BreakableName name={paint.name} />
                           </span>
                         </button>
                         </Tooltip>
@@ -2077,6 +2093,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                           side="bottom"
                         >
                           <button
+                            // glass-exempt: a cosmetic tile in the overlay's solid grid; its gradient is the fill.
                             onClick={() => setSelectedCosmetic(cosmetic)}
                             className={`flex flex-col items-center gap-2 p-3 transition-all duration-300 group relative ${
                               isActive ? 'rounded-xl bg-gradient-to-br from-[#d4a84b]/20 to-[#b8860b]/10 border border-[#d4a84b]/50 shadow-[inset_0_1px_1px_rgba(255,255,255,0.1),0_4px_20px_rgba(212,168,75,0.2)] backdrop-blur-md ring-2 ring-accent/50 hover:bg-[#d4a84b]/25 hover:border-[#d4a84b]/60' :
@@ -2087,23 +2104,23 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                             <div className={`w-18 h-18 flex items-center justify-center bg-transparent group-hover:scale-110 transition-transform duration-300 relative ${
                               owned ? 'drop-shadow-[0_0_15px_rgba(212,168,75,0.4)]' : ''
                             }`}>
-                              <img
-                                src={asset}
-                                alt={cosmetic.name}
+                              <CosmeticArt
+                                cosmetic={cosmetic}
+                                chatSize
                                 className="w-16 h-16 object-contain"
                                 loading="lazy"
                               />
                             </div>
                             {owned && (
-                              <div className="absolute -top-1 -right-1 w-6 h-6 rounded-full flex items-center justify-center bg-black/40 backdrop-blur-md border border-[#d4a84b]/60 shadow-[0_0_15px_rgba(212,168,75,0.4)] overflow-hidden">
+                              <div className="absolute -top-1 -right-1 w-6 h-6 rounded-full flex items-center justify-center bg-glass-ink/40 backdrop-blur-md border border-[#d4a84b]/60 shadow-[0_0_15px_rgba(212,168,75,0.4)] overflow-hidden">
                                 <div className="absolute inset-0 bg-gradient-to-br from-[#d4a84b]/30 to-transparent pointer-events-none" />
                                 <Check size={13} className="text-[#f0d78c] drop-shadow-[0_0_3px_rgba(212,168,75,0.8)] z-10" strokeWidth={2.5} />
                               </div>
                             )}
-                            <span className={`text-xs text-center line-clamp-2 transition-all duration-300 font-medium ${
+                            <span className={`w-full text-xs text-center line-clamp-2 [overflow-wrap:anywhere] transition-all duration-300 font-medium ${
                               owned ? 'text-[#f0d78c] drop-shadow-[0_0_8px_rgba(212,168,75,0.3)]' : 'text-textSecondary group-hover:text-textPrimary'
                             }`}>
-                              {cosmetic.name}
+                              <BreakableName name={cosmetic.name} />
                             </span>
                           </button>
                         </Tooltip>
@@ -2251,10 +2268,10 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                               loading="lazy"
                             />
                           </div>
-                          <span className={`text-xs text-center line-clamp-2 transition-colors font-medium ${
+                          <span className={`w-full text-xs text-center line-clamp-2 [overflow-wrap:anywhere] transition-colors font-medium ${
                             badge.owned ? 'text-[#e84b4b]' : 'text-textSecondary group-hover:text-textPrimary'
                           }`}>
-                            {badge.title}
+                            <BreakableName name={badge.title} />
                           </span>
                         </button>
                         </Tooltip>
@@ -2456,9 +2473,13 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
               Logger.error('Failed to open support URL:', err);
             }
           };
+          // Contributor tiers are earned in the Discord, so there is nothing to buy.
+          const contributionPoints = cosmetic.contribution_min_points ?? null;
           const acquireLabel = cosmetic.is_default
             ? 'Free for every StreamNook member'
-            : cosmetic.payment_type === 'Subscription'
+            : contributionPoints != null
+              ? `Earned with ${contributionPoints} points from bug reports and feature requests in the StreamNook Discord that shipped`
+              : cosmetic.payment_type === 'Subscription'
               ? 'Awarded for an active monthly subscription'
               : cosmetic.payment_type === 'Donation'
                 ? 'Awarded for a one-time donation'
@@ -2486,12 +2507,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                 <div className="flex justify-center mb-6">
                   <div className="w-32 h-32 flex items-center justify-center bg-transparent rounded-xl">
                     {asset ? (
-                      <img
-                        src={asset}
-                        alt={cosmetic.name}
-                        className="w-28 h-28 object-contain"
-                        draggable={false}
-                      />
+                      <CosmeticArt cosmetic={cosmetic} className="w-28 h-28 object-contain" />
                     ) : (
                       <div className="w-28 h-28 rounded bg-white/[0.04]" />
                     )}
@@ -2533,7 +2549,7 @@ const BadgesOverlay = ({ onClose, onBadgeClick, initialPaintId, initialBadgeId, 
                       >
                         {isActive ? 'Equipped' : 'Equip'}
                       </button>
-                    ) : supportUrl ? (
+                    ) : supportUrl && contributionPoints == null ? (
                       <button
                         onClick={handleGet}
                         className="flex-1 px-4 py-2 text-sm font-medium glass-button text-textPrimary hover:bg-white/5 transition-all flex items-center justify-center gap-2"

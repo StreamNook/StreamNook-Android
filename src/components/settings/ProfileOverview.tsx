@@ -8,6 +8,7 @@ import {
   MessageSquare,
   Tv,
   Gift,
+  HandHeart,
   Coins,
   Palette,
   Award,
@@ -50,11 +51,16 @@ import {
   Drumstick,
   TreePine,
   Flag,
+  Target,
   type LucideIcon,
 } from 'lucide-react';
 import { Tooltip } from '../ui/Tooltip';
 import { TwitchGlyph, TwitchVerifiedMark } from '../ui/TwitchGlyph';
 import { Logger } from '../../utils/logger';
+import { formatShortCount } from '../../utils/streamStats';
+import { fitHeaderDensity } from '../chat/fitHeaderDensity';
+import { memberNumberName } from '../../utils/memberNumberNames';
+import { isPalindrome, outOfReachAccolades } from '../../utils/accoladeReach';
 import {
   getUserStats,
   getAccolades,
@@ -69,6 +75,7 @@ import type { InventoryResponse, ChannelPointsBalance, IvrUserSummary } from '..
 import { pickHoursRoast, type PickedRoast } from '../../utils/hoursWatchedRoasts';
 import { SEASONAL_ACCOLADES, getActiveSeasonalAccoladeIds, isCakeDay, CAKE_DAY_ID } from '../../utils/seasonalAccolades';
 import { RESTLESS_ACCOLADE_ID } from '../../utils/notifAchievement';
+import { PERFECT_CORNER_ACCOLADE_ID, SHINY_ACCOLADE_ID, WORTH_THE_WAIT_ACCOLADE_ID } from '../../utils/offlineAccoladeIds';
 import { MAJOR_COLOGNE_ACCOLADE_ID } from '../../services/cologneEvent';
 import { GRAND_FINALE_ACCOLADE_ID, SEMIQUINCENTENNIAL_ACCOLADE_ID } from '../../services/semiquincentennialEvent';
 import SubscriptionsSection from './SubscriptionsSection';
@@ -171,6 +178,10 @@ const StatTile = ({
   const display = value !== undefined ? value : animated.toLocaleString();
   const accentRgb = useContext(ProfileAccentContext);
   const compact = useContext(ProfileCompactContext);
+  // A count too wide for its tile switches to its short form ("123.5M")
+  // instead of being cut with an ellipsis (globals.css `.sn-stat-value`).
+  const [valueEl, setValueEl] = useState<HTMLDivElement | null>(null);
+  useEffect(() => (valueEl ? fitHeaderDensity(valueEl, 1, 0) : undefined), [valueEl]);
   const inner = (
     // glass-tile = display depth (top-lit material + layering), NOT a button.
     <div
@@ -185,7 +196,17 @@ const StatTile = ({
           {label}
         </span>
       </div>
-      <div className={`truncate font-bold tabular-nums text-textPrimary ${compact ? 'text-base' : 'text-2xl'}`}>{display}</div>
+      {value !== undefined ? (
+        <div className={`truncate font-bold tabular-nums text-textPrimary ${compact ? 'text-base' : 'text-2xl'}`}>{display}</div>
+      ) : (
+        <div
+          ref={setValueEl}
+          className={`sn-stat-value truncate font-bold tabular-nums text-textPrimary ${compact ? 'text-base' : 'text-2xl'}`}
+        >
+          <span className="sn-stat-full">{display}</span>
+          <span className="sn-stat-short">{formatShortCount(animated)}</span>
+        </div>
+      )}
       {caption && <div className={`leading-snug text-textSecondary ${compact ? 'mt-0.5 text-[10px]' : 'mt-1 text-[11px]'}`}>{caption}</div>}
     </div>
   );
@@ -358,8 +379,9 @@ const ProfileOverview = ({
   const [roast, setRoast] = useState<PickedRoast | null>(null);
   const [showAllAccolades, setShowAllAccolades] = useState(false);
 
-  // Twitch Recap hours from before joining, as the server counted them, ride
-  // along with the tracked hours everywhere hours are used (accolades too).
+  // Twitch Recap from before joining, as the server counted it, simply counts:
+  // it rides along with the tracked stats everywhere they are used (accolades
+  // too), with no mark of where it came from.
   const recapHours = Number(stats?.recap_hours ?? 0);
   const hours = (stats?.hours_watched ?? 0) + recapHours;
   const animatedHours = useCountUp(Math.round(hours));
@@ -479,18 +501,18 @@ const ProfileOverview = ({
         : 'Viewer';
 
   const cosmeticsTotal = seventvPaintCount + seventvBadgeCount + ownedCosmeticsCount;
-  const messages = stats?.messages_sent ?? 0;
+  const messages = (stats?.messages_sent ?? 0) + Number(stats?.recap_messages ?? 0);
+  const subsGifted = Number(stats?.recap_subs_gifted ?? 0);
+  const recapPoints = Number(stats?.recap_points ?? 0);
   const streams = stats?.streams_watched ?? 0;
 
   const pts = pointsHeld ?? 0;
   const drops = dropsClaimed ?? 0;
   const years = age?.years ?? 0;
   const memberNo = streamNookUserNumber;
-  const isPalindrome = (n: number | null): boolean => {
-    if (n === null || n < 10) return false;
-    const s = String(n);
-    return s === s.split('').reverse().join('');
-  };
+  const memberName = memberNumberName(memberNo);
+  // Accolades this member can never earn now stay off the wall unless held.
+  const outOfReach = outOfReachAccolades(memberNo);
 
   const baseAccolades: Accolade[] = [
     { id: 'chatterbox', label: 'Chatterbox', icon: MessageCircle, grad: 'linear-gradient(140deg, #6aa9ff, #3b6fd4)', earned: messages >= 1000, hint: `Messages sent: ${messages.toLocaleString()} / 1,000` },
@@ -511,15 +533,24 @@ const ProfileOverview = ({
     { id: 'ancient', label: 'Ancient One', icon: Hourglass, grad: 'linear-gradient(140deg, #a855f7, #7e22ce)', earned: years >= 10, hint: `Years on Twitch: ${years} / 10` },
     { id: 'og', label: 'OG', icon: Crown, grad: 'linear-gradient(140deg, #fbbf24, #d97706)', earned: streamNookUserNumber !== null && streamNookUserNumber <= 100, hint: 'Be one of the first 100 StreamNook members' },
   ].map((a) => ({ ...a, earned: a.earned || earnedAccolades.has(a.id) }));
-  const allBaseEarned = baseAccolades.every((a) => a.earned);
+  // Counts only the base accolades this member can still earn, so OG's
+  // first-100 cut never puts Completionist out of reach.
+  const allBaseEarned = baseAccolades.every((a) => a.earned || outOfReach.has(a.id));
 
   const secretAccolades: Accolade[] = [
     { id: 'completionist', label: 'Completionist', icon: Star, grad: 'linear-gradient(140deg, #f472b6, #db2777)', secret: true, earned: allBaseEarned, hint: "When there's nothing else left to earn, this one shows up." },
     { id: 'triple', label: 'Triple Threat', icon: Layers, grad: 'linear-gradient(140deg, #34d399, #0f766e)', secret: true, earned: messages >= 1000 && hours >= 100 && drops >= 25, hint: 'Talk, watch, and collect until all three run deep.' },
     { id: 'palindrome', label: 'Palindrome', icon: Repeat, grad: 'linear-gradient(140deg, #c084fc, #7e22ce)', secret: true, earned: isPalindrome(memberNo), hint: 'A number that reads the same coming and going.' },
-    { id: 'nice', label: 'Nice', icon: Smile, grad: 'linear-gradient(140deg, #facc15, #ca8a04)', secret: true, earned: memberNo !== null && [69, 420, 666, 777, 1337].includes(memberNo), hint: 'Land on a number the internet never lets you forget.' },
+    // One accolade for every meme number; the label is that number's own name.
+    { id: 'nice', label: memberName ?? 'Nice', icon: Smile, grad: 'linear-gradient(140deg, #facc15, #ca8a04)', secret: true, earned: memberName !== null, hint: 'Land on a number the internet never lets you forget.' },
     { id: RESTLESS_ACCOLADE_ID, label: 'Restless', icon: BellRing, grad: 'linear-gradient(140deg, #818cf8, #4338ca)', secret: true, earned: earnedAccolades.has(RESTLESS_ACCOLADE_ID), hint: "The test notification really wishes you'd stop." },
     { id: GRAND_FINALE_ACCOLADE_ID, label: 'Grand Finale', icon: Sparkles, grad: 'linear-gradient(140deg, #fcd34d, #dc3d55)', secret: true, earned: earnedAccolades.has(GRAND_FINALE_ACCOLADE_ID), hint: 'Stay a while under the anniversary sky.' },
+    // The offline room's moments (utils/offlineAccolades.ts grants them).
+    // Not secret: named from the start, their hints say plainly what to do.
+    // Listed here for the earned-state handling below, outside Completionist.
+    { id: PERFECT_CORNER_ACCOLADE_ID, label: 'Perfect Corner', icon: Target, grad: 'linear-gradient(140deg, #5eead4, #0f766e)', earned: earnedAccolades.has(PERFECT_CORNER_ACCOLADE_ID), hint: 'Wait in an offline chat long enough to see it land dead in the corner.' },
+    { id: SHINY_ACCOLADE_ID, label: 'Shiny', icon: Sparkles, grad: 'linear-gradient(140deg, #fde68a, #d97706)', earned: earnedAccolades.has(SHINY_ACCOLADE_ID), hint: 'Only a few of the sad frogs are golden.' },
+    { id: WORTH_THE_WAIT_ACCOLADE_ID, label: 'Worth the Wait', icon: Hourglass, grad: 'linear-gradient(140deg, #f9a8d4, #9333ea)', earned: earnedAccolades.has(WORTH_THE_WAIT_ACCOLADE_ID), hint: "Be waiting in a channel's offline chat when the stream finally starts." },
     // Same persisted-set fallback as the base accolades: an earned secret stays
     // lit even when its live source is absent — notably on the public/preview
     // view, which never fetches your drops or channel points (so Triple Threat's
@@ -588,7 +619,11 @@ const ProfileOverview = ({
         : 'Open StreamNook around the Fourth of July, 2026 (July 3 to 5)',
     },
   ];
-  const allAccolades: Accolade[] = [...baseAccolades, ...secretAccolades, ...seasonalAccolades, ...eventAccolades];
+  // An accolade nobody can earn any more (a member number that does not
+  // qualify, an event that is over) is only listed for those who hold it.
+  const allAccolades: Accolade[] = [...baseAccolades, ...secretAccolades, ...seasonalAccolades, ...eventAccolades].filter(
+    (a) => a.earned || !outOfReach.has(a.id),
+  );
   // On someone else's PUBLIC profile, hide locked SECRET accolades entirely: a
   // viewer shouldn't see placeholders for hidden achievements the member hasn't
   // earned, and must never be able to read a how-to off them. Your own profile
@@ -614,6 +649,7 @@ const ProfileOverview = ({
       statHidden('streams') &&
       statHidden('cosmetics') &&
       statHidden('favorite_channel') &&
+      statHidden('subs_gifted') &&
       statHidden('member_rank')
     );
   const sectionStyle = accentRgb ? { borderColor: `rgba(${accentRgb}, 0.3)` } : undefined;
@@ -656,11 +692,6 @@ const ProfileOverview = ({
         </span>
         <span className="text-sm text-textMuted">hrs</span>
       </div>
-      {recapHours > 0 && (
-        <p className="mt-1 text-[11px] text-textMuted">
-          Includes {Math.round(recapHours).toLocaleString()} hrs from Twitch Recap, before StreamNook
-        </p>
-      )}
       {roast && !statHidden('roast_line') && (
         <div className={`flex items-start justify-between gap-3 ${compact ? 'mt-2' : 'mt-3'}`}>
           <p className={`leading-relaxed text-textSecondary ${compact ? 'text-[12px]' : 'text-[15px]'}`}>
@@ -738,9 +769,9 @@ const ProfileOverview = ({
           <StatTile
             icon={Coins}
             label="Channel points"
-            count={pointsHeld ?? undefined}
-            value={pointsHeld === null ? 'Unknown' : undefined}
-            caption={pointsChannels > 0 ? `held across ${pointsChannels} channels` : 'watch a stream to start tracking'}
+            count={pointsHeld === null && recapPoints === 0 ? undefined : (pointsHeld ?? 0) + recapPoints}
+            value={pointsHeld === null && recapPoints === 0 ? 'Unknown' : undefined}
+            caption={pointsChannels > 0 ? `across ${pointsChannels} channels` : 'watch a stream to start tracking'}
             color={ICON_COLOR.amber}
           />
         )}
@@ -754,6 +785,9 @@ const ProfileOverview = ({
           />
         )}
         {!statHidden('streams') && <StatTile icon={Tv} label="Streams watched" count={streams} color={ICON_COLOR.sky} />}
+        {subsGifted > 0 && !statHidden('subs_gifted') && (
+          <StatTile icon={HandHeart} label="Subs gifted" count={subsGifted} color={ICON_COLOR.violet} />
+        )}
         {isOwnProfile && (
           <StatTile
             icon={Gift}

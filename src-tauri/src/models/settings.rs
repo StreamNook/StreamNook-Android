@@ -72,6 +72,51 @@ impl Default for AudioBoostSettings {
     }
 }
 
+impl AudioBoostSettings {
+    /// Every value held to the range the audio graph accepts, so a bad write
+    /// can never reach a compressor or gain node. A non-finite value takes the
+    /// default.
+    pub fn clamped(self) -> Self {
+        let d = Self::default();
+        let fit = |v: f32, lo: f32, hi: f32, fallback: f32| if v.is_finite() { v.clamp(lo, hi) } else { fallback };
+        Self {
+            enabled: self.enabled,
+            gain: fit(self.gain, 0.0, 4.0, d.gain),
+            threshold: fit(self.threshold, -100.0, 0.0, d.threshold),
+            knee: fit(self.knee, 0.0, 40.0, d.knee),
+            ratio: fit(self.ratio, 1.0, 20.0, d.ratio),
+            attack: fit(self.attack, 0.0, 1.0, d.attack),
+            release: fit(self.release, 0.0, 1.0, d.release),
+        }
+    }
+}
+
+/// Song identification (the /song command and the player's music button):
+/// how long to listen and how many times to try again. The page captures and
+/// clamps them (3 to 30 seconds, 0 to 3 retries); this is where they persist.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SongIdSettings {
+    /// Seconds of audio to fingerprint.
+    #[serde(default = "default_song_capture_seconds")]
+    pub capture_seconds: u32,
+    /// Extra listens when the first finds nothing.
+    #[serde(default = "default_song_retries")]
+    pub retries: u32,
+}
+
+fn default_song_capture_seconds() -> u32 {
+    10
+}
+fn default_song_retries() -> u32 {
+    1
+}
+
+impl Default for SongIdSettings {
+    fn default() -> Self {
+        Self { capture_seconds: default_song_capture_seconds(), retries: default_song_retries() }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VideoPlayerSettings {
     pub max_buffer_length: u32,
@@ -84,8 +129,15 @@ pub struct VideoPlayerSettings {
     /// them match the theme background so the video appears to float.
     #[serde(default)]
     pub cinema_mode: bool,
+    /// While a stream or VOD plays in the main window, the title bar slides
+    /// away and the picture takes the top edge; the bar comes back when the
+    /// pointer reaches the top. Off by default.
+    #[serde(default)]
+    pub hide_title_bar_while_watching: bool,
     #[serde(default)]
     pub audio_boost: AudioBoostSettings,
+    #[serde(default)]
+    pub song_id: SongIdSettings,
     /// Drive playback through the parts-based LL-HLS origin (Twitch-parity
     /// latency) instead of the whole-segment path. On by default since 2026-09-21,
     /// when it was measured level with twitch.tv on H.264 and 1440p channels; the
@@ -120,6 +172,10 @@ pub struct VideoPlayerSettings {
     /// Middle-clicking the player toggles mute. On by default.
     #[serde(default = "default_true")]
     pub middle_click_mute: bool,
+    /// Middle-clicking a stream card or sidebar row opens it in MultiNook. On
+    /// by default.
+    #[serde(default = "default_true")]
+    pub middle_click_multinook: bool,
     /// How much one wheel notch moves the volume (0.01-0.25). Default 5%.
     #[serde(default = "default_wheel_volume_step")]
     pub wheel_volume_step: f32,
@@ -127,6 +183,12 @@ pub struct VideoPlayerSettings {
     /// VOD from the top (positions are still recorded for the cards).
     #[serde(default = "default_true")]
     pub resume_vod_playback: bool,
+    /// Keep Continue Watching in step across the viewer's StreamNook installs
+    /// (and their place in Twitch's own apps), so a VOD left on one device
+    /// resumes on another. On by default; only applies while
+    /// `resume_vod_playback` is on.
+    #[serde(default = "default_true")]
+    pub sync_vod_progress: bool,
     /// Ad-free live playback (Android). Routes the playlist through a public
     /// relay and strips ad segments out of what the player is served. On by
     /// default, matching the behavior the phone app shipped with through 7.8.6.
@@ -140,11 +202,13 @@ pub struct VideoPlayerSettings {
     pub ad_bypass_proxies: String,
     /// What leaving the app does while a stream is playing (Android only).
     ///
-    /// "pip"   - float the video in a system picture-in-picture window. Default,
-    ///           and the behaviour the phone app has always had.
-    /// "audio" - no floating window: the stream drops to its audio-only
-    ///           rendition and keeps playing behind a media notification, which
-    ///           taps back into the app.
+    /// Leaving the app always floats the video in a system picture-in-picture
+    /// window where the phone allows it; this decides what happens after that:
+    /// "pip"   - closing the window ends the stream. Default.
+    /// "audio" - "Background play": closing the window, or leaving when the
+    ///           video cannot float, keeps the stream going on its audio-only
+    ///           rendition behind a media notification, which taps back into
+    ///           the app.
     ///
     /// The audio path is not merely a preference. Backgrounding without PiP
     /// destroys the activity's window surface, and Chromium tears down a media
@@ -172,7 +236,9 @@ impl Default for VideoPlayerSettings {
             start_quality: -1,
             lock_aspect_ratio: true,
             cinema_mode: false,
+            hide_title_bar_while_watching: false,
             audio_boost: AudioBoostSettings::default(),
+            song_id: SongIdSettings::default(),
             experimental_low_latency: true,
             low_latency_engine_defaulted: true,
             ll_target_latency: None,
@@ -182,8 +248,10 @@ impl Default for VideoPlayerSettings {
             scroll_volume: true,
             scroll_about_reveal: true,
             middle_click_mute: true,
+            middle_click_multinook: true,
             wheel_volume_step: 0.05,
             resume_vod_playback: true,
+            sync_vod_progress: true,
         }
     }
 }
@@ -235,6 +303,10 @@ pub struct ChatDesignSettings {
     pub mention_color: String,   // Hex color for @ mentions
     pub reply_color: String,     // Hex color for reply threads
     pub mention_animation: bool, // Enable red-shift animation for mentions
+    /// Keep a mention or reply to you tinted in its color for as long as it is
+    /// on screen, instead of only flashing as it lands.
+    #[serde(default)]
+    pub mention_hold: bool,
     #[serde(default)]
     pub show_timestamps: bool, // Show timestamp next to each message
     #[serde(default)]
@@ -256,6 +328,10 @@ pub struct ChatDesignSettings {
     /// that reveals it on click. Default true.
     #[serde(default = "default_true")]
     pub show_chat_gifs: bool,
+    /// Twitch chat GIF size multiplier on the 80px base height, held to
+    /// `GIF_SCALE_MIN..=GIF_SCALE_MAX` on every load and save. Default 1.
+    #[serde(default = "default_gif_scale", deserialize_with = "deserialize_gif_scale")]
+    pub gif_scale: f64,
     /// Opacity of backfilled history rows, 0-100 (100 = same as live).
     #[serde(default = "default_backfill_opacity")]
     pub backfill_opacity: u32,
@@ -264,7 +340,7 @@ pub struct ChatDesignSettings {
     #[serde(default = "default_emote_hover_size")]
     pub emote_hover_size: u32, // Enlarged emote height in hover preview, px
     #[serde(default = "default_deleted_message_style")]
-    pub deleted_message_style: String, // strikethrough | hidden | dimmed | keep
+    pub deleted_message_style: String, // strikethrough | hidden | dimmed | italic | keep
     #[serde(default)]
     pub hide_shared_chat: bool,
     #[serde(default = "default_true")]
@@ -303,13 +379,54 @@ pub struct ChatDesignSettings {
     #[serde(default = "default_true")]
     pub drag_moderation_enabled: bool, // deprecated: superseded by mod_action_style
     #[serde(default = "default_mod_action_style")]
-    pub mod_action_style: String, // buttons | drag | both
+    pub mod_action_style: String, // buttons | drag | both | none (hover buttons, drag to tiles)
+    /// Where the grab cursor shows while drag-to-moderate is on: "row" (the
+    /// whole message, so the gesture announces itself) or "edge" (only the
+    /// accent strip at the left edge). A press anywhere lifts the chatter
+    /// either way.
+    #[serde(default = "default_mod_drag_cursor")]
+    pub mod_drag_cursor: String, // row | edge
     #[serde(default = "default_mod_drag_layout")]
     pub mod_drag_layout: String, // column | bar
     #[serde(default = "default_pinned_collapsed_style")]
     pub pinned_collapsed_style: String, // bar | hidden
     #[serde(default = "default_mod_pin_style")]
     pub mod_pin_style: String, // inline | drag | both
+    /// The slider on a message's left edge: drag right through the timeout
+    /// steps to Ban, release to apply. Moderators only.
+    #[serde(default = "default_true")]
+    pub mod_slider: bool,
+    /// The slider's first step deletes the message.
+    #[serde(default = "default_true")]
+    pub mod_slider_delete: bool,
+    /// The slider's timeouts in seconds (drawn shortest first whatever order
+    /// they are saved in).
+    #[serde(default = "default_mod_slider_timeouts")]
+    pub mod_slider_timeouts: Vec<u32>,
+    /// The slider ends in Ban.
+    #[serde(default = "default_true")]
+    pub mod_slider_ban: bool,
+    /// How much of the message width the slider's steps spread over:
+    /// "short" (half), "medium" (four fifths), "long" (all of it).
+    #[serde(default = "default_mod_slider_length")]
+    pub mod_slider_length: String,
+    /// Line buttons: small action buttons at the start of every line a
+    /// moderator can act on, one click each. They take the left edge, so the
+    /// slider grip is not drawn while they are on. Moderators only.
+    #[serde(default)]
+    pub mod_line_buttons: bool,
+    /// The line buttons start with Delete.
+    #[serde(default = "default_true")]
+    pub mod_line_delete: bool,
+    /// The line buttons' timeouts in seconds (drawn shortest first).
+    #[serde(default = "default_mod_line_timeouts")]
+    pub mod_line_timeouts: Vec<u32>,
+    /// The line buttons end with Ban.
+    #[serde(default = "default_true")]
+    pub mod_line_ban: bool,
+    /// Seconds a drop on the drag-to-moderate Timeout tile times out for.
+    #[serde(default = "default_mod_bucket_timeout")]
+    pub mod_bucket_timeout: u32,
     /// "hsl_loop" (default) walks a chatter's color toward the readable side
     /// of the theme; "off" renders it as Twitch sent it.
     #[serde(default = "default_name_color_adjustment")]
@@ -320,6 +437,10 @@ pub struct ChatDesignSettings {
     pub show_badges: bool,
     #[serde(default = "default_badge_scale")]
     pub badge_scale: f64,
+    /// A channel's own moderator and VIP badge art from its FrankerFaceZ room
+    /// in place of Twitch's (`services::ffz_room_badges`).
+    #[serde(default = "default_true")]
+    pub ffz_custom_role_badges: bool,
     #[serde(default = "default_true")]
     pub show_third_party_badges: bool,
     #[serde(default)]
@@ -354,6 +475,55 @@ pub struct ChatDesignSettings {
     pub pinned_start_collapsed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polls_start_collapsed: Option<bool>,
+    /// Sound played when a live message mentions you: a built-in tone id or
+    /// `file:<id>` from the custom sounds. Absent or empty means no sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_sound: Option<String>,
+    /// Mention sound volume, percent of the sound's own level (0-200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_sound_volume: Option<u32>,
+    /// Whether a reply to one of your messages also plays the mention sound,
+    /// while `reply_sound` follows the mention sound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_sound_replies: Option<bool>,
+    /// Sound for a reply to one of your messages: absent or empty follows the
+    /// mention sound (and `mention_sound_replies`), "none" is silent, anything
+    /// else is a built-in tone id or `file:<id>` of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_sound: Option<String>,
+    /// Volume of a reply sound of its own, percent of its level (0-200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_sound_volume: Option<u32>,
+    /// @mention text weight in message bodies: regular | medium | bold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_weight: Option<String>,
+    /// @mention slant: inherit (italic inside /me messages) | never | always.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_italic: Option<String>,
+    /// @mention shape: plain (coloured text, the default) | pill (tinted capsule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_style: Option<String>,
+    /// @mention colour: absent follows the mentioned user's name colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mention_text_color: Option<String>,
+    /// How docked chats are switched in a chat column: menu | tabs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_dock_switcher: Option<String>,
+    /// Ticks on the chat scrollbar where marked rows sit (mentions, subs,
+    /// announcements and so on), so a viewer scrolled away can find them.
+    #[serde(default = "default_true")]
+    pub scrollbar_marks: bool,
+    /// Which mark kinds draw: mention (replies to you included) | highlight
+    /// | pinned | announcement | sub | redeem | raid | first_time.
+    #[serde(default = "default_scrollbar_mark_kinds")]
+    pub scrollbar_mark_kinds: Vec<String>,
+}
+
+pub fn default_scrollbar_mark_kinds() -> Vec<String> {
+    ["mention", "highlight", "pinned", "announcement", "sub", "redeem", "raid"]
+        .iter()
+        .map(|k| k.to_string())
+        .collect()
 }
 
 fn default_name_color_adjustment() -> String {
@@ -383,6 +553,34 @@ fn default_reply_style() -> String {
 fn default_emote_scale() -> f64 {
     1.0
 }
+
+/// Smallest chat GIF size: half the 80px default.
+pub const GIF_SCALE_MIN: f64 = 0.5;
+/// Largest chat GIF size: twice the 80px default.
+pub const GIF_SCALE_MAX: f64 = 2.0;
+
+fn default_gif_scale() -> f64 {
+    1.0
+}
+
+/// A GIF size held to its range; anything that is not a finite number (a
+/// hand-edited file, a stray null) takes the default instead of failing the
+/// whole settings load.
+pub fn clamp_gif_scale(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(GIF_SCALE_MIN, GIF_SCALE_MAX)
+    } else {
+        default_gif_scale()
+    }
+}
+
+fn deserialize_gif_scale<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(clamp_gif_scale(raw.as_f64().unwrap_or_else(default_gif_scale)))
+}
 fn default_emote_margin() -> f64 {
     0.125
 }
@@ -407,6 +605,21 @@ fn default_mod_action_style() -> String {
 fn default_mod_drag_layout() -> String {
     "column".to_string()
 }
+fn default_mod_drag_cursor() -> String {
+    "row".to_string()
+}
+fn default_mod_slider_length() -> String {
+    "medium".to_string()
+}
+fn default_mod_bucket_timeout() -> u32 {
+    600
+}
+fn default_mod_slider_timeouts() -> Vec<u32> {
+    crate::services::moderation::DEFAULT_SLIDER_TIMEOUTS.to_vec()
+}
+fn default_mod_line_timeouts() -> Vec<u32> {
+    crate::services::moderation::DEFAULT_LINE_TIMEOUTS.to_vec()
+}
 fn default_pinned_collapsed_style() -> String {
     "bar".to_string()
 }
@@ -428,12 +641,14 @@ impl Default for ChatDesignSettings {
             mention_color: "#ff4444".to_string(),
             reply_color: "#ff6b6b".to_string(),
             mention_animation: true,
+            mention_hold: false,
             show_timestamps: false,
             show_timestamp_seconds: false,
             timestamp_format: default_timestamp_format(),
             emote_scale: 1.0,
             animate_emotes: default_animate_emotes(),
             show_chat_gifs: true,
+            gif_scale: default_gif_scale(),
             backfill_opacity: default_backfill_opacity(),
             emote_margin: 0.125,
             emote_hover_size: 96,
@@ -455,6 +670,7 @@ impl Default for ChatDesignSettings {
             name_color_adjustment: default_name_color_adjustment(),
             show_badges: true,
             badge_scale: 1.0,
+            ffz_custom_role_badges: true,
             show_third_party_badges: true,
             hidden_badge_providers: Vec::new(),
             message_entrance: default_message_entrance(),
@@ -470,12 +686,59 @@ impl Default for ChatDesignSettings {
             username_colon: None,
             pinned_start_collapsed: None,
             polls_start_collapsed: None,
+            mention_sound: None,
+            mention_sound_volume: None,
+            mention_sound_replies: None,
+            reply_sound: None,
+            reply_sound_volume: None,
+            mention_weight: None,
+            mention_italic: None,
+            mention_style: None,
+            mention_text_color: None,
+            chat_dock_switcher: None,
+            scrollbar_marks: true,
+            scrollbar_mark_kinds: default_scrollbar_mark_kinds(),
             username_accent_source: "user".to_string(),
             drag_moderation_enabled: true,
             mod_action_style: "both".to_string(),
+            mod_drag_cursor: default_mod_drag_cursor(),
             mod_drag_layout: "column".to_string(),
             pinned_collapsed_style: "bar".to_string(),
             mod_pin_style: "both".to_string(),
+            mod_slider: true,
+            mod_slider_delete: true,
+            mod_slider_timeouts: default_mod_slider_timeouts(),
+            mod_slider_ban: true,
+            mod_slider_length: default_mod_slider_length(),
+            mod_line_buttons: false,
+            mod_line_delete: true,
+            mod_line_timeouts: default_mod_line_timeouts(),
+            mod_line_ban: true,
+            mod_bucket_timeout: default_mod_bucket_timeout(),
+        }
+    }
+}
+
+impl ChatDesignSettings {
+    /// The look a brand-new install starts with. `Default` stays what an
+    /// absent `chat_design` block has always meant, so an old settings file
+    /// that lacks one never changes under its owner.
+    ///
+    /// Phones keep Twitch's 14px text and 8px spacing on a narrow screen, and
+    /// keep mod buttons: the phone chat has no drag layer, so drag-only would
+    /// leave a moderator there with no actions at all. Desktop starts with the
+    /// hover buttons on beside the slider (the default message edge), and
+    /// drag to tiles off: the slider holds the edge, so tiles would not show.
+    pub fn first_run() -> Self {
+        let desktop = cfg!(not(mobile));
+        Self {
+            font_size: if desktop { 16 } else { 14 },
+            message_spacing: if desktop { 11 } else { 8 },
+            message_entrance: "slide".to_string(),
+            deleted_message_style: "italic".to_string(),
+            mod_action_style: if desktop { "buttons" } else { "both" }.to_string(),
+            mod_drag_layout: if desktop { "bar" } else { "column" }.to_string(),
+            ..Self::default()
         }
     }
 }
@@ -486,6 +749,10 @@ pub struct LiveNotificationSettings {
     pub play_sound: bool,
     #[serde(default)]
     pub sound_type: Option<String>,
+    /// Notification sound volume, percent of the sound's own level (0-200).
+    /// Absent plays at the sound's own level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_volume: Option<u32>,
     // Notification type toggles
     #[serde(default = "default_true")]
     pub show_live_notifications: bool,
@@ -516,14 +783,34 @@ pub struct LiveNotificationSettings {
     /// that names them, whoever did the watching or the claiming.
     #[serde(default = "default_true")]
     pub show_twitch_reward_notifications: bool,
+    /// Someone mentions you, or replies to you, in a Twitch chat you joined,
+    /// while StreamNook is not the window in use (services/mention_notify.rs).
+    #[serde(default = "default_true")]
+    pub show_mention_notifications: bool,
+    /// A Rewards button, and a right-click item for these settings, on the
+    /// Windows channel points notification (services/points_notify.rs).
+    #[serde(default)]
+    pub points_rewards_button: bool,
+    /// A bar toward the cheapest reward you cannot afford yet, on the Windows
+    /// channel points notification.
+    #[serde(default)]
+    pub points_next_reward: bool,
+    /// A notification when a prediction opens on a channel you are watching,
+    /// while StreamNook is not the window in use.
+    #[serde(default)]
+    pub show_prediction_notifications: bool,
     // Notification method toggles (Dynamic Island vs Toast)
     #[serde(default = "default_true")]
     pub use_dynamic_island: bool,
     #[serde(default = "default_true")]
     pub use_toast: bool,
-    // Native OS notifications (Windows/macOS)
+    /// System notifications: Windows / macOS / Linux desktop notifications
+    /// while StreamNook is not the window in use (services/system_notify.rs).
+    /// The phone keeps it on; the system shade is its delivery surface.
     #[serde(default)]
     pub use_native_notifications: bool,
+    /// Left from an earlier desktop attempt; nothing reads it. System
+    /// notifications always wait until StreamNook is not the window in use.
     #[serde(default = "default_true")]
     pub native_only_when_unfocused: bool,
     // Quick update: clicking update toast immediately starts update
@@ -576,6 +863,7 @@ impl Default for LiveNotificationSettings {
             enabled: true,
             play_sound: true,
             sound_type: None,
+            sound_volume: None,
             show_live_notifications: true,
             show_favorite_live_notifications: true,
             show_whisper_notifications: true,
@@ -586,6 +874,10 @@ impl Default for LiveNotificationSettings {
             show_badge_notifications: true,
             show_gift_sub_notifications: true,
             show_twitch_reward_notifications: true,
+            show_mention_notifications: true,
+            points_rewards_button: false,
+            points_next_reward: false,
+            show_prediction_notifications: false,
             use_dynamic_island: true,
             use_toast: true,
             use_native_notifications: false,
@@ -658,6 +950,76 @@ pub struct CompactViewSettings {
     pub custom_presets: Vec<CompactViewPreset>,
 }
 
+/// How MultiNook arranges its tiles.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiNookLayoutMode {
+    /// Every tile the same size.
+    #[default]
+    Grid,
+    /// The first tile large, the rest in a strip below it.
+    MainRow,
+    /// The first tile large, the rest in a strip beside it.
+    MainColumn,
+}
+
+/// The MultiNook layout. Read leniently (see its `Deserialize`): settings load
+/// as ONE parse, so a value this build does not know must never fail the file.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct MultiNookLayout {
+    pub mode: MultiNookLayoutMode,
+    /// The small tiles' strip as a share of the stage: its height for
+    /// `MainRow`, its width for `MainColumn`.
+    pub strip_share: f64,
+    /// Small tiles play at about this height at most (480 = 480p), or their
+    /// own quality when `None`. Main layouts only.
+    pub small_quality_cap: Option<u32>,
+}
+
+impl MultiNookLayout {
+    pub const MIN_SHARE: f64 = 0.15;
+    pub const MAX_SHARE: f64 = 0.40;
+    pub const DEFAULT_SHARE: f64 = 0.25;
+    /// The heights the small-tile cap may take.
+    pub const CAPS: [u32; 3] = [720, 480, 360];
+
+    /// Whether a tile in this spot plays under the cap. Grid has no small tiles.
+    pub fn caps_small_tiles(&self) -> Option<u32> {
+        match self.mode {
+            MultiNookLayoutMode::Grid => None,
+            _ => self.small_quality_cap,
+        }
+    }
+}
+
+impl Default for MultiNookLayout {
+    fn default() -> Self {
+        Self { mode: MultiNookLayoutMode::Grid, strip_share: Self::DEFAULT_SHARE, small_quality_cap: None }
+    }
+}
+
+impl<'de> Deserialize<'de> for MultiNookLayout {
+    /// Field by field, each falling back on its own: an unknown mode (a newer
+    /// build's, or a hand edit) reads as Grid, a share is clamped, a cap that
+    /// is not one of `CAPS` reads as none.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let mut out = Self::default();
+        if let Some(mode) = v.get("mode").and_then(|m| serde_json::from_value::<MultiNookLayoutMode>(m.clone()).ok()) {
+            out.mode = mode;
+        }
+        if let Some(share) = v.get("strip_share").and_then(|x| x.as_f64()).filter(|x| x.is_finite()) {
+            out.strip_share = share.clamp(Self::MIN_SHARE, Self::MAX_SHARE);
+        }
+        out.small_quality_cap = v
+            .get("small_quality_cap")
+            .and_then(|x| x.as_u64())
+            .and_then(|x| u32::try_from(x).ok())
+            .filter(|x| Self::CAPS.contains(x));
+        Ok(out)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MultiNookSlot {
@@ -693,6 +1055,11 @@ pub struct MultiNookSlot {
     /// directly above, which is here for exactly that reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// This tile's own Audio Boost, set from the tile's boost panel. Absent
+    /// means the tile uses the player's `video_player.audio_boost` until the
+    /// viewer changes it on the tile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_boost: Option<AudioBoostSettings>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -716,6 +1083,19 @@ pub struct Settings {
     /// settings file in the field needs migrating.
     #[serde(default)]
     pub favorite_channels: Vec<FavoriteChannel>,
+    /// Twitch categories the viewer starred, in the order they were added.
+    /// Edited only through `set_favorite_category` (an in-place change).
+    #[serde(default)]
+    pub favorite_categories: Vec<FavoriteCategory>,
+    /// Channels hidden from browsing (Discover, suggestions, categories,
+    /// directories), keyed like `favorite_streamers`. Edited only through
+    /// `set_channel_hidden` and `set_hidden_channel_blocked`.
+    #[serde(default)]
+    pub hidden_channels: Vec<HiddenChannel>,
+    /// What a newly hidden channel is hidden from besides browsing; each
+    /// hidden channel keeps its own copy, adjustable in Settings.
+    #[serde(default)]
+    pub hidden_channel_defaults: HiddenRealms,
     #[serde(default)]
     pub chat_design: ChatDesignSettings,
     #[serde(default)]
@@ -746,6 +1126,11 @@ pub struct Settings {
     pub glass_blur: bool,
     #[serde(default)]
     pub setup_complete: bool,
+    /// Set once this install has been moved onto the first-run chat look (see
+    /// `adopt_first_run_look_once`). Backend-owned: a frontend save never
+    /// writes it, so a later choice of the old look is never flipped again.
+    #[serde(default)]
+    pub first_run_look_adopted: bool,
     #[serde(default)]
     pub compact_view: Option<CompactViewSettings>,
     /// Whether diagnostic logging is enabled (defaults to true)
@@ -756,6 +1141,10 @@ pub struct Settings {
     pub multi_nook_slots: Vec<MultiNookSlot>,
     #[serde(default)]
     pub multi_nook_chat_hidden: bool,
+    /// How the MultiNook tiles are arranged (grid, or one main tile with the
+    /// rest small).
+    #[serde(default)]
+    pub multi_nook_layout: MultiNookLayout,
     /// Whether the Moderator Logs pane is shown. Persisted so it survives app
     /// restarts and settings reloads instead of resetting to off each session.
     #[serde(default)]
@@ -798,6 +1187,23 @@ pub struct Settings {
     /// every window sees one copy.
     #[serde(default)]
     pub snippets: SnippetSettings,
+    /// How 7TV cosmetics draw: paint shadows and 7TV profile pictures. Typed so
+    /// a new field persists; unknown keys inside the group ride its own `extra`.
+    #[serde(default)]
+    pub cosmetics: CosmeticsSettings,
+    /// The message box's own preferences. Typed so a new field persists and
+    /// its default comes from here; the composer keys this struct does not
+    /// name ride its own `extra`.
+    #[serde(default)]
+    pub chat_input: ChatInputSettings,
+    /// `/spam` and `/pyramid`: the pause between lines and whether repeats
+    /// are varied. Typed because the Rust runner reads it.
+    #[serde(default)]
+    pub chat_burst: ChatBurstSettings,
+    /// The phones' Chats screen keeps the screen on while it is in front, until
+    /// `chat_tabs::KEEP_AWAKE_IDLE_SECS` pass with no touch.
+    #[serde(default = "default_true")]
+    pub chats_keep_screen_on: bool,
     /// Catch-all for preference groups the frontend manages but this struct does
     /// not model field-by-field: highlight phrases, custom chat commands,
     /// moderation prefs, custom themes, the OLED accent, and any future ones.
@@ -891,6 +1297,136 @@ pub struct CustomSnippet {
     pub keywords: Option<String>,
 }
 
+/// The message box. Mirrors the frontend `ChatInputSettings`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ChatInputSettings {
+    /// Show the channel's chat modes (emote-only, followers-only, slow mode
+    /// and the rest) in the message box while they are on.
+    pub show_room_modes: bool,
+    /// How the modes show: `prompt` (the default: named in place of "Send a
+    /// message", and only while a mode holds you back) or `chip` (one chip at
+    /// the box's edge whenever a mode is on).
+    pub room_modes_style: String,
+    /// Set once `move_room_modes_to_prompt_once` has run. Field default false
+    /// so a file from before it existed takes the move; a new install starts
+    /// with it set.
+    #[serde(default)]
+    pub room_modes_prompt_adopted: bool,
+    /// The composer keys this struct does not name (placeholder, buttons,
+    /// spellcheck, tab completion, ...), kept verbatim.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Default for ChatInputSettings {
+    fn default() -> Self {
+        Self {
+            show_room_modes: true,
+            room_modes_style: "prompt".into(),
+            room_modes_prompt_adopted: true,
+            extra: HashMap::new(),
+        }
+    }
+}
+
+/// 7TV cosmetic display. Mirrors the frontend `CosmeticsSettings`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(from = "CosmeticsSettingsFile")]
+pub struct CosmeticsSettings {
+    /// Paint drop shadows: "all", "one" or "none"; unset draws them all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paint_shadows: Option<String>,
+    /// Whose picture a person shows: "seventv" (the picture they set on 7TV,
+    /// otherwise their platform's) or "twitch" (always the platform's own,
+    /// and no 7TV picture is ever looked up).
+    pub profile_picture_source: String,
+    /// When a 7TV picture moves: "always", "hover" (focal surfaces move,
+    /// lists on hover) or "never". Separate from the Motion setting.
+    pub profile_picture_animation: String,
+    /// Keys the frontend adds to this group before this struct names them.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+pub const PROFILE_PICTURE_SOURCE_SEVENTV: &str = "seventv";
+pub const PROFILE_PICTURE_SOURCE_TWITCH: &str = "twitch";
+
+impl CosmeticsSettings {
+    /// Whether 7TV profile pictures are shown, so looked up at all.
+    pub fn shows_seventv_pictures(&self) -> bool {
+        self.profile_picture_source != PROFILE_PICTURE_SOURCE_TWITCH
+    }
+}
+
+impl Default for CosmeticsSettings {
+    fn default() -> Self {
+        Self {
+            paint_shadows: None,
+            profile_picture_source: PROFILE_PICTURE_SOURCE_SEVENTV.to_string(),
+            profile_picture_animation: "always".to_string(),
+            extra: HashMap::new(),
+        }
+    }
+}
+
+/// `CosmeticsSettings` as a file may hold it, including the on/off switch the
+/// source choice replaced (`seventv_profile_pictures`): a file that turned
+/// 7TV pictures off reads as the Twitch source, and the old key is not kept.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CosmeticsSettingsFile {
+    paint_shadows: Option<String>,
+    profile_picture_source: Option<String>,
+    seventv_profile_pictures: Option<bool>,
+    profile_picture_animation: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, serde_json::Value>,
+}
+
+impl From<CosmeticsSettingsFile> for CosmeticsSettings {
+    fn from(file: CosmeticsSettingsFile) -> Self {
+        let defaults = Self::default();
+        let source = match file.profile_picture_source.as_deref() {
+            Some(PROFILE_PICTURE_SOURCE_TWITCH) => PROFILE_PICTURE_SOURCE_TWITCH,
+            Some(_) => PROFILE_PICTURE_SOURCE_SEVENTV,
+            None if file.seventv_profile_pictures == Some(false) => PROFILE_PICTURE_SOURCE_TWITCH,
+            None => PROFILE_PICTURE_SOURCE_SEVENTV,
+        };
+        Self {
+            paint_shadows: file.paint_shadows,
+            profile_picture_source: source.to_string(),
+            profile_picture_animation: file.profile_picture_animation.unwrap_or(defaults.profile_picture_animation),
+            extra: file.extra,
+        }
+    }
+}
+
+/// `/spam` and `/pyramid`. Mirrors the frontend `ChatBurstSettings`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ChatBurstSettings {
+    /// Milliseconds between two lines (10 to 5000). 1000 is Twitch's
+    /// per-channel pace for a regular viewer.
+    pub delay_ms: u32,
+    /// Make a line that repeats the one before it differ by invisible
+    /// characters, so Twitch's duplicate filter does not drop it.
+    pub vary_repeats: bool,
+    /// Keys the frontend adds to this group before this struct names them.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Default for ChatBurstSettings {
+    fn default() -> Self {
+        Self {
+            delay_ms: crate::services::chat_burst::DEFAULT_DELAY_MS,
+            vary_repeats: true,
+            extra: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct SnippetSettings {
@@ -939,6 +1475,14 @@ impl Default for ChatBlendSettings {
     }
 }
 
+impl ChatBlendSettings {
+    /// A brand-new install merges a streamer's other platforms into one chat
+    /// from the start. `Default` (off) stays what an absent block means.
+    pub fn first_run() -> Self {
+        Self { enabled: true, ..Self::default() }
+    }
+}
+
 /// Identity for a favourited channel, so an unfollowed favourite can still be
 /// drawn while it is offline (a name and a face; `favorite_streamers` is only
 /// ids). Membership stays in `favorite_streamers` — this is a best-effort
@@ -947,6 +1491,49 @@ impl Default for ChatBlendSettings {
 ///
 /// Rows whose id has left `favorite_streamers` are ignored where they're read
 /// rather than pruned, so nothing has to write settings during startup.
+/// A hidden channel: the favourites' row shape, so the list in Settings can
+/// draw it, whether StreamNook also blocked it on Twitch, and where besides
+/// browsing (always) it is hidden.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HiddenChannel {
+    #[serde(flatten)]
+    pub channel: FavoriteChannel,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(flatten)]
+    pub realms: HiddenRealms,
+}
+
+/// Where a hidden channel is hidden besides browsing lists.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HiddenRealms {
+    /// Their messages, in every chat room.
+    pub chat: bool,
+    /// Search results.
+    pub search: bool,
+    /// Following, favourites, the Sidebar and live notifications.
+    pub follows: bool,
+}
+
+impl Default for HiddenRealms {
+    fn default() -> Self {
+        Self { chat: true, search: true, follows: true }
+    }
+}
+
+/// A starred Twitch category. The name and box art are kept so the row paints
+/// before Twitch answers, and when it does not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct FavoriteCategory {
+    /// Twitch game id.
+    pub id: String,
+    pub name: String,
+    /// Helix's template form (`{width}x{height}`) or a sized URL.
+    #[serde(default)]
+    pub box_art_url: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FavoriteChannel {
     /// The key used in `favorite_streamers`: a Twitch numeric user id, or a
@@ -984,12 +1571,19 @@ impl Default for Settings {
             drops: DropsSettings::default(),
             favorite_streamers: vec![],
             favorite_channels: vec![],
+            favorite_categories: vec![],
+            hidden_channels: vec![],
+            hidden_channel_defaults: HiddenRealms::default(),
             provider_follows: vec![],
             youtube_chat_view: YouTubeChatView::default(),
             channel_links: vec![],
-            chat_blend: ChatBlendSettings::default(),
+            chat_blend: ChatBlendSettings::first_run(),
             snippets: SnippetSettings::default(),
-            chat_design: ChatDesignSettings::default(),
+            cosmetics: CosmeticsSettings::default(),
+            chat_input: ChatInputSettings::default(),
+            chat_burst: ChatBurstSettings::default(),
+            chats_keep_screen_on: true,
+            chat_design: ChatDesignSettings::first_run(),
             live_notifications: LiveNotificationSettings::default(),
             last_seen_version: None,
             auto_switch: AutoSwitchSettings::default(),
@@ -999,10 +1593,12 @@ impl Default for Settings {
             glass_transparency: None,
             glass_blur: default_glass_blur(),
             setup_complete: false, // New users need to complete setup
+            first_run_look_adopted: true, // already starts with that look
             compact_view: None,
             error_reporting_enabled: true, // Diagnostics enabled by default
             multi_nook_slots: Vec::new(),
             multi_nook_chat_hidden: false,
+            multi_nook_layout: MultiNookLayout::default(),
             show_mod_logs: false,
             keybindings: HashMap::new(),
             chat_logging: ChatLoggingSettings::default(),
@@ -1139,6 +1735,45 @@ impl Settings {
         self.provider_follows = authoritative.provider_follows.clone();
         self.drops = authoritative.drops.clone();
         self.channel_links = authoritative.channel_links.clone();
+        self.first_run_look_adopted = authoritative.first_run_look_adopted;
+    }
+
+    /// One-time move of an existing install onto the first-run chat look,
+    /// setting by setting: a setting still at the value it shipped with was
+    /// never changed (as far as a settings file can tell), so it takes the new
+    /// default; anything the viewer picked stays. Runs once per install, so a
+    /// viewer who sets the old value back afterwards keeps it.
+    pub fn adopt_first_run_look_once(&mut self) {
+        if self.first_run_look_adopted {
+            return;
+        }
+        let new = ChatDesignSettings::first_run();
+        let d = &mut self.chat_design;
+        if d.font_size == 14 {
+            d.font_size = new.font_size;
+        }
+        if d.message_spacing == 8 {
+            d.message_spacing = new.message_spacing;
+        }
+        if d.message_entrance == "none" {
+            d.message_entrance = new.message_entrance;
+        }
+        if d.deleted_message_style == "strikethrough" {
+            d.deleted_message_style = new.deleted_message_style;
+        }
+        // "both" is also what a file from before mod_action_style existed
+        // loads as; there the old switch says what the viewer chose, and
+        // drag_moderation_enabled = false meant buttons only.
+        if d.mod_action_style == "both" && d.drag_moderation_enabled {
+            d.mod_action_style = new.mod_action_style;
+        }
+        if d.mod_drag_layout == "column" {
+            d.mod_drag_layout = new.mod_drag_layout;
+        }
+        if !self.chat_blend.enabled {
+            self.chat_blend.enabled = ChatBlendSettings::first_run().enabled;
+        }
+        self.first_run_look_adopted = true;
     }
 
     /// One-time flip of the low-latency engine to on for installs written before
@@ -1155,6 +1790,19 @@ impl Settings {
     /// every `false` there came from a header click aimed at one streamer, and
     /// it silently kept that platform out of every feed and every suggestion.
     /// The Settings switches stay the global control from here on.
+    /// One-time move of an existing install from the room-mode chip (the old
+    /// default) to the prompt, which says nothing unless a mode holds you back.
+    /// Runs once, so choosing the chip again afterwards sticks.
+    pub fn move_room_modes_to_prompt_once(&mut self) {
+        let input = &mut self.chat_input;
+        if !input.room_modes_prompt_adopted {
+            if input.room_modes_style == "chip" {
+                input.room_modes_style = "prompt".into();
+            }
+            input.room_modes_prompt_adopted = true;
+        }
+    }
+
     pub fn scope_blend_header_marks_once(&mut self) {
         if !self.chat_blend.header_marks_scoped {
             self.chat_blend.platforms.clear();
@@ -1166,6 +1814,16 @@ impl Settings {
         if self.video_player.ll_target_latency == Some(LEGACY_LIVE_EDGE_GAP_DEFAULT) {
             self.video_player.ll_target_latency = None;
         }
+    }
+
+    /// Lifts each custom theme's muted text to the contrast floor in the saved
+    /// value itself, so every window that builds a palette from settings paints
+    /// the lifted color. Runs on load and on every save; returns whether
+    /// anything changed.
+    pub fn lift_custom_theme_muted(&mut self) -> bool {
+        self.extra
+            .get_mut("custom_themes")
+            .is_some_and(crate::services::theme_palette::lift_custom_themes)
     }
 }
 
@@ -1207,6 +1865,56 @@ mod backup_persistence_tests {
         let mut parsed: Settings = serde_json::from_value(json).expect("parse");
         parsed.enable_low_latency_engine_once();
         assert!(parsed.video_player.experimental_low_latency);
+    }
+
+    #[test]
+    fn hide_title_bar_while_watching_persists_and_defaults_off() {
+        assert!(!Settings::default().video_player.hide_title_bar_while_watching);
+
+        let mut on = Settings::default();
+        on.video_player.hide_title_bar_while_watching = true;
+        let json = serde_json::to_string(&on).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("parse");
+        assert!(back.video_player.hide_title_bar_while_watching);
+
+        // A file written before the field existed parses to off.
+        let mut old = serde_json::to_value(Settings::default()).expect("serialize");
+        old["video_player"]
+            .as_object_mut()
+            .expect("video_player object")
+            .remove("hide_title_bar_while_watching");
+        let parsed: Settings = serde_json::from_value(old).expect("settings without the field parse");
+        assert!(!parsed.video_player.hide_title_bar_while_watching);
+    }
+
+    #[test]
+    fn gif_scale_persists_defaults_to_one_and_stays_in_range() {
+        assert_eq!(Settings::default().chat_design.gif_scale, 1.0);
+
+        let mut big = Settings::default();
+        big.chat_design.gif_scale = 1.75;
+        let json = serde_json::to_string(&big).expect("serialize");
+        let back: Settings = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back.chat_design.gif_scale, 1.75);
+
+        // `None` drops the key, as a file written before the field existed.
+        let parse_with = |value: Option<serde_json::Value>| -> f64 {
+            let mut file = serde_json::to_value(Settings::default()).expect("serialize");
+            let cd = file["chat_design"].as_object_mut().expect("chat_design object");
+            match value {
+                Some(v) => cd.insert("gif_scale".into(), v),
+                None => cd.remove("gif_scale"),
+            };
+            let parsed: Settings = serde_json::from_value(file).expect("settings parse");
+            parsed.chat_design.gif_scale
+        };
+        assert_eq!(parse_with(None), 1.0);
+        // Out of range is held to the slider's ends, never a broken row.
+        assert_eq!(parse_with(Some(serde_json::json!(9.0))), GIF_SCALE_MAX);
+        assert_eq!(parse_with(Some(serde_json::json!(0.1))), GIF_SCALE_MIN);
+        assert_eq!(parse_with(Some(serde_json::json!(0.75))), 0.75);
+        // A stray null takes the default instead of failing the whole load.
+        assert_eq!(parse_with(Some(serde_json::Value::Null)), 1.0);
     }
 
     #[test]
@@ -1357,11 +2065,12 @@ mod backup_persistence_tests {
         assert!(!back.extra.contains_key("channel_links"));
     }
 
-    /// Blend is off unless the user turns it on, and a settings file written
-    /// before it existed must load rather than failing the whole parse.
+    /// A fresh install starts with blend on, and a settings file written
+    /// before it existed loads with it off rather than failing the parse or
+    /// switching it on under its owner.
     #[test]
-    fn chat_blend_defaults_to_off_and_tolerates_an_older_file() {
-        assert!(!Settings::default().chat_blend.enabled, "off by default");
+    fn chat_blend_is_on_for_a_fresh_install_and_off_for_an_older_file() {
+        assert!(Settings::default().chat_blend.enabled, "on for a fresh install");
         assert!(Settings::default().chat_blend.suggest_links);
 
         let mut value = serde_json::to_value(Settings::default()).expect("serialize");
@@ -1373,10 +2082,217 @@ mod backup_persistence_tests {
         assert!(parsed.channel_links.is_empty());
     }
 
+    /// An existing install written before the first-run look: every setting
+    /// still at its shipped value takes the new one, anything chosen stays,
+    /// and it happens once.
+    #[test]
+    fn an_existing_install_adopts_the_first_run_look_only_where_untouched() {
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        let obj = value.as_object_mut().expect("object");
+        obj.remove("first_run_look_adopted");
+        obj.insert("chat_design".into(), serde_json::to_value(ChatDesignSettings::default()).unwrap());
+        obj.insert("chat_blend".into(), serde_json::to_value(ChatBlendSettings::default()).unwrap());
+        let mut old: Settings = serde_json::from_value(value).expect("parses");
+        assert!(!old.first_run_look_adopted);
+        // Two choices the viewer made.
+        old.chat_design.message_spacing = 4;
+        old.chat_design.deleted_message_style = "hidden".into();
+
+        old.adopt_first_run_look_once();
+        let fresh = ChatDesignSettings::first_run();
+        assert!(old.first_run_look_adopted);
+        assert!(old.chat_blend.enabled);
+        assert_eq!(old.chat_design.font_size, fresh.font_size);
+        assert_eq!(old.chat_design.message_entrance, "slide");
+        assert_eq!(old.chat_design.mod_action_style, fresh.mod_action_style);
+        assert_eq!(old.chat_design.message_spacing, 4, "a chosen spacing stays");
+        assert_eq!(old.chat_design.deleted_message_style, "hidden", "a chosen style stays");
+
+        // Setting the old look back afterwards sticks across loads.
+        old.chat_design.font_size = 14;
+        old.chat_blend.enabled = false;
+        old.adopt_first_run_look_once();
+        assert_eq!(old.chat_design.font_size, 14);
+        assert!(!old.chat_blend.enabled);
+
+        // A frontend save cannot clear the flag and re-run it.
+        let mut incoming = old.clone();
+        incoming.first_run_look_adopted = false;
+        incoming.adopt_backend_owned(&old);
+        assert!(incoming.first_run_look_adopted);
+    }
+
+    /// The old on/off drag switch, off, meant buttons only. A file from before
+    /// mod_action_style loads that field as "both"; the first-run look must
+    /// not overwrite what that switch meant.
+    #[test]
+    fn buttons_only_from_the_old_switch_is_not_moved_to_drag() {
+        let mut old = Settings::default();
+        old.first_run_look_adopted = false;
+        old.chat_design = ChatDesignSettings::default();
+        old.chat_design.drag_moderation_enabled = false;
+        old.adopt_first_run_look_once();
+        assert_eq!(old.chat_design.mod_action_style, "both");
+    }
+
+    /// The first-run chat look reaches only a fresh install. A file that
+    /// predates a field (or the whole block) keeps the look it always had.
+    #[test]
+    fn first_run_chat_look_reaches_only_a_fresh_install() {
+        let fresh = Settings::default().chat_design;
+        assert_eq!(fresh.message_entrance, "slide");
+        assert_eq!(fresh.deleted_message_style, "italic");
+        assert_eq!(fresh.font_size, if cfg!(mobile) { 14 } else { 16 });
+        assert_eq!(fresh.message_spacing, if cfg!(mobile) { 8 } else { 11 });
+        assert_eq!(fresh.mod_action_style, if cfg!(mobile) { "both" } else { "buttons" });
+        assert!(!fresh.show_dividers);
+
+        // A file without the block at all.
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value.as_object_mut().expect("object").remove("chat_design");
+        let parsed: Settings = serde_json::from_value(value).expect("parses");
+        assert_eq!(parsed.chat_design.message_entrance, "none");
+        assert_eq!(parsed.chat_design.font_size, 14);
+        assert_eq!(parsed.chat_design.deleted_message_style, "strikethrough");
+
+        // A file whose block predates the newer fields.
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        let design = value["chat_design"].as_object_mut().expect("block");
+        design.remove("message_entrance");
+        design.remove("deleted_message_style");
+        let parsed: Settings = serde_json::from_value(value).expect("parses");
+        assert_eq!(parsed.chat_design.message_entrance, "none");
+        assert_eq!(parsed.chat_design.deleted_message_style, "strikethrough");
+    }
+
     /// Frontend-managed preference groups the struct doesn't model (highlight
     /// phrases, custom themes, the OLED accent, ...) must survive a save/load
     /// round-trip through the flattened `extra` map instead of being dropped,
     /// and must serialize back at the top level (not nested under "extra").
+    #[test]
+    fn cosmetics_are_modelled_and_an_old_file_keeps_its_paint_shadows() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.cosmetics.profile_picture_source, "seventv", "7TV profile pictures are the default source");
+        assert!(defaults.cosmetics.shows_seventv_pictures());
+        assert_eq!(defaults.cosmetics.paint_shadows, None);
+        assert_eq!(defaults.cosmetics.profile_picture_animation, "always", "every install starts on Always");
+
+        // A file written while `cosmetics` rode the top-level catch-all.
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["cosmetics"] = serde_json::json!({ "paint_shadows": "none", "future_key": 3 });
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert!(!parsed.extra.contains_key("cosmetics"));
+        assert_eq!(parsed.cosmetics.paint_shadows.as_deref(), Some("none"));
+        assert_eq!(parsed.cosmetics.profile_picture_source, "seventv", "a missing field takes the default");
+        assert_eq!(parsed.cosmetics.profile_picture_animation, "always", "a missing choice is Always");
+
+        let mut off = parsed.clone();
+        off.cosmetics.profile_picture_source = "twitch".to_string();
+        off.cosmetics.profile_picture_animation = "never".to_string();
+        let back: Settings = serde_json::from_value(serde_json::to_value(&off).unwrap()).unwrap();
+        assert_eq!(back.cosmetics.profile_picture_source, "twitch");
+        assert!(!back.cosmetics.shows_seventv_pictures());
+        assert_eq!(back.cosmetics.profile_picture_animation, "never");
+        assert_eq!(back.cosmetics.extra.get("future_key"), Some(&serde_json::json!(3)));
+    }
+
+    /// `chat_input` used to ride the top-level catch-all whole. Typed now, its
+    /// other keys must survive a load and save, and a file without the room
+    /// modes switch shows them.
+    #[test]
+    fn room_modes_move_from_the_chip_to_the_prompt_once() {
+        // An install from before the move, still on the old chip default.
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["chat_input"] = serde_json::json!({ "show_room_modes": true, "room_modes_style": "chip" });
+        let mut old: Settings = serde_json::from_value(value).unwrap();
+        assert!(!old.chat_input.room_modes_prompt_adopted);
+        old.move_room_modes_to_prompt_once();
+        assert_eq!(old.chat_input.room_modes_style, "prompt");
+        assert!(old.chat_input.room_modes_prompt_adopted);
+
+        // Choosing the chip again afterwards sticks across later loads.
+        old.chat_input.room_modes_style = "chip".into();
+        let mut again: Settings = serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        again.move_room_modes_to_prompt_once();
+        assert_eq!(again.chat_input.room_modes_style, "chip");
+
+        // A new install starts on the prompt with nothing to move.
+        let fresh = Settings::default();
+        assert_eq!(fresh.chat_input.room_modes_style, "prompt");
+        assert!(fresh.chat_input.room_modes_prompt_adopted);
+    }
+
+    #[test]
+    fn chat_input_is_modelled_and_keeps_its_other_keys() {
+        assert!(Settings::default().chat_input.show_room_modes, "room modes show by default");
+
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["chat_input"] = serde_json::json!({ "hide_placeholder": true, "emote_tab_complete_match_mode": "includes" });
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert!(!parsed.extra.contains_key("chat_input"));
+        assert!(parsed.chat_input.show_room_modes, "a missing switch takes the default");
+        assert_eq!(parsed.chat_input.room_modes_style, "prompt", "a missing style takes the prompt");
+        assert!(!parsed.chat_input.room_modes_prompt_adopted, "a file from before the move still takes it");
+        assert_eq!(parsed.chat_input.extra.get("hide_placeholder"), Some(&serde_json::json!(true)));
+
+        let mut off = parsed.clone();
+        off.chat_input.show_room_modes = false;
+        off.chat_input.room_modes_style = "prompt".into();
+        let out = serde_json::to_value(&off).unwrap();
+        assert_eq!(out["chat_input"]["show_room_modes"], false);
+        assert_eq!(out["chat_input"]["room_modes_style"], "prompt");
+        assert_eq!(out["chat_input"]["emote_tab_complete_match_mode"], "includes", "flattened back in place");
+        let back: Settings = serde_json::from_value(out).unwrap();
+        assert!(!back.chat_input.show_room_modes);
+        assert_eq!(back.chat_input.room_modes_style, "prompt");
+    }
+
+    /// The on/off switch the source choice replaced: a file that turned 7TV
+    /// pictures off keeps platform pictures, one that left them on keeps 7TV,
+    /// a saved source wins over the old switch, and the old key is dropped.
+    #[test]
+    fn the_old_seventv_picture_switch_reads_as_a_source() {
+        let read = |cosmetics: serde_json::Value| -> CosmeticsSettings {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value["cosmetics"] = cosmetics;
+            serde_json::from_value::<Settings>(value).unwrap().cosmetics
+        };
+        let off = read(serde_json::json!({ "seventv_profile_pictures": false, "profile_picture_animation": "hover" }));
+        assert_eq!(off.profile_picture_source, "twitch");
+        assert_eq!(off.profile_picture_animation, "hover");
+        assert!(!off.extra.contains_key("seventv_profile_pictures"), "the old key is not carried along");
+        assert_eq!(read(serde_json::json!({ "seventv_profile_pictures": true })).profile_picture_source, "seventv");
+        assert_eq!(
+            read(serde_json::json!({ "seventv_profile_pictures": false, "profile_picture_source": "seventv" })).profile_picture_source,
+            "seventv",
+            "a saved source wins"
+        );
+        assert_eq!(read(serde_json::json!({ "profile_picture_source": "bogus" })).profile_picture_source, "seventv");
+        let written = serde_json::to_value(&off).unwrap();
+        assert_eq!(written["profile_picture_source"], "twitch");
+        assert!(written.get("seventv_profile_pictures").is_none());
+    }
+
+    #[test]
+    fn chat_burst_settings_persist_and_an_old_file_gets_the_defaults() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.chat_burst.delay_ms, 1000);
+        assert!(defaults.chat_burst.vary_repeats);
+
+        // A file from before the group existed.
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("chat_burst");
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.chat_burst, ChatBurstSettings::default());
+
+        // What the page saves comes back, and never lands in the catch-all.
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["chat_burst"] = serde_json::json!({ "delay_ms": 30, "vary_repeats": false });
+        let parsed: Settings = serde_json::from_value(value).unwrap();
+        assert!(!parsed.extra.contains_key("chat_burst"));
+        assert_eq!((parsed.chat_burst.delay_ms, parsed.chat_burst.vary_repeats), (30, false));
+    }
+
     #[test]
     fn snippets_are_modelled_and_survive_a_round_trip() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
@@ -1448,6 +2364,31 @@ mod backup_persistence_tests {
         assert_eq!(again["chat_design"]["name_color_adjustment"], serde_json::json!("off"));
     }
 
+    /// The scrollbar marks keys persist through a save, and an old settings
+    /// file without them gets marks on with the default kinds.
+    #[test]
+    fn scrollbar_marks_settings_persist_and_default_on() {
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize defaults");
+        let design = value["chat_design"].as_object_mut().expect("chat_design object");
+        assert_eq!(design.get("scrollbar_marks"), Some(&serde_json::json!(true)));
+        design.remove("scrollbar_marks");
+        design.remove("scrollbar_mark_kinds");
+        let old: Settings = serde_json::from_value(value.clone()).expect("deserialize old file");
+        assert!(old.chat_design.scrollbar_marks);
+        assert_eq!(old.chat_design.scrollbar_mark_kinds, default_scrollbar_mark_kinds());
+
+        let design = value["chat_design"].as_object_mut().unwrap();
+        design.insert("scrollbar_marks".into(), serde_json::json!(false));
+        design.insert("scrollbar_mark_kinds".into(), serde_json::json!(["mention", "first_time"]));
+        let parsed: Settings = serde_json::from_value(value).expect("deserialize");
+        let again = serde_json::to_value(&parsed).expect("re-serialize");
+        assert_eq!(again["chat_design"]["scrollbar_marks"], serde_json::json!(false));
+        assert_eq!(
+            again["chat_design"]["scrollbar_mark_kinds"],
+            serde_json::json!(["mention", "first_time"])
+        );
+    }
+
     #[test]
     fn default_settings_round_trip_with_empty_extra() {
         let original = Settings::default();
@@ -1464,6 +2405,111 @@ mod backup_persistence_tests {
     /// restarts AND ride along in exported settings backups (export_settings
     /// serializes this exact shape, minus the non-portable session keys). Every
     /// nested field (per-channel quality, the icon) must survive verbatim.
+    /// A layout this build cannot read must cost only the layout, never the
+    /// settings file: the whole file is one parse.
+    /// The Song Identification sliders write `video_player.song_id`. With no
+    /// typed field, a save dropped it and the values reverted on restart.
+    #[test]
+    fn song_id_settings_survive_a_save() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v["video_player"]["song_id"] = serde_json::json!({ "capture_seconds": 18, "retries": 3 });
+        let parsed: Settings = serde_json::from_value(v).expect("deserialize");
+        assert_eq!(parsed.video_player.song_id, SongIdSettings { capture_seconds: 18, retries: 3 });
+        let back = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(back["video_player"]["song_id"]["capture_seconds"], 18);
+        assert_eq!(back["video_player"]["song_id"]["retries"], 3);
+    }
+
+    /// A file from before the field, or a partial object, loads the defaults
+    /// the page has always used (10 seconds, one retry).
+    #[test]
+    fn song_id_settings_default_when_absent_or_partial() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v["video_player"].as_object_mut().unwrap().remove("song_id");
+        let parsed: Settings = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(parsed.video_player.song_id, SongIdSettings { capture_seconds: 10, retries: 1 });
+        v["video_player"]["song_id"] = serde_json::json!({ "retries": 0 });
+        let parsed: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.video_player.song_id, SongIdSettings { capture_seconds: 10, retries: 0 });
+    }
+
+    #[test]
+    fn a_bad_multi_nook_layout_never_fails_the_settings_load() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v["multi_nook_layout"] = serde_json::json!({ "mode": "hexagon_swirl", "strip_share": 9.5, "small_quality_cap": 123 });
+        v["multi_nook_chat_hidden"] = serde_json::json!(true);
+        let parsed: Settings = serde_json::from_value(v).expect("the rest of the file still loads");
+        assert!(parsed.multi_nook_chat_hidden);
+        assert_eq!(parsed.multi_nook_layout.mode, MultiNookLayoutMode::Grid);
+        assert_eq!(parsed.multi_nook_layout.strip_share, MultiNookLayout::MAX_SHARE);
+        assert_eq!(parsed.multi_nook_layout.small_quality_cap, None);
+
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v["multi_nook_layout"] = serde_json::json!("not even an object");
+        let parsed: Settings = serde_json::from_value(v).expect("still loads");
+        assert_eq!(parsed.multi_nook_layout, MultiNookLayout::default());
+    }
+
+    #[test]
+    fn a_multi_nook_layout_round_trips() {
+        let mut s = Settings::default();
+        s.multi_nook_layout = MultiNookLayout {
+            mode: MultiNookLayoutMode::MainColumn,
+            strip_share: 0.3,
+            small_quality_cap: Some(480),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"mode\":\"main_column\""));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.multi_nook_layout, s.multi_nook_layout);
+        assert_eq!(back.multi_nook_layout.caps_small_tiles(), Some(480));
+        let grid = MultiNookLayout { mode: MultiNookLayoutMode::Grid, ..s.multi_nook_layout.clone() };
+        assert_eq!(grid.caps_small_tiles(), None, "a grid has no small tiles");
+    }
+
+    #[test]
+    fn multi_nook_slot_keeps_its_audio_boost() {
+        let slot: MultiNookSlot = serde_json::from_value(serde_json::json!({
+            "id": "cell-1", "channelLogin": "mande", "volume": 0.5, "muted": false, "isFocused": true,
+            "audioBoost": { "enabled": true, "gain": 2.25 }
+        }))
+        .expect("slot with a boost");
+        let boost = slot.audio_boost.clone().expect("boost kept");
+        assert!(boost.enabled);
+        assert_eq!(boost.gain, 2.25);
+        assert_eq!(boost.ratio, default_audio_ratio(), "missing fields take the defaults");
+        let out = serde_json::to_value(&slot).expect("serialize slot");
+        assert_eq!(out["audioBoost"]["gain"], serde_json::json!(2.25));
+
+        let plain: MultiNookSlot = serde_json::from_value(serde_json::json!({
+            "id": "cell-2", "channelLogin": "x", "volume": 0.5, "muted": true, "isFocused": false
+        }))
+        .expect("slot without a boost");
+        assert!(plain.audio_boost.is_none());
+        assert!(serde_json::to_value(&plain).unwrap().get("audioBoost").is_none());
+    }
+
+    #[test]
+    fn audio_boost_clamps_to_the_graph_range() {
+        let wild = AudioBoostSettings {
+            enabled: true,
+            gain: 99.0,
+            threshold: 12.0,
+            knee: f32::NAN,
+            ratio: 0.0,
+            attack: -1.0,
+            release: f32::INFINITY,
+        }
+        .clamped();
+        assert_eq!(wild.gain, 4.0);
+        assert_eq!(wild.threshold, 0.0);
+        assert_eq!(wild.knee, default_audio_knee());
+        assert_eq!(wild.ratio, 1.0);
+        assert_eq!(wild.attack, 0.0);
+        assert_eq!(wild.release, default_audio_release());
+        assert!(wild.enabled);
+    }
+
     #[test]
     fn multi_nook_presets_round_trip_through_extra() {
         let mut value = serde_json::to_value(Settings::default()).expect("serialize defaults");

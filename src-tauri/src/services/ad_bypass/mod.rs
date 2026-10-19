@@ -36,12 +36,12 @@
 //! regardless of the experimental setting. The two cannot both own the
 //! playlist, so `LlOrigin::start` returns inactive while `active()` is true.
 
-// Android builds only. The unit tests run against the Android target too (built
-// with `cargo test --target aarch64-linux-android` and executed on the device),
-// so there is no reason to let this compile into a desktop test build and every
-// reason not to: a desktop `cargo test` is the one place a supposedly frozen
-// build could still break.
-#![cfg(target_os = "android")]
+// Phone builds only (Android and iPhone). The unit tests run against the
+// Android target too (built with `cargo test --target aarch64-linux-android`
+// and executed on the device), so there is no reason to let this compile into
+// a desktop test build and every reason not to: a desktop `cargo test` is the
+// one place a supposedly frozen build could still break.
+#![cfg(mobile)]
 
 pub mod filter;
 pub mod master;
@@ -149,6 +149,25 @@ pub async fn resolve_master(
         auth,
     );
     Some(resolved)
+}
+
+/// The ad-free resolution for a stream that plays somewhere other than this
+/// phone (a Cast device). Same entitlement rule, race and splice as
+/// [`resolve_master`], with none of its effects: `ENABLED`, `ACTIVE` and the
+/// pivot all describe the stream this phone's own player is serving, and a TV
+/// stream must not arm or disarm them.
+pub(crate) async fn resolve_detached(
+    channel: &str,
+    core: Option<&ResolvedLive>,
+    settings: &VideoPlayerSettings,
+) -> Option<ResolvedLive> {
+    if !settings.ad_bypass_enabled || core.map(|r| r.status.entitled).unwrap_or(false) {
+        return None;
+    }
+    let (configured, user_supplied) = configured_bases(settings);
+    resolve_through_relay(channel, "best", core, &configured, &[], !user_supplied)
+        .await
+        .map(|(resolved, _)| resolved)
 }
 
 /// The relay bases to prefer, and whether they came from the user rather than

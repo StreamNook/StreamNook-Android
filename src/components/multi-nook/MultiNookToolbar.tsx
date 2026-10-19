@@ -12,6 +12,10 @@ import { useAppStore } from '../../stores/AppStore';
 import { ChannelItem, useChannelSearch, itemKey, parseTypedChannel } from './channelSearch';
 import { ChannelResultRow } from './ChannelResultRow';
 import MultiNookPresets from './MultiNookPresets';
+import MultiNookLayoutPicker from './MultiNookLayoutPicker';
+import { alignTiles } from './tileSync';
+import { SevenTvAvatar } from '../SevenTvAvatar';
+import { slotSevenTvId } from './slotSevenTvId';
 
 interface MultiNookToolbarProps {
   isDragging?: boolean;
@@ -59,6 +63,7 @@ const MultiNookToolbar: React.FC<MultiNookToolbarProps> = ({
     query,
     isSearching,
     followingItems,
+    offlineItems,
     searchItems,
     visibleItems,
     followedCount,
@@ -67,7 +72,9 @@ const MultiNookToolbar: React.FC<MultiNookToolbarProps> = ({
     listRef,
     refreshFollowing,
     reset: resetSearch,
-  } = useChannelSearch({ excludeKeys: existingKeys, providers: GRID_PICKER_PROVIDERS });
+    // An offline channel is a tile too: it shows its offline card, keeps its
+    // chat, and starts playing when the channel goes live.
+  } = useChannelSearch({ excludeKeys: existingKeys, providers: GRID_PICKER_PROVIDERS, includeOffline: true });
 
   // Focus input when the panel opens, and refresh the live-following list so it's
   // current the moment the panel appears.
@@ -343,7 +350,7 @@ const MultiNookToolbar: React.FC<MultiNookToolbarProps> = ({
                     tint alone reads as see-through. */}
                 <div
                   className="liquid-glass-panel overflow-hidden"
-                  style={{ backgroundColor: 'rgba(16, 16, 20, 0.92)' }}
+                  style={{ backgroundColor: 'color-mix(in srgb, rgb(16 16 20) 92%, var(--glass-under, transparent))' }}
                 >
                   <div ref={listRef} className="max-h-80 overflow-y-auto custom-scrollbar p-1.5">
 
@@ -373,6 +380,33 @@ const MultiNookToolbar: React.FC<MultiNookToolbarProps> = ({
                       </>
                     )}
 
+                    {/* Offline favorites and follows, most recently live first */}
+                    {offlineItems.length > 0 && (
+                      <>
+                        <div className="px-2.5 pt-2 pb-1 flex items-center gap-1.5">
+                          <span aria-hidden className="h-[7px] w-[7px] rounded-full border-[1.5px] border-textMuted" />
+                          <span className="text-[10px] font-bold uppercase tracking-wider text-textMuted">Offline</span>
+                        </div>
+                        <div className="space-y-0.5">
+                          {offlineItems.map((item, i) => {
+                            const idx = followingItems.length + i;
+                            return (
+                              <ChannelResultRow
+                                key={`o-${itemKey(item)}`}
+                                item={item}
+                                index={idx}
+                                highlighted={highlightIndex === idx}
+                                disabled={isAdding}
+                                reason={gridRefusal(item.provider ?? 'twitch')}
+                                onSelect={handleSelectItem}
+                                onHover={setHighlightIndex}
+                              />
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+
                     {/* Channel search across every platform the grid accepts (debounced) */}
                     {query && (searchItems.length > 0 || isSearching) && (
                       <>
@@ -385,7 +419,7 @@ const MultiNookToolbar: React.FC<MultiNookToolbarProps> = ({
                         </div>
                         <div className="space-y-0.5">
                           {searchItems.map((item, i) => {
-                            const idx = followingItems.length + i;
+                            const idx = followingItems.length + offlineItems.length + i;
                             return (
                               <ChannelResultRow
                                 key={`s-${itemKey(item)}`}
@@ -435,12 +469,19 @@ const MultiNookToolbar: React.FC<MultiNookToolbarProps> = ({
           {/* Presets. Saved, named channel sets openable in one click */}
           <MultiNookPresets />
 
+          {/* Layout: Grid, or one main stream with the rest small. */}
+          <MultiNookLayoutPicker />
+
           <span className="mx-0.5 h-4 w-px bg-borderSubtle" aria-hidden />
 
-          {/* Resync — force every tile to reload so co-streams line up again. */}
-          <Tooltip content="Resync playback on every stream" delay={200} side="bottom">
+          {/* Resync: line every playing tile up at one delay behind live, in
+              place, and retry any tile that failed to load. */}
+          <Tooltip content="Line up every stream" delay={200} side="bottom">
             <button
-              onClick={resyncAllSlots}
+              onClick={() => {
+                resyncAllSlots();
+                alignTiles();
+              }}
               disabled={slots.length === 0}
               className="titlebar-icon-btn hover:!text-accent active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
             >
@@ -542,7 +583,13 @@ const DraggableDockPill: React.FC<{
       >
         <div className="flex items-center gap-1.5 opacity-80 group-hover:opacity-100 transition-opacity">
         {slot.profileImageUrl ? (
-          <img src={slot.profileImageUrl} alt="" className="w-5 h-5 rounded-full object-cover shadow-sm bg-black/20" />
+          <SevenTvAvatar
+            cosmeticsId={slotSevenTvId(slot)}
+            px={20}
+            src={slot.profileImageUrl}
+            alt=""
+            className="w-5 h-5 rounded-full object-cover shadow-sm bg-black/20"
+          />
         ) : (
           <div className="w-2 h-2 ml-2 rounded-full bg-accent animate-pulse"></div>
         )}

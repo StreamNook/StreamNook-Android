@@ -6,8 +6,9 @@
 //! Anonymous: no Kick login is needed to read. Sending (official OAuth API) is
 //! a later step; `send_capability` reports read-only for now.
 //!
-//! Flow: resolve the chatroom id from `kick.com/api/v2/channels/{slug}`, connect
-//! to Pusher, subscribe to `chatrooms.{id}.v2`, and decode the (double-encoded)
+//! Flow: resolve the chatroom id from `kick.com/api/v2/channels/{slug}`, ask
+//! Kick's realtime negotiation for the current Pusher app, connect, subscribe to
+//! `chatrooms.{id}.v2`, and decode the (double-encoded)
 //! `App\Events\ChatMessageEvent` payload.
 
 use super::kick_emotes;
@@ -31,9 +32,15 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-// Kick's public Pusher app. The key occasionally rotates; if messages stop,
-// re-read it from the website's websocket URL in DevTools.
-const PUSHER_URL: &str = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0-rc2&flash=false";
+// Kick hands out its realtime app through a negotiation endpoint (the website
+// offers Pusher and Centrifugo; a Pusher-only offer still gets a Pusher app).
+// The key rotates, and a retired key is refused outright with close 4001 "App
+// key ... not in this cluster", so the key is asked for, not baked in. The
+// fallback is only for when the endpoint itself cannot be reached.
+const REALTIME_NEGOTIATE_URL: &str = "https://web.kick.com/api/v1/realtime/connection";
+const PUSHER_FALLBACK_KEY: &str = "34bf7a0ff419a2a775b9";
+const PUSHER_FALLBACK_CLUSTER: &str = "us2";
+const PUSHER_APP_TTL: Duration = Duration::from_secs(30 * 60);
 // Pusher's idle activity timeout is ~120s; ping before then.
 const READ_TIMEOUT_SECS: u64 = 100;
 const RECONNECT_DELAY_SECS: u64 = 3;
@@ -186,6 +193,8 @@ impl ChatProvider for KickProvider {
             // modes to the next client that attaches.
             crate::services::irc_service::remove_provider_room_state(&key::make_key("kick", &slug))
                 .await;
+            // And its live 7TV feed: nothing reads this channel's set now.
+            crate::services::seventv_eventapi::unsubscribe_channel_on(&slug, "kick").await;
         }
         Ok(())
     }
@@ -214,6 +223,7 @@ impl ChatProvider for KickProvider {
         for slug in dropped {
             crate::services::irc_service::remove_provider_room_state(&key::make_key("kick", &slug))
                 .await;
+            crate::services::seventv_eventapi::unsubscribe_channel_on(&slug, "kick").await;
         }
     }
 
@@ -816,25 +826,12 @@ async fn resolve_via_webview(slug: &str) -> Result<u64> {
 
     match result {
         Ok(Ok(resolved)) => {
-            if !resolved.sub_badges.is_empty() {
-                if let Ok(mut m) = sub_badges_cache().lock() {
-                    m.insert(slug_lc.clone(), resolved.sub_badges);
-                }
-            }
-            if let Some(meta) = resolved.meta {
-                let uid = meta.user_id;
-                if let Ok(mut m) = kick_meta_cache().lock() {
-                    m.insert(slug_lc.clone(), meta);
-                }
-                // Warm the channel's 7TV emotes now that its numeric Kick id is
-                // known (the fetch self-throttles, so this won't re-hit 7TV).
-                if let Some(uid) = uid {
-                    let slug_owned = slug_lc.clone();
-                    tokio::spawn(async move {
-                        kick_emotes::refresh(&slug_owned, uid).await;
-                    });
-                }
-            }
+            // The same commit as the http path: badges, meta, room modes, the
+            // 7TV set AND its live subscription. A hand copy here had drifted
+            // and never subscribed, so a channel resolved this way got no live
+            // emote updates.
+            let chatroom_id = resolved.chatroom_id;
+            commit_resolved(&slug_lc, resolved);
             // Keep the (hidden) resolver webview alive just long enough to collect
             // the native emotes it's still fetching, then store them and close it.
             // Detached so the chrome above is already live for the caller.
@@ -849,7 +846,7 @@ async fn resolve_via_webview(slug: &str) -> Result<u64> {
                 }
                 pending_emotes().lock().await.remove(&label_owned);
             });
-            Ok(resolved.chatroom_id)
+            Ok(chatroom_id)
         }
         other => {
             // Chrome never arrived: drop the emote channel + destroy the webview now.
@@ -1045,6 +1042,66 @@ fn kick_resolve_script(slug: &str, label: &str) -> String {
     )
 }
 
+/// The negotiated Pusher app (key, cluster), shared by every chat socket.
+static PUSHER_APP: OnceLock<std::sync::Mutex<Option<(String, String, Instant)>>> = OnceLock::new();
+
+fn pusher_app_cache() -> &'static std::sync::Mutex<Option<(String, String, Instant)>> {
+    PUSHER_APP.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Ask Kick which Pusher app to use. Cached for `PUSHER_APP_TTL`; a socket that
+/// Pusher refuses for an app-level reason clears it so the next attempt asks again.
+async fn pusher_app() -> (String, String) {
+    if let Some((k, c, at)) = pusher_app_cache().lock().unwrap().clone() {
+        if at.elapsed() < PUSHER_APP_TTL {
+            return (k, c);
+        }
+    }
+    let body = json!({
+        "client": { "id": uuid::Uuid::new_v4().to_string(), "type": "web" },
+        "capabilities": { "accepted_providers": [{ "provider": "pusher" }] }
+    });
+    let negotiated = async {
+        let v: Value = HTTP_RESOLVE
+            .post(REALTIME_NEGOTIATE_URL)
+            .json(&body)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        v.pointer("/data/connections")?.as_array()?.iter().find_map(|c| {
+            if c.get("provider")?.as_str()? != "pusher" {
+                return None;
+            }
+            let creds = c.get("credentials")?;
+            Some((
+                creds.get("app_key")?.as_str()?.to_string(),
+                creds.get("cluster")?.as_str()?.to_string(),
+            ))
+        })
+    }
+    .await;
+    match negotiated {
+        Some((k, c)) => {
+            *pusher_app_cache().lock().unwrap() = Some((k.clone(), c.clone(), Instant::now()));
+            (k, c)
+        }
+        None => {
+            log::warn!("[Kick] realtime negotiation offered no Pusher app, using the fallback");
+            (PUSHER_FALLBACK_KEY.to_string(), PUSHER_FALLBACK_CLUSTER.to_string())
+        }
+    }
+}
+
+fn pusher_url(key: &str, cluster: &str) -> String {
+    format!(
+        "wss://ws-{}.pusher.com/app/{}?protocol=7&client=js&version=8.4.0-rc2&flash=false",
+        cluster, key
+    )
+}
+
 /// Connect + stream forever, reconnecting on drop, until the task is aborted.
 async fn run_connection(slug: String, chatroom_id: u64) {
     let channel_key = key::make_key("kick", &slug);
@@ -1061,7 +1118,8 @@ async fn run_connection(slug: String, chatroom_id: u64) {
 }
 
 async fn connect_and_stream(chatroom_id: u64, channel_id: Option<u64>, channel_key: &str) -> Result<()> {
-    let (ws, _) = connect_async(PUSHER_URL).await?;
+    let (app_key, cluster) = pusher_app().await;
+    let (ws, _) = connect_async(pusher_url(&app_key, &cluster)).await?;
     let (mut write, mut read) = ws.split();
 
     let subscribe = json!({
@@ -1100,6 +1158,16 @@ async fn connect_and_stream(chatroom_id: u64, channel_id: Option<u64>, channel_k
                     "pusher:ping" => {
                         let pong = json!({ "event": "pusher:pong", "data": {} });
                         let _ = write.send(Message::text(pong.to_string())).await;
+                    }
+                    "pusher:error" => {
+                        log::warn!("[Kick] pusher error: {}", frame.get("data").unwrap_or(&Value::Null));
+                    }
+                    "pusher:subscription_error" => {
+                        log::warn!(
+                            "[Kick] subscription refused on {}: {}",
+                            frame.get("channel").and_then(|c| c.as_str()).unwrap_or("?"),
+                            frame.get("data").unwrap_or(&Value::Null)
+                        );
                     }
                     "App\\Events\\ChatMessageEvent" => {
                         if let Some(msg) = parse_chat_message(&frame, channel_key) {
@@ -1191,7 +1259,19 @@ async fn connect_and_stream(chatroom_id: u64, channel_id: Option<u64>, channel_k
             Ok(Some(Ok(Message::Ping(p)))) => {
                 let _ = write.send(Message::Pong(p)).await;
             }
-            Ok(Some(Ok(Message::Close(_)))) => return Ok(()),
+            Ok(Some(Ok(Message::Close(frame)))) => {
+                // Pusher's 4000-4099 closes are app-level refusals (retired key,
+                // wrong cluster, app disabled): reconnecting with the same app
+                // can never work, so forget it and negotiate again.
+                if let Some(f) = frame {
+                    let code = u16::from(f.code);
+                    if (4000..4100).contains(&code) {
+                        *pusher_app_cache().lock().unwrap() = None;
+                        return Err(anyhow!("pusher refused app {}: {} {}", app_key, code, f.reason));
+                    }
+                }
+                return Ok(());
+            }
             Ok(Some(Err(e))) => return Err(e.into()),
             Ok(Some(Ok(_))) => {}
         }
@@ -1324,8 +1404,15 @@ fn parse_chat_message(frame: &Value, channel_key: &str) -> Option<ChatMessage> {
 
     // Replies carry a sibling `metadata` with the original sender + message. The
     // original sender exposes only id + cased username (no slug/color/badges).
+    // Live frames carry `metadata` as an object; the history API sends the same
+    // object as a JSON string, which read as an object gave every reply an
+    // empty parent (a lone reply arrow on the phone).
+    let reply_meta = data.get("metadata").and_then(|m| match m {
+        Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+        other => Some(other.clone()),
+    });
     let reply_info = if data.get("type").and_then(|t| t.as_str()) == Some("reply") {
-        data.get("metadata").map(|m| {
+        reply_meta.as_ref().map(|m| {
             let parent_name = m
                 .pointer("/original_sender/username")
                 .and_then(|u| u.as_str())
@@ -1344,22 +1431,30 @@ fn parse_chat_message(frame: &Value, channel_key: &str) -> Option<ChatMessage> {
                     .unwrap_or("")
                     .to_string(),
                 parent_display_name: parent_name.clone(),
-                // The reply preview is a plain-text surface, so Kick's inline
-                // `[emote:id:name]` tokens are reduced to their names the same way
-                // the pinned banner does it. Left raw, the preview literally read
-                // "[emote:37225:KEKW]".
+                // The plain text keeps Kick's inline `[emote:id:name]` tokens
+                // reduced to their names (left raw it read "[emote:37225:KEKW]");
+                // the segments render them, and this channel's 7TV words, as the
+                // parent's own row would.
                 parent_msg_body: strip_emote_tokens(
                     m.pointer("/original_message/content")
                         .and_then(|c| c.as_str())
                         .unwrap_or(""),
                 ),
+                parent_segments: m
+                    .pointer("/original_message/content")
+                    .and_then(|c| c.as_str())
+                    .filter(|c| !c.is_empty())
+                    .map(|c| parse_segments(c, &slug).0),
                 parent_user_id: parent_id,
                 parent_user_login: parent_name.to_lowercase(),
+                parent_shown_name: String::new(),
             }
         })
     } else {
         None
-    };
+    }
+    // A reply that names no parent at all has nothing to show above the row.
+    .filter(|r: &ReplyInfo| !r.parent_display_name.is_empty() || !r.parent_msg_body.is_empty());
     let has_reply = reply_info.is_some();
 
     // The renderer reads the display name from the `display-name` tag (a Twitch
@@ -1749,17 +1844,34 @@ fn build_roomstate(s: &Value, channel_key: &str) -> String {
             .or_else(|| s.get(flat).and_then(|x| x.as_u64()))
             .unwrap_or(0)
     };
+    let slow = if on("slow_mode") { num("slow_mode", "message_interval", "message_interval") } else { 0 };
+    // -1 is "off" and 0 is "any follower", matching Twitch's followers-only tag.
+    let followers_only = if on("followers_mode") {
+        num("followers_mode", "min_duration", "following_min_duration") as i64
+    } else {
+        -1
+    };
+    // The modes in words for the message box. Kick says nothing about the
+    // viewer's standing on this event, so the words claim nothing about it.
+    let modes = crate::services::room_modes::describe(
+        &crate::services::room_modes::ModesIn {
+            slow_seconds: slow,
+            followers_only_minutes: followers_only,
+            subs_only: on("subscribers_mode"),
+            emote_only: on("emotes_mode"),
+            unique: false,
+        },
+        crate::services::room_modes::Standing::Unknown,
+    );
     json!({
         "type": "ROOMSTATE",
         "provider": "kick",
         "channel": channel_key,
-        "slow": if on("slow_mode") { num("slow_mode", "message_interval", "message_interval") } else { 0 },
+        "slow": slow,
         "subs_only": on("subscribers_mode"),
-        // -1 is "off" and 0 is "any follower", matching Twitch's followers-only tag.
-        "followers_only": if on("followers_mode") {
-            num("followers_mode", "min_duration", "following_min_duration") as i64
-        } else { -1 },
+        "followers_only": followers_only,
         "emote_only": on("emotes_mode"),
+        "modes": modes,
     })
     .to_string()
 }
@@ -2357,6 +2469,36 @@ mod roomstate_tests {
     }
 
     #[test]
+    fn a_history_reply_reads_its_parent_from_string_metadata() {
+        // The history API's shape: `metadata` is a JSON string.
+        let row = json!({
+            "id": "m2", "chatroom_id": 1, "content": "agreed", "type": "reply",
+            "created_at": "2026-10-16T20:00:00Z",
+            "sender": { "id": 7, "username": "Replier", "slug": "replier", "identity": { "color": "#fff", "badges": [] } },
+            "metadata": "{\"original_sender\":{\"id\":9,\"username\":\"Parent\"},\"original_message\":{\"id\":\"m1\",\"content\":\"hello there\"}}"
+        });
+        let framed = json!({ "data": serde_json::to_string(&row).unwrap() });
+        let msg = parse_chat_message(&framed, "kick:somebody").expect("a row");
+        let reply = msg.metadata.reply_info.expect("a reply");
+        assert_eq!(reply.parent_display_name, "Parent");
+        assert_eq!(reply.parent_msg_body, "hello there");
+        assert_eq!(reply.parent_msg_id, "m1");
+    }
+
+    #[test]
+    fn a_reply_with_no_parent_is_a_plain_row() {
+        let row = json!({
+            "id": "m3", "chatroom_id": 1, "content": "hm", "type": "reply",
+            "created_at": "2026-10-16T20:00:00Z",
+            "sender": { "id": 7, "username": "Replier", "slug": "replier", "identity": { "color": "#fff", "badges": [] } },
+            "metadata": "{}"
+        });
+        let framed = json!({ "data": serde_json::to_string(&row).unwrap() });
+        let msg = parse_chat_message(&framed, "kick:somebody").expect("a row");
+        assert!(msg.metadata.reply_info.is_none());
+    }
+
+    #[test]
     fn reads_the_nested_pusher_shape() {
         let data = serde_json::json!({
             "id": 281473,
@@ -2376,6 +2518,20 @@ mod roomstate_tests {
         // Kick has no unique-chat mode; sending r9k would clear a value the
         // store merges from elsewhere.
         assert!(out.get("r9k").is_none());
+        // The same modes in words for the message box, claiming nothing about
+        // the viewer's standing.
+        let kinds: Vec<&str> = out["modes"]["modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["subs_only", "followers_only", "slow"]);
+        assert_eq!(out["modes"]["modes"][1]["label"], "Followers-only chat (10 minutes)");
+        assert_eq!(out["modes"]["chip"], "Sub-only");
+        assert_eq!(out["modes"]["prompt"], "Subscriber-only");
+        assert_eq!(out["modes"]["prompt_short"], "Sub-only");
+        assert_eq!(out["modes"]["standing"], Value::Null);
     }
 
     #[test]

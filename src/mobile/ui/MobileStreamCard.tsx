@@ -1,15 +1,13 @@
 // Touch-native stream card in StreamNook's own card language, matching the
 // desktop Home cards: padded glass panel, rounded thumbnail, the canonical
-// CardChip (LIVE, DROPS, hype train, watch-streak flame),
+// CardChip (DROPS, hype train, watch-streak flame; live is the dot in the viewers chip),
 // .glass-badge viewer chip, a "+2" beside the name while the channel streams
 // with others, partner verified mark, and Apple-style emoji titles.
 // Only the sizing is phone-tuned.
 import React from 'react';
 import { Flame } from 'lucide-react';
-import { Package, UsersThree } from 'phosphor-react';
+import { Package } from 'phosphor-react';
 import StreamTitleWithEmojis from '../../components/StreamTitleWithEmojis';
-import { campaignEarnableOn } from '../dropsEligibility';
-import type { DropsByGame } from '../dropsCampaigns';
 import type { TwitchStream } from '../../types';
 import { previewStamp } from '../followRefresh';
 import { ProviderMark } from '../../components/ProviderLogo';
@@ -18,6 +16,9 @@ import { CardChip } from '../../components/ui/CardChip';
 import { TogetherTag } from '../../components/SharedViewers';
 import { useAppStore } from '../../stores/AppStore';
 import { groupFor } from '../../utils/sharedViewers';
+import { SevenTvAvatar } from '../../components/SevenTvAvatar';
+import { sevenTvIdForStream } from '../../services/sevenTvPictures';
+import { useChannelHold } from './ChannelHold';
 
 // The stamp is what makes a refreshed list show refreshed previews: Twitch's
 // preview URL is fixed per channel and the WebView caches it, so without a
@@ -59,7 +60,6 @@ const StreakBadge: React.FC<{ streak: number }> = ({ streak }) => (
 
 export const MobileStreamCard: React.FC<{
   stream: TwitchStream;
-  dropsGameNames?: DropsByGame;
   hypeTrain?: HypeTrainBadgeInfo;
   watchStreak?: number;
   onPress: (stream: TwitchStream) => void;
@@ -68,7 +68,9 @@ export const MobileStreamCard: React.FC<{
   showPlatform?: boolean;
   /** 'card' = big thumbnail stack; 'row' = compact list row (thumb left). */
   variant?: 'card' | 'row';
-}> = ({ stream, dropsGameNames, hypeTrain, watchStreak, onPress, variant = 'card', showPlatform = true }) => {
+  /** Off where the screen already names the category (a category's own list). */
+  showCategory?: boolean;
+}> = ({ stream, hypeTrain, watchStreak, onPress, variant = 'card', showPlatform = true, showCategory = true }) => {
   // The icon means "you can earn drops HERE", not "this game has drops".
   //
   // It used to mean the latter, which put a gift on every channel in a
@@ -81,22 +83,20 @@ export const MobileStreamCard: React.FC<{
   // Twitch's Shared Viewership or Shared Chat, from the Rust home snapshot.
   // Read here rather than passed in, so every screen's cards carry it.
   const collab = useAppStore((s) => groupFor(s.collaborations, s.sharedChats, stream));
-  // Drops are Twitch campaigns matched by category name; a Kick stream in the
-  // same category earns nothing.
-  const hasDrops = isTwitch && !!(
-    stream.game_name &&
-    (dropsGameNames?.get(stream.game_name.toLowerCase()) ?? []).some((c) =>
-      campaignEarnableOn(c, stream.user_login),
-    )
-  );
+  // Rust stamps it on every Twitch row it serves; a Kick stream in the same
+  // category earns nothing.
+  const hasDrops = isTwitch && !!stream.drops_earnable;
+  // A tap watches; a hold offers the chat on its own.
+  const hold = useChannelHold(stream, onPress);
 
   if (variant === 'row') {
     return (
+      <>
       <button
-        onClick={() => onPress(stream)}
-        className="w-full text-left glass-panel media-card p-2 flex gap-2.5 active:opacity-80 transition-opacity"
+        {...hold.handlers}
+        className="w-full text-left glass-panel media-card p-2 flex gap-2.5 active:opacity-80 transition-opacity select-none [-webkit-touch-callout:none]"
       >
-        <div className="relative w-[156px] shrink-0 overflow-hidden rounded self-center">
+        <div className="sn-card-thumb relative w-[156px] shrink-0 overflow-hidden self-center">
           <img
             loading="lazy"
             decoding="async"
@@ -154,14 +154,21 @@ export const MobileStreamCard: React.FC<{
             </CardChip>
           )}
         </div>
+        {/* Line heights at about 1.2 times the size, as the iPhone sets them:
+            five lines then stand as tall as the 156-wide preview, so the card's
+            8px inset reads the same on every side. Looser leading made the
+            column 14px taller than the preview, which sat 15px from the top and
+            bottom but 8px from the left. */}
         <div className="flex-1 min-w-0 flex flex-col justify-center gap-0.5">
-          <h3 className="text-textPrimary font-medium text-[13px] leading-snug line-clamp-2">
+          <h3 className="text-textPrimary font-semibold text-[14px] leading-[17px] line-clamp-2 mb-px">
             <StreamTitleWithEmojis title={stream.title} />
           </h3>
-          <div className="flex items-center gap-1 text-textSecondary text-[12px]">
+          <div className="flex items-center gap-1 text-textSecondary text-[13px] leading-4">
             <span className="truncate">{stream.user_name}</span>
             {collab && <TogetherTag collab={collab} compact />}
-            {showPlatform && !isTwitch && <ProviderMark provider={streamProvider(stream)} size={12} />}
+            {/* At the name's cap height: the Kick K fills its box, so 12 stood
+                taller than the letters beside it. */}
+            {showPlatform && !isTwitch && <ProviderMark provider={streamProvider(stream)} size={10} />}
             {stream.broadcaster_type === 'partner' && (
               <svg className="w-2.5 h-2.5 flex-shrink-0" viewBox="0 0 16 16" fill="#9146FF">
                 <path
@@ -172,29 +179,40 @@ export const MobileStreamCard: React.FC<{
               </svg>
             )}
           </div>
-          {stream.game_name && (
-            <div className="flex items-center gap-1 text-textMuted text-[12px]">
+          {showCategory && stream.game_name && (
+            <div className="flex items-center gap-1 text-textMuted text-[12.5px] leading-[15px]">
               <span className="truncate">{stream.game_name}</span>
               {/* The DROPS badge over the thumbnail already says this. */}
             </div>
           )}
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <span className="text-[11.5px] text-textMuted">
-              {stream.viewer_count.toLocaleString()} viewers
-            </span>
-            {!!watchStreak && watchStreak > 0 && <StreakBadge streak={watchStreak} />}
+          {/* The streak rides the viewers line as amber words: as a dark chip it
+              was the heaviest thing in the text column. */}
+          <div className="flex items-center gap-2 text-[12.5px] leading-[15px]">
+            <span className="text-textMuted">{stream.viewer_count.toLocaleString()} viewers</span>
+            {!!watchStreak && watchStreak > 0 && (
+              <span
+                className="flex items-center gap-0.5 tabular-nums text-[#fcd34d]"
+                aria-label={`Watch streak ${watchStreak}`}
+              >
+                <Flame size={11} className="fill-current stroke-[2.5]" aria-hidden />
+                {watchStreak}
+              </span>
+            )}
           </div>
         </div>
       </button>
+      {hold.sheet}
+      </>
     );
   }
 
   return (
+    <>
     <button
-      onClick={() => onPress(stream)}
-      className="w-full text-left glass-panel media-card p-2 active:opacity-80 transition-opacity"
+      {...hold.handlers}
+      className="w-full text-left glass-panel media-card p-2 active:opacity-80 transition-opacity select-none [-webkit-touch-callout:none]"
     >
-      <div className="relative mb-2 overflow-hidden rounded">
+      <div className="sn-card-thumb relative mb-2 overflow-hidden">
         <img
           loading="lazy"
           decoding="async"
@@ -203,8 +221,9 @@ export const MobileStreamCard: React.FC<{
           className="w-full aspect-video object-cover"
           draggable={false}
         />
+        {/* No LIVE chip: every stream in these lists is live, so live is said
+            once, by the red dot in the viewers chip. */}
         <div className="absolute top-1.5 left-1.5 flex items-center gap-1">
-          <CardChip kind="live">LIVE</CardChip>
           {hasDrops && (
             <CardChip kind="drops">
               <Package size={10} />
@@ -213,8 +232,12 @@ export const MobileStreamCard: React.FC<{
           )}
           {hypeTrain && <HypeTrainBadge info={hypeTrain} />}
         </div>
-        <CardChip kind="neutral" className="absolute bottom-1.5 left-1.5">
-          <UsersThree size={12} weight="bold" className="shrink-0 opacity-80" aria-label="viewers" />
+        <CardChip
+          kind="neutral"
+          className="absolute bottom-1.5 left-1.5 tabular-nums"
+          aria-label={`Live, ${stream.viewer_count.toLocaleString()} viewers`}
+        >
+          <span className="blend-live-dot" aria-hidden />
           {stream.viewer_count.toLocaleString()}
         </CardChip>
         {!!watchStreak && watchStreak > 0 && (
@@ -224,12 +247,14 @@ export const MobileStreamCard: React.FC<{
         )}
       </div>
       <div className="space-y-0.5 px-0.5 pb-0.5">
-        <h3 className="text-textPrimary font-medium text-[13px] leading-snug line-clamp-2">
+        <h3 className="text-textPrimary font-semibold text-[14px] leading-snug line-clamp-2 mb-px">
           <StreamTitleWithEmojis title={stream.title} />
         </h3>
         <div className="flex items-center gap-1 text-textSecondary text-[13px]">
           {stream.profile_image_url && (
-            <img
+            <SevenTvAvatar
+              cosmeticsId={sevenTvIdForStream(stream)}
+              px={16}
               src={stream.profile_image_url}
               alt=""
               draggable={false}
@@ -240,7 +265,7 @@ export const MobileStreamCard: React.FC<{
           )}
           <span className="truncate">{stream.user_name}</span>
           {collab && <TogetherTag collab={collab} />}
-          {showPlatform && !isTwitch && <ProviderMark provider={streamProvider(stream)} size={12} />}
+          {showPlatform && !isTwitch && <ProviderMark provider={streamProvider(stream)} size={10} />}
           {stream.broadcaster_type === 'partner' && (
             <svg className="w-3 h-3 flex-shrink-0" viewBox="0 0 16 16" fill="#9146FF">
               <path
@@ -254,10 +279,14 @@ export const MobileStreamCard: React.FC<{
         {/* Always rendered with a reserved height, so cards in a row share a
             baseline whether or not this one has a category. The DROPS badge
             over the thumbnail already says the rest. */}
-        <div className="flex items-center gap-1 text-textMuted text-[13px] min-h-4">
-          {stream.game_name && <span className="line-clamp-1">{stream.game_name}</span>}
-        </div>
+        {showCategory && (
+          <div className="flex items-center gap-1 text-textMuted text-[12.5px] min-h-4">
+            {stream.game_name && <span className="line-clamp-1">{stream.game_name}</span>}
+          </div>
+        )}
       </div>
     </button>
+    {hold.sheet}
+    </>
   );
 };

@@ -5,6 +5,7 @@ import streamnookLogo from '../../assets/streamnook-logo.png';
 import { SettingsSection, SettingsRow } from './_primitives';
 import { useAppStore } from '../../stores/AppStore';
 import { IS_MOBILE } from '../../utils/platform';
+import { useSettingReset } from './settingReset';
 
 import { Logger } from '../../utils/logger';
 
@@ -19,26 +20,19 @@ const Toggle = ({ enabled, onChange }: { enabled: boolean; onChange: () => void 
     </button>
 );
 
-const COMMUNITY_DISCORD_INVITE_CODE = '2xvuF9TES7';
-const COMMUNITY_DISCORD_INVITE = `https://discord.gg/${COMMUNITY_DISCORD_INVITE_CODE}`;
-
-// The server's live Discord banner is stale and can't be refreshed without more
-// server boosts, so the card header is overridden with this CDN-hosted banner
-// (R2 via cdn.streamnook.app — kept OFF the app bundle so it's swappable without
-// shipping a release). Set to null to use the live Discord banner instead; and if
-// the CDN URL ever fails to load, it falls back to the live banner at runtime too.
-const CUSTOM_BANNER: string | null = 'https://cdn.streamnook.app/community-banner.gif';
-
-interface DiscordInviteData {
-    guild?: {
-        id: string;
-        name: string;
-        icon: string | null;
-        banner?: string | null;
-        description?: string | null;
-    };
-    approximate_member_count?: number;
-    approximate_presence_count?: number;
+/** The community Discord card as Rust reads it (cached, refreshed at most
+ *  once a minute). A failed read still answers, with the server details null. */
+interface CommunityInvite {
+    name: string | null;
+    description: string | null;
+    icon_url: string | null;
+    /** The hosted banner first, then the server's own; the card shows the
+     *  first one that loads. */
+    banner_urls: string[];
+    online: number | null;
+    members: number | null;
+    invite_url: string;
+    invite_label: string;
 }
 
 // Inline -webkit clamp so we don't depend on the Tailwind line-clamp utility
@@ -51,57 +45,40 @@ const clamp = (lines: number): CSSProperties => ({
 });
 
 const SupportSettings = () => {
-    const [serverData, setServerData] = useState<DiscordInviteData | null>(null);
-    // If the CDN banner fails to load, fall back to the live Discord banner.
-    const [customBannerFailed, setCustomBannerFailed] = useState(false);
+    const [invite, setInvite] = useState<CommunityInvite | null>(null);
+    // Banners that failed to load; the header falls through to the next one.
+    const [failedBanners, setFailedBanners] = useState<string[]>([]);
 
     useEffect(() => {
-        const fetchServerData = async () => {
-            try {
-                const response = await fetch(
-                    `https://discord.com/api/v10/invites/${COMMUNITY_DISCORD_INVITE_CODE}?with_counts=true`
-                );
-                if (response.ok) {
-                    setServerData(await response.json());
-                }
-            } catch (error) {
-                Logger.error('Failed to fetch Discord server preview:', error);
-            }
+        const read = () => {
+            invoke<CommunityInvite>('get_community_invite')
+                .then(setInvite)
+                .catch((error) => Logger.error('Failed to read the community invite:', error));
         };
 
-        fetchServerData();
-        const interval = setInterval(fetchServerData, 60000);
+        read();
+        const interval = setInterval(read, 60000);
         return () => clearInterval(interval);
     }, []);
 
-    const getServerIconUrl = (guildId: string, iconHash: string) => {
-        const extension = iconHash.startsWith('a_') ? 'gif' : 'png';
-        return `https://cdn.discordapp.com/icons/${guildId}/${iconHash}.${extension}?size=128`;
-    };
-
-    const getServerBannerUrl = (guildId: string, bannerHash: string) => {
-        const extension = bannerHash.startsWith('a_') ? 'gif' : 'png';
-        return `https://cdn.discordapp.com/banners/${guildId}/${bannerHash}.${extension}?size=512`;
-    };
-
+    const inviteUrl = invite?.invite_url ?? null;
     const handleJoinCommunity = async () => {
+        if (!inviteUrl) return;
         try {
             const { open } = await import('@tauri-apps/plugin-shell');
-            await open(COMMUNITY_DISCORD_INVITE);
+            await open(inviteUrl);
         } catch (err) {
             Logger.error('Failed to open Discord invite:', err);
-            window.open(COMMUNITY_DISCORD_INVITE, '_blank');
+            window.open(inviteUrl, '_blank');
         }
     };
 
-    const guild = serverData?.guild;
-    const name = guild?.name ?? 'StreamNook';
-    const iconUrl = guild?.icon ? getServerIconUrl(guild.id, guild.icon) : null;
-    const discordBanner = guild?.banner ? getServerBannerUrl(guild.id, guild.banner) : null;
-    const bannerUrl = CUSTOM_BANNER && !customBannerFailed ? CUSTOM_BANNER : discordBanner;
-    const description = guild?.description ?? null;
-    const presence = serverData?.approximate_presence_count;
-    const members = serverData?.approximate_member_count;
+    const name = invite?.name ?? 'StreamNook';
+    const iconUrl = invite?.icon_url ?? null;
+    const bannerUrl = invite?.banner_urls.find((url) => !failedBanners.includes(url)) ?? null;
+    const description = invite?.description ?? null;
+    const presence = invite?.online;
+    const members = invite?.members;
     const hasCounts = typeof presence === 'number' && typeof members === 'number';
 
     // Matches the card's own surface so the overlapping icon reads as cut into
@@ -138,7 +115,7 @@ const SupportSettings = () => {
                             src={bannerUrl}
                             alt=""
                             className="absolute inset-0 h-full w-full object-cover"
-                            onError={() => setCustomBannerFailed(true)}
+                            onError={() => setFailedBanners((failed) => [...failed, bannerUrl])}
                         />
                     ) : (
                         <div className="absolute inset-0" style={{ background: 'rgba(215, 165, 140, 0.07)' }} />
@@ -157,6 +134,7 @@ const SupportSettings = () => {
                                 of the icon then rest on a plain frosted blur (no color bleed); an
                                 opaque square icon simply covers it. */}
                             <div
+                                // glass-exempt: an icon frame on the solid settings page; the icon covers it.
                                 className={`relative h-[68px] w-[68px] overflow-hidden rounded-2xl border ${
                                     iconUrl ? 'bg-white/[0.04] backdrop-blur-md' : ''
                                 }`}
@@ -184,7 +162,7 @@ const SupportSettings = () => {
                     {/* Name + invite handle */}
                     <h3 className="truncate text-[15px] font-semibold text-textPrimary">{name}</h3>
                     <p className="mt-0.5 text-[11px] font-medium uppercase tracking-[0.08em] text-textMuted">
-                        discord.gg/{COMMUNITY_DISCORD_INVITE_CODE}
+                        {invite?.invite_label ?? '\u00a0'}
                     </p>
 
                     {description && (
@@ -238,8 +216,8 @@ const SupportSettings = () => {
 /**
  * The diagnostic logging toggle.
  *
- * `error_reporting_enabled` already drove `set_diagnostics_enabled` from
- * AppStore, but it had no control anywhere in the app, so the only way to raise
+ * `error_reporting_enabled` already drove the log level (Rust applies it when
+ * it is saved), but it had no control anywhere in the app, so the only way to raise
  * the log level was to edit settings.json by hand. That is precisely the moment
  * someone needs it: they are trying to produce a log for a bug report and the
  * file is empty apart from the watchdog line.
@@ -265,6 +243,7 @@ const DiagnosticLoggingSection = () => {
     // Absent means ON, matching how AppStore reads it (`!== false`), so an
     // existing install is not silently switched off by adding this control.
     const enabled = settings.error_reporting_enabled !== false;
+    const resetFor = useSettingReset();
 
     return (
         <SettingsSection
@@ -273,7 +252,8 @@ const DiagnosticLoggingSection = () => {
             description="How much StreamNook writes to its log file, and where to find that file when someone asks you for it."
         >
             <SettingsRow
-                title="Keep a detailed log for bug reports"
+                title="Detailed log"
+                onReset={resetFor(['error_reporting_enabled', true])}
                 description="Records connection, playback, and chat activity to streamnook.log on this device so a problem can be traced after the fact."
                 help="Leave it on if you might report a bug; with it off the log holds almost nothing worth sending. The file stays on your device until you choose to share it."
                 control={
@@ -287,7 +267,7 @@ const DiagnosticLoggingSection = () => {
                 // The phone keeps its logs in the app's private folder, which a
                 // file manager cannot open without root, so they are shared.
                 <SettingsRow
-                    title="Get the log file"
+                    title="Log export"
                     description="Saves your logs as one zip in Downloads, or sends it straight to an app, so you can attach it to a bug report."
                     control={
                         <div className="flex gap-2">
@@ -308,7 +288,7 @@ const DiagnosticLoggingSection = () => {
                 />
             ) : (
                 <SettingsRow
-                    title="Find the log file"
+                    title="Log folder"
                     description="Opens the folder that holds streamnook.log so you can attach it to a bug report."
                     control={
                         <button
@@ -339,8 +319,8 @@ const DiagnosticLoggingSection = () => {
  */
 const DataRecordedSection = () => (
     <SettingsSection
-        label="What your account records"
-        description="Signed in, StreamNook keeps a few counts against your account. Chat messages and anything you type are not among them."
+        label="Account Data"
+        description="Signed in, StreamNook keeps a few things against your account. Chat messages and anything you type are not among them."
     >
         <SettingsRow
             title="Channels and emotes"
@@ -355,6 +335,11 @@ const DataRecordedSection = () => (
         <SettingsRow
             title="Linked accounts"
             description="Records which other platforms you have connected, so they survive a reinstall."
+        />
+        <SettingsRow
+            title="VOD positions"
+            description="With Device sync on, keeps where you left off in each VOD you open, so Continue Watching follows you to your other devices."
+            help="Only past broadcasts you open yourself, never live watching. Kept for 90 days. Turn off Device sync under Player > Resume VODs and nothing more is sent."
         />
     </SettingsSection>
 );

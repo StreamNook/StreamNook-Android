@@ -55,6 +55,17 @@ pub struct SearchHit {
     pub flags: u32,
 }
 
+/// One held message as a moderation sweep reads it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SweepEntry {
+    pub id: String,
+    pub user_id: String,
+    pub login: String,
+    pub display: String,
+    pub content: String,
+    pub ts_ms: i64,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct HistoryStats {
     pub channels: usize,
@@ -150,6 +161,11 @@ impl ChatHistory {
                 v.insert(VecDeque::with_capacity(64))
             }
         };
+        // One entry per message id: a backfill that overlaps what already
+        // arrived live (a rejoin, a reconnect) must not list it twice.
+        if ring.iter().rev().any(|e| e.id == entry.id) {
+            return;
+        }
         if ring.len() >= cap {
             ring.pop_front();
         }
@@ -207,6 +223,45 @@ impl ChatHistory {
             }
         }
         out
+    }
+
+    /// Everyone who chatted in a channel at or after `since_ms`, newest first,
+    /// one `(login, user_id, display_name)` per person. Shared-chat rows are
+    /// skipped (their senders are in the other channel) and so are system rows.
+    pub fn recent_chatters(channel: &str, since_ms: i64) -> Vec<(String, String, String)> {
+        let key = channel.trim_start_matches('#').to_lowercase();
+        let Ok(map) = rings().lock() else { return Vec::new() };
+        let Some(ring) = map.get(&key) else { return Vec::new() };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for e in ring.iter().rev() {
+            if e.ts_ms < since_ms || e.login.is_empty() || e.flags & (F_SHARED | F_SYSTEM) != 0 {
+                continue;
+            }
+            if seen.insert(e.login.clone()) {
+                out.push((e.login.clone(), e.user_id.clone(), e.display.clone()));
+            }
+        }
+        out
+    }
+
+    /// Every message `channel` holds that was sent at or after `since_ms`,
+    /// oldest first, for a moderation sweep (`/nuke`'s look-back window).
+    pub fn since(channel: &str, since_ms: i64) -> Vec<SweepEntry> {
+        let key = channel.trim_start_matches('#').to_lowercase();
+        let Ok(map) = rings().lock() else { return Vec::new() };
+        let Some(ring) = map.get(&key) else { return Vec::new() };
+        ring.iter()
+            .filter(|e| e.ts_ms >= since_ms)
+            .map(|e| SweepEntry {
+                id: e.id.clone(),
+                user_id: e.user_id.clone(),
+                login: e.login.clone(),
+                display: e.display.clone(),
+                content: e.content.clone(),
+                ts_ms: e.ts_ms,
+            })
+            .collect()
     }
 
     /// Drop a channel's ring. Called when its last consumer parts.
@@ -429,6 +484,32 @@ mod tests {
     }
 
     #[test]
+    fn recent_chatters_are_distinct_recent_and_local() {
+        let mut old = entry("carol", "earlier", 0);
+        old.ts_ms = 10;
+        let mut a = entry("alice", "hi", 0);
+        a.ts_ms = 100;
+        let mut b = entry("bob", "yo", 0);
+        b.ts_ms = 110;
+        let mut a2 = entry("alice", "again", 0);
+        a2.ts_ms = 120;
+        let mut shared = entry("dave", "from elsewhere", F_SHARED);
+        shared.ts_ms = 130;
+        let mut system = entry("eve", "subscribed", F_SYSTEM);
+        system.ts_ms = 140;
+        rings().lock().unwrap().insert(
+            "recentchatterstest".into(),
+            VecDeque::from(vec![old, a, b, a2, shared, system]),
+        );
+        let logins: Vec<String> = ChatHistory::recent_chatters("#RecentChattersTest", 50)
+            .into_iter()
+            .map(|(login, _, _)| login)
+            .collect();
+        assert_eq!(logins, vec!["alice", "bob"]);
+        assert!(ChatHistory::recent_chatters("nosuchchannel", 0).is_empty());
+    }
+
+    #[test]
     fn a_users_newest_own_row_gives_their_look() {
         let mut older = entry("bob", "hi", 0);
         older.badge_keys = vec!["subscriber/12".into()];
@@ -473,7 +554,9 @@ mod tests {
 
     #[test]
     fn ring_caps_and_searches_newest_first() {
-        ChatHistory::clear_all();
+        // Only this test's own ring: the rings are shared with the other
+        // tests, which run at the same time.
+        ChatHistory::clear_channel("ringtest");
         ChatHistory::set_cap(200);
         let mut m = crate::models::chat_layout::ChatMessage {
             id: String::new(),
@@ -499,8 +582,15 @@ mod tests {
             let facts = MessageFacts::from_message(&m);
             ChatHistory::push(&m, &facts, false, false);
         }
-        let stats = ChatHistory::stats();
-        assert_eq!(stats.entries, 200);
+        // The same message again (a backfill overlapping live rows) is not a
+        // second entry.
+        m.id = "id249".into();
+        m.content = "message number 249 again".into();
+        let facts = MessageFacts::from_message(&m);
+        ChatHistory::push(&m, &facts, false, false);
+        assert!(ChatHistory::search(Some("ringtest"), "again", 5).unwrap().is_empty());
+        assert_eq!(rings().lock().unwrap()["ringtest"].len(), 200);
+        assert!(ChatHistory::stats().entries >= 200);
         let hits = ChatHistory::search(Some("ringtest"), "number 24", 10).unwrap();
         assert_eq!(hits.len(), 10);
         assert_eq!(hits[0].id, "id249");
@@ -511,6 +601,6 @@ mod tests {
         let del = ChatHistory::search(Some("ringtest"), "is:deleted", 5).unwrap();
         assert_eq!(del.len(), 1);
         ChatHistory::clear_channel("ringtest");
-        assert_eq!(ChatHistory::stats().entries, 0);
+        assert!(!rings().lock().unwrap().contains_key("ringtest"));
     }
 }

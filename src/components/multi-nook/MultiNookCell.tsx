@@ -1,8 +1,8 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
-import { motion } from 'framer-motion';
+import { AnimatePresence, motion } from 'framer-motion';
 import { invoke } from '@tauri-apps/api/core';
-import { MultiNookSlot } from '../../types';
+import { MultiNookSlot, type AudioBoostSettings } from '../../types';
 import { useMultiNookPlayer } from './useMultiNookPlayer';
 import { usemultiNookStore } from '../../stores/multiNookStore';
 import { useContextMenuStore } from '../../stores/contextMenuStore';
@@ -25,10 +25,25 @@ import StreamTitleWithEmojis from '../StreamTitleWithEmojis';
 import { Tooltip } from '../ui/Tooltip';
 import { TwitchVerifiedMark } from '../ui/TwitchGlyph';
 import { ProviderLogo } from '../ProviderLogo';
-import { GripHorizontal, Undo2, Loader2, RefreshCcw, EyeOff, WifiOff, Maximize2, Minimize2, Plus, Check, Radio } from 'lucide-react';
+import { OfflineCard } from '../OfflineRoomScreen';
+import { useOfflineRoom } from '../../hooks/useOfflineRoom';
+import { ArrowLeftRight, GripHorizontal, Undo2, Loader2, Maximize2, Minimize2, Plus, Check, Radio } from 'lucide-react';
+import type { SizeTier } from './nookLayout';
 import { Heart, HeartBreak, X as XIcon } from 'phosphor-react';
 import { Logger } from '../../utils/logger';
+import {
+  AUDIO_BOOST_BUTTON_HTML,
+  AUDIO_GRAPH_SUPPORTED,
+  applyAudioBoost,
+  paintAudioBoostButton,
+  releaseAudioGraphOnceGone,
+  resolveAudioBoost,
+} from '../../utils/audioBoost';
+import { injectPlyrControl } from '../../utils/plyrControls';
+import { AudioBoostControls } from '../AudioBoostFaders';
 import { canGridProvider, PROVIDER_WATCH, type ProviderId } from '../../types/providers';
+import { SevenTvAvatar } from '../SevenTvAvatar';
+import { slotSevenTvId } from './slotSevenTvId';
 
 interface MultiNookCellProps {
   slot: MultiNookSlot;
@@ -37,6 +52,11 @@ interface MultiNookCellProps {
   customStyle?: React.CSSProperties;
   /** True when this tile is filling the whole grid area (solo-like). */
   isMaximized?: boolean;
+  /** How much chrome fits the tile's size (nookLayout's tiers): everything,
+   *  a trimmed set, or the least. */
+  sizeTier?: SizeTier;
+  /** One of a main layout's small tiles: offer to make it the main one. */
+  canMakeMain?: boolean;
 }
 
 /** A single pending "unfocus" (focus toggle-off) shared across all tiles. Clicking
@@ -51,13 +71,15 @@ const clearPendingFocusToggle = () => {
   }
 };
 
-const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, gridSpanClass = '', customStyle = {}, isMaximized = false }) => {
+const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, gridSpanClass = '', customStyle = {}, isMaximized = false, sizeTier = 'full', canMakeMain = false }) => {
+  const full = sizeTier === 'full';
+  const mini = sizeTier === 'mini';
   const { id, provider, channelLogin, channelName, channelId, volume, muted, isFocused, streamUrl, isMinimized = false, loadError, profileImageUrl, title, broadcasterType, raid } = slot;
   // Actions only, so read them without subscribing. A bare `usemultiNookStore()`
   // here subscribed this tile to the WHOLE store, which meant any mutation
   // (including a volume drag on a sibling tile) re-rendered every tile in the
   // grid. Zustand actions keep the same identity for the store's lifetime.
-  const { toggleFocusSlot, toggleMaximizeSlot, dockSlot, removeSlot, changeSlotQuality, retrySlot, addSlot, dismissSlotRaid } =
+  const { toggleFocusSlot, toggleMaximizeSlot, makeMainSlot, dockSlot, removeSlot, changeSlotQuality, setSlotAudioBoost, retrySlot, addSlot, dismissSlotRaid } =
     usemultiNookStore.getState();
 
   // The raid card offers the raided channel as a new tile, never in place of
@@ -73,6 +95,8 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
 
   // Offline tiles show the offline overlay instead of an endless loading spinner.
   const isLoading = !streamUrl && !loadError;
+  // What the offline card shows for a Twitch channel (cached in Rust).
+  const offlineRoom = useOfflineRoom(loadError && (provider ?? 'twitch') === 'twitch' ? channelLogin : null);
 
   // Whether the decoded picture is taller than it is wide, which decides how the
   // tile fits it. Seeded from the platform's usual shape so a portrait source
@@ -96,6 +120,28 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     isMinimized,
   });
 
+  // StreamNook watch time: Rust registers this tile as a source when its
+  // stream starts and drops it when the tile stops; the media element's
+  // play/pause is the one thing only the page knows; Rust's earning gate
+  // (services/earning_gate.rs) waits out a pause's grace, so a quality swap's
+  // transient pause never gates the minute off.
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || !streamUrl) return;
+    const report = (state: 'playing' | 'paused' | 'teardown') =>
+      invoke('report_player_state', { state, slot: id }).catch(() => {});
+    const onPlaying = () => report('playing');
+    const onPause = () => report('paused');
+    if (!el.paused && el.readyState > 2) onPlaying();
+    el.addEventListener('playing', onPlaying);
+    el.addEventListener('pause', onPause);
+    return () => {
+      report('teardown');
+      el.removeEventListener('playing', onPlaying);
+      el.removeEventListener('pause', onPause);
+    };
+  }, [videoRef, streamUrl, id]);
+
   // Correct the seeded orientation from the real frame once one is decoded.
   useEffect(() => {
     const el = videoRef.current;
@@ -115,6 +161,53 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       el.removeEventListener('resize', measure);
     };
   }, [videoRef, streamUrl]);
+
+  // Audio Boost, per tile. A tile with its own settings (slot.audioBoost, set
+  // from its boost panel) uses those; one without uses the player's Audio Boost
+  // until it is changed here. Same per-element graph as the solo player
+  // (utils/audioBoost). Applied only while this tile can be heard, so a tile
+  // that stays muted (focus mode mutes every other tile) is never tapped and
+  // never opens an audio context of its own. Once tapped, the element keeps its
+  // graph until the tile unmounts. `playing` re-applies so a context that
+  // started suspended picks up once the stream actually plays.
+  const playerBoostSettings = useAppStore((s) => s.settings.video_player?.audio_boost);
+  const tileBoostSettings = slot.audioBoost;
+  const ownBoost = tileBoostSettings !== undefined;
+  const resolvedBoost = resolveAudioBoost(tileBoostSettings ?? playerBoostSettings);
+  const audible = !!streamUrl && !muted && !isAllMuted && !isMinimized;
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el || !audible) return;
+    const apply = () => applyAudioBoost(el, resolveAudioBoost(tileBoostSettings ?? playerBoostSettings));
+    apply();
+    el.addEventListener('playing', apply);
+    return () => el.removeEventListener('playing', apply);
+  }, [videoRef, audible, tileBoostSettings, playerBoostSettings, streamUrl]);
+
+  // Edits from the tile's panel always land on the tile's own copy, seeded from
+  // whatever it was using, so changing one tile never moves the player or any
+  // other tile. Reads fresh state so a fast fader drag never clobbers itself.
+  const patchTileBoost = useCallback(
+    (patch: Partial<AudioBoostSettings>) => {
+      const current = usemultiNookStore.getState().slots.find((s) => s.id === id)?.audioBoost;
+      const base = resolveAudioBoost(current ?? useAppStore.getState().settings.video_player?.audio_boost);
+      setSlotAudioBoost(id, { ...base, ...patch });
+    },
+    [id, setSlotAudioBoost],
+  );
+
+  // The tile's boost panel, opened from the control-bar button.
+  const [boostPanelOpen, setBoostPanelOpen] = useState(false);
+  const boostPanelRef = useRef<HTMLDivElement>(null);
+
+  // The tile's <video> lives as long as the tile (Plyr swaps in a clone on
+  // destroy), so hand it back once it has left the page. See releaseAudioGraph.
+  useEffect(() => {
+    const el = videoRef.current;
+    return () => {
+      if (el) releaseAudioGraphOnceGone(el);
+    };
+  }, [videoRef]);
 
   // Volume readout for this tile's wheel/middle-click changes.
   const { osd, showOsd } = useVolumeOsd();
@@ -147,9 +240,9 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     userName: channelName,
     enabled: socialEnabled,
   });
-  const showFollowButton = socialEnabled && playerOverlayButtonOn(playerOverlayButtons, 'follow');
+  const showFollowButton = socialEnabled && full && playerOverlayButtonOn(playerOverlayButtons, 'follow');
   const showSubscribeButton =
-    socialEnabled && offersMembership && playerOverlayButtonOn(playerOverlayButtons, 'subscribe');
+    socialEnabled && full && offersMembership && playerOverlayButtonOn(playerOverlayButtons, 'subscribe');
 
   // This tile's own quality menu. Every tile offers one, not just the focused
   // tile: the relay kept the list its resolve discovered, so asking for it
@@ -196,13 +289,17 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
 
     const displayedQuality = slot.quality || 'best';
     const cap = (q: string) => q.charAt(0).toUpperCase() + q.slice(1);
+    // A small tile under the small-tile cap plays below the quality it keeps
+    // for when it is large again; say so rather than show a quality it is not
+    // playing.
+    const capNote = slot.startedCap ? ` · ${slot.startedCap}p while small` : '';
 
     const qualityMenuItem = document.createElement('button');
     qualityMenuItem.className = 'plyr__control';
     qualityMenuItem.setAttribute('data-plyr', 'quality');
     qualityMenuItem.setAttribute('type', 'button');
     qualityMenuItem.setAttribute('role', 'menuitem');
-    qualityMenuItem.innerHTML = `<span>Quality<span class="plyr__menu__value">${cap(displayedQuality)}</span></span>`;
+    qualityMenuItem.innerHTML = `<span>Quality<span class="plyr__menu__value">${cap(displayedQuality)}${capNote}</span></span>`;
     qualityMenuItem.addEventListener('click', () => {
       const submenu = settingsMenu.querySelector('[data-quality-menu]');
       if (submenu) {
@@ -270,7 +367,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
         changeSlotQuality(id, selected);
       });
     });
-  }, [availableQualities, slot.quality, id, changeSlotQuality, playerRef]);
+  }, [availableQualities, slot.quality, slot.startedCap, id, changeSlotQuality, playerRef]);
 
   // Add the quality submenu once this tile knows its qualities.
   useEffect(() => {
@@ -280,6 +377,60 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     return () => window.clearTimeout(timer);
     // isPlaying/streamUrl re-trigger after the player (re)initialises
   }, [availableQualities, updateQualityMenu, isPlaying, streamUrl]);
+
+  // The Audio Boost button in this tile's control bar, right after volume, the
+  // same control the solo player has. It opens the tile's own boost panel, and
+  // is shown but inert on macOS (paintAudioBoostButton says why). One effect
+  // both inserts (idempotent, keyed by the attribute) and paints, so a button
+  // the retry inserts late still gets the current state.
+  const audioBoostOn = resolvedBoost.enabled;
+  useEffect(() => {
+    const container = (playerRef.current as unknown as { elements?: { container?: HTMLElement } } | null)?.elements
+      ?.container;
+    if (!container) return;
+    paintAudioBoostButton(container.querySelector('[data-streamnook-audioboost]'), audioBoostOn);
+    return injectPlyrControl(container, {
+      attr: 'data-streamnook-audioboost',
+      className: '',
+      html: AUDIO_BOOST_BUTTON_HTML,
+      onClick: () => {
+        if (AUDIO_GRAPH_SUPPORTED) setBoostPanelOpen((o) => !o);
+      },
+      place: (controls) => {
+        const volume = controls.querySelector(':scope > .plyr__volume');
+        if (volume) return { after: volume };
+        const menu = controls.querySelector(':scope > .plyr__menu');
+        return menu ? { before: menu } : null;
+      },
+      onInserted: (btn) => paintAudioBoostButton(btn, audioBoostOn),
+    });
+    // isPlaying/streamUrl re-trigger after the player (re)initialises
+  }, [audioBoostOn, isPlaying, streamUrl, playerRef]);
+
+  // Close the panel on Escape or a press outside it (the button itself toggles).
+  // Capture phase so it runs before the tile's own pointer handlers.
+  useEffect(() => {
+    if (!boostPanelOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      // Handled: the same press must not also leave the tile's full screen.
+      e.preventDefault();
+      setBoostPanelOpen(false);
+    };
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      const panel = boostPanelRef.current;
+      const btn = (playerRef.current as unknown as { elements?: { container?: HTMLElement } } | null)?.elements
+        ?.container?.querySelector('[data-streamnook-audioboost]');
+      if (panel && !panel.contains(target) && !(btn && btn.contains(target))) setBoostPanelOpen(false);
+    };
+    document.addEventListener('keydown', onKey);
+    document.addEventListener('mousedown', onDown, true);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.removeEventListener('mousedown', onDown, true);
+    };
+  }, [boostPanelOpen, playerRef]);
 
   const {
     attributes,
@@ -310,7 +461,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     const onDblCapture = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
       // Let real player controls (incl. the fullscreen button) behave normally.
-      if (target.closest('button') || target.closest('.plyr__controls') || target.closest('.plyr__menu')) return;
+      if (target.closest('button') || target.closest('.plyr__controls') || ignoresPlayerMouse(target)) return;
       e.stopPropagation();
       e.preventDefault();
       clearPendingFocusToggle(); // a double-click cancels any deferred unfocus
@@ -426,7 +577,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     );
   };
 
-  const glassButton = 'flex items-center justify-center p-1.5 glass-button rounded-lg';
+  const glassButton = `flex items-center justify-center ${full ? 'p-1.5' : 'p-1'} glass-button rounded-lg`;
 
   return (
     <motion.div
@@ -439,7 +590,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       onClick={(e) => {
         // Ignore clicks on buttons, tools, or plyr control sliders.
         const target = e.target as HTMLElement;
-        if (target.closest('button') || target.closest('.plyr__controls') || target.closest('.plyr__menu')) return;
+        if (target.closest('button') || target.closest('.plyr__controls') || ignoresPlayerMouse(target)) return;
         // While maximized, a bare click shouldn't change focus (you're already
         // watching this one). The second click of a double-click (detail === 2)
         // is left for the capture-phase dblclick handler that fills the space.
@@ -489,48 +640,24 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
         </div>
       )}
 
-      {/* Offline / unreachable: the proxy could not start (e.g. the streamer is
-          offline). Lets the user retry or hide the tile so it stops eating grid
-          space while the others play. */}
-      {loadError && !raid && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/85 backdrop-blur-sm z-30 px-4 text-center">
-          {profileImageUrl ? (
-            <img
-              src={profileImageUrl}
-              alt=""
-              className="w-12 h-12 rounded-full object-cover ring-2 ring-white/10 grayscale opacity-80"
-            />
-          ) : (
-            <div className="w-12 h-12 rounded-full bg-white/[0.06] flex items-center justify-center">
-              <WifiOff className="w-5 h-5 text-textMuted" />
-            </div>
-          )}
-          <div>
-            <p className="text-sm font-semibold text-white/90 truncate max-w-[220px]">
-              {channelName || channelLogin}
-            </p>
-            <p className="text-xs text-textMuted mt-0.5">Offline or unreachable</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Tooltip content="Try loading this stream again" delay={300} side="bottom">
-              <button
-                onClick={() => retrySlot(id)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg glass-button text-textSecondary hover:text-accent text-xs font-semibold"
-              >
-                <RefreshCcw className="w-3.5 h-3.5" /> Retry
-              </button>
-            </Tooltip>
-            <Tooltip content="Hide this stream (tuck it into the dock tray)" delay={300} side="bottom">
-              <button
-                onClick={() => dockSlot(id)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg glass-button text-textSecondary hover:text-white text-xs font-semibold"
-              >
-                <EyeOff className="w-3.5 h-3.5" /> Hide
-              </button>
-            </Tooltip>
-          </div>
-        </div>
-      )}
+      {/* Offline: the same card the main view shows, compact, over the
+          channel's own offline art. A Twitch tile starts its stream on its own
+          when the channel goes live (Rust's grid live check), so there is no
+          Retry; the toolbar's reload covers an unreachable tile. Chat keeps
+          working like any tile's. */}
+      <AnimatePresence>
+        {loadError && !raid && (
+          <OfflineCard
+            compact
+            room={offlineRoom}
+            fallbackName={channelName || channelLogin}
+            fallbackAvatar={profileImageUrl}
+            live={offlineRoom?.live ?? null}
+            joining={false}
+            onWatchLive={() => retrySlot(id)}
+          />
+        )}
+      </AnimatePresence>
 
       {error && !raid && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/80 z-10 text-rose-500 pointer-events-none">
@@ -545,7 +672,10 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       {raid && (
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/85 backdrop-blur-sm z-30 px-4 text-center">
           {raid.target_image ? (
-            <img
+            <SevenTvAvatar
+              cosmeticsId={raid.target_id}
+              px={56}
+              motion="animate"
               src={raid.target_image}
               alt=""
               className="w-14 h-14 rounded-full object-cover ring-2 ring-accent/60"
@@ -601,37 +731,42 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
         className={`stream-title-overlay absolute top-0 left-0 right-0 z-40 transition-all duration-300 opacity-0 group-hover:opacity-100`}
       >
         <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/20 to-transparent pointer-events-none" />
-        <div className="relative px-3 pt-2 pb-6 flex items-start justify-between">
-          {/* Absolute Center Grab Handle — hidden while maximized (nothing to reorder) */}
-          {!isMaximized && (
+        <div className={`relative flex items-start justify-between ${full ? 'px-3 pt-2 pb-6' : 'px-2 pt-1.5 pb-4'}`}>
+          {/* Absolute Center Grab Handle — hidden while maximized (nothing to
+              reorder) and on the smallest tiles, which move with Make main or
+              the right-click menu instead. */}
+          {!isMaximized && !mini && (
             <div className="absolute left-1/2 -translate-x-1/2 top-1.5 z-20">
               <Tooltip content="Drag to reposition stream" delay={500} side="top">
                 <div
-                  className="cursor-grab active:cursor-grabbing flex items-center justify-center px-3 py-1 glass-button rounded-lg text-emerald-300 hover:text-emerald-200 active:scale-95 [&_*]:cursor-grab"
-                  style={{ backgroundColor: 'rgba(16, 185, 129, 0.20)', backdropFilter: 'blur(16px)' }}
+                  className={`cursor-grab active:cursor-grabbing flex items-center justify-center ${full ? 'px-3 py-1' : 'px-2 py-0.5'} glass-button rounded-lg text-emerald-300 hover:text-emerald-200 active:scale-95 [&_*]:cursor-grab`}
+                  style={{ backgroundColor: 'color-mix(in srgb, rgb(16 185 129) 20%, var(--glass-under, transparent))', backdropFilter: 'blur(16px)' }}
                   {...attributes}
                   {...listeners}
                 >
-                  <GripHorizontal className="w-5 h-5 drop-shadow-md" />
+                  <GripHorizontal className={`${full ? 'w-5 h-5' : 'w-4 h-4'} drop-shadow-md`} />
                 </div>
               </Tooltip>
             </div>
           )}
 
           {/* Left: channel identity, then the stream title beneath it */}
-          <div className="flex-1 min-w-0 pr-12 z-10">
+          <div className={`flex-1 min-w-0 z-10 ${mini ? 'pr-2' : 'pr-12'}`}>
             {/* Sized to match the full player's identity row. No live ring on the
                 avatar though — a tile can be offline. */}
-            <div className="flex items-center gap-2 min-w-0 mt-1">
-              {profileImageUrl ? (
-                <img
+            <div className={`flex items-center min-w-0 ${full ? 'gap-2 mt-1' : 'gap-1.5 mt-0.5'}`}>
+              {mini ? null : profileImageUrl ? (
+                <SevenTvAvatar
+                  cosmeticsId={slotSevenTvId(slot)}
+                  px={full ? 28 : 20}
+                  motion="hover"
                   src={profileImageUrl}
                   alt=""
                   draggable={false}
-                  className="w-7 h-7 rounded-full object-cover shrink-0 bg-black/20"
+                  className={`${full ? 'w-7 h-7' : 'w-5 h-5'} rounded-full object-cover shrink-0 bg-black/20`}
                 />
               ) : (
-                <div className="w-7 h-7 rounded-full bg-white/15 shrink-0 flex items-center justify-center text-[12px] font-bold text-white">
+                <div className={`${full ? 'w-7 h-7 text-[12px]' : 'w-5 h-5 text-[10px]'} rounded-full bg-white/15 shrink-0 flex items-center justify-center font-bold text-white`}>
                   {(channelName || channelLogin || '?').charAt(0).toUpperCase()}
                 </div>
               )}
@@ -641,7 +776,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
                     login re-cased or a CJK localization — never emoji. */}
                 {/* min-w-0: a flex item won't shrink below its content width by
                     default, which makes `truncate` a no-op and overflows instead. */}
-                <h3 className="text-[15px] font-semibold truncate min-w-0 drop-shadow-lg select-none text-white/90">
+                <h3 className={`${full ? 'text-[15px]' : mini ? 'text-[11px]' : 'text-[13px]'} font-semibold truncate min-w-0 drop-shadow-lg select-none text-white/90`}>
                   {channelName || channelLogin}
                 </h3>
               </Tooltip>
@@ -661,7 +796,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
                 </Tooltip>
               )}
             </div>
-            {title?.trim() && (
+            {full && title?.trim() && (
               <Tooltip content={title} delay={200} side="top">
                 <p className="text-white/70 text-[13px] mt-1 line-clamp-1 drop-shadow-md select-none">
                   <StreamTitleWithEmojis title={title} />
@@ -739,7 +874,22 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
                 </Tooltip>
             )}
 
+            {/* Make main: swap places with the large tile; sound and chat follow. */}
+            {canMakeMain && (
+              <Tooltip content="Make main" delay={200} side="top">
+                <button
+                  onClick={() => makeMainSlot(id)}
+                  className={glassButton}
+                  style={{ backdropFilter: 'blur(16px)' }}
+                  aria-label="Make main"
+                >
+                  <ArrowLeftRight className={`${full ? 'w-4 h-4' : 'w-3.5 h-3.5'} text-white`} />
+                </button>
+              </Tooltip>
+            )}
+
             {/* Spotlight this stream (fills the space) / restore the grid */}
+            {!mini && (
             <Tooltip content={isMaximized ? 'Back to grid · double-click or Esc' : 'Spotlight · double-click'} delay={200} side="top">
               <button
                 onClick={() => toggleMaximizeSlot(id)}
@@ -749,13 +899,14 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
                 {isMaximized ? (
                   <Minimize2 className="w-4 h-4 text-white" />
                 ) : (
-                  <Maximize2 className="w-4 h-4 text-white" />
+                  <Maximize2 className={`${full ? 'w-4 h-4' : 'w-3.5 h-3.5'} text-white`} />
                 )}
               </button>
             </Tooltip>
+            )}
 
             {/* Dock (minimize to the tray strip) — hidden while maximized */}
-            {!isMaximized && (
+            {!isMaximized && !mini && (
               <Tooltip content="Dock Stream" delay={200} side="top">
                 <button
                   onClick={() => dockSlot(id)}
@@ -772,7 +923,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
               <button
                 onClick={() => removeSlot(id)}
                 className={glassButton}
-                style={{ backgroundColor: 'rgba(239, 68, 68, 0.25)', backdropFilter: 'blur(16px)' }}
+                style={{ backgroundColor: 'color-mix(in srgb, rgb(239 68 68) 25%, var(--glass-under, transparent))', backdropFilter: 'blur(16px)' }}
               >
                 <XIcon weight="bold" className="w-4 h-4 text-red-400" />
               </button>
@@ -781,7 +932,49 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
         </div>
       </div>
 
-      <PlayerVolumeOsd osd={osd} />
+      {/* This tile's Audio Boost panel. Sits above the control bar and scrolls
+          inside a short tile; globals.css pins it to the viewport while the tile
+          is fullscreen. Swallows pointer events so it never focuses, maximizes
+          or re-volumes the tile underneath. */}
+      <AnimatePresence>
+        {boostPanelOpen && (
+          <motion.div
+            ref={boostPanelRef}
+            initial={{ opacity: 0, y: 8, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 8, scale: 0.98 }}
+            transition={{ duration: 0.16, ease: 'easeOut' }}
+            onClick={(e) => e.stopPropagation()}
+            onDoubleClick={(e) => e.stopPropagation()}
+            onMouseDown={(e) => e.stopPropagation()}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+            }}
+            data-no-wheel-volume
+            className="tile-audio-boost-panel liquid-glass-panel absolute bottom-14 right-2 z-[60] overflow-y-auto rounded-xl p-4 cursor-default"
+            style={{ width: 'min(460px, calc(100% - 16px))', maxHeight: 'calc(100% - 64px)' }}
+          >
+            <AudioBoostControls
+              boost={resolvedBoost}
+              onPatch={patchTileBoost}
+              note={ownBoost ? 'Set for this stream only.' : 'Matching the main player. Changes here apply to this stream only.'}
+              footer={
+                ownBoost ? (
+                  <button
+                    onClick={() => setSlotAudioBoost(id, undefined)}
+                    className="text-xs text-textSecondary underline-offset-2 hover:text-textPrimary hover:underline"
+                  >
+                    Match main player
+                  </button>
+                ) : null
+              }
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <PlayerVolumeOsd osd={osd} boost={resolvedBoost.enabled && AUDIO_GRAPH_SUPPORTED ? resolvedBoost.gain : 1} />
     </motion.div>
   );
 };
@@ -805,5 +998,6 @@ export const MultiNookCell = React.memo(MultiNookCellInner, (prev, next) => {
   if (prev.cssOrder !== next.cssOrder) return false;
   if (prev.gridSpanClass !== next.gridSpanClass) return false;
   if (prev.isMaximized !== next.isMaximized) return false;
+  if (prev.sizeTier !== next.sizeTier || prev.canMakeMain !== next.canMakeMain) return false;
   return sameStyle(prev.customStyle, next.customStyle);
 });

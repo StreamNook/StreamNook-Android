@@ -2,6 +2,7 @@ import { parseBadges } from './twitchBadges';
 import type { SongMatch } from '../utils/songId';
 import type { ProviderId } from '../types/providers';
 import { kickBadgeImage } from '../utils/kickBadges';
+import type { HeldRowData } from '../stores/automodStore';
 
 // Message segment types - matches Rust MessageSegment enum
 export type MessageSegment =
@@ -22,6 +23,10 @@ export interface BackendReplyInfo {
   parent_msg_body: string;
   parent_user_id: string;
   parent_user_login: string;
+  /** The parent author's name as rows show it, stamped by Rust. */
+  parent_shown_name?: string;
+  /** The quoted parent tokenized by Rust with the channel it was said in. */
+  parent_segments?: MessageSegment[];
 }
 
 // Pre-computed message metadata - THE ENDGAME
@@ -64,6 +69,31 @@ export interface MessageMetadata {
   suspicious?: 'monitored' | 'restricted' | string;
   /** Row came from a history backfill rather than live delivery. */
   from_backfill?: boolean;
+  /** The author's name as every row type shows it, stamped by Rust (the
+   *  viewer's nickname override is applied on top at render). */
+  shown_name?: string;
+  /** The tick this row puts on the chat scrollbar, stamped by Rust. */
+  scrollbar_mark?: ScrollbarMarkStamp;
+}
+
+/** Kinds a chat row can be marked with on the scrollbar. Rust stamps every
+ *  kind but `pinned`, which the page adds from the channel's pinned ids. */
+export type ScrollbarMarkKind =
+  | 'mention'
+  | 'reply'
+  | 'highlight'
+  | 'pinned'
+  | 'announcement'
+  | 'sub'
+  | 'redeem'
+  | 'raid'
+  | 'first_time';
+
+/** A row's scrollbar tick, stamped by the Rust rule engine. */
+export interface ScrollbarMarkStamp {
+  kind: ScrollbarMarkKind;
+  /** The row's own tint colour; absent means the kind's theme colour. */
+  color?: string;
 }
 
 /** A matched highlight rule, stamped by the Rust rule engine. */
@@ -73,6 +103,8 @@ export interface HighlightStamp {
   color: string;
   sound_id?: string | null;
   cooldown_ms: number;
+  /** Keep tinted: hold the rule's color while the row is on screen. */
+  hold?: boolean;
 }
 
 /** A built-in event highlight, stamped by the Rust rule engine. */
@@ -123,6 +155,8 @@ export interface BackendChatMessage {
   metadata?: MessageMetadata;
   // Local-only: the "/song" result card (album art + clickable service links).
   songCard?: SongMatch;
+  // Local-only: a message AutoMod held, drawn with Allow and Deny (phones).
+  automodHeld?: HeldRowData;
 }
 
 // Frontend-facing reply info (camelCase for consistency)
@@ -132,6 +166,10 @@ export interface ReplyInfo {
   parentMsgBody: string;
   parentUserId: string;
   parentUserLogin: string;
+  /** The parent author's shown name, when Rust stamped one. */
+  parentShownName?: string;
+  /** Rust's segments for the quoted parent, when the row carries them. */
+  parentSegments?: MessageSegment[];
 }
 
 // Structured backend rows are parsed at least twice per message today (the
@@ -181,12 +219,32 @@ const parseMessageUncached = (raw: string | BackendChatMessage, channelId?: stri
         if (url) {
           badgeData.push({
             key: `${b.name}/${b.version}`,
-            info: { localUrl: url, image_url_1x: url, image_url_4x: url, title: b.title },
+            // `provider` marks these as the platform's own badges, so a click
+            // opens the spotlight card and never the Twitch badge page.
+            info: { localUrl: url, image_url_1x: url, image_url_4x: url, title: b.title, provider: raw.provider },
           });
         }
       }
     } else {
       badgeData = parseBadges(badgeStr, effectiveChannelId);
+      // A Shared Chat partner row's channel badges arrive with that room's own
+      // art (Rust reads the partner's badge set); that art wins over the cache.
+      if (raw.metadata?.is_from_shared_chat) {
+        badgeData = badgeData.map((entry, i) => {
+          const carried = raw.badges[i];
+          if (!carried?.image_url_1x) return entry;
+          return {
+            ...entry,
+            info: {
+              ...(entry.info ?? {}),
+              image_url_1x: carried.image_url_1x,
+              image_url_2x: carried.image_url_2x ?? carried.image_url_1x,
+              image_url_4x: carried.image_url_4x ?? carried.image_url_1x,
+              title: carried.title ?? entry.info?.title,
+            },
+          };
+        });
+      }
     }
 
     // PHASE 3.1 - THE ENDGAME: Use pre-computed reply info from Rust
@@ -200,6 +258,8 @@ const parseMessageUncached = (raw: string | BackendChatMessage, channelId?: stri
         parentMsgBody: ri.parent_msg_body,
         parentUserId: ri.parent_user_id,
         parentUserLogin: ri.parent_user_login,
+        parentShownName: ri.parent_shown_name,
+        parentSegments: ri.parent_segments,
       };
     } else {
       // Fallback: parse from tags (legacy support)
@@ -282,17 +342,19 @@ const parseMessageUncached = (raw: string | BackendChatMessage, channelId?: stri
   const isUserNotice = message.includes('USERNOTICE');
 
   // Parse IRC message format: :user!user@user.tmi.twitch.tv PRIVMSG #channel :message
-  // Extract username from prefix or tags
-  let username = tags.get('display-name') || tags.get('login') || 'unknown';
+  // `username` is the login, as on structured rows; the display name is its
+  // own field. A PRIVMSG carries the login in its prefix, a USERNOTICE in `login`.
+  let username = tags.get('login') || '';
   if (message.startsWith(':')) {
     const prefixEnd = message.indexOf(' ');
     const prefix = message.slice(1, prefixEnd);
     const userMatch = prefix.match(/^([^!]+)!/);
-    if (userMatch && username === 'unknown') {
-      username = userMatch[1];
+    if (userMatch && !username) {
+      username = userMatch[1].toLowerCase();
     }
     message = message.slice(prefixEnd + 1);
   }
+  if (!username) username = tags.get('display-name')?.toLowerCase() || 'unknown';
 
   // Extract the actual message content
   let content = '';

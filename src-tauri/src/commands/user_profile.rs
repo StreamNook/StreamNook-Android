@@ -1,4 +1,6 @@
 use crate::services::ivr;
+use crate::services::follow_lookup;
+use crate::services::sub_standing::{self, SubStanding};
 use crate::services::twitch_service::TwitchService;
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,11 @@ pub struct UserProfileComplete {
 
     // IVR data
     pub ivr_data: IVRData,
+
+    /// The chatter's sub in this channel, with its words. Stamped on every
+    /// answer (cached or not), because the badge it was opened from is part of it.
+    #[serde(default)]
+    pub sub_standing: Option<SubStanding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,18 +100,21 @@ pub struct ThirdPartyBadge {
     pub image1x: Option<String>,
     pub image2x: Option<String>,
     pub image4x: Option<String>,
+    /// The badge's wear category (its `set_id`): a chatter wears one badge per
+    /// category, and the badge picker switches within one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SevenTVCosmetics {
     pub paints: Vec<SevenTVPaint>,
     pub badges: Vec<SevenTVBadge>,
-    /// 7TV animated profile picture URL (`style.activeProfilePicture`), if the
-    /// user has set a custom one. `None` when they have no 7TV avatar — callers
-    /// then fall back to the Twitch profile image. 7TV has no profile *banner*,
-    /// only this avatar, so this is the only 7TV image surface for the card.
+    /// The profile picture the user set on 7TV, still and animated renditions
+    /// per scale. `None` when they have none; the card then shows the
+    /// platform's picture. 7TV has no profile banner, only this picture.
     #[serde(default)]
-    pub avatar_url: Option<String>,
+    pub profile_picture: Option<crate::services::seventv_cosmetics_resolver::ProfilePicture>,
 }
 
 // v4 API Paint structure with layers
@@ -201,11 +211,14 @@ pub struct SevenTVBadge {
 pub struct IVRData {
     pub created_at: Option<String>,
     pub following_since: Option<String>,
+    /// Whether the follow is actually known. False means no source could say
+    /// (Twitch only shares a channel's followers with its moderators), and the
+    /// card must not read a missing date as "not following".
+    #[serde(default)]
+    pub follow_known: bool,
     pub status_hidden: bool,
-    pub is_subscribed: bool,
-    pub sub_streak: Option<i32>,
-    pub sub_cumulative: Option<i32>,
-    pub is_founder: bool,
+    /// IVR's subage answer in the card's channel; None when IVR had nothing.
+    pub sub: Option<ivr::SubFacts>,
     pub is_mod: bool,
     pub mod_since: Option<String>,
     pub is_vip: bool,
@@ -225,14 +238,6 @@ pub struct IVRData {
     // How many chatters are currently in THIS user's own channel. Present
     // whether or not they're live, and unrelated to the channel you're viewing.
     pub chatter_count: Option<i32>,
-    // Subscription tier ("1" / "2" / "3" / "Prime"), type ("paid" / "prime" /
-    // "gift"), and the gifter's login + display name when the sub is a gift.
-    // All optional — only present when the user is currently subscribed and
-    // IVR's subage `meta` block returned the data.
-    pub sub_tier: Option<String>,
-    pub sub_type: Option<String>,
-    pub sub_gifter_login: Option<String>,
-    pub sub_gifter_display_name: Option<String>,
     pub error: Option<String>,
 }
 
@@ -255,10 +260,20 @@ pub async fn get_user_profile_complete(
     channel_id: String,
     channel_name: String,
     on_part: tauri::ipc::Channel<ProfilePart>,
+    worn_badges: Option<Vec<String>>,
+    viewer_moderates: Option<bool>,
 ) -> Result<UserProfileComplete, String> {
     let send = |part: ProfilePart| {
         let _ = on_part.send(part);
     };
+    let worn = worn_badges.unwrap_or_default();
+    // The channel's sub badges (tenure art, the next milestone) and the global
+    // badges the sub tile shows, fetched beside everything else; usually a
+    // cache hit.
+    let ladder = tokio::spawn({
+        let channel = channel_name.clone();
+        async move { sub_standing::room_badges(&channel).await }
+    });
     // Check cache first
     let cache_key = format!("{}:{}:{}", user_id, username, channel_id);
     {
@@ -266,7 +281,10 @@ pub async fn get_user_profile_complete(
         if let Some(cached) = cache.peek(&cache_key) {
             if cached.timestamp.elapsed().unwrap_or(CACHE_DURATION) < CACHE_DURATION {
                 debug!("[UserProfile] Cache hit for: {}", username);
-                return Ok(cached.profile.clone());
+                let profile = cached.profile.clone();
+                drop(cache);
+                let ladder = ladder.await.unwrap_or_default();
+                return Ok(with_sub_standing(profile, &username, &channel_name, &worn, &ladder));
             }
         }
     }
@@ -290,7 +308,14 @@ pub async fn get_user_profile_complete(
             None
         }
     };
-    let ((twitch_result, badges_result, seventv_result), speculative) = tokio::join!(
+    // Helix is the only place that can still say whether someone follows; it
+    // runs beside the rest and is merged with IVR's (now always empty) date.
+    let role = match viewer_moderates {
+        Some(true) => follow_lookup::ViewerRole::Moderates,
+        Some(false) => follow_lookup::ViewerRole::DoesNot,
+        None => follow_lookup::ViewerRole::Unknown,
+    };
+    let ((twitch_result, badges_result, seventv_result), speculative, helix_follow) = tokio::join!(
         async {
             tokio::join!(
                 async {
@@ -310,7 +335,8 @@ pub async fn get_user_profile_complete(
                 }
             )
         },
-        speculative
+        speculative,
+        follow_lookup::helix_follow(&user_id, &channel_id, role)
     );
 
     // The canonical login from Helix; the passed username only if Helix failed.
@@ -328,6 +354,16 @@ pub async fn get_user_profile_complete(
             fetch_ivr_data(&lookup_login, &channel_name)
         ),
     };
+
+    let ivr_result = ivr_result.map(|mut ivr| {
+        let answer = follow_lookup::merge(ivr.following_since.as_deref(), helix_follow);
+        ivr.follow_known = answer != follow_lookup::FollowAnswer::Unknown;
+        ivr.following_since = match answer {
+            follow_lookup::FollowAnswer::Following(at) => Some(at),
+            _ => None,
+        };
+        ivr
+    });
 
     let twitch_profile = twitch_result.ok().map(|mut p| {
         if p.banner_image_url.is_none() {
@@ -347,11 +383,9 @@ pub async fn get_user_profile_complete(
         ivr_data: ivr_result.unwrap_or_else(|e| IVRData {
             created_at: None,
             following_since: None,
+            follow_known: false,
             status_hidden: false,
-            is_subscribed: false,
-            sub_streak: None,
-            sub_cumulative: None,
-            is_founder: false,
+            sub: None,
             is_mod: false,
             mod_since: None,
             is_vip: false,
@@ -361,12 +395,9 @@ pub async fn get_user_profile_complete(
             follows_count: None,
             banned: false,
             chatter_count: None,
-            sub_tier: None,
-            sub_type: None,
-            sub_gifter_login: None,
-            sub_gifter_display_name: None,
             error: Some(e),
         }),
+        sub_standing: None,
     };
 
     // Cache the result
@@ -381,7 +412,36 @@ pub async fn get_user_profile_complete(
         );
     }
 
-    Ok(profile)
+    let ladder = ladder.await.unwrap_or_default();
+    Ok(with_sub_standing(profile, &username, &channel_name, &worn, &ladder))
+}
+
+/// Stamps the sub standing for this room onto a profile, from its IVR answer
+/// and the badges on the message the card was opened from.
+fn with_sub_standing(
+    mut profile: UserProfileComplete,
+    username: &str,
+    channel_name: &str,
+    worn: &[String],
+    ladder: &sub_standing::RoomBadges,
+) -> UserProfileComplete {
+    profile.sub_standing = (!channel_name.is_empty()).then(|| {
+        let login = profile
+            .twitch_profile
+            .as_ref()
+            .map(|p| p.login.as_str())
+            .filter(|l| !l.is_empty())
+            .unwrap_or(username)
+            .to_lowercase();
+        sub_standing::sub_standing(
+            profile.ivr_data.sub.as_ref(),
+            sub_standing::worn_sub(worn),
+            ladder,
+            &login,
+            channel_name,
+        )
+    });
+    profile
 }
 
 /// Clear profile cache
@@ -573,6 +633,7 @@ async fn fetch_badge_data(
                 image1x: Some(b.badge_info.image_1x),
                 image2x: Some(b.badge_info.image_2x),
                 image4x: Some(b.badge_info.image_4x),
+                category: Some(b.badge_info.set_id),
             })
             .collect(),
     })
@@ -597,9 +658,7 @@ fn cosmetics_from_inventory(owned: &crate::services::seventv_cosmetics_resolver:
     SevenTVCosmetics {
         paints: owned.cosmetics.paints.iter().filter_map(paint_from_definition).collect(),
         badges: owned.cosmetics.badges.iter().filter_map(badge_from_definition).collect(),
-        // 7TV animated avatar (only present if the user set one). None lets the
-        // card fall back to the Twitch pfp.
-        avatar_url: pick_best_seventv_image(&owned.avatar_images),
+        profile_picture: owned.cosmetics.profile_picture.clone(),
     }
 }
 
@@ -651,31 +710,6 @@ fn badge_from_definition(badge: &serde_json::Value) -> Option<SevenTVBadge> {
         description: text_of(badge, "description"),
         selected: is_selected(badge),
     })
-}
-
-/// Pick the highest-quality usable image URL from a 7TV `images[]` array.
-/// Prefers webp (broadly supported in WebView2) at the largest scale, falling
-/// back to the largest image of any format. Normalizes protocol-relative URLs.
-fn pick_best_seventv_image(images: &[serde_json::Value]) -> Option<String> {
-    let score = |img: &serde_json::Value| -> i64 {
-        let scale = img.get("scale").and_then(|s| s.as_i64()).unwrap_or(0);
-        let is_webp = img
-            .get("mime")
-            .and_then(|m| m.as_str())
-            .map(|m| m.contains("webp"))
-            .unwrap_or(false);
-        scale * 10 + if is_webp { 5 } else { 0 }
-    };
-    images
-        .iter()
-        .max_by_key(|img| score(img))
-        .and_then(|img| img.get("url"))
-        .and_then(|u| u.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| match s.strip_prefix("//") {
-            Some(rest) => format!("https://{}", rest),
-            None => s.to_string(),
-        })
 }
 
 // Helper function to parse a color object
@@ -769,11 +803,9 @@ async fn fetch_ivr_data(username: &str, channel_name: &str) -> Result<IVRData, S
     let mut ivr_data = IVRData {
         created_at: None,
         following_since: None,
+        follow_known: false,
         status_hidden: false,
-        is_subscribed: false,
-        sub_streak: None,
-        sub_cumulative: None,
-        is_founder: false,
+        sub: None,
         is_mod: false,
         mod_since: None,
         is_vip: false,
@@ -783,10 +815,6 @@ async fn fetch_ivr_data(username: &str, channel_name: &str) -> Result<IVRData, S
         follows_count: None,
         banned: false,
         chatter_count: None,
-        sub_tier: None,
-        sub_type: None,
-        sub_gifter_login: None,
-        sub_gifter_display_name: None,
         error: None,
     };
 
@@ -834,45 +862,7 @@ async fn fetch_ivr_data(username: &str, channel_name: &str) -> Result<IVRData, S
             .get("followedAt")
             .and_then(|v| v.as_str())
             .map(String::from);
-        ivr_data.is_subscribed = subage
-            .get("subscriber")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        ivr_data.is_founder = subage
-            .get("founder")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        if let Some(cumulative) = subage.get("cumulative") {
-            ivr_data.sub_cumulative = cumulative
-                .get("months")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-        }
-
-        if let Some(streak) = subage.get("streak") {
-            ivr_data.sub_streak = streak
-                .get("months")
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32);
-        }
-
-        // `meta` block carries the current-period sub details (tier, type,
-        // gifter). Only present while the user is actively subscribed.
-        if let Some(meta) = subage.get("meta") {
-            ivr_data.sub_tier = meta.get("tier").and_then(|v| v.as_str()).map(String::from);
-            ivr_data.sub_type = meta.get("type").and_then(|v| v.as_str()).map(String::from);
-            if let Some(giver) = meta.get("giver") {
-                ivr_data.sub_gifter_login = giver
-                    .get("login")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                ivr_data.sub_gifter_display_name = giver
-                    .get("displayName")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-        }
+        ivr_data.sub = Some(ivr::sub_facts_from(&subage));
     }
 
     // Process mod/vip data
@@ -920,10 +910,42 @@ pub async fn get_ivr_subage_summary(
     ivr::subage_summary(&login, &channel).await
 }
 
+/// A chatter's sub in a channel with its words, for surfaces that do not load
+/// the whole profile (the phone's profile sheet). `worn_badges` are the badge
+/// keys on the message it was opened from. IVR being unreachable is not an
+/// error here: the worn badge still answers, and otherwise the standing is
+/// unknown.
+#[tauri::command]
+pub async fn get_sub_standing(
+    login: String,
+    channel: String,
+    worn_badges: Option<Vec<String>>,
+) -> Result<Option<SubStanding>, String> {
+    if login.is_empty() || channel.is_empty() {
+        return Ok(None);
+    }
+    let (facts, ladder) = tokio::join!(
+        ivr::sub_facts(&login, &channel),
+        sub_standing::room_badges(&channel)
+    );
+    let facts = facts.unwrap_or_else(|e| {
+        debug!("[UserProfile] sub standing without IVR: {}", e);
+        None
+    });
+    let worn = sub_standing::worn_sub(&worn_badges.unwrap_or_default());
+    Ok(Some(sub_standing::sub_standing(
+        facts.as_ref(),
+        worn,
+        &ladder,
+        &login.to_lowercase(),
+        &channel.to_lowercase(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::seventv_cosmetics_resolver::{Inventory, UserCosmetics};
+    use crate::services::seventv_cosmetics_resolver::{Inventory, PictureImage, ProfilePicture, UserCosmetics};
     use serde_json::json;
 
     #[test]
@@ -949,8 +971,13 @@ mod tests {
                 })],
                 badges: vec![json!({ "id": "b1", "name": "Sub", "description": "desc" })],
                 seventv_user_id: Some("7tv".into()),
+                profile_picture: Some(ProfilePicture {
+                    id: "pp".into(),
+                    still: vec![PictureImage { url: "https://cdn.7tv.app/a/1x.webp".into(), scale: 1 }],
+                    animated: vec![],
+                }),
+                ..Default::default()
             },
-            avatar_images: vec![json!({ "url": "//cdn.7tv.app/a/4x.webp", "mime": "image/webp", "scale": 4 })],
         };
         let c = cosmetics_from_inventory(&owned);
         assert_eq!(c.paints.len(), 1);
@@ -960,6 +987,6 @@ mod tests {
         assert_eq!(c.badges.len(), 1);
         assert!(!c.badges[0].selected);
         assert_eq!(c.badges[0].description.as_deref(), Some("desc"));
-        assert!(c.avatar_url.is_some());
+        assert_eq!(c.profile_picture.as_ref().map(|p| p.id.as_str()), Some("pp"));
     }
 }

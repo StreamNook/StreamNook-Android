@@ -24,6 +24,7 @@ pub mod youtube;
 pub mod youtube_account;
 pub mod youtube_emotes;
 pub mod youtube_media;
+pub mod youtube_send;
 pub mod youtube_subscribe;
 
 use crate::models::chat_layout::ChatMessage;
@@ -230,6 +231,7 @@ pub fn emit_platform_account_changed(providers: &[&str]) {
         let payload: Vec<String> = providers.iter().map(|p| p.to_string()).collect();
         let _ = app.emit("platform-account-changed", payload);
     }
+    crate::services::account_roster::notify();
 }
 
 /// Tell every window that a platform SESSION died on its own (expired or revoked),
@@ -237,6 +239,7 @@ pub fn emit_platform_account_changed(providers: &[&str]) {
 /// loud instead of quietly showing a connected account with nobody live.
 pub fn emit_platform_session_expired(provider: &str) {
     use tauri::Emitter;
+    crate::services::account_roster::mark_expired(provider);
     if let Some(app) = app_handle() {
         let _ = app.emit("platform-session-expired", provider.to_string());
     }
@@ -268,8 +271,15 @@ pub async fn publish_chat_message(msg: &ChatMessage) {
         crate::services::irc_service::run_message_side_effects(evaluated);
         return;
     }
+    // A native shell draws the row Rust laid out, as on the Twitch lane.
+    crate::services::chat_row_view::stamp(&mut evaluated);
     let msg = &evaluated;
     if let Ok(json) = serde_json::to_string(msg) {
+        let frame = crate::services::chat_bridge_route::BridgeFrame::row(
+            &msg.channel,
+            json,
+            msg.metadata.is_mentioned || msg.metadata.is_reply_to_me,
+        );
         match IrcService::broadcaster().await {
             Some(tx) => {
                 // `broadcast::send` fails when NOTHING is subscribed, and the
@@ -279,13 +289,13 @@ pub async fn publish_chat_message(msg: &ChatMessage) {
                 // backlog is the normal case: it is published within ~100ms of
                 // resolving, before the frontend's WS client attaches. Hold it for
                 // the handshake to replay instead of discarding it.
-                if let Err(e) = tx.send(json) {
+                if let Err(e) = tx.send(frame) {
                     crate::services::irc_service::hold_undelivered_message(e.0).await;
                 }
             }
             // The bus itself is not up yet (the bridge opens alongside the first
             // channel). Same remedy: hold, then replay on attach.
-            None => crate::services::irc_service::hold_undelivered_message(json).await,
+            None => crate::services::irc_service::hold_undelivered_message(frame).await,
         }
     }
     // The same per-message side effects Twitch messages get: chat-log file write
@@ -301,6 +311,8 @@ pub async fn publish_chat_message(msg: &ChatMessage) {
 /// + mod log by emitting the same frame shape Twitch's IRC path does.
 pub async fn publish_frame(json: String) {
     if let Some(tx) = IrcService::broadcaster().await {
-        let _ = tx.send(json);
+        // Every window: the frame's channel is inside the JSON, and the rule is
+        // to deliver when the route cannot tell.
+        let _ = tx.send(crate::services::chat_bridge_route::BridgeFrame::all(json));
     }
 }

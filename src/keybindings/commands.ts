@@ -3,12 +3,17 @@
 // (shortcut hints), and the Keybindings settings tab.
 
 import { useAppStore } from '../stores/AppStore';
+import { usemultiNookStore } from '../stores/multiNookStore';
+import { chatKey, dockView, setDockPanelOpen, showDockedChat, useChatDockStore } from '../stores/chatDockStore';
+import { streamProvider } from '../utils/streamProvider';
 import { WATCHABLE_PROVIDERS, type ProviderId } from '../types/providers';
 import { getPlayerControls, isPlayerControllable } from './playerControls';
 import { getChatModController } from './chatModController';
 import { getChatSearchController } from './chatSearchController';
 import { getPaneFocusController } from './paneFocusController';
 import { IS_MAC } from '../utils/platform';
+import { exitPlayerFullscreen } from '../utils/windowFullscreen';
+import { escapeHasOwner } from './escapeOwner';
 import type { BindableCommand } from './types';
 
 const app = () => useAppStore.getState();
@@ -153,7 +158,9 @@ function build(): BindableCommand[] {
       // Cmd (see chord.ts), and modifier order is Ctrl, Alt, Shift, Meta.
       defaultBindings: IS_MAC ? ['Ctrl+Meta+F'] : ['F11'],
       keywords: 'fullscreen full screen borderless taskbar immersive window maximize theater theatre cinema',
-      run: () => app().toggleWindowFullscreen(),
+      // In the player's own full screen the window is full screen through the
+      // player, so leave through the player and the two stay in step.
+      run: () => (app().isPlayerFullscreen ? exitPlayerFullscreen() : app().toggleWindowFullscreen()),
     },
     {
       id: 'window.toggleKeepOnTop',
@@ -281,6 +288,23 @@ function build(): BindableCommand[] {
       keywords: 'fullscreen full screen',
       isAvailable: isPlayerControllable,
       run: () => pc()?.toggleFullscreen(),
+    },
+    {
+      id: 'player.exitFullscreen',
+      label: 'Exit full screen',
+      description: "Leave the player's full screen. An open menu, dialog or text field keeps Esc for itself.",
+      category: 'Player',
+      // Global rather than player: a MultiNook tile's full screen has no
+      // single player behind the player context, and Esc has to leave it too.
+      context: 'global',
+      defaultBindings: ['Esc'],
+      keywords: 'escape exit leave fullscreen full screen',
+      // Plyr's own Esc goes with its keyboard handling, which StreamNook turns
+      // off (it owns the player keys). Deferred, so whatever else is open and
+      // answers Esc (a menu, a popover, a dialog) gets the press first.
+      deferred: true,
+      isAvailable: () => app().isPlayerFullscreen && !escapeHasOwner(),
+      run: () => exitPlayerFullscreen(),
     },
     {
       id: 'cs.toggleTheatre',
@@ -577,6 +601,49 @@ function build(): BindableCommand[] {
       },
     },
 
+    // ---------------- Chat dock ----------------
+    // The chats docked beside the stream: open the list, or step through the
+    // watched stream's chat and every docked chat in the list's order.
+    {
+      id: 'chat.toggleDockList',
+      label: 'Open the chat list',
+      description: 'Show or hide the list of the chats docked beside the stream you are watching.',
+      category: 'Chat',
+      context: 'global',
+      defaultBindings: ['Ctrl+Alt+P'],
+      keywords: 'dock docked chats list switch chat tabs multiple',
+      isAvailable: () => !usemultiNookStore.getState().isMultiNookActive,
+      run: () => setDockPanelOpen(!useChatDockStore.getState().panelOpen),
+    },
+    {
+      id: 'chat.nextDockedChat',
+      label: 'Next docked chat',
+      description: 'Show the next chat in the chat list.',
+      category: 'Chat',
+      context: 'global',
+      defaultBindings: ['Ctrl+Alt+ArrowDown'],
+      keywords: 'dock docked chat next cycle switch',
+      isAvailable: () => dockCycle(1) !== undefined,
+      run: () => {
+        const next = dockCycle(1);
+        if (next !== undefined) void showDockedChat(next);
+      },
+    },
+    {
+      id: 'chat.prevDockedChat',
+      label: 'Previous docked chat',
+      description: 'Show the previous chat in the chat list.',
+      category: 'Chat',
+      context: 'global',
+      defaultBindings: ['Ctrl+Alt+ArrowUp'],
+      keywords: 'dock docked chat previous cycle switch',
+      isAvailable: () => dockCycle(-1) !== undefined,
+      run: () => {
+        const prev = dockCycle(-1);
+        if (prev !== undefined) void showDockedChat(prev);
+      },
+    },
+
     // ---------------- Reserved documentation entries ----------------
     // Shown for discoverability; the key is owned by the listed component, so
     // the engine never dispatches it and it cannot be rebound here (yet).
@@ -662,4 +729,23 @@ function build(): BindableCommand[] {
       reserved: true,
     },
   ];
+}
+
+/**
+ * The chat `step` places along from the one on screen, in the chat list's
+ * order (the watched stream's chat, then the docked chats), as the key
+ * `showDockedChat` takes (null = the watched stream's). Undefined when there
+ * is nothing to step to.
+ */
+function dockCycle(step: 1 | -1): string | null | undefined {
+  const { chats, active } = useChatDockStore.getState();
+  const stream = useAppStore.getState().currentStream;
+  const live = stream ? { provider: streamProvider(stream), login: stream.user_login } : null;
+  const view = dockView(chats, active, live, usemultiNookStore.getState().isMultiNookActive);
+  if (!view.held) return undefined;
+  const order: (string | null)[] = [...(live ? [null] : []), ...view.others.map(chatKey)];
+  if (order.length < 2) return undefined;
+  const here = view.shown ? chatKey(view.shown) : null;
+  const i = Math.max(0, order.indexOf(here));
+  return order[(i + step + order.length) % order.length];
 }

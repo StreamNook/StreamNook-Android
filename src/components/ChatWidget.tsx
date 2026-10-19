@@ -1,60 +1,71 @@
 import React, { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback, useId } from 'react';
-import { createPortal } from 'react-dom';
+import { flushSync } from 'react-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import ChatMessageList from './ChatMessageList';
-import { readableNameColor } from '../hooks/useNameColor';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { openProfilePopup } from '../utils/openProfilePopup';
-import { Pickaxe, Zap, BarChart3, Filter, SquareSlash } from 'lucide-react';
+import { Zap, Filter } from 'lucide-react';
 import ChatSearchBar from './chat/ChatSearchBar';
+import { fitHeaderDensity } from './chat/fitHeaderDensity';
 import AutomodQueueStrip from './chat/AutomodQueueStrip';
 import { useStreamerMode } from '../utils/streamerMode';
 import { resolveUploadTarget, encodeExtraFields } from '../utils/imageUploadHosts';
 import { registerChatSearchController } from '../keybindings/chatSearchController';
 import { Dropdown, type DropdownOption } from './ui/Dropdown';
 
-// Channel Points Icon (Twitch style)
-const ChannelPointsIcon = ({ className = "", size = 14 }: { className?: string; size?: number }) => (
-  <svg width={size} height={size} viewBox="0 0 24 24" className={className} fill="currentColor">
-    <path d="M12 5v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Z"></path>
-    <path fillRule="evenodd" d="M1 12C1 5.925 5.925 1 12 1s11 4.925 11 11-4.925 11-11 11S1 18.075 1 12Zm11 9a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z" clipRule="evenodd"></path>
-  </svg>
-);
 import { useTwitchChat, type ModerationContext } from '../hooks/useTwitchChat';
-import { useChannelEmotes, ensureChannelEmotes, getChannelEmotes, emoteCacheKey, refreshChannelEmotes, useChannelChat, useChannelChatMeta, useChatConnectionStore, setChannelPaused, sliceLookupKey, injectRedemptionMessage, injectSystemMessage, systemSourceFor } from '../stores/chatConnectionStore';
+import { useChannelEmotes, ensureChannelEmotes, getChannelEmotes, emoteCacheKey, refreshChannelEmotes, useChannelChat, useChannelChatMeta, useChatConnectionStore, setChannelPaused, sliceLookupKey, injectSystemMessage, systemSourceFor } from '../stores/chatConnectionStore';
 import { useSpellcheck } from '../hooks/useSpellcheck';
 import { warmSpellcheck } from '../utils/spellcheck';
 import SpellcheckUnderlay from './chat/SpellcheckUnderlay';
 import { makeKey, parseKey } from '../utils/providerKey';
+import { onWalletRequest, takeWalletRequest } from '../utils/walletRequest';
 import { isHomeRow, rowProvider } from '../utils/chatAuthority';
 import { useBlendedChatSource } from '../hooks/useBlendedChatSource';
 import { useBlendCompanions, type BlendCompanion } from '../hooks/useBlendCompanions';
 import { sendToSource } from '../utils/sendToSource';
+import { varyRepeat } from '../utils/sentContent';
 import { ProviderMark } from './ProviderLogo';
 import BlendBar, { type BlendView } from './chat/BlendBar';
+import { BlendSourcesButton } from './chat/BlendSourcesButton';
 import { historyKey as chatterHistoryKey } from '../utils/chatterIdentity';
 import { streamProvider } from '../utils/streamProvider';
 import { PROVIDERS, type ProviderId } from '../types/providers';
-import { Plus, Timer, UsersThree } from 'phosphor-react';
+import { ChatCircle, Chats, PushPin, ShieldCheck, Timer, UsersThree } from 'phosphor-react';
+import { ChatDockPanel, ChatDockSwitcher, ChatDockTabs } from './chat/ChatDock';
+import { useDockSwitcherFloor } from '../hooks/useChatDock';
+import ChatHeaderMenu, { type ChatHeaderMenuItem } from './chat/ChatHeaderMenu';
+import { dockChat, setDockPanelOpen, undockChat, useChatDockStore } from '../stores/chatDockStore';
+import { passesLocalViews, useLocalViewFilterIds } from '../stores/localChatViewStore';
 import { PlatformAccountChip } from './PlatformAccountChip';
+import { PlatformLoginButton } from './PlatformLoginButton';
+import { useAccountRosterStore } from '../stores/accountRosterStore';
+import { signInReasonText, twitchSignInReason } from '../utils/twitchSignIn';
 import { ProviderLogo } from './ProviderLogo';
 import { TogetherChip } from './SharedViewers';
 import { useAppStore } from '../stores/AppStore';
 import { useChannelState, watchChannel, unwatchChannel, refreshChannelState } from '../stores/channelStateStore';
 import { useProviderEmoteStore } from '../stores/providerEmoteStore';
 import { usePlatformAccountStore } from '../stores/platformAccountStore';
-import { useFollowsStore } from '../stores/followsStore';
 import { incrementStat } from '../services/supabaseService';
 import { trackEmoteUsage } from '../utils/trackEmoteUsage';
+import { EmoteText, buildEmoteNameMap } from '../utils/emoteText';
+import { isImeComposing } from '../utils/imeComposing';
+import { syncComposerPlaceholder, trackComposerWidth } from '../utils/composerNarrow';
 import { LinkPreviewCard } from './chat/LinkPreviewCard';
+import { PinnedChatter } from './chat/PinnedChatter';
+import { SevenTvAvatar } from './SevenTvAvatar';
 import { extractPreviewUrls } from '../services/linkPreviewService';
 import UserProfileCard from './UserProfileCard';
 import ErrorBoundary from './ErrorBoundary';
 import PredictionOverlay from './PredictionOverlay';
 import PollOverlay from './PollOverlay';
 import { ChatOverlayStack } from './chat/ChatOverlayStack';
+import { useChatTopStack } from './chat/chatTopStack';
 import PollPredictionComposer from './chat/PollPredictionComposer';
+import StreamManagerPanel, { type ManagerPanelKind } from './chat/StreamManagerPanel';
+import { useStreamManager } from '../services/streamManager';
 import HypeTrainBanner from './HypeTrainBanner';
 import ViewersPanel from './ViewersPanel';
 import ModRoomPane from './modroom/ModRoomPane';
@@ -63,13 +74,17 @@ import { isCachedModerator, setCachedModerator, loadModeratedChannelIds, subscri
 import type { ModRoomMember } from '../services/modRoomService';
 import { ensureRoom, releaseRoom } from '../services/modRoomManager';
 import { useModRoomStore } from '../stores/modRoomStore';
-import ChannelPointsMenu from './ChannelPointsMenu';
-import ModeratorMenu from './chat/ModeratorMenu';
+import { WalletFace, WalletMenu, type WalletPoints } from './chat/ChannelWallet';
+import { walletHasAny } from '../utils/wallet';
+import ChannelToolsMenu, { type DropsTool } from './chat/ChannelToolsMenu';
+import { CheerBar } from './chat/CheerBar';
+import { useCheerDraft } from '../stores/cheerPromptStore';
+import { channelToolSections } from '../utils/channelTools';
 import ResubNotificationBanner, { ResubNotification } from './ResubNotificationBanner';
 import WatchStreakBanner, { WatchStreakMilestone } from './WatchStreakBanner';
-import { Emote, EmoteSet, queueChannelEmotesForCaching, setEmoteCacheBurst } from '../services/emoteService';
+import { EmoteSet, queueChannelEmotesForCaching, setEmoteCacheBurst, youTubeChannelEmojiRows, type YouTubeChannelEmoji } from '../services/emoteService';
+import { useEmotePalette, type PaletteChannel } from '../hooks/useEmotePalette';
 import { prefetchChannelBadges } from '../services/badgeService';
-import { parseBadges } from '../services/twitchBadges';
 import { initializeBadgeImageCache } from '../services/badgeImageCacheService';
 import { parseMessage } from '../services/twitchChat';
 import { loadFavoriteEmotes } from '../services/favoriteEmoteService';
@@ -78,16 +93,15 @@ import { useChatUserStore } from '../stores/chatUserStore';
 import { forceRefreshCosmetics } from '../services/cosmeticsCache';
 import MentionAutocomplete from './MentionAutocomplete';
 import CommandAutocomplete from './chat/CommandAutocomplete';
-import CommandMenu from './chat/CommandMenu';
 import EmoteAutocomplete from './chat/EmoteAutocomplete';
 import EmoteSearchList from './chat/EmoteSearchList';
 import SendAsPicker from './SendAsPicker';
 import { useSendAccountStore } from '../stores/sendAccountStore';
 import {
+  insertAtCaret,
   getWordRange,
   wordBeforeCaret,
   emoteSearchTrigger,
-  withChatterCandidates,
   wrapIndex,
   emoteOptionId,
   EmoteTabCandidate,
@@ -103,16 +117,17 @@ import {
   COMMAND_DEFINITIONS,
   CommandDefinition,
   buildUserCommandDefinitions,
-  matchPlainTextUserCommand,
-  expandUserCommand,
-  findUserCommand,
+  rankCommandMatches,
+  resolveCommandAlias,
 } from '../utils/chatCommands';
-import { buildTemplateContext, handleSlashCommand } from '../utils/commandHandler';
+import { applySlashOutcome, handleSlashCommand, runSlashCommand } from '../utils/commandHandler';
+import ChatBurstStatus from './chat/ChatBurstStatus';
 import { getRemindFlowSuggestions, tokenizeRemindOverlay } from '../utils/reminderEngine';
 
 import { BackendChatMessage } from '../services/twitchChat';
 import { registerChatModController, getChatModController, type ChatModController } from '../keybindings';
 import { Tooltip } from './ui/Tooltip';
+import { RoomModeIndicator } from './chat/RoomModeIndicator';
 
 interface ParsedMessage {
   username: string;
@@ -134,98 +149,12 @@ import { Logger } from '../utils/logger';
 // Unsent composer text per channel key, for the per-channel draft restore.
 const chatDrafts = new Map<string, string>();
 import { useVisibleInterval } from '../utils/useVisibleInterval';
-import { formatUptimeClock } from '../utils/streamStats';
-import { kickAppliedSeconds, kickTimeoutMinutes } from '../utils/kickTimeout';
-
-// Channel Points hover tooltip — portalled to document.body to escape overflow-hidden
-const ChannelPointsTooltip = ({ anchorRef, customPointsIconUrl, customPointsName, isLoadingChannelPoints, channelPoints }: {
-  anchorRef: React.RefObject<HTMLDivElement | null>;
-  customPointsIconUrl: string | null;
-  customPointsName: string | null;
-  isLoadingChannelPoints: boolean;
-  channelPoints: number | null;
-}) => {
-  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
-  // Horizontal offset applied to the bubble after viewport-edge clamping.
-  // The arrow stays pinned to the anchor center, so when we shift the bubble
-  // to keep it on-screen (e.g. inside the narrow MultiChat popout where the
-  // anchor sits close to the right edge), the arrow's `left` is recomputed
-  // separately so it still points at the icon below.
-  const [bubbleShift, setBubbleShift] = useState(0);
-  const bubbleRef = useRef<HTMLDivElement>(null);
-
-  // Step 1: measure the anchor and stage the centered position. The bubble
-  // isn't rendered yet on this pass (we early-return below when `pos` is null),
-  // so we can't measure its width here.
-  useLayoutEffect(() => {
-    const el = anchorRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    setPos({ left: rect.left + rect.width / 2, top: rect.top - 8 });
-  }, [anchorRef]);
-
-  // Step 2: now that the bubble is in the DOM (pos is set), measure its
-  // natural width and clamp horizontally so it never escapes the viewport.
-  // 8px margin keeps a breathing buffer at each edge. Re-runs whenever the
-  // bubble's content can change width (custom points name, points number,
-  // loading state) since those swap the rendered text.
-  useLayoutEffect(() => {
-    if (!pos) return;
-    const bubble = bubbleRef.current;
-    if (!bubble) return;
-    const margin = 8;
-    const bubbleRect = bubble.getBoundingClientRect();
-    const half = bubbleRect.width / 2;
-    const minLeft = margin + half;
-    const maxLeft = window.innerWidth - margin - half;
-    const clamped = Math.max(minLeft, Math.min(pos.left, maxLeft));
-    setBubbleShift(clamped - pos.left);
-  }, [pos, customPointsName, channelPoints, isLoadingChannelPoints]);
-
-  if (!pos) return null;
-
-  return createPortal(
-    <div
-      ref={bubbleRef}
-      className="fixed px-3 py-1.5 bg-black/95 border border-border rounded-lg shadow-lg z-[9999] min-w-max pointer-events-none"
-      style={{
-        left: pos.left + bubbleShift,
-        top: pos.top,
-        transform: 'translate(-50%, -100%)',
-      }}
-    >
-      <div className="flex items-center gap-1.5">
-        {customPointsIconUrl ? (
-          <img
-            src={customPointsIconUrl}
-            alt={customPointsName || "Channel Points"}
-            className="w-[14px] h-[14px] flex-shrink-0"
-          />
-        ) : (
-          <ChannelPointsIcon size={14} className="text-accent-neon flex-shrink-0" />
-        )}
-        {isLoadingChannelPoints ? (
-          <span className="text-sm text-textSecondary">Loading...</span>
-        ) : channelPoints !== null ? (
-          <span className="text-sm font-bold text-accent-neon">{channelPoints.toLocaleString()}</span>
-        ) : (
-          <span className="text-sm text-textSecondary">--</span>
-        )}
-        {customPointsName && channelPoints !== null && (
-          <span className="text-xs text-textSecondary">{customPointsName}</span>
-        )}
-      </div>
-      {/* Arrow still points at the anchor center even when the bubble has
-          been shifted to stay on-screen — its `left` is the anchor center
-          relative to the (shifted) bubble's left edge. */}
-      <div
-        className="absolute top-full w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-black/95"
-        style={{ left: `calc(50% - ${bubbleShift}px)`, transform: 'translateX(-50%)' }}
-      />
-    </div>,
-    document.body
-  );
-};
+import { formatUptimeClock, pickLiveStartedAt } from '../utils/streamStats';
+import { fitCount, fitSeconds } from '../utils/fitNumber';
+import { lastLiveLabel } from '../utils/lastLive';
+import { moderateChatter, moderateWithToast, type ModAction, type ModRequest } from '../services/moderation';
+import { openBadgeInfo } from '../stores/badgeSpotlightStore';
+import { twitchRowBadgeRef, type TwitchRowBadgeInfo } from '../utils/badgeSpotlight';
 
 /** Lets ChatWidget render against a caller-supplied channel instead of the
  *  AppStore's currentStream — same pattern as the MultiNook synthesis branch
@@ -296,22 +225,6 @@ const EMPTY_EMOTE_SET = Object.freeze({
   youtube: [],
 }) as unknown as EmoteSet;
 
-/** A follower-mode minimum, in minutes, as something readable.
- *  Kick states these in minutes and they get large — xqc's is 5760, which as
- *  "5760m" is a number you have to do arithmetic on to understand. */
-function formatFollowAge(minutes: number): string {
-  if (minutes >= 10080 && minutes % 10080 === 0) return `${minutes / 10080}w`;
-  if (minutes >= 1440) {
-    const days = Math.round(minutes / 1440);
-    return `${days}d`;
-  }
-  if (minutes >= 60) {
-    const hours = Math.round(minutes / 60);
-    return `${hours}h`;
-  }
-  return `${minutes}m`;
-}
-
 // C7 checkpoint B: the message-list subtree owns its own per-channel chat
 // subscription. While the parent still holds its own subscription this is
 // behavior-identical; checkpoint C cuts the parent's per-flush subscription so
@@ -330,6 +243,9 @@ const USER_HISTORY_MAX_USERS = 300;
  *  fresh `[]` while blend is off would re-run a walk of every open chat slice on
  *  every render of the widget. */
 const NO_BLEND_SOURCES: BlendCompanion[] = [];
+
+// Lifts an unpainted pinned name off the glass; a 7TV paint brings its own shadow.
+const PIN_NAME_SHADOW = { textShadow: '0 1px 2px rgba(0,0,0,0.8)' } as const;
 
 interface ChatMessagesPanelProps {
   /** Live slice key (bare Twitch login / composite provider key); ignored when
@@ -370,6 +286,8 @@ interface ChatMessagesPanelProps {
   headerSpaceReserved?: boolean;
   /** The floating header's measured height, for when nothing else cleared it. */
   headerInset?: number;
+  /** This channel's pinned message ids, for the scrollbar's pinned marks. */
+  pinnedIds?: ReadonlySet<string>;
 }
 
 /** How many consecutive untagged messages end the shared-chat indicator. */
@@ -408,18 +326,26 @@ const ChatMessagesPanel = ({
   filterId,
   headerSpaceReserved,
   headerInset,
+  pinnedIds,
 }: ChatMessagesPanelProps) => {
   const live = useChannelChat(override ? null : channelKey);
   const src: ChatMessagesPanelSource = override ?? live;
   // A saved filter narrows this pane to rows the Rust rule engine stamped
   // with its id (metadata.filter_ids). Render-time only, so switching the
   // filter never drops history; O(buffer) per flush, and the buffer is capped.
+  // Local views (/localmod, /localsub, /localascii) narrow it further, on the
+  // built-in ids the same engine stamps on every message.
+  const localViewKey = useLocalViewFilterIds(channelKey).join(',');
   const shownMessages = useMemo(() => {
-    if (!filterId) return src.messages;
-    return src.messages.filter(
-      (m) => typeof m !== 'string' && !!m.metadata?.filter_ids?.includes(filterId),
-    );
-  }, [src.messages, filterId]);
+    const base = filterId
+      ? src.messages.filter(
+          (m) => typeof m !== 'string' && !!m.metadata?.filter_ids?.includes(filterId),
+        )
+      : src.messages;
+    if (!localViewKey) return base;
+    const required = localViewKey.split(',');
+    return base.filter((m) => passesLocalViews(m, required));
+  }, [src.messages, filterId, localViewKey]);
   const addUser = useChatUserStore((state) => state.addUser);
   /** Consecutive Twitch messages seen with no source-room-id tag. Drives the
    *  shared-chat session-end detection below. */
@@ -529,6 +455,11 @@ const ChatMessagesPanel = ({
               sharedRoomsRef.current.add(srcRoom);
               prefetchChannelBadges(srcRoom).catch((err) =>
                 Logger.warn('[ChatWidget] Failed to prefetch badges for shared channel:', srcRoom, err),
+              );
+              // Rows from the guest channel resolve against its own badge set
+              // (its sub badges, its moderator / VIP art), so index it too.
+              void import('../services/twitchBadges').then(({ initializeBadgeCache }) =>
+                initializeBadgeCache(srcRoom),
               );
             }
           } else if (srcRoom) {
@@ -679,6 +610,7 @@ const ChatMessagesPanel = ({
             homeProvider={provider}
             headerSpaceReserved={headerSpaceReserved}
             headerInset={headerInset}
+            pinnedIds={pinnedIds}
           />
         </ErrorBoundary>
       )}
@@ -715,7 +647,9 @@ const PausedNewCount = ({ sliceKeys, isPaused }: { sliceKeys: string; isPaused: 
   }, [isPaused, sliceKeys]);
   if (!isPaused || !sliceKeys || anchor === null) return null;
   const delta = Math.max(0, sumLive() - anchor);
-  return delta > 0 ? <> ({delta} new)</> : null;
+  // Capped at 99+: a busy room passes thousands in seconds, and the pill
+  // must stay one line.
+  return delta > 0 ? <> ({fitCount(delta)} new)</> : null;
 };
 
 const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp, onFilterIdChange }: ChatWidgetProps = {}) => {
@@ -854,6 +788,10 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // used to be a 5s `kick_is_connected` poll PER PANE, reading a pure in-memory
   // bool that only ever changes when the user connects or disconnects.
   const kickConnected = usePlatformAccountStore((s) => provider === 'kick' && s.kick.connected);
+  // Set when StreamNook signed you out of Twitch itself: Twitch sends wait on a
+  // new sign-in, and the composer says so instead of swallowing input.
+  const twitchSignInOwedFor = useAccountRosterStore((s) => (isTwitch ? twitchSignInReason(s.roster) : null));
+  const twitchSignInOwed = twitchSignInOwedFor !== null;
   // The connected Kick account's username, lowercased — used to spot our OWN
   // (badged) messages so we can tell whether we may moderate this Kick channel
   // (Kick gives no Twitch-style USERSTATE with our role).
@@ -878,10 +816,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const [youtubeCanModerate, setYoutubeCanModerate] = useState(false);
   const youtubeSlug = channelOverride?.user_login;
   const canModerateActive = provider === 'youtube' && youtubeConnected && !!youtubeSlug;
+  // Cleared on every channel change too: the previous channel's answer must not
+  // grant mod tools here while the new probe is in flight.
   useEffect(() => {
-    if (canModerateActive) return;
     setYoutubeCanModerate(false);
-  }, [canModerateActive]);
+  }, [canModerateActive, youtubeSlug]);
   useEffect(() => {
     if (!canModerateActive) return;
     let active = true;
@@ -945,6 +884,14 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // and level-up logic below all work per-pane with no further changes.
   const currentHypeTrain = channelOverride ? (hypeTrainOverride ?? null) : globalHypeTrain;
   const isMultiNookActive = usemultiNookStore((s) => s.isMultiNookActive);
+  // The chat dock, main window only (MultiNook picks its chat among tiles).
+  // While anything is docked the window keeps several chats, so nothing here
+  // may treat a switch between them as leaving a channel.
+  const dockChats = useChatDockStore((s) => s.chats);
+  const dockHeld = isMainSurface && dockChats.length > 0 && !isMultiNookActive;
+  // The dock as a row of tabs under the header instead of the capsule's list.
+  const dockTabs = useAppStore((s) => s.settings.chat_design?.chat_dock_switcher === 'tabs') && dockHeld;
+  const dockSwitcherFloor = useDockSwitcherFloor();
   const activeChatChannelId = usemultiNookStore((s) => s.activeChatChannelId);
   const slots = usemultiNookStore((s) => s.slots);
 
@@ -996,11 +943,16 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
           type: 'live',
           title: `multi-nook: ${activeSlot.channelName || activeSlot.channelLogin}`,
           viewer_count: 0,
-          started_at: new Date().toISOString(),
+          // Unknown here; the header's uptime reads Rust's channel state for
+          // Twitch. Faking "now" restarted the clock on every chat switch.
+          started_at: '',
           language: 'en',
           thumbnail_url: '',
           tag_ids: [],
-          is_mature: false
+          is_mature: false,
+          // Rust's grid live check (Twitch tiles): an offline tile's chat says
+          // when it was last live, as everywhere else.
+          is_live: activeSlot.offline !== true,
         } as TwitchStream;
       }
     }
@@ -1016,6 +968,16 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // buffered and backfilled message exactly once.
   const [kickModDetected, setKickModDetected] = useState(false);
   const onKickModeratorDetected = useCallback(() => setKickModDetected(true), []);
+  // Our Twitch badges for the channel this pane SHOWS. `userBadges` from the
+  // chat hook follows the channel it has finished joining, which trails a
+  // switch by the whole JOIN round trip; read through it, the previous
+  // channel's moderator badge granted mod tools (and wrote the mod-room cache)
+  // in a channel where we are not a moderator. null until USERSTATE lands; ''
+  // once Twitch confirms we hold no badges here.
+  const twitchBadgeMeta = useChannelChatMeta(
+    isTwitch && chat !== replayChat ? currentStream?.user_login?.toLowerCase() ?? null : null,
+  );
+  const ownTwitchBadges = twitchBadgeMeta.userBadges;
   const isModerator = useMemo(() => {
     if (provider === 'youtube') return youtubeCanModerate;
     // The API answer wins once it arrives, but the badge heuristic stays as an OR:
@@ -1025,19 +987,54 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       return kickCanModerate === null ? kickModDetected : kickCanModerate || kickModDetected;
     }
     if (!isTwitch) return false; // tiktok + other read-only providers: no mod actions
-    if (!userBadges) return false;
-    return userBadges.includes('moderator') || userBadges.includes('broadcaster');
-  }, [provider, youtubeCanModerate, isTwitch, kickModDetected, kickCanModerate, userBadges]);
+    if (!ownTwitchBadges) return false;
+    return /(?:^|,)(?:moderator|broadcaster)\//.test(ownTwitchBadges);
+  }, [provider, youtubeCanModerate, isTwitch, kickModDetected, kickCanModerate, ownTwitchBadges]);
   
   // UI state
   const [messageInput, setMessageInput] = useState('');
+  // Put text in the box and the caret at its end (the cheer bar's remove and
+  // a refused cheer coming back).
+  const setComposerText = useCallback((text: string) => {
+    setMessageInput(text);
+    inputRef.current?.focus({ preventScroll: true });
+    setTimeout(() => inputRef.current?.setSelectionRange(text.length, text.length), 0);
+  }, []);
   // Per-channel drafts: switching channels parks the unsent text and brings
   // back whatever was typed there before (module-level, survives remounts).
   const draftKeyRef = useRef<string | null>(null);
-  // Slow-mode countdown: the wall-clock of our last send; the composer shows
-  // the remaining wait while roomState.slow is on.
-  const [lastSentAt, setLastSentAt] = useState(0);
-  const [slowNow, setSlowNow] = useState(0);
+  // Slow-mode countdown: the wall-clock of our last chat line and the room it
+  // went to (another room's send starts no wait here); the composer shows the
+  // remaining wait while roomState.slow is on.
+  const [lastSent, setLastSent] = useState<{ channel: string | null; at: number } | null>(null);
+  // The seconds left, with the deadline they were counted for. A count kept
+  // for an older deadline is never shown: a deadline compared with a clock
+  // that was never read put the whole epoch on the send button.
+  const [slowTick, setSlowTick] = useState({ until: 0, left: 0 });
+  // A YouTube send whose answer came back without its posted row counts as
+  // sent. Rust watches chat for the row and says so here when it never came,
+  // so the text can be put back and sent again.
+  useEffect(() => {
+    if (!providerKey) return;
+    const key = providerKey.toLowerCase();
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    void listen<{ channel: string; text: string }>('provider-send-unconfirmed', (event) => {
+      if (event.payload.channel.toLowerCase() !== key) return;
+      const text = event.payload.text;
+      useAppStore.getState().addToast("Your YouTube message may not have posted", 'warning', {
+        label: 'Restore',
+        onClick: () => setMessageInput((prev) => (prev.trim() ? `${prev} ${text}` : text)),
+      });
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [providerKey]);
   const [activeView, setActiveView] = useState<'chat' | 'viewers' | 'modroom'>('chat');
   // Streamer mode (Rust-owned flag): hides the viewer count here.
   const streamerModeActive = useStreamerMode((st) => st.active);
@@ -1097,10 +1094,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     // id into the Twitch mod-room cache (the id namespaces collide).
     if (!isTwitch) return;
     const id = currentStream?.user_id;
-    if (!id || !userBadges) return; // persist only once USERSTATE has resolved
+    // Persist only once USERSTATE has resolved for THIS channel. An empty badge
+    // list is an answer too (no badges here), and it must clear a stale flag.
+    if (!id || ownTwitchBadges == null) return;
     setCachedModerator(id, isModerator);
     setCachedMod(isModerator);
-  }, [isTwitch, isModerator, userBadges, currentStream?.user_id]);
+  }, [isTwitch, isModerator, ownTwitchBadges, currentStream?.user_id]);
   // Mod rooms are Twitch-only: without the isTwitch gate, a Kick/YouTube
   // moderator in an override pane would get a Mods toggle whose channel id
   // belongs to the wrong platform.
@@ -1137,18 +1136,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     return subscribeModeratedChannels(() => setCachedMod(isCachedModerator(currentStream?.user_id)));
   }, [currentStream?.user_id]);
 
-  // The viewers list is mod-only (Helix Get Chatters needs mod/broadcaster auth).
-  // If mod status drops while it's open, fall back to the chat view. The mod-room
-  // tab uses the optimistic eligibility so it isn't yanked before USERSTATE lands.
+  // The viewers list is Twitch-only (anyone gets the public list; moderators the
+  // full roster). The mod-room tab uses the optimistic eligibility so it isn't
+  // yanked before USERSTATE lands.
   useEffect(() => {
-    if (activeView === 'viewers' && (!isModerator || !isTwitch)) setActiveView('chat');
+    if (activeView === 'viewers' && !isTwitch) setActiveView('chat');
     if (activeView === 'modroom' && !modRoomEligible) setActiveView('chat');
-  }, [activeView, isModerator, modRoomEligible, isTwitch]);
+  }, [activeView, modRoomEligible, isTwitch]);
   const [showEmotePicker, setShowEmotePicker] = useState(false);
-  // Browsable command menu (button left of the emote picker). Mutually
-  // exclusive with the emote picker: they share the space above the box.
-  const [showCommandMenu, setShowCommandMenu] = useState(false);
-  const commandMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const emoteButtonRef = useRef<HTMLButtonElement>(null);
   // While the picker is open, fill the emote disk cache aggressively (the user is
   // actively waiting on these); the matching cleanup drops back to the polite
   // background trickle on close. Ref-counted in the service so split panes /
@@ -1202,7 +1198,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     // `isConnected` cannot go true until that same resolve has run, which makes
     // it an exact "the set is ready now" signal: no polling, no retry timer.
     let cancelled = false;
-    void invoke<Array<{ id: string; name: string; url: string; is_global: boolean; locked: boolean }>>(
+    void invoke<YouTubeChannelEmoji[]>(
       'get_youtube_channel_emojis',
       { channel: videoId },
     )
@@ -1218,24 +1214,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
           return;
         }
         seededYouTubeRef.current.add(providerKey);
-        useProviderEmoteStore.getState().seed(
-          providerKey,
-          list.map((e) => ({
-            id: e.id,
-            name: e.name,
-            url: e.url,
-            provider: 'youtube' as const,
-            // Custom channel emoji lead the grid; YouTube's own set follows.
-            emote_type: e.is_global ? 'youtube' : 'custom',
-            locked: e.locked,
-            lockedLabel: e.locked ? 'Members only' : undefined,
-            // Unicode entries insert the literal character, which needs no
-            // server-side shortcut lookup. Custom emoji ids are `UC…/hash`, so
-            // the slash is what tells the two apart. NOT codepoint length: flags
-            // and ZWJ sequences are multi-codepoint and would be misread.
-            insertText: e.is_global && !e.id.includes('/') ? e.id : e.name,
-          })),
-        );
+        useProviderEmoteStore.getState().seed(providerKey, youTubeChannelEmojiRows(list));
       })
       .catch(() => {
         // Chat still resolving. The isConnected dep brings us back.
@@ -1275,7 +1254,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const smiley = useSwappingSmiley();
   const [isLoadingEmotes, setIsLoadingEmotes] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const channelPointsRef = useRef<HTMLDivElement>(null);
   // Always-latest reference to handleUsernameClick so window-event listeners
   // (the /usercard and /user slash commands) open the card with current channel
   // context instead of a stale mount-time closure.
@@ -1401,12 +1379,27 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     ro.observe(chromeEl);
     return () => ro.disconnect();
   }, [chromeEl]);
+  // The header row compacts in place instead of pushing its last controls past
+  // the edge, where the header clips them (a moderator's Chat / Mods switch is
+  // wide enough to do that at an ordinary chat width). Five steps, each giving
+  // up less than the next: tighter spacing and the duplicate viewers button;
+  // the switch's words, the filter's label and the word "Together" become
+  // their icons; the uptime goes; the viewer count goes; the pin switch keeps
+  // only its pictures and the combine button waits.
+  // The first also runs to keep the title whole; the switch's words matter
+  // more than the title, so the rest wait for a real overflow. Written straight
+  // to the element, so a resize never re-renders the chat.
+  const [headerRowEl, setHeaderRowEl] = useState<HTMLDivElement | null>(null);
+  useEffect(() => (headerRowEl ? fitHeaderDensity(headerRowEl, 5, 1) : undefined), [headerRowEl]);
   // Rows scroll beneath the floating header, so the header takes pointer input
   // itself: a click on it must never land on a name hidden underneath. The
   // wheel is the one input that should still reach what it covers, so it is
   // handed to the list below, both to scroll it and so the list's own wheel
   // handler still reads the pause-on-scroll-up intent.
   const forwardHeaderWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    // Something in the header used it already (the dock's tab row scrolling
+    // sideways), so the chat underneath must not scroll as well.
+    if (e.defaultPrevented) return;
     const header = e.currentTarget;
     const beneath = document
       .elementsFromPoint(e.clientX, e.clientY)
@@ -1446,6 +1439,9 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // at the same spot, so a live poll and a pin are both readable at once.
   const [overlayStackEl, setOverlayStackEl] = useState<HTMLDivElement | null>(null);
   const [overlayStackHeight, setOverlayStackHeight] = useState(0);
+  // The poll and prediction stack's layout, from Rust: order, the one open
+  // card, and a cap measured against this chat's height.
+  const topStack = useChatTopStack(chatContainerEl);
   useEffect(() => {
     if (!overlayStackEl) return;
     const sync = () => setOverlayStackHeight(Math.round(overlayStackEl.getBoundingClientRect().height));
@@ -1458,57 +1454,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
   const settings = useAppStore((s) => s.settings);
 
-  // No-input channel-point redemptions (from Twitch's channel-wide community
-  // points feed). Message-style and text-input rewards already surface in chat
-  // on their own, so we inject only the ones that otherwise wouldn't show, as a
-  // native-looking redemption row. Gated by a setting (defaults on).
-  // The channel's points icon loads asynchronously and this listener only
-  // re-subscribes on channel change, so read the latest value from a ref at
-  // redemption time (synced just below the customPointsIconUrl state).
-  const customPointsIconRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (!isTwitch) return;
-    const channelId = currentStream?.user_id;
-    const channelLogin = currentStream?.user_login;
-    if (!channelId || !channelLogin) return;
-    const unlisten = listen<{
-      channel_id: string;
-      user_login: string;
-      user_name: string;
-      user_id: string;
-      reward_id: string;
-      reward_title: string;
-      reward_cost: number;
-      is_input_required: boolean;
-      redemption_id: string;
-      image_url: string;
-      background_color: string;
-      /** `name/version,...` the redeemer last showed in this chat, if any. */
-      badges?: string;
-      color?: string;
-    }>('channel-points-community-redemption', (event) => {
-      const p = event.payload;
-      if (p.channel_id !== channelId || p.is_input_required) return;
-      if (useAppStore.getState().settings.show_channel_point_redemptions === false) return;
-      injectRedemptionMessage(channelLogin.toLowerCase(), {
-        userLogin: p.user_login,
-        userName: p.user_name,
-        userId: p.user_id,
-        rewardId: p.reward_id,
-        rewardTitle: p.reward_title,
-        cost: p.reward_cost,
-        redemptionId: p.redemption_id,
-        pointsIconUrl: customPointsIconRef.current,
-        rewardImageUrl: p.image_url || undefined,
-        rewardBackground: p.background_color || undefined,
-        badges: p.badges || undefined,
-        color: p.color || undefined,
-      });
-    });
-    return () => {
-      unlisten.then((fn) => fn()).catch(() => {});
-    };
-  }, [isTwitch, currentStream?.user_id, currentStream?.user_login]);
   const [selectedUser, setSelectedUser] = useState<{
     userId: string;
     username: string;
@@ -1766,27 +1711,19 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
   // Channel points state
   const [channelPoints, setChannelPoints] = useState<number | null>(null);
-  // Mirror of the balance so the claim callback can compute a true earned
-  // amount (balance delta) as a fallback, without depending on render state.
-  const channelPointsBalanceRef = useRef<number | null>(null);
-  const [channelPointsHovered, setChannelPointsHovered] = useState(false);
   // Bonus-chest claim for the actively watched channel. When auto-claim is on
-  // it is collected silently; when off a clickable chest surfaces on the
+  // Rust collects it silently; when off a clickable chest surfaces on the
   // points button. Background automation of channels you are not watching is a
   // separate opt-in plugin, not this.
   const [availableClaim, setAvailableClaim] = useState<{ id: string; channelId: string } | null>(null);
   const [claimingChest, setClaimingChest] = useState(false);
   const claimingChestRef = useRef(false);
-  // Brief "+N" feedback on the points button after a chest is collected,
-  // whether the user clicked it or auto-claim grabbed it.
-  const [claimCelebration, setClaimCelebration] = useState<number | null>(null);
-  const claimCelebrationTimer = useRef<number | null>(null);
   const autoClaimWatching = useAppStore((s) => s.settings.auto_claim_points_watching ?? true);
   const [showChannelPointsMenu, setShowChannelPointsMenu] = useState(false);
+  const pointsButtonRef = useRef<HTMLButtonElement>(null);
   const [isLoadingChannelPoints, setIsLoadingChannelPoints] = useState(false);
   const [customPointsName, setCustomPointsName] = useState<string | null>(null);
   const [customPointsIconUrl, setCustomPointsIconUrl] = useState<string | null>(null);
-  customPointsIconRef.current = customPointsIconUrl;
 
   // Pinned chat state
   interface PinnedMessage {
@@ -1796,6 +1733,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     message_text: string;
     sender_id: string;
     sender_name: string;
+    sender_login?: string;
+    sender_shown_name?: string;
     sender_color: string;
     sender_avatar: string;
     sender_badges: Array<{ set_id: string; version: string }>;
@@ -1805,46 +1744,32 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     started_at: string;
   }
   const [pinnedMessages, setPinnedMessages] = useState<PinnedMessage[]>([]);
+  // The scrollbar's pinned marks find their rows by these ids.
+  const pinnedIds = useMemo(
+    () => new Set(pinnedMessages.map((m) => m.message_id).filter(Boolean)),
+    [pinnedMessages],
+  );
   const [isPinnedExpanded, setIsPinnedExpanded] = useState(
     () => !(useAppStore.getState().settings.chat_design?.pinned_start_collapsed ?? true),
   );
   const seenPinIdRef = useRef<string | null>(null);
 
   // Name -> emote lookup for pinned-message bodies. GQL pins arrive as plain
-  // text with no emote ranges, so emotes are matched per whitespace word.
-  // Insertion order is reverse priority so the chat's precedence holds:
-  // 7TV > BTTV > FFZ > Twitch (later inserts overwrite earlier ones).
-  const pinEmoteMap = useMemo(() => {
-    const map = new Map<string, Emote>();
-    if (!emotes) return map;
-    for (const list of [emotes.twitch, emotes.ffz, emotes.bttv, emotes['7tv']]) {
-      for (const e of list) map.set(e.name, e);
-    }
-    return map;
-  }, [emotes]);
+  // text with no emote ranges, so emotes are matched per whitespace word, with
+  // the chat's precedence: a Twitch emote wins a name, then 7TV > BTTV > FFZ.
+  const pinEmoteMap = useMemo(() => buildEmoteNameMap(emotes), [emotes]);
 
   // Render a plain-text chunk of a pinned message with emote words swapped for
   // inline images. `emoteClass` sets the image size (expanded body vs collapsed bar).
-  const renderPinTextWithEmotes = (text: string, keyPrefix: string, emoteClass: string) => {
-    const tokens = text.split(/(\s+)/);
-    return tokens.map((tok, i) => {
-      const emote = pinEmoteMap.get(tok);
-      if (!emote) return <span key={`${keyPrefix}-${i}`}>{tok}</span>;
-      return (
-        <Tooltip key={`${keyPrefix}-${i}`} content={emote.name}>
-          <img
-            src={emote.url}
-            alt={emote.name}
-            className={`inline-block align-middle object-contain ${emoteClass}`}
-            loading="lazy"
-          />
-        </Tooltip>
-      );
-    });
-  };
+  const renderPinTextWithEmotes = (text: string, keyPrefix: string, emoteClass: string) => (
+    <EmoteText
+      text={text}
+      emoteMap={pinEmoteMap}
+      keyPrefix={keyPrefix}
+      imgClassName={`inline-block align-middle object-contain ${emoteClass}`}
+    />
+  );
 
-  // Cache for channel names (broadcaster ID -> display name) used in emote picker grouping
-  const [channelNameCache, setChannelNameCache] = useState<Map<string, string>>(new Map());
 
   // Dynamic chat privileges based on IRC badge context & room state
   const isSubOnly = roomState?.subsOnly || false;
@@ -1866,47 +1791,20 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // reliably whether YOU are exempt (the subscription list is an imported
   // snapshot that goes stale), and locking out a real subscriber is worse than
   // letting the platform refuse the message, which is now surfaced with its
-  // reason. The mode still shows in the indicator row below.
+  // reason. The mode still shows in the message box.
   const isInputDisabled =
-    !canSendHere || !isConnected || (isTwitch && isSubOnly && !canBypassSubOnly);
-  // Room modes worth telling the viewer about before they type. Twitch renders
-  // none of these today, so this stays provider-only to keep it byte-identical.
-  //
-  // Only modes that actually GATE YOU are listed. Telling a follower the channel
-  // is followers-only describes a restriction they already satisfy, which is
-  // noise rather than information — the point of the row is "here is why your
-  // message may not send", not an inventory of the channel's settings.
-  const providerChannel = channelOverride?.user_login?.toLowerCase();
-  const followsThis = useFollowsStore((s) =>
-    !isTwitch && providerChannel ? s.isFollowed(provider, providerChannel) : false,
-  );
-  const subscribesToThis = useFollowsStore((s) =>
-    !isTwitch && providerChannel ? s.isSubscribed(provider, providerChannel) : false,
-  );
-  const providerRoomModes: string[] = [];
-  if (!isTwitch && roomState && !isModerator) {
-    // Slow and emote-only bind everyone who is not a moderator.
-    if (roomState.slow > 0) providerRoomModes.push(`Slow mode · ${roomState.slow}s`);
-    if (roomState.emoteOnly) providerRoomModes.push('Emote-only');
-    // Kick tells us exactly when we started following, so we can decide whether
-    // the requirement actually binds instead of naming it defensively.
-    const followedMinutes =
-      kickViewer?.following_since != null
-        ? (Date.now() - new Date(kickViewer.following_since).getTime()) / 60000
-        : followsThis
-          ? Number.POSITIVE_INFINITY // following per our own list, age unknown
-          : -1;
-    const meetsFollowRule =
-      followedMinutes >= 0 && followedMinutes >= (roomState.followersOnly ?? 0);
-    if ((roomState.followersOnly ?? -1) >= 0 && !meetsFollowRule) {
-      providerRoomModes.push(
-        roomState.followersOnly > 0
-          ? `Followers-only · ${formatFollowAge(roomState.followersOnly)}`
-          : 'Followers-only',
-      );
-    }
-    if (roomState.subsOnly && !subscribesToThis) providerRoomModes.push('Subscriber-only');
-  }
+    !canSendHere || !isConnected || (isTwitch && isSubOnly && !canBypassSubOnly) || twitchSignInOwed;
+  // The room's chat modes, worded by Rust (services/room_modes.rs) and shipped
+  // on the ROOMSTATE frame, for every platform that reports them. One place
+  // shows them, the viewer's pick: a chip at the field's end that stays while
+  // you type (the default), or the prompt in place of "Send a message".
+  const roomModes =
+    (settings.chat_input?.show_room_modes ?? true) && roomState?.modes && roomState.modes.modes.length > 0
+      ? roomState.modes
+      : null;
+  const roomModesAsPrompt = settings.chat_input?.room_modes_style !== 'chip';
+  const roomModePrompt = roomModesAsPrompt ? (roomModes?.prompt ?? null) : null;
+  const roomModePromptShort = roomModesAsPrompt ? (roomModes?.prompt_short ?? null) : null;
   const chatPlaceholder = isReplayReadOnly
     ? 'Viewing chat replay (read-only)'
     : !canSendHere
@@ -1917,28 +1815,53 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       : provider === 'tiktok'
       ? 'Connect your TikTok account to send'
       : "Read-only — sending isn't available yet"
+    : twitchSignInOwed
+    ? 'Sign in again to chat'
     : isWatchStreakMode
     ? "Add a message (optional)..."
-    : (isSubOnly && !canBypassSubOnly ? "Subscriber-Only Mode" : "Send a message");
+    : roomModePrompt ?? (isSubOnly && !canBypassSubOnly ? "Subscriber-Only Mode" : "Send a message");
+  // The same prompt in a word or two for a narrow composer row, where the
+  // full one is cut mid-word: Chromium draws no ellipsis on a textarea
+  // placeholder. utils/composerNarrow.ts swaps between the two.
+  const chatPlaceholderNarrow = isReplayReadOnly
+    ? 'Read-only'
+    : !canSendHere
+    ? provider === 'kick' || provider === 'youtube' || provider === 'tiktok'
+      ? 'Sign in'
+      : 'Read-only'
+    : twitchSignInOwed
+    ? 'Sign in'
+    : isWatchStreakMode
+    ? 'Message'
+    : roomModePromptShort ?? (isSubOnly && !canBypassSubOnly ? 'Sub-only' : 'Message');
 
   // Optional composer chrome. The placeholder keeps its text whenever it is
   // saying something the user can act on (read-only, connect your account,
-  // sub-only), so hiding it only ever drops the idle "Send a message" prompt.
+  // sub-only, a room mode), so hiding it only ever drops the idle "Send a
+  // message" prompt.
   const chatInputPrefs = settings.chat_input;
   const showEmoteButton = !chatInputPrefs?.hide_emote_button;
   const showPointsBalance = !chatInputPrefs?.hide_points_balance;
+  const pointsBalanceInline = !!chatInputPrefs?.show_points_balance_inline;
+  const walletGains = chatInputPrefs?.wallet_gains === 'chest' ? 'chest' : 'all';
+  // The box's text cheers (Rust's live check): Send becomes the cheer.
+  const composerCheer = useCheerDraft(isTwitch ? (channelOverride?.user_login ?? currentStream?.user_login) : null, messageInput);
   const visiblePlaceholder =
-    chatInputPrefs?.hide_placeholder && !isInputDisabled && !isWatchStreakMode
+    chatInputPrefs?.hide_placeholder && !isInputDisabled && !isWatchStreakMode && !roomModePrompt
       ? ''
       : chatPlaceholder;
+  const visiblePlaceholderNarrow = visiblePlaceholder ? chatPlaceholderNarrow : '';
+  // A render that changes the prompt writes the full one onto the field; put
+  // the short one back while the row is narrow (the row's width observer
+  // covers resizes).
+  useLayoutEffect(() => {
+    const row = inputRef.current?.closest<HTMLElement>('.sn-composer-row');
+    if (row) syncComposerPlaceholder(row);
+  }, [visiblePlaceholder, visiblePlaceholderNarrow]);
   // 36px clears the inset emote button; 12px is the plain input inset once it's
   // hidden. The /remind highlight backdrop reuses this so its text stays
   // pixel-aligned with the real textarea underneath it.
-  const showCommandButton = !chatInputPrefs?.hide_command_button;
-  // Each inset button is 28px wide; the command button sits first, so
-  // everything to its right (emote button, send-as picker, text) shifts.
-  const commandInset = showCommandButton ? 28 : 0;
-  const composerPaddingLeft = `${(showSendAsPicker ? 74 : showEmoteButton ? 36 : 12) + commandInset}px`;
+  const composerPaddingLeft = `${showSendAsPicker ? 74 : showEmoteButton ? 36 : 12}px`;
 
   // Dry run of the /nuke being typed, so you see the blast radius before you
   // commit to it. Deliberately a count in ChatWidget's own state rendered above
@@ -1982,22 +1905,14 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     let cancelled = false;
     const timer = setTimeout(async () => {
       try {
-        const mod = await import('../utils/nukeEngine');
-        const parsed = mod.parseNukeArgs(args);
-        // A half-typed command is the normal case while typing, so an unparseable
-        // one just shows nothing rather than an error.
-        if ('error' in parsed) {
-          if (!cancelled) setNukePreview(null);
-          return;
-        }
-        const { matchedMessages, affected } = mod.previewNuke(channel, parsed);
-        if (!cancelled) {
-          setNukePreview({
-            messages: matchedMessages,
-            users: affected.length,
-            action: mod.describeAction(parsed.action),
-          });
-        }
+        // Rust counts from the same code the command acts with. A half-typed
+        // command is the normal case while typing, so one that does not parse
+        // yet answers null and shows nothing.
+        const preview = await invoke<{ messages: number; users: number; action: string } | null>('nuke_preview', {
+          channel,
+          args,
+        });
+        if (!cancelled) setNukePreview(preview);
       } catch {
         if (!cancelled) setNukePreview(null);
       }
@@ -2158,22 +2073,37 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     setMessageInput(restored);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [panelChannelKey]);
-  const slowSeconds = roomState?.slow ?? 0;
-  const slowRemaining =
-    slowSeconds > 0 && lastSentAt > 0 && !isModerator
-      ? Math.max(0, Math.ceil((lastSentAt + slowSeconds * 1000 - slowNow) / 1000))
+  // Rust's words carry the wait that applies to you (none for a VIP); a frame
+  // without words (a YouTube send cooldown) carries only the raw wait.
+  const slowSeconds = roomState?.modes ? roomState.modes.slow_seconds : (roomState?.slow ?? 0);
+  const slowUntil =
+    slowSeconds > 0 && !isModerator && lastSent && lastSent.channel === panelChannelKey
+      ? lastSent.at + slowSeconds * 1000
       : 0;
+  // Never more than the room's own wait, even if the wall clock jumped back.
+  const slowRemaining =
+    slowUntil > 0 && slowTick.until === slowUntil ? Math.min(slowSeconds, slowTick.left) : 0;
   useEffect(() => {
-    if (slowSeconds <= 0 || lastSentAt <= 0 || isModerator) return;
-    const until = lastSentAt + slowSeconds * 1000;
-    if (Date.now() >= until) return;
-    const id = window.setInterval(() => {
-      const now = Date.now();
-      setSlowNow(now);
-      if (now >= until) window.clearInterval(id);
-    }, 250);
-    return () => window.clearInterval(id);
-  }, [slowSeconds, lastSentAt, isModerator]);
+    if (slowUntil <= 0) return;
+    // Every count reads the clock against this deadline, including the first,
+    // so slow mode turning on long after a send counts straight to 0.
+    let interval = 0;
+    const tick = () => {
+      const left = Math.max(0, Math.ceil((slowUntil - Date.now()) / 1000));
+      // Same second, same object: the composer re-renders once a second.
+      setSlowTick((prev) => (prev.until === slowUntil && prev.left === left ? prev : { until: slowUntil, left }));
+      if (left === 0) window.clearInterval(interval);
+    };
+    const first = window.setTimeout(tick, 0);
+    interval = window.setInterval(tick, 250);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(interval);
+      // A count lives only as long as the timer keeping it current: back on
+      // this channel later, an old count must not show for the same deadline.
+      setSlowTick((prev) => (prev.until === 0 ? prev : { until: 0, left: 0 }));
+    };
+  }, [slowUntil]);
   // Replay still wins: it is a different feed entirely, not a merge of live ones.
   const blendOverride = useMemo(
     () =>
@@ -2293,9 +2223,40 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     }
     setViewerCount(channelState?.viewer_count ?? null);
   }, [isTwitch, currentStream?.viewer_count, channelState?.viewer_count]);
+  // When the broadcast began. For Twitch, Rust's channel state (polled with the
+  // viewer count) is the source, so a MultiNook chat switch, whose synthesized
+  // stream has no start time, keeps the real uptime. The stream's own value is
+  // the fallback until Rust answers, but not under a VOD, clip or offline
+  // chat: there it is the video's date, not a live start.
+  const playingRecording =
+    !channelOverride &&
+    (currentMediaType === 'video' || currentMediaType === 'clip' || currentMediaType === 'offline_chat');
+  const liveStartedAt = pickLiveStartedAt(
+    isTwitch ? channelState?.started_at : null,
+    currentStream?.started_at,
+    playingRecording,
+  );
+  // Known to be offline, never merely "not answered yet": the main view's
+  // offline room, or a docked / MultiChat channel Rust reported offline. The
+  // header then says when it was last live, worded like everywhere else.
+  const knownOffline = channelOverride
+    ? channelOverride.is_live === false
+    : isMultiNookActive
+      ? currentStream?.is_live === false
+      : currentMediaType === 'offline_chat';
+  const offlineChannelId = knownOffline ? (currentStream?.user_id ?? '') : '';
+  const lastLiveAt = useAppStore((s) => {
+    if (!offlineChannelId) return null;
+    if (!channelOverride && s.offlineRoom?.user_id === offlineChannelId) return s.offlineRoom.last_live_at;
+    return s.offlineLastBroadcasts[offlineChannelId] ?? null;
+  });
   // Shared Viewership: while the channel streams with others, the header shows
-  // a Together chip beside the channel's own count.
-  const collab = isTwitch ? (channelState?.collab ?? null) : null;
+  // a Together chip beside the channel's own count. Outside one, a Twitch
+  // Shared Chat session takes the same slot ("Shared chat" with the partners'
+  // faces; Rust reads it with the group), so people know whose chatters these
+  // are.
+  const sharedChatGroup = isTwitch ? (channelState?.shared_chat ?? null) : null;
+  const collab = isTwitch ? (channelState?.collab ?? sharedChatGroup) : null;
 
   // Auto-heal a set whose 7TV rows are not this channel's real dictionary. Rust
   // says so with `seven_tv_ok`: false when the channel document fetch failed and
@@ -2325,7 +2286,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       // Same clock the Compact View chips use, so the two never drift apart.
       // Empty string when there is no start time, which is what the old inline
       // version wrote too.
-      const uptimeString = formatUptimeClock(currentStream?.started_at);
+      const uptimeString = formatUptimeClock(liveStartedAt);
       streamUptimeRef.current = uptimeString;
       if (!headerElement) headerElement = document.getElementById('stream-uptime-display');
       if (headerElement) headerElement.textContent = uptimeString;
@@ -2333,7 +2294,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     updateUptime();
     const intervalId = setInterval(updateUptime, 1000);
     return () => clearInterval(intervalId);
-  }, [currentStream?.started_at]);
+  }, [liveStartedAt]);
 
   // Only the main surface empties the chatter store on a channel switch. The
   // store is one per window, so in MultiChat every pane shares it, and a pane
@@ -2346,14 +2307,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const usersClearedForRef = useRef<string | null>(null);
   useLayoutEffect(() => {
     const login = currentStream?.user_login;
-    if (!isMainSurface || !login || usersClearedForRef.current === login) return;
+    // With chats docked the window shows several chats in turn; emptying the
+    // store on each switch would strip paints and badges off the others'
+    // backlogs. Its LRU cap bounds it instead.
+    if (!isMainSurface || dockHeld || !login || usersClearedForRef.current === login) return;
     usersClearedForRef.current = login;
     clearUsers();
-  }, [isMainSurface, currentStream?.user_login, clearUsers]);
+  }, [isMainSurface, dockHeld, currentStream?.user_login, clearUsers]);
 
   useEffect(() => {
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
-
     // Late-arriving room id: same login, but user_id changed from empty to
     // populated. Re-call connectChat so chatConnectionStore can register the
     // real broadcaster_id (which it needs to populate the Twitch badge cache).
@@ -2395,10 +2357,14 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       userMessageHistory.current.clear();
       sharedRoomsSeenRef.current.clear();
       setIsSharedChat(false);
-      // PHASE 3: Clear Rust user message history when switching channels
-      invoke('clear_user_message_history').catch(err => 
-        Logger.warn('[ChatWidget] Failed to clear Rust user history:', err)
-      );
+      // Clear Rust user message history when switching channels; not while
+      // chats are docked, where a switch between them is not leaving one
+      // (the history's LRU cap bounds it).
+      if (!(isMainSurface && !isMultiNookActive && useChatDockStore.getState().chats.length > 0)) {
+        invoke('clear_user_message_history').catch(err =>
+          Logger.warn('[ChatWidget] Failed to clear Rust user history:', err)
+        );
+      }
       // Reset channel points when switching channels
       setChannelPoints(null);
       setCustomPointsName(null);
@@ -2419,46 +2385,13 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       // Reset to chat view when switching channels
       setActiveView('chat');
       
-      // Hot-swap backend tracking context if inside MultiNook.
-      //
-      // Intentionally skipped in popout mode (`channelOverride` set):
-      //   • drops monitoring: popouts are chat-only, not "actively
-      //     watching", so we don't collect drops for them.
-      //   • EventSub disconnect+reconnect — the EventSub service is single-
-      //     broadcaster today. Letting the popout reconnect it would steal
-      //     the connection from the main app's stream and break hype train /
-      //     raid / pin events there. Multi-broadcaster EventSub is its own
-      //     follow-up; until then, popouts piggyback on whatever EventSub
-      //     the main app has connected, or get nothing if main isn't
-      //     watching this channel.
-      //   • register_active_channel — same reason: this marks the "active"
-      //     viewing context for backend bookkeeping (drops, automation,
-      //     analytics). Popouts aren't an active viewing context.
+      // MultiNook moved the chat to another tile: drop the banner of the train
+      // it was showing. The watch EventSub socket, drops monitoring and the
+      // predictions set follow the grid's focus in Rust, declared by
+      // MultiNookView (set_multi_nook_focus). Popouts (`channelOverride`)
+      // never move them: a chat-only window is not a viewing context.
       if (isMultiNookActive && !channelOverride) {
-        Logger.info(`[MultiNook] Hot-swapping backend tracking for ${currentStream.user_login}...`);
-
-        // Immediate clean up front-end state
         useAppStore.getState().setCurrentHypeTrain(null);
-
-        const channelId = currentStream.user_id;
-        const channelName = currentStream.user_login;
-
-        if (channelId) {
-          // Debounce the backend network shifting (250ms) to prevent UI spamming
-          timeoutId = setTimeout(() => {
-            invoke('start_drops_monitoring', { channelId, channelName }).catch(e => Logger.warn('[Drops] Failed to hot-swap', e));
-            invoke('register_active_channel', { channelId }).catch(() => {});
-
-            invoke('disconnect_eventsub')
-              .then(() => {
-                // Delay reconnection by 150ms to ensure the OS socket closes safely
-                setTimeout(() => {
-                  invoke('connect_eventsub', { broadcasterId: channelId }).catch(e => Logger.warn('[EventSub] Failed to hot-swap', e));
-                }, 150);
-              })
-              .catch(() => {});
-          }, 250);
-        }
       }
     }
     
@@ -2480,7 +2413,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
     return () => {
       if (currentStream?.user_login !== connectedChannelRef.current) connectedChannelRef.current = null;
-      if (timeoutId) clearTimeout(timeoutId);
     };
   }, [currentStream?.user_login, currentStream?.user_id, isMultiNookActive, channelOverride, setChatPaused, isVodReplay, chatMode]);
 
@@ -2553,55 +2485,67 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     setIsLoadingChannelPoints(isTwitch && !!currentStream?.user_login);
   }, [isTwitch, currentStream?.user_login]);
 
-  // Keep the balance mirror current for the claim callback's delta fallback.
-  useEffect(() => {
-    channelPointsBalanceRef.current = channelPoints;
-  }, [channelPoints]);
+  // The wallet's points: present while the first answer is on its way and
+  // while the channel has points on; null where it has them off.
+  const walletPoints: WalletPoints | null = isTwitch && (isLoadingChannelPoints || channelState?.points?.enabled)
+    ? {
+        balance: channelPoints,
+        name: customPointsName,
+        iconUrl: customPointsIconUrl,
+        loading: isLoadingChannelPoints,
+        lastGain: channelState?.points?.last_gain ?? null,
+      }
+    : null;
+  const chestWaiting = !!availableClaim && !autoClaimWatching;
 
-  // Claim the watched channel's bonus chest (manual click or auto). The
-  // command returns the exact credited amount (multipliers included) and the
-  // new balance; the "+N" pop uses the credited amount.
+  // A notification's Rewards button: open the wallet once this chat shows the
+  // channel it named (the click may have just started that stream).
+  const walletChannel = isTwitch ? currentStream?.user_login : undefined;
+  useEffect(() => {
+    const take = () => {
+      if (takeWalletRequest(walletChannel)) setShowChannelPointsMenu(true);
+    };
+    take();
+    return onWalletRequest(take);
+  }, [walletChannel]);
+
+  // A click on the chest button (auto-claim off). Rust claims it and reports
+  // the claim; the `watched-chest-claimed` listener below shows the "+N".
   const claimWatchedChest = useCallback(async (claimId: string, channelId: string) => {
     if (!isTwitch) return; // channel-points claim is Twitch-only
     if (claimingChestRef.current) return;
     claimingChestRef.current = true;
     setClaimingChest(true);
     try {
-      const result = await invoke<{ new_balance: number; points_earned: number }>('claim_channel_points', {
+      await invoke('claim_channel_points', {
         channelId,
         channelName: currentStream?.user_login ?? '',
         claimId,
       });
-      setAvailableClaim(null);
-      // Show the true credited amount (multipliers included): prefer the claim
-      // response's exact figure, fall back to the balance delta, never a
-      // fabricated preset. This matches the points-claimed notification, which
-      // reflects the same Twitch-credited amount.
-      const prevBalance = channelPointsBalanceRef.current;
-      const earned = result.points_earned > 0
-        ? result.points_earned
-        : (prevBalance !== null && result.new_balance > prevBalance ? result.new_balance - prevBalance : 0);
-      if (result.new_balance > 0) setChannelPoints(result.new_balance);
-      if (earned > 0) {
-        setClaimCelebration(earned);
-        if (claimCelebrationTimer.current) window.clearTimeout(claimCelebrationTimer.current);
-        claimCelebrationTimer.current = window.setTimeout(() => setClaimCelebration(null), 1800);
-        // Keep the profile stat the old backend auto-claim used to feed; the
-        // "+N" pop above is the only on-screen feedback (no toast).
-        if (currentUser?.user_id) {
-          incrementStat(currentUser.user_id, 'channel_points_collected', earned).catch(err => {
-            Logger.warn('[ChatWidget] Failed to track channel points stat:', err);
-          });
-        }
-      }
-      fetchChannelPoints();
     } catch (err) {
       Logger.warn('[ChatWidget] bonus chest claim failed:', err);
     } finally {
       claimingChestRef.current = false;
       setClaimingChest(false);
     }
-  }, [currentStream?.user_login, currentUser?.user_id, fetchChannelPoints]);
+  }, [isTwitch, currentStream?.user_login]);
+
+  // Every chest Rust collects on this channel, automatic or clicked: clear the
+  // chest. The new balance and the "+N" arrive through channel_state.
+  useEffect(() => {
+    const channelId = currentStream?.user_id;
+    if (!isTwitch || !channelId) return;
+    const unlisten = listen<{ channel_id: string; points_earned: number; new_balance: number }>(
+      'watched-chest-claimed',
+      (event) => {
+        if (event.payload.channel_id !== channelId) return;
+        setAvailableClaim(null);
+      },
+    );
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [isTwitch, currentStream?.user_id]);
 
   // Instant chest detection: PubSub pushes claim-available the moment Twitch
   // offers the bonus. Detection only — sets availableClaim; the auto-claim
@@ -2622,17 +2566,10 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     };
   }, [currentStream?.user_id]);
 
-  // (The minute poll for a mid-stream chest now runs in Rust: channel_state
-  // polls points every 60 s for every watched channel and emits on change.)
-
-  // Single auto-collect point: every detection path only sets availableClaim;
-  // when auto-claim is on, this grabs it. Keeping the claim in one place means
-  // detection paths can't double-fire and don't each need claim logic.
-  useEffect(() => {
-    if (availableClaim && autoClaimWatching && !claimingChestRef.current) {
-      claimWatchedChest(availableClaim.id, availableClaim.channelId);
-    }
-  }, [availableClaim, autoClaimWatching, claimWatchedChest]);
+  // (The minute poll for a mid-stream chest runs in Rust: channel_state polls
+  // points every 60 s for every watched channel and emits on change. With
+  // auto-claim on, Rust collects the chest itself (services/watched_chest.rs),
+  // whichever chat is on screen; detection here only drives the chest button.)
 
   // Fetch resub notification when entering a new channel
   useEffect(() => {
@@ -2701,16 +2638,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     setPinnedMessages(messages);
     usePinStore.getState().setPinnedIds(messages.map((m) => m.message_id).filter(Boolean));
   }, [isTwitch, channelState?.pinned, channelState?.pinned_at]);
-  // Real-time refresh: any pin/unpin action bumps refreshNonce, so the pin shows
-  // up immediately instead of after the 30s poll. A short second pass covers
-  // Twitch's brief propagation lag (the Helix 204 can land just before GQL
-  // GetPinnedChat reflects it). Skips the initial mount (nonce 0).
+  // Any pin/unpin action bumps refreshNonce for an immediate read. Rust's
+  // pin and unpin commands keep re-reading on their own until Twitch's pinned
+  // chat reflects the change (it lags the Helix answer, longer when a pin
+  // replaces another), so no timed second pass is needed here. Skips the
+  // initial mount (nonce 0).
   const pinRefreshNonce = usePinStore((s) => s.refreshNonce);
   useEffect(() => {
     if (pinRefreshNonce === 0) return;
     fetchPinnedMessages();
-    const t = setTimeout(() => fetchPinnedMessages(), 1200);
-    return () => clearTimeout(t);
   }, [pinRefreshNonce, fetchPinnedMessages]);
   // Non-Twitch (e.g. Kick) pins are pushed over the chat bus into the channel
   // slice, not fetched — feed that into the same pinned banner.
@@ -2719,36 +2655,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     const pin = providerMeta.pinnedMessage;
     setPinnedMessages(pin ? [pin] : []);
   }, [isTwitch, providerMeta.pinnedMessage]);
-
-  // Listen for channel points updates from backend events. Twitch-only: points
-  // do not exist on other platforms, and without this the handlers compared a
-  // Twitch channel id against a Kick slug / YouTube UC id on every event.
-  useEffect(() => {
-    if (!isTwitch || !currentStream?.user_id) return;
-    
-    const unlistenSpent = listen<{ channel_id?: string | null; points: number; balance: number }>('channel-points-spent', (event) => {
-      Logger.debug('[ChatWidget] Points spent event:', event.payload, 'currentChannel:', currentStream.user_id);
-      // Update if channel matches OR if no channel_id in event (prediction bets sometimes don't include it)
-      if (!event.payload.channel_id || event.payload.channel_id === currentStream.user_id) {
-        Logger.debug('[ChatWidget] Updating channel points to:', event.payload.balance);
-        setChannelPoints(event.payload.balance);
-      }
-    });
-
-    const unlistenEarned = listen<{ channel_id?: string | null; points: number; balance: number }>('channel-points-earned', (event) => {
-      Logger.debug('[ChatWidget] Points earned event:', event.payload, 'currentChannel:', currentStream.user_id);
-      // Update if channel matches OR if no channel_id in event
-      if (!event.payload.channel_id || event.payload.channel_id === currentStream.user_id) {
-        Logger.debug('[ChatWidget] Updating channel points to:', event.payload.balance);
-        setChannelPoints(event.payload.balance);
-      }
-    });
-
-    return () => {
-      unlistenSpent.then(fn => fn());
-      unlistenEarned.then(fn => fn());
-    };
-  }, [currentStream?.user_id]);
 
   // Load drops data when stream changes to check if game has active drops
   useEffect(() => {
@@ -2866,6 +2772,40 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     }
   };
 
+  // The Tools button's sections (chat/ChannelToolsMenu). Polls are Twitch's
+  // broadcaster-only create endpoints; drops need the drops plugin, since core
+  // earns natively on the watched channel with no automation control; the
+  // moderation rows are all Helix calls, so Twitch only.
+  const toolSections = channelToolSections({
+    isTwitch,
+    isModerator: !!isModerator,
+    isBroadcaster: !!isBroadcaster,
+    isVodReplay: !!isVodReplay,
+    hasDropsCampaign: !!dropsCampaign && !!externalDropsProvider,
+  });
+  // The stream manager, read from Rust when a chat you manage opens (one read,
+  // then Rust's pushes), so the Tools menu opens with its rows already there.
+  const [managerPanel, setManagerPanel] = useState<ManagerPanelKind | null>(null);
+  const [managerChannel, setManagerChannel] = useState(currentStream?.user_id);
+  if (managerChannel !== currentStream?.user_id) {
+    setManagerChannel(currentStream?.user_id);
+    setManagerPanel(null);
+  }
+  const streamManager = useStreamManager(
+    toolSections.polls ? currentStream?.user_id : null,
+    currentStream?.user_login ?? '',
+    true,
+  );
+  const dropsTool: DropsTool | null =
+    toolSections.drops && dropsCampaign
+      ? {
+          gameName: dropsCampaign.game_name,
+          collecting: isDropProgressing,
+          busy: isLoadingDrops,
+          onToggle: () => void handleToggleAutomation(),
+        }
+      : null;
+
   const getMessageId = useCallback((message: string | BackendChatMessage): string | null => {
     if (typeof message !== 'string') {
       return message.id;
@@ -2938,6 +2878,18 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     return () => window.removeEventListener('streamnook-open-user-card', handler);
   }, []);
 
+  // /redeem opens this channel's rewards, the same menu as the points button.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const channel = (e as CustomEvent<{ channel?: string }>).detail?.channel?.toLowerCase();
+      if (!isTwitch || !currentStream?.user_login) return;
+      if (channel && channel !== currentStream.user_login.toLowerCase()) return;
+      setShowChannelPointsMenu(true);
+    };
+    window.addEventListener('streamnook-open-channel-points', handler);
+    return () => window.removeEventListener('streamnook-open-channel-points', handler);
+  }, [isTwitch, currentStream?.user_login]);
+
   // Maintain the "N new since paused" badge off the monotonic live-message
   // counter. Anchor the baseline exactly on the not-paused -> paused edge (so a
   // brief pause flicker can't corrupt it), zero it while live, and recompute the
@@ -2950,13 +2902,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     setChatPaused(false, { scrollToBottom: true, force: true });
   };
 
-  const handleBadgeClick = useCallback(async (badgeKey: string, badgeInfo: any) => {
-    const [setId] = badgeKey.split('/');
-    // In a popout the badges overlay lives in main, so route there (opening main if
-    // Go Live closed it) rather than flipping the popout's own overlay-less store,
-    // which renders nothing. In the main window this opens the overlay directly.
-    const { openBadgeDetailInMain } = await import('../utils/openBadgesInMain');
-    openBadgeDetailInMain(badgeInfo, setId);
+  // A Twitch badge click opens its badge page in the Badges overlay with the
+  // version id (the page's metadata, earn guide and window lookups key on it).
+  // Kick / YouTube / TikTok badges have no such page and open the small card
+  // in this window instead.
+  const handleBadgeClick = useCallback((badgeKey: string, badgeInfo: TwitchRowBadgeInfo) => {
+    openBadgeInfo(twitchRowBadgeRef(badgeKey, badgeInfo));
   }, []);
 
   // Helper function to scroll to a specific message by ID
@@ -2990,8 +2941,13 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     // Use container-aware scrolling instead of scrollIntoView
     // scrollIntoView can cause the entire document to scroll in WebViews,
     // which makes the title bar disappear in Tauri apps with custom decorations
+    // Scoped to this widget: a MultiChat split can show the same channel in two
+    // panes, and a document-wide lookup would scroll whichever came first.
+    // Escaped because provider message ids are not guaranteed selector-safe.
     requestAnimationFrame(() => {
-      const element = document.querySelector(`[data-message-id="${messageId}"]`) as HTMLElement | null;
+      const element = (chatContainerEl ?? document).querySelector(
+        `[data-message-id="${CSS.escape(messageId)}"]`,
+      ) as HTMLElement | null;
       if (element) {
         // Find the scrollable chat container (ChatMessageList's container)
         const container = element.closest('.overflow-y-auto') as HTMLElement | null;
@@ -3054,7 +3010,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     }
 
     return true;
-  }, [getMessageId, setChatPaused]);
+  }, [getMessageId, setChatPaused, chatContainerEl]);
 
   const handleReplyClick = useCallback((parentMsgId: string) => {
     Logger.debug('[ChatWidget] handleReplyClick called for parentMsgId:', parentMsgId);
@@ -3141,12 +3097,19 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       }
       return { items, idx, t: items[idx] };
     };
-    const fmtDur = (s: number) => (s < 60 ? `${s}s` : s < 3600 ? `${s / 60}m` : `${s / 3600}h`);
-    const act = async (
-      run: (t: ModMsg, broadcasterId: string) => Promise<unknown>,
-      label: (t: ModMsg) => string,
-      advance: boolean,
-    ) => {
+    // Rust `moderate_chatter` picks the platform API for `provider` and words
+    // the toast with what the platform really applied.
+    const request = (t: ModMsg, b: string, action: ModAction): ModRequest => ({
+      provider,
+      broadcasterId: b,
+      channel: youtubeSlug,
+      targetUserId: t.userId,
+      targetName: t.displayName,
+      action,
+    });
+    // Through `moderateWithToast`, so a key ban or timeout gets the same words
+    // and Undo as every other surface.
+    const act = async (action: (t: ModMsg) => ModAction, advance: boolean) => {
       const f = focused();
       if (!f) return;
       const broadcasterId = broadcasterIdRef.current;
@@ -3154,17 +3117,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         useAppStore.getState().addToast('No channel to moderate', 'warning');
         return;
       }
-      try {
-        await run(f.t, broadcasterId);
-        useAppStore.getState().addToast(label(f.t), 'success');
-        if (advance) {
-          const older = f.items[f.idx - 1];
-          if (older) focusAt(f.items, f.idx - 1);
-          else setModFocusId(null);
-        }
-      } catch (err) {
-        Logger.error('[Mod] keyboard action failed:', err);
-        useAppStore.getState().addToast('Moderation action failed', 'error');
+      const outcome = await moderateWithToast(request(f.t, broadcasterId, action(f.t)));
+      if (outcome && advance) {
+        const older = f.items[f.idx - 1];
+        if (older) focusAt(f.items, f.idx - 1);
+        else setModFocusId(null);
       }
     };
 
@@ -3181,60 +3138,10 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
           detail: { userId: f.t.userId, username: f.t.username, displayName: f.t.displayName },
         }));
       },
-      deleteFocused: () => void act(
-        (t, b) =>
-          isTwitch
-            ? invoke('delete_chat_message', { broadcasterId: b, messageId: t.deleteId })
-            : provider === 'youtube'
-            ? invoke('youtube_delete_message', { channel: youtubeSlug, messageId: t.deleteId })
-            : invoke('kick_delete_message', { messageId: t.deleteId }),
-        (t) => `Deleted message from ${t.displayName}`,
-        true,
-      ),
-      timeoutFocused: (seconds: number) => void act(
-        (t, b) =>
-          isTwitch
-            ? invoke('ban_user', { broadcasterId: b, targetUserId: t.userId, duration: seconds, reason: null })
-            : provider === 'youtube'
-            ? invoke('youtube_ban_user', { channel: youtubeSlug, targetChannelId: t.userId, durationSeconds: seconds })
-            : invoke('kick_ban_user', {
-                broadcasterUserId: Number(b),
-                targetUserId: Number(t.userId),
-                durationMinutes: kickTimeoutMinutes(seconds),
-                reason: null,
-              }),
-        // Kick rounds to whole minutes, so name the duration it really applies.
-        (t) =>
-          `Timed out ${t.displayName} (${fmtDur(
-            provider === 'kick' ? kickAppliedSeconds(seconds) : seconds,
-          )})`,
-        true,
-      ),
-      banFocused: () => void act(
-        (t, b) =>
-          isTwitch
-            ? invoke('ban_user', { broadcasterId: b, targetUserId: t.userId, duration: null, reason: null })
-            : provider === 'youtube'
-            ? invoke('youtube_ban_user', { channel: youtubeSlug, targetChannelId: t.userId, durationSeconds: null })
-            : invoke('kick_ban_user', {
-                broadcasterUserId: Number(b),
-                targetUserId: Number(t.userId),
-                durationMinutes: null,
-                reason: null,
-              }),
-        (t) => `Banned ${t.displayName}`,
-        true,
-      ),
-      unbanFocused: () => void act(
-        (t, b) =>
-          isTwitch
-            ? invoke('unban_user', { broadcasterId: b, targetUserId: t.userId })
-            : provider === 'youtube'
-            ? invoke('youtube_unban_user', { channel: youtubeSlug, targetChannelId: t.userId })
-            : invoke('kick_unban_user', { broadcasterUserId: Number(b), targetUserId: Number(t.userId) }),
-        (t) => `Unbanned ${t.displayName}`,
-        false,
-      ),
+      deleteFocused: () => void act((t) => ({ kind: 'delete', messageId: t.deleteId }), true),
+      timeoutFocused: (seconds: number) => void act(() => ({ kind: 'timeout', seconds }), true),
+      banFocused: () => void act(() => ({ kind: 'ban' }), true),
+      unbanFocused: () => void act(() => ({ kind: 'unban' }), false),
     };
     registerChatModController(controller);
     return () => {
@@ -3281,40 +3188,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       // Note: We use loading="lazy" on emote picker images instead of preloading
       // This prevents WebView connection throttling issues with 900+ images
 
-      // BACKGROUND: Fetch channel names for Twitch emote owners (for grouped display)
-      // This can happen after emotes are already displayed
-      if (emoteSet?.twitch) {
-        const ownerIds = new Set<string>();
-        for (const emote of emoteSet.twitch) {
-          if (emote.owner_id && emote.emote_type === 'subscriptions') {
-            ownerIds.add(emote.owner_id);
-          }
-        }
-        
-        // Fetch display names for all unique owner IDs (in parallel, non-blocking)
-        if (ownerIds.size > 0) {
-          const newCache = new Map(channelNameCache);
-          const idsToFetch = Array.from(ownerIds).filter(id => !newCache.has(id));
-          
-          if (idsToFetch.length > 0) {
-            Logger.debug(`[ChatWidget] Fetching ${idsToFetch.length} channel names for emote groups`);
-            Promise.allSettled(
-              idsToFetch.map(async (id) => {
-                const user = await invoke<{ display_name: string }>('get_user_by_id', { userId: id });
-                return { id, name: user.display_name };
-              })
-            ).then(results => {
-              for (const result of results) {
-                if (result.status === 'fulfilled') {
-                  newCache.set(result.value.id, result.value.name);
-                }
-              }
-              setChannelNameCache(new Map(newCache));
-            });
-          }
-        }
-      }
-
       // BACKGROUND: Load favorite emotes for the picker (non-blocking). Completion
       // ranking reads favorites from Rust.
       loadFavoriteEmotes().catch(err => Logger.warn('[ChatWidget] Failed to load favorites:', err));
@@ -3325,19 +3198,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     }
   };
 
-  // Per-channel last-sent cache for the bypass-duplicate feature. Keyed by
-  // currentStream user_id so switching channels resets the tracking.
+  // Per-channel last-sent text (as sent, suffix included) for the
+  // bypass-duplicate feature, keyed by the chat the line went to.
   const lastSentRef = useRef<Map<string, string>>(new Map());
-  // Invisible Plane-14 tag character that Twitch's duplicate-message detector
-  // ignores but the IRC pipeline accepts. Used to bypass the rejection when
-  // the user opts in. Single char, takes no visual space in chat.
-  const DUPLICATE_BYPASS_SUFFIX = ' \u{E0000}';
 
   // Slash commands on a Kick/YouTube channel. The Twitch handler is Helix, GQL
   // and raw IRC end to end, so nothing here may fall through to it. Moderation
   // verbs map onto the provider's own commands; everything else says so out
   // loud rather than silently doing nothing (or worse, hitting Twitch).
-  const handleProviderSlashCommand = async (raw: string) => {
+  const handleProviderSlashCommand = async (raw: string, depth = 0) => {
     const notice = (text: string) => {
       if (!providerKey) return;
       injectSystemMessage(providerKey, text, undefined, systemSourceFor(providerKey));
@@ -3347,30 +3216,18 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     const cmd = (parts[0] || '').toLowerCase();
     const args = parts.slice(1);
 
-    // User-defined text macros are platform-neutral, so they keep working here
-    // exactly as they do on Twitch (same lookup and expansion as commandHandler).
-    const userCommand = findUserCommand(
-      cmd,
-      useAppStore.getState().settings.chat_commands?.user_commands,
-      true,
-    );
-    if (userCommand) {
-      const ctx = buildTemplateContext(
-        args,
-        channelOverride?.user_id || '',
-        channelOverride?.user_login || '',
-      );
-      const expansion = expandUserCommand(userCommand.expansion, ctx);
-      if (expansion.missing_args.length > 0) {
-        notice(
-          `/${cmd} expects argument${expansion.missing_args.length > 1 ? 's' : ''} ${expansion.missing_args
-            .map((i) => `{${i}}`)
-            .join(', ')}`,
-        );
+    // Your own commands and the commands that need no Twitch API (text tools,
+    // timers, settings) run in Rust for any platform's chat, the same as on
+    // Twitch. Rust answers "not mine" for the rest.
+    if (providerKey) {
+      const outcome = await runSlashCommand(raw, '', providerKey, depth).catch((err) => {
+        Logger.error('[Provider] run_slash_command failed:', err);
+        return null;
+      });
+      if (outcome?.handled) {
+        await applySlashOutcome(outcome, providerKey, '', (msg) => void sendMessage(msg));
         return;
       }
-      if (expansion.text) await sendMessage(expansion.text);
-      return;
     }
 
     // Resolve a target by name out of the visible buffer: provider chat has no
@@ -3402,6 +3259,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     const runModeration = async (
       verb: 'ban' | 'timeout' | 'unban',
       seconds: number | null,
+      typed: string | null = null,
     ) => {
       if (!isModerator) {
         notice(`You don't have moderator permissions in this channel.`);
@@ -3414,53 +3272,47 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         );
         return;
       }
+      // Rust `moderate_chatter` routes Kick and YouTube and words the result
+      // with what the platform applied (Kick's whole minutes, YouTube's 5m).
       try {
-        if (verb === 'unban') {
-          await (isYouTube
-            ? invoke('youtube_unban_user', { channel: youtubeSlug, targetChannelId: target.user_id })
-            : invoke('kick_unban_user', {
-                broadcasterUserId: Number(broadcasterId),
-                targetUserId: Number(target.user_id),
-              }));
-          useAppStore.getState().addToast(`Unbanned ${target.display_name || target.username}`, 'success');
-          return;
-        }
-        const reason = args.slice(verb === 'timeout' ? 2 : 1).join(' ') || null;
-        await (isYouTube
-          ? invoke('youtube_ban_user', {
-              channel: youtubeSlug,
-              targetChannelId: target.user_id,
-              durationSeconds: seconds,
-            })
-          : invoke('kick_ban_user', {
-              broadcasterUserId: Number(broadcasterId),
-              targetUserId: Number(target.user_id),
-              durationMinutes: seconds === null ? null : kickTimeoutMinutes(seconds),
-              reason,
-            }));
-        useAppStore
-          .getState()
-          .addToast(
-            verb === 'ban'
-              ? `Banned ${target.display_name || target.username}`
-              : `Timed out ${target.display_name || target.username}`,
-            'success',
-          );
+        const outcome = await moderateChatter({
+          provider: isYouTube ? 'youtube' : 'kick',
+          broadcasterId,
+          channel: youtubeSlug,
+          targetUserId: target.user_id,
+          targetName: target.display_name || target.username,
+          action:
+            verb === 'unban'
+              ? { kind: 'unban' }
+              : seconds === null
+                ? { kind: 'ban' }
+                : { kind: 'timeout', seconds },
+          reason: verb === 'unban' || typed !== null ? null : args.slice(verb === 'timeout' ? 2 : 1).join(' ') || null,
+          typed,
+        });
+        useAppStore.getState().addToast(outcome.message, 'success');
       } catch (err) {
         Logger.error('[Provider] moderation command failed:', err);
-        useAppStore.getState().addToast('Moderation action failed', 'error');
+        useAppStore.getState().addToast(String(err), 'error');
       }
     };
 
-    switch (cmd) {
+    // `/b`, `/u` and `/p` mean the same here as on Twitch.
+    const canonical = resolveCommandAlias(cmd);
+    switch (canonical) {
       case 'ban':
         await runModeration('ban', null);
         return;
-      case 'timeout': {
-        const secs = Number(args[1]);
-        await runModeration('timeout', Number.isFinite(secs) && secs > 0 ? secs : 600);
+      case 'timeout':
+        // Rust reads the length and reason as every app does: a leading length,
+        // else Twitch's ten minutes with every word as the reason.
+        await runModeration('timeout', 600, args.slice(1).join(' '));
         return;
-      }
+      // Clears their messages with the shortest timeout the platform has
+      // (a minute on Kick).
+      case 'purge':
+        await runModeration('timeout', 1);
+        return;
       case 'unban':
       case 'untimeout':
         await runModeration('unban', null);
@@ -3471,7 +3323,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   };
 
   const handleSendMessage = async (opts?: { keepInput?: boolean }) => {
-    setLastSentAt(Date.now());
+    // A chat line that went out to this room starts its slow-mode wait. A
+    // command, a failed send or a reply sent to another platform's room
+    // leaves the wait alone.
+    const sendStartedAt = Date.now();
+    const sendChannel = panelChannelKey;
+    const noteChatLineSent = () => setLastSent({ channel: sendChannel, at: sendStartedAt });
     // Twitch sends need the Twitch account; a provider send needs only that
     // platform's own connection, so a Kick/YouTube user with no Twitch login
     // can still talk.
@@ -3481,24 +3338,22 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       const keepInput = !!opts?.keepInput;
       let messageToSend = messageInput;
 
-      // Bypass duplicate — if this message is identical to the last one we
-      // sent on this channel, append the invisible suffix so Twitch accepts
-      // the second send. Skipped for slash commands (which Twitch doesn't
-      // dedupe) and resub/streak modes (different code path entirely).
-      const channelKey = currentStream?.user_id || '_';
+      // Bypass duplicate: a repeat of the last line sent here goes out varied
+      // or plain, whichever differs from that line (varyRepeat). Skipped for
+      // slash commands (which Twitch doesn't dedupe) and resub/streak modes
+      // (different code path entirely).
+      const channelKey = sendChannel || '_';
       if (
         isTwitch &&
         inputSettings?.bypass_duplicate &&
         !messageToSend.startsWith('/') &&
         !isResubMode &&
-        !isWatchStreakMode &&
-        lastSentRef.current.get(channelKey) === messageToSend
+        !isWatchStreakMode
       ) {
-        messageToSend = messageToSend + DUPLICATE_BYPASS_SUFFIX;
+        messageToSend = varyRepeat(messageToSend, lastSentRef.current.get(channelKey));
       }
-      // Record what we sent (the original, pre-suffix form) so a third send
-      // of the same text also triggers the bypass.
-      lastSentRef.current.set(channelKey, messageInput);
+      // What actually went out, so the next repeat flips the other way.
+      lastSentRef.current.set(channelKey, messageToSend.trimEnd());
 
       // Push the sent text onto the arrow-key recall history. De-dupe against
       // the immediately-previous entry and cap the buffer. Reset the navigation
@@ -3577,43 +3432,28 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       }
 
       try {
-        // Plain-text user commands (require_slash: false). Run BEFORE the
-        // slash-command intercept so a non-slash trigger expansion can still
-        // start with "/" — the expansion result is re-evaluated as a new
-        // message body, including being able to fire a built-in slash command.
+        // Plain-text user commands (require_slash: false) run in Rust like the
+        // slash ones; an expansion that starts with "/" runs as that command.
+        // Only asked when one is saved, so ordinary chat makes no extra call.
         if (!messageToSend.startsWith('/')) {
-          const plainMatch = matchPlainTextUserCommand(
-            messageToSend,
-            useAppStore.getState().settings.chat_commands?.user_commands,
-          );
-          if (plainMatch) {
-            const ctx = buildTemplateContext(
-              plainMatch.args,
-              currentStream?.user_id || '',
-              currentStream?.user_login || '',
-            );
-            const expansion = expandUserCommand(plainMatch.command.expansion, ctx);
-            if (expansion.missing_args.length > 0) {
-              useAppStore.getState().addToast(
-                `Trigger "${plainMatch.command.trigger}" expects argument${expansion.missing_args.length > 1 ? 's' : ''} ${expansion.missing_args.map((i) => `{${i}}`).join(', ')}`,
-                'error',
-              );
+          const own = useAppStore.getState().settings.chat_commands?.user_commands;
+          const room = isTwitch ? currentStream?.user_login || '' : providerKey ?? '';
+          if (room && own?.some((c) => c.enabled && c.require_slash === false)) {
+            const user = currentUser;
+            const send =
+              isTwitch && user
+                ? (msg: string) =>
+                    void sendMessage(msg, {
+                      username: user.login || user.username,
+                      displayName: user.display_name || user.username,
+                      userId: user.user_id,
+                      color: undefined,
+                      badges: '',
+                    })
+                : (msg: string) => void sendMessage(msg);
+            if (await handleSlashCommand(messageToSend, isTwitch ? currentStream?.user_id || '' : '', room, send)) {
               return;
             }
-            if (!expansion.text) {
-              useAppStore.getState().addToast(`Trigger "${plainMatch.command.trigger}" expanded to an empty message`, 'error');
-              return;
-            }
-            // Re-enter with the expanded text. Replace input and recurse via
-            // setMessageInput so the existing flow handles the slash-command
-            // detection, optimistic send, etc.
-            setMessageInput(expansion.text);
-            // Defer one tick so the input state lands before the next send.
-            setTimeout(() => {
-              const form = inputRef.current?.form;
-              form?.requestSubmit();
-            }, 0);
-            return;
           }
         }
 
@@ -3644,7 +3484,22 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             return;
           }
 
-          // Unhandled slash commands (like /mods, /vips, /me) get sent directly
+          // /me is a chat line: it takes the normal send, whose own row Rust
+          // builds as an action. IRC never echoes your own line, so without
+          // that row it never showed.
+          if (messageToSend.startsWith('/me ') && currentUser) {
+            await sendMessage(messageToSend, {
+              username: currentUser.login || currentUser.username,
+              displayName: currentUser.display_name || currentUser.username,
+              userId: currentUser.user_id,
+              color: undefined,
+              badges: ''
+            });
+            noteChatLineSent();
+            return;
+          }
+
+          // Other unhandled slash commands (like /mods, /vips) get sent directly
           // through IRC without optimistic rendering. Twitch IRC responds with
           // a NOTICE message which the frontend already handles inline.
           await invoke('send_chat_message', {
@@ -3686,6 +3541,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             color: undefined,
             badges: ''
           } : undefined, replyParentMsgId, senderAccount);
+          noteChatLineSent();
         }
 
         // Stats and emote tallies are keyed by the Twitch user id, so they only
@@ -3715,8 +3571,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
-    // Emote list navigation. Skipped mid-composition so an IME keeps its keys.
-    if (emoteList && !e.nativeEvent.isComposing) {
+    // An IME composing owns every key until it commits: Enter confirms the
+    // candidate (it must not send or pick a suggestion), arrows walk candidates.
+    if (isImeComposing(e)) return;
+    // Emote list navigation.
+    if (emoteList) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
@@ -3946,8 +3805,14 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     // Temporarily set overflow hidden to get accurate scrollHeight
     textarea.style.overflow = 'hidden';
     textarea.style.height = 'auto'; // Reset to calculate new height
+    // An empty field is one line tall whatever its placeholder: a placeholder
+    // wrapped by a narrow column counts toward scrollHeight and grew the field
+    // a line per word.
+    const placeholder = textarea.value ? '' : textarea.placeholder;
+    if (placeholder) textarea.placeholder = '';
     const maxHeight = 120; // ~5 lines max
     const newHeight = Math.min(textarea.scrollHeight, maxHeight);
+    if (placeholder) textarea.placeholder = placeholder;
     textarea.style.height = `${newHeight}px`;
     // Enable scrolling only if we hit max height
     textarea.style.overflow = newHeight >= maxHeight ? 'auto' : 'hidden';
@@ -4034,7 +3899,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         const userCommands = buildUserCommandDefinitions(settings.chat_commands?.user_commands);
         const allCommands = [...availableCommands, ...userCommands];
 
-        const matches = allCommands.filter(cmd => cmd.name.toLowerCase().startsWith(query));
+        // The command the typed name runs comes first, so Enter picks it.
+        const matches = rankCommandMatches(allCommands, query);
         setMatchingCommands(matches);
         flowReplaceFromRef.current = null; // completing a command name, not a /remind arg
         setShowCommandAutocomplete(matches.length > 0);
@@ -4235,10 +4101,38 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     }, 0);
   }, [messageInput, mentionStartPosition, mentionQuery, provider]);
 
+  // At the cursor, spaced from its neighbours. The textarea keeps its caret
+  // while focus is elsewhere (the emote menu, or the popped-out one in another
+  // window), so this lands where the viewer left off.
   const insertEmote = (emoteName: string) => {
-    setMessageInput(prev => prev + (prev ? ' ' : '') + emoteName + ' ');
-    inputRef.current?.focus({ preventScroll: true });
+    const ta = inputRef.current;
+    const value = ta?.value ?? messageInput;
+    const { text, caret } = insertAtCaret(
+      value,
+      ta?.selectionStart ?? value.length,
+      ta?.selectionEnd ?? value.length,
+      emoteName,
+    );
+    // Committed before the caret is placed. A pick from the popped-out menu
+    // arrives as a Tauri event, not a React one, so a plain state update renders
+    // in a later task, and that commit would put the caret back at the end
+    // after any timer had moved it.
+    flushSync(() => setMessageInput(text));
+    const el = inputRef.current;
+    el?.focus({ preventScroll: true });
+    el?.setSelectionRange(caret, caret);
   };
+  // The emote menu popped out into its own window types into this chat box.
+  const paletteChannel = useMemo<PaletteChannel | null>(() => {
+    if (!currentStream?.user_login || (provider !== 'twitch' && provider !== 'kick' && provider !== 'youtube')) return null;
+    return {
+      login: currentStream.user_login,
+      id: currentStream.user_id || null,
+      name: currentStream.user_name || null,
+      provider,
+    };
+  }, [currentStream, provider]);
+  const popOutEmotes = useEmotePalette(paletteChannel, insertEmote);
 
   /**
    * Put matches[index] in place of the word being completed and remember the
@@ -4338,7 +4232,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
     const lookup = { value, cursor, steps: 0 };
     tabLookupRef.current = lookup;
-    const chatInput = settings.chat_input;
     const request = atGap
       ? matchEmotes(emoteMatchTarget, '', 'search', { limit: 50 })
       : matchEmotes(emoteMatchTarget, word, 'cycle');
@@ -4348,18 +4241,13 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       // Applied only to the text it was asked about.
       const ta = inputRef.current;
       if (!ta || ta.value !== value || ta.selectionStart !== cursor) return;
-      const includeChatters = !atGap && (chatInput?.emote_tab_complete_include_chatters ?? true);
-      const matches = withChatterCandidates(
-        rowsToTabCandidates(res.rows),
-        word,
-        includeChatters ? getMatchingUsers(word.replace(/^@/, '')) : [],
-        chatInput?.emote_tab_complete_match_mode ?? 'starts_with',
-      );
+      // A cycle answer carries the room's recent chatters after the emotes.
+      const matches = rowsToTabCandidates(res.rows);
       if (matches.length === 0) return;
       applyTabMatch(matches, wrapIndex(0, lookup.steps, matches.length), ws, word, word.length, value);
     });
     return true;
-  }, [emoteTabState, emoteMatchTarget, applyTabMatch, getMatchingUsers, settings.chat_input]);
+  }, [emoteTabState, emoteMatchTarget, applyTabMatch]);
 
   /**
    * Swap what Tab opens from the popover itself, and show the other view on the
@@ -4539,7 +4427,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
   if (!currentStream) {
     return (
-      <div className="h-full bg-secondary backdrop-blur-md flex items-center justify-center p-4">
+      <div className="h-full bg-glass-raised/0 backdrop-blur-md flex items-center justify-center p-4">
         <p className="text-textSecondary">No stream selected</p>
       </div>
     );
@@ -4558,8 +4446,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       ? useChatConnectionStore.getState().channels.get(panelChannelKey)?.messages.length ?? 0
       : 0) === 0;
   // The header row and its pin button both open and close the pinned message.
+  // Pins float over chat only, so from the viewers list or the mod room the
+  // pin button returns to chat with the pin open.
   const togglePinned = () => {
-    const next = !isPinnedExpanded;
+    const next = activeView !== 'chat' || !isPinnedExpanded;
+    if (activeView !== 'chat') setActiveView('chat');
     setIsPinnedExpanded(next);
     if (next) seenPinIdRef.current = pinnedMessages[0]?.id || '';
   };
@@ -4570,12 +4461,137 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const overlayTop = chromeBottom + 8;
   const pinnedTop = overlayTop + (overlayStackHeight > 0 ? overlayStackHeight + 8 : 0);
   // The action capsule only renders when it would hold at least one button.
+  // Dock this chat (keep it open beside whatever stream plays), or close it
+  // when it is a docked chat. `provider` is this widget's own platform, so a
+  // docked pane (an override on its platform) reads as docked too.
+  const canDockChat = isMainSurface && !isMultiNookActive && !!currentStream?.user_login;
+  const thisChatKey = currentStream?.user_login ? makeKey(provider, currentStream.user_login) : null;
+  const thisChatDocked = !!thisChatKey && dockChats.some((c) => makeKey(c.provider, c.login) === thisChatKey);
   const hasHeaderActions =
-    (!!currentStream && (!channelOverride || (isModerator && isTwitch))) || pinnedMessages.length > 0;
+    (!!currentStream && (!channelOverride || isTwitch)) || pinnedMessages.length > 0 || canDockChat;
+
+  // The header's "more" menu. Pop out opens a MultiChat window with this
+  // channel (every tile's chat in MultiNook) and survives the main window;
+  // float opens the see-through overlay. Neither is offered inside a popout or
+  // a docked pane, where they would open a second copy of what is on screen.
+  const headerMenuItems: ChatHeaderMenuItem[] = [];
+  if (canDockChat && currentStream && thisChatKey) {
+    const stream = currentStream;
+    const key = thisChatKey;
+    headerMenuItems.push({
+      key: 'dock',
+      icon: <PushPin size={15} weight={thisChatDocked ? 'fill' : 'regular'} />,
+      label: thisChatDocked ? 'Close this docked chat' : 'Dock this chat',
+      detail: thisChatDocked ? 'Remove it from your chat list' : 'Keep it open when you switch streams',
+      active: thisChatDocked,
+      onSelect: () => {
+        if (thisChatDocked) {
+          void undockChat(key);
+          return;
+        }
+        // Shown on dock: while it is the stream being watched it simply is
+        // that stream's chat, and after a stream switch it stays on screen.
+        void dockChat(
+          {
+            provider,
+            login: stream.user_login,
+            channel_id: stream.user_id || '',
+            display_name: stream.user_name || stream.user_login,
+            avatar_url: stream.profile_image_url || null,
+          },
+          true,
+        );
+      },
+    });
+  }
+  if (canDockChat) {
+    headerMenuItems.push({
+      key: 'dock-list',
+      icon: <Chats size={15} />,
+      label: dockChats.length > 0 ? 'Chat list' : 'Dock another chat',
+      detail: dockChats.length > 0 ? 'Switch between your open chats' : 'Keep other channels\' chats beside this stream',
+      onSelect: () => setDockPanelOpen(true),
+    });
+  }
+  if (currentStream && !channelOverride) {
+    const stream = currentStream;
+    const popAll = isMultiNookActive && slots.length > 1;
+    headerMenuItems.push({
+      key: 'popout',
+      icon: (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M9 2h5v5" />
+          <path d="M14 2L7 9" />
+          <path d="M13 9v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h4" />
+        </svg>
+      ),
+      label: popAll ? 'Pop out all chats' : 'Pop out chat',
+      detail: 'In a window of its own',
+      onSelect: async () => {
+        try {
+          const { openMultiChatWindow } = await import('../utils/multichatWindow');
+          const mn = usemultiNookStore.getState();
+          if (mn.isMultiNookActive && mn.slots.length > 1) {
+            // In MultiNook with multiple streams: pop out ALL of them into a
+            // FRESH MultiChat window (replace any tabs that were open). The IRC
+            // bridge is shared and these channels are already joined (MultiNook
+            // keeps every tile connected), so the popout attaches to the live
+            // session instead of reloading it.
+            await openMultiChatWindow({
+              replace: true,
+              channels: mn.slots.map((s) => ({
+                channel: s.channelLogin,
+                channelId: s.channelId ?? null,
+                channelName: s.channelName ?? s.channelLogin,
+              })),
+            });
+            // Chat now lives in the popout: hide the in-grid chat panel to
+            // reclaim space. (Re-show any time via the toolbar chat toggle.)
+            const after = usemultiNookStore.getState();
+            if (!after.isChatHidden) after.toggleChatHidden();
+          } else {
+            await openMultiChatWindow({
+              channel: stream.user_login,
+              channelId: stream.user_id || undefined,
+              channelName: stream.user_name || undefined,
+            });
+          }
+        } catch (err) {
+          Logger.error('[ChatWidget] Pop out chat failed:', err);
+        }
+      },
+    });
+  }
+  if (currentStream && !channelOverride && isTwitch) {
+    const stream = currentStream;
+    headerMenuItems.push({
+      key: 'float',
+      icon: (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="2" y="2" width="9" height="9" rx="1.5" />
+          <path d="M6 14h7.5a.5.5 0 0 0 .5-.5V6" strokeDasharray="2 1.5" />
+        </svg>
+      ),
+      label: 'Float chat',
+      detail: 'See-through, over other apps (its own window, about 150 MB)',
+      onSelect: async () => {
+        try {
+          const { openChatOverlayWindow } = await import('../utils/chatOverlayWindow');
+          await openChatOverlayWindow({
+            channel: stream.user_login,
+            channelId: stream.user_id || undefined,
+            channelName: stream.user_name || undefined,
+          });
+        } catch (err) {
+          Logger.error('[ChatWidget] Open chat overlay failed:', err);
+        }
+      },
+    });
+  }
 
   if (showLoadingScreen) {
     return (
-      <div className="h-full bg-secondary backdrop-blur-md flex items-center justify-center p-4">
+      <div className="h-full bg-glass-raised/0 backdrop-blur-md flex items-center justify-center p-4">
         <p className="text-textSecondary">Connecting to chat...</p>
       </div>
     );
@@ -4584,45 +4600,48 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   return (
     <>
       <div ref={setChatContainerEl} className="h-full bg-secondary overflow-hidden flex flex-col relative">
+        {isMainSurface && !isMultiNookActive && <ChatDockPanel top={chromeHeight} />}
         {/* Floating cards at the top of chat. Twitch allows a poll and a
-            prediction at once, so they stack in one column rather than both
-            pinning themselves to the same box. Order is the user's choice. */}
-        <ChatOverlayStack top={overlayTop} stackRef={setOverlayStackEl}>
-          {(settings.chat_overlay_order === 'poll-first'
-            ? (['poll', 'prediction'] as const)
-            : (['prediction', 'poll'] as const)
-          ).map((kind) => {
-            // Polls and predictions are Twitch products driven by EventSub. On a
-            // provider stream both overlays were still mounting and watching a
-            // Kick slug / YouTube UC id that can never produce an event.
-            if (!isTwitch) return null;
-            if (kind === 'poll') {
-              if (settings.show_polls === false) return null;
-              return (
-                <PollOverlay
-                  key="poll"
-                  channelId={currentStream?.user_id}
-                  channelLogin={currentStream?.user_login}
-                />
-              );
-            }
-            if (settings.show_predictions === false) return null;
-            return (
-              <PredictionOverlay
-                key="prediction"
-                channelId={currentStream?.user_id}
-                channelLogin={currentStream?.user_login}
-              />
-            );
-          })}
+            prediction at once, so they stack in one column, laid out by Rust:
+            the user's order, one card open, and no more than its share of
+            the chat's height (the open card scrolls inside it).
+            Polls and predictions are Twitch products driven by EventSub. On a
+            provider stream both overlays were still mounting and watching a
+            Kick slug / YouTube UC id that can never produce an event. */}
+        <ChatOverlayStack
+          top={overlayTop}
+          maxHeight={topStack.maxHeight}
+          stackRef={setOverlayStackEl}
+          hidden={activeView !== 'chat'}
+        >
+          {isTwitch && settings.show_predictions !== false && (
+            <PredictionOverlay
+              key="prediction"
+              channelId={currentStream?.user_id}
+              channelLogin={currentStream?.user_login}
+              stack={topStack.control.prediction}
+            />
+          )}
+          {isTwitch && settings.show_polls !== false && (
+            <PollOverlay
+              key="poll"
+              channelId={currentStream?.user_id}
+              channelLogin={currentStream?.user_login}
+              stack={topStack.control.poll}
+            />
+          )}
         </ChatOverlayStack>
 
         {/* Chat header - transforms when Hype Train active */}
+        {/* While the dock's tab row is unfolded the header rises above the pinned
+            message (z-15) and the poll stack (z-40): the unfolded lines live
+            inside the header's own stacking context and could not otherwise
+            draw over them. */}
         {/* flex-col-reverse keeps the stream-info row on top while the hype bar
             (declared first below) renders underneath it */}
         {/* The tint follows Glassiness: 10% of the rows show through at full
             glass, none at 0%, where the blur is stripped too. */}
-        <div ref={setChromeEl} onWheel={forwardHeaderWheel} className={`absolute top-0 left-0 right-0 px-3 py-1.5 border-b backdrop-blur-ultra z-10 shadow-[0_8px_18px_-12px_rgba(0,0,0,0.7)] overflow-hidden flex flex-col-reverse ${
+        <div ref={setChromeEl} onWheel={forwardHeaderWheel} className={`absolute top-0 left-0 right-0 px-3 py-1.5 border-b backdrop-blur-ultra z-10 has-[.sn-tabs-unfolded]:z-[45] shadow-[0_8px_18px_-12px_rgba(0,0,0,0.7)] overflow-x-clip flex flex-col-reverse ${
           isSharedChat && !currentHypeTrain ? 'iridescent-border' : 'border-borderSubtle'
         }`} style={{ backgroundColor: 'color-mix(in srgb, var(--color-background) calc(100% - 10% * var(--glass-strength, 1)), transparent)' }}>
           {currentHypeTrain && (
@@ -4634,10 +4653,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               }}
             />
           )}
+          {/* The dock's tab row, right under the stream-info row (the column is
+              reversed, so declared here it sits between that row and the hype
+              bar). The header is measured, so the chat below makes room for it. */}
+          {dockTabs && <ChatDockTabs />}
           {/* Stream-info header, always visible; sits as the top row, above the hype bar */}
           <div className="relative z-10">
               <div
-                className={`flex items-center gap-2 ${pinnedMessages.length > 0 ? 'pointer-events-auto cursor-pointer' : ''}`}
+                ref={setHeaderRowEl}
+                className={`chat-header-row flex items-center gap-2 ${pinnedMessages.length > 0 ? 'pointer-events-auto cursor-pointer' : ''}`}
                 onClick={pinnedMessages.length > 0 ? togglePinned : undefined}
               >
                 <span className={`chat-header-dot ${isConnected ? '' : 'chat-header-dot--off'}`} aria-hidden />
@@ -4657,7 +4681,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: 4 }}
                       transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-                      className="flex min-w-0 items-center gap-2 whitespace-nowrap"
+                      data-fit-label
+                      className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap"
                     >
                       {modRoomStatus.connected ? (
                         <Tooltip
@@ -4698,6 +4723,24 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                         <span className="text-xs text-textSecondary">Connecting...</span>
                       )}
                     </motion.div>
+                  ) : dockHeld && !dockTabs ? (
+                    <motion.div
+                      key="chat-dock-switch"
+                      initial={{ opacity: 0, y: -4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 4 }}
+                      transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                      // The capsule's floor, sized to the name it shows
+                      // (useDockSwitcherFloor). Squeezed below it, the capsule
+                      // spilled over the platform marks beside it instead of
+                      // the row reporting overflow, so the header never
+                      // compacted. Not min-w-min: that is the full name's
+                      // width, so a long name would refuse to truncate.
+                      className="flex items-center"
+                      style={{ minWidth: dockSwitcherFloor }}
+                    >
+                      <ChatDockSwitcher />
+                    </motion.div>
                   ) : (
                     <motion.p
                       key="chat-header"
@@ -4705,13 +4748,14 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0, y: 4 }}
                       transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-                      className={`chat-header-title min-w-0 truncate whitespace-nowrap ${isSharedChat ? 'iridescent-title' : ''}`}
+                      data-fit-label
+                      className={`chat-header-title min-w-0 truncate whitespace-nowrap ${isSharedChat && !sharedChatGroup ? 'iridescent-title' : ''}`}
                     >
                       {!isConnected
                         ? 'Disconnected'
                         : channelOverride && !isMainSurface
                           ? channelOverride.user_name || channelOverride.user_login || 'Stream chat'
-                          : isSharedChat
+                          : isSharedChat && !sharedChatGroup
                             ? 'Shared stream chat'
                             : currentMediaType === 'offline_chat'
                               ? 'Offline chat'
@@ -4721,110 +4765,43 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     </motion.p>
                   )}
                 </AnimatePresence>
-                {/* Which platforms this feed is drawing from, in the header rather
-                    than on a line of their own: the label already says the chat is
-                    combined, so the marks are the only thing left to say and they
-                    fit beside it. Clicking one drops that platform out of THIS
-                    streamer's feed, stored with the link in Rust; the global
-                    switches belong to Settings and a header click never touches
-                    them. */}
+                {/* Which platforms this feed is drawing from, as one control: their
+                    marks overlap in a fixed-size capsule (separate buttons cost
+                    about 22px each and truncated the title at three), and its
+                    menu holds a switch per platform. A switch drops that platform
+                    out of THIS streamer's feed, stored with the link in Rust; the
+                    global switches belong to Settings. With nothing linked it is
+                    the way into combining, and suggestions wait behind it. */}
                 {blendEnabled && isMainSurface && homeChannel && activeView !== 'modroom' && (
-                  <span className="pointer-events-auto flex shrink-0 items-center gap-0.5">
-                    {blendLinked.map((c) => {
+                  <BlendSourcesButton
+                    rows={blendLinked.map((c) => {
                       const offInSettings = settings.chat_blend?.platforms?.[c.provider] === false;
-                      const included = blendOn && !offInSettings && !c.hidden;
-                      const meta = PROVIDERS[c.provider];
-                      const err = blendErrorMap?.[c.provider];
-                      return (
-                        <Tooltip
-                          key={`${c.provider}:${c.channel}`}
-                          content={
-                            offInSettings
-                              ? `${meta.label} is off for every channel in Settings, Chat, Combined Chat`
-                              : err ?? `${included ? 'Hide' : 'Show'} ${c.channelName}'s ${meta.label} chat here`
-                          }
-                          side="bottom"
-                        >
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              if (offInSettings) return;
-                              if (!blendOn) {
-                                setBlendOn(true);
-                                if (c.hidden) void editBlendLink({ provider: c.provider, channel: c.channel }, 'show');
-                                return;
-                              }
-                              void editBlendLink({ provider: c.provider, channel: c.channel }, included ? 'hide' : 'show');
-                            }}
-                            // The mark is drawn with an empty alt (it is
-                            // decorative inside the button), so the button has to
-                            // carry the name itself or it reads as nothing.
-                            aria-label={`${included ? 'Hide' : 'Show'} ${meta.label} chat`}
-                            aria-pressed={included}
-                            aria-disabled={offInSettings}
-                            className={`grid h-5 w-5 place-items-center rounded-full transition-colors ${
-                              offInSettings ? 'cursor-default' : 'hover:bg-white/10'
-                            }`}
-                          >
-                            <ProviderMark
-                              provider={c.provider}
-                              size={12}
-                              className={included ? '' : 'opacity-40 grayscale'}
-                            />
-                          </button>
-                        </Tooltip>
-                      );
+                      return {
+                        source: c,
+                        included: blendOn && !offInSettings && !c.hidden,
+                        offInSettings,
+                        error: blendErrorMap?.[c.provider],
+                      };
                     })}
-                    {/* The one way into combining: suggestions wait behind it
-                        rather than pushing a row into chat. With something
-                        found, it shows those platforms' marks and, until
-                        looked at, a small dot. */}
-                    <Tooltip
-                      content={
-                        blendPanel !== 'closed'
-                          ? 'Close'
-                          : blendSuggestions.length > 0
-                            ? `Also streaming on ${blendSuggestions
-                                .map((s) => PROVIDERS[s.candidate.provider].label)
-                                .join(' and ')}? Take a look`
-                            : blendLinked.length > 0
-                              ? "Link another of this streamer's channels"
-                              : 'Combine chat from another platform'
+                    suggestions={blendSuggestions}
+                    suggestionsUnseen={blendSuggestionsUnseen}
+                    panelOpen={blendPanel !== 'closed'}
+                    onToggle={(c) => {
+                      const included = blendOn && !c.hidden;
+                      if (!blendOn) {
+                        setBlendOn(true);
+                        if (c.hidden) void editBlendLink({ provider: c.provider, channel: c.channel }, 'show');
+                        return;
                       }
-                      side="bottom"
-                    >
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (blendPanel !== 'closed') {
-                            setBlendPanel('closed');
-                            return;
-                          }
-                          if (blendSuggestions.length > 0) {
-                            setSeenBlendSuggestions(blendSuggestionsKey);
-                            setBlendPanel('suggestions');
-                          } else {
-                            setBlendPanel('editor');
-                          }
-                        }}
-                        aria-label={blendSuggestions.length > 0 ? 'Suggested channels' : 'Link another platform'}
-                        aria-expanded={blendPanel !== 'closed'}
-                        className={`blend-trigger ${blendSuggestions.length > 0 ? 'blend-trigger--found' : ''} ${
-                          blendPanel !== 'closed' ? 'is-open' : ''
-                        }`}
-                      >
-                        <Plus size={10} weight="bold" />
-                        {blendSuggestions.map((s) => (
-                          <ProviderMark key={s.candidate.provider} provider={s.candidate.provider} size={11} />
-                        ))}
-                        {blendSuggestionsUnseen && blendPanel === 'closed' && (
-                          <span className="blend-trigger-dot" aria-hidden />
-                        )}
-                      </button>
-                    </Tooltip>
-                  </span>
+                      void editBlendLink({ provider: c.provider, channel: c.channel }, included ? 'hide' : 'show');
+                    }}
+                    onOpenSuggestions={() => {
+                      setSeenBlendSuggestions(blendSuggestionsKey);
+                      setBlendPanel('suggestions');
+                    }}
+                    onOpenEditor={() => setBlendPanel('editor')}
+                    onClosePanel={() => setBlendPanel('closed')}
+                  />
                 )}
                 {/* MultiChat panes have no player, so surface the live title/game
                     here. The MAIN window does have one — showing them again in the
@@ -4838,19 +4815,16 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     </p>
                   </Tooltip>
                 )}
-                <div className="flex items-center gap-2 ml-auto shrink-0">
+                <div className="chat-header-actions flex items-center gap-2 ml-auto shrink-0">
                   {/* Compact Chat / Mod Room toggle: the active pill slides between
                       the two with a spring (magnetic). Shown for moderators, using
                       the optimistic eligibility so it appears instantly on revisit. */}
                   {modRoomEligible && currentStream && (
-                    <div
-                      className="pointer-events-auto relative order-last flex items-center rounded-full p-0.5"
-                      style={{ background: 'rgba(255,255,255,0.06)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.07)' }}
-                    >
+                    <div className="chrome-glaze chrome-glaze--flat chat-header-capsule pointer-events-auto order-last">
                       {(
                         [
-                          { key: 'chat', label: 'Chat', active: activeView !== 'modroom' },
-                          { key: 'modroom', label: 'Mods', active: activeView === 'modroom' },
+                          { key: 'chat', label: 'Chat', Icon: ChatCircle, active: activeView !== 'modroom' },
+                          { key: 'modroom', label: 'Mods', Icon: ShieldCheck, active: activeView === 'modroom' },
                         ] as const
                       ).map((seg) => (
                         <button
@@ -4860,8 +4834,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                             e.stopPropagation();
                             setActiveView(seg.key);
                           }}
-                          className={`relative rounded-full px-3.5 py-1 text-xs font-semibold transition-colors ${seg.active ? 'text-textPrimary' : 'text-textSecondary hover:text-textPrimary'}`}
+                          aria-label={seg.label}
+                          aria-pressed={seg.active}
+                          className={`chat-header-pill chat-header-seg transition-colors ${seg.active ? 'text-textPrimary' : 'text-textSecondary hover:text-textPrimary'}`}
                         >
+                          {/* The narrowest header swaps the words for icons. */}
+                          <seg.Icon size={13} weight={seg.active ? 'fill' : 'regular'} className="chat-header-seg-icon relative z-10" aria-hidden />
                           {seg.active && (
                             <motion.span
                               layoutId="modroom-toggle-pill"
@@ -4870,7 +4848,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                               transition={{ type: 'spring', stiffness: 480, damping: 28 }}
                             />
                           )}
-                          <span className="relative z-10">{seg.label}</span>
+                          <span className="chat-header-seg-label relative z-10">{seg.label}</span>
                           {/* Unread chip: mentions turn it red so a ping is
                               visible from the Chat view without opening the room. */}
                           {seg.key === 'modroom' && !seg.active && modRoomUnread > 0 && (
@@ -4893,7 +4871,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       initial={{ opacity: 0, scale: 0.9 }}
                       animate={{ opacity: 1, scale: 1 }}
                       transition={{ type: 'spring', stiffness: 520, damping: 30 }}
-                      className="inline-flex select-none items-center gap-1 rounded-full px-2 py-[3px] text-[11px] font-semibold tracking-tight text-emerald-300"
+                      className="chat-header-capsule select-none gap-1.5 px-2.5 font-semibold tracking-tight text-emerald-300"
                       style={{
                         background: 'linear-gradient(180deg, rgba(16,185,129,0.16), rgba(16,185,129,0.08))',
                         boxShadow: 'inset 0 0 0 1px rgba(16,185,129,0.28), inset 0 1px 0 rgba(255,255,255,0.06)',
@@ -4903,22 +4881,25 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                         <rect x="3" y="11" width="18" height="11" rx="2" />
                         <path d="M7 11V7a5 5 0 0 1 10 0v4" />
                       </svg>
-                      Encrypted
+                      <span className="chat-header-badge-label">Encrypted</span>
                     </motion.span>
                   )}
                   {activeView !== 'modroom' && (
                     <>
                   {/* Saved message filter for this pane (Chat settings). */}
                   {filterOptions.length > 1 && (
+                    <div className="chrome-glaze chrome-glaze--flat chat-header-capsule chat-header-filter pointer-events-auto">
                     <Dropdown
+                      bare
                       value={filterId ?? ''}
                       options={filterOptions}
                       onChange={(v) => setFilterId(v ? String(v) : null)}
                       leadingIcon={<Filter size={11} />}
-                      className={`pointer-events-auto h-5 px-1.5 text-[11px] ${filterId ? 'text-accent' : 'text-textSecondary'}`}
+                      className={`chat-header-pill !px-2 ${filterId ? 'text-accent' : 'text-textSecondary hover:text-textPrimary'}`}
                       align="right"
                       ariaLabel="Message filter"
                     />
+                    </div>
                   )}
                   {viewerCount !== null && !streamerModeActive && collab && (
                     <TogetherChip
@@ -4932,24 +4913,60 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       allowMultiNook={!channelOverride}
                     />
                   )}
+                  {/* Offline: when it was last live, in the live numbers' place. */}
+                  {knownOffline && viewerCount === null && !liveStartedAt && (
+                    <div className="chrome-glaze chrome-glaze--flat chat-header-stats chat-header-stats--uptime-only">
+                      <Tooltip
+                        content={lastLiveAt ? `Last live ${new Date(lastLiveAt).toLocaleString()}` : 'Not streaming right now'}
+                        side="bottom"
+                      >
+                        <span className="chat-header-stat cursor-default pointer-events-auto text-textSecondary">
+                          {lastLiveLabel(lastLiveAt)}
+                        </span>
+                      </Tooltip>
+                    </div>
+                  )}
                   {/* The live numbers read as one object: viewers and uptime in a
                       single capsule, split by a hairline. */}
-                  {((viewerCount !== null && !streamerModeActive) || currentStream?.started_at) && (
-                    <div className="chrome-glaze chrome-glaze--flat chat-header-stats">
+                  {((viewerCount !== null && !streamerModeActive) || liveStartedAt) && (
+                    <div
+                      className={`chrome-glaze chrome-glaze--flat chat-header-stats ${
+                        viewerCount !== null && !streamerModeActive ? '' : 'chat-header-stats--uptime-only'
+                      }`}
+                    >
                       {viewerCount !== null && !streamerModeActive && (
-                        <Tooltip content="Watching now" side="bottom">
-                          <span className="chat-header-stat cursor-default pointer-events-auto">
-                            <UsersThree size={13} weight="fill" />
-                            {viewerCount.toLocaleString()}
-                          </span>
-                        </Tooltip>
+                        isTwitch && currentStream ? (
+                          // The count opens the viewers list, as on twitch.tv.
+                          <Tooltip content={activeView === 'viewers' ? 'Back to chat' : 'See who is watching'} side="bottom">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setActiveView(activeView === 'viewers' ? 'chat' : 'viewers');
+                              }}
+                              className="chat-header-stat chat-header-stat--button pointer-events-auto"
+                              aria-label="Viewers list"
+                              aria-pressed={activeView === 'viewers'}
+                            >
+                              <UsersThree size={13} weight="fill" />
+                              {viewerCount.toLocaleString()}
+                            </button>
+                          </Tooltip>
+                        ) : (
+                          <Tooltip content="Watching now" side="bottom">
+                            <span className="chat-header-stat cursor-default pointer-events-auto">
+                              <UsersThree size={13} weight="fill" />
+                              {viewerCount.toLocaleString()}
+                            </span>
+                          </Tooltip>
+                        )
                       )}
-                      {viewerCount !== null && !streamerModeActive && currentStream?.started_at && (
+                      {viewerCount !== null && !streamerModeActive && liveStartedAt && (
                         <span className="chat-header-rule" aria-hidden />
                       )}
-                      {currentStream?.started_at && (
+                      {liveStartedAt && (
                         <Tooltip content="Live for" side="bottom">
-                          <span className="chat-header-stat cursor-default pointer-events-auto">
+                          <span className="chat-header-stat chat-header-uptime cursor-default pointer-events-auto">
                             <Timer size={13} weight="bold" />
                             <span id="stream-uptime-display">{streamUptimeRef.current}</span>
                           </span>
@@ -4959,12 +4976,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                   )}
                   {hasHeaderActions && (
                     <div className="chrome-glaze chrome-glaze--flat chat-header-cluster pointer-events-auto">
-                  {/* Viewers list — the official chatters roster grouped by role.
-                      Mod/broadcaster only (Helix Get Chatters requires it), so the
-                      toggle is hidden on channels the user doesn't moderate.
-                      Twitch-only: Helix is the only roster source, so on a
-                      provider channel the id would be for a different platform. */}
-                  {isModerator && isTwitch && currentStream && (
+                  {/* Viewers list, grouped by role: the full roster where the
+                      user moderates, Twitch's public list everywhere else (Rust
+                      picks). Twitch-only: on a provider channel the id would be
+                      for a different platform. */}
+                  {isTwitch && currentStream && (
                     <Tooltip content={activeView === 'viewers' ? 'Back to chat' : 'Viewers'} side="bottom">
                       <button
                         type="button"
@@ -4972,7 +4988,9 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                           e.stopPropagation();
                           setActiveView(activeView === 'viewers' ? 'chat' : 'viewers');
                         }}
-                        className={`chat-header-btn ${activeView === 'viewers' ? 'is-active' : ''}`}
+                        className={`chat-header-btn ${activeView === 'viewers' ? 'is-active' : ''} ${
+                          viewerCount !== null && !streamerModeActive ? 'chat-header-btn--dup' : ''
+                        }`}
                         aria-label="Viewers list"
                         aria-pressed={activeView === 'viewers'}
                       >
@@ -4981,96 +4999,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                           <circle cx="9" cy="7" r="4" />
                           <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
                           <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-                        </svg>
-                      </button>
-                    </Tooltip>
-                  )}
-                  {/* Pop out chat — opens a separate StreamNook MultiChat window
-                      pre-loaded with the currently watched channel. The window
-                      survives the main app's lifecycle inside one Tauri process.
-                      Hidden when ChatWidget is already inside a popout (channelOverride
-                      set) — popping out of a popout would be confusing. */}
-                  {currentStream && !channelOverride && (
-                    <Tooltip content={isMultiNookActive && slots.length > 1 ? 'Pop out all chats' : 'Pop out chat'} side="bottom">
-                      <button
-                        type="button"
-                        onClick={async (e) => {
-                          e.stopPropagation();
-                          try {
-                            const { openMultiChatWindow } = await import('../utils/multichatWindow');
-                            const mn = usemultiNookStore.getState();
-                            if (mn.isMultiNookActive && mn.slots.length > 1) {
-                              // In MultiNook with multiple streams: pop out ALL of them into
-                              // a FRESH MultiChat window (replace any tabs that were open).
-                              // The IRC bridge is shared and these channels are already
-                              // joined (MultiNook keeps every tile connected), so the popout
-                              // attaches to the live session instead of reloading it.
-                              await openMultiChatWindow({
-                                replace: true,
-                                channels: mn.slots.map((s) => ({
-                                  channel: s.channelLogin,
-                                  channelId: s.channelId ?? null,
-                                  channelName: s.channelName ?? s.channelLogin,
-                                })),
-                              });
-                              // Chat now lives in the popout — hide the in-grid chat panel to
-                              // reclaim space. (Re-show any time via the toolbar chat toggle.)
-                              const after = usemultiNookStore.getState();
-                              if (!after.isChatHidden) after.toggleChatHidden();
-                            } else {
-                              await openMultiChatWindow({
-                                channel: currentStream.user_login,
-                                channelId: currentStream.user_id || undefined,
-                                channelName: currentStream.user_name || undefined,
-                              });
-                            }
-                          } catch (err) {
-                            Logger.error('[ChatWidget] Pop out chat failed:', err);
-                          }
-                        }}
-                        className="chat-header-btn"
-                        aria-label="Pop out chat"
-                      >
-                        <svg
-                          width="13"
-                          height="13"
-                          viewBox="0 0 16 16"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.5"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        >
-                          <path d="M9 2h5v5" />
-                          <path d="M14 2L7 9" />
-                          <path d="M13 9v4a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h4" />
-                        </svg>
-                      </button>
-                    </Tooltip>
-                  )}
-                  {!channelOverride && isTwitch && currentStream && (
-                    <Tooltip content="Float chat as a see-through window over other apps (its own renderer, about 150 MB)" side="bottom">
-                      <button
-                        type="button"
-                        onClick={async (e) => {
-                          e.stopPropagation();
-                          try {
-                            const { openChatOverlayWindow } = await import('../utils/chatOverlayWindow');
-                            await openChatOverlayWindow({
-                              channel: currentStream.user_login,
-                              channelId: currentStream.user_id || undefined,
-                              channelName: currentStream.user_name || undefined,
-                            });
-                          } catch (err) {
-                            Logger.error('[ChatWidget] Open chat overlay failed:', err);
-                          }
-                        }}
-                        className="chat-header-btn"
-                        aria-label="Float chat as overlay"
-                      >
-                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                          <rect x="2" y="2" width="9" height="9" rx="1.5" />
-                          <path d="M6 14h7.5a.5.5 0 0 0 .5-.5V6" strokeDasharray="2 1.5" />
                         </svg>
                       </button>
                     </Tooltip>
@@ -5099,6 +5027,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       </Tooltip>
                     );
                   })()}
+                  {/* Pin, pop out and float: occasional actions, in words. */}
+                  <ChatHeaderMenu items={headerMenuItems} />
                     </div>
                   )}
                     </>
@@ -5111,7 +5041,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
         {/* Free Floating Pinned Message Modal */}
         {pinnedMessages.length > 0 && (
-          <div className="absolute left-3 right-3 z-[15] pointer-events-none flex flex-col items-center"
+          <div className={`absolute left-3 right-3 z-[15] pointer-events-none flex flex-col items-center ${activeView !== 'chat' ? 'hidden' : ''}`}
             style={{
               top: pinnedTop,
             }}>
@@ -5122,7 +5052,29 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                   animate={{ opacity: 1, y: 0, scale: 1, height: 'auto' }}
                   exit={{ opacity: 0, y: -10, scale: 0.96, height: 0 }}
                   transition={{ duration: 0.3, ease: [0.175, 0.885, 0.32, 1.2] }}
-                  className="sn-popover w-full max-w-sm mt-2 pointer-events-auto overflow-hidden origin-top"
+                  className="sn-popover w-full max-w-sm mt-2 pointer-events-auto overflow-hidden origin-top cursor-pointer"
+                  // Clicking the open pin folds it back to the bar, the same
+                  // gesture that opened it. Interactive children (unpin, links,
+                  // preview cards) keep their own click, and a drag that selected
+                  // text is a copy, not a collapse.
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={true}
+                  aria-label="Collapse pinned message"
+                  onClick={(e) => {
+                    const target = e.target as HTMLElement;
+                    if (target.closest('button, a, input, textarea, select, video, [role="button"]:not([data-pin-card]), [data-no-pin-toggle]')) return;
+                    if ((window.getSelection()?.toString() ?? '').length > 0) return;
+                    setIsPinnedExpanded(false);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.target !== e.currentTarget) return;
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setIsPinnedExpanded(false);
+                    }
+                  }}
+                  data-pin-card=""
                 >
                 {pinnedMessages.map((pin, i) => {
                   // Same link-preview pipeline the main chat uses, applied to the
@@ -5179,8 +5131,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     <div className="flex items-start gap-3">
                       {/* Sender avatar */}
                       {pin.sender_avatar ? (
-                        <img
+                        <SevenTvAvatar
+                          cosmeticsId={provider === 'twitch' ? pin.sender_id : `${provider}:${pin.sender_id}`}
                           src={pin.sender_avatar}
+                          px={36}
+                          motion="animate"
                           alt={pin.sender_name}
                           className="w-9 h-9 rounded-full flex-shrink-0 object-cover border border-white/5"
                         />
@@ -5195,29 +5150,23 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       <div className="flex-1 min-w-0 pt-0.5">
                         {/* Name + badges row */}
                         <div className="flex items-center gap-1.5 flex-wrap">
-                          {/* Badges — resolved from in-memory badge cache */}
-                          {(() => {
-                            const badgeStr = pin.sender_badges?.map(b => `${b.set_id}/${b.version}`).join(',') || '';
-                            if (!badgeStr) return null;
-                            const resolved = parseBadges(badgeStr, currentStream?.user_id);
-                            return resolved.map((badge: { key: string; info: { image_url_1x?: string; image_url_2x?: string; title?: string } | null }, bi: number) => (
-                              badge.info?.image_url_1x ? (
-                                <Tooltip key={`${badge.key}-${bi}`} content={badge.info.title || badge.key}>
-                                <img
-                                  src={badge.info.image_url_2x || badge.info.image_url_1x}
-                                  alt={badge.info.title || badge.key}
-                                  className="w-4 h-4 flex-shrink-0 drop-shadow-sm"
-                                />
-                                </Tooltip>
-                              ) : null
-                            ));
-                          })()}
-                          <span
-                            className="text-sm font-bold tracking-tight"
-                            style={{ color: readableNameColor(pin.sender_color), textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}
-                          >
-                            {pin.sender_name}
-                          </span>
+                          {/* Badges and name exactly as a chat row draws them:
+                              chat-order badges, 7TV, third-party, StreamNook,
+                              then the name in its paint. */}
+                          <PinnedChatter
+                            variant="card"
+                            provider={provider}
+                            userId={pin.sender_id}
+                            name={pin.sender_name}
+                            login={pin.sender_login}
+                            shownName={pin.sender_shown_name}
+                            color={pin.sender_color}
+                            badges={pin.sender_badges}
+                            channelId={currentStream?.user_id}
+                            onBadgeClick={handleBadgeClick}
+                            nameClassName="text-sm font-bold tracking-tight"
+                            plainNameStyle={PIN_NAME_SHADOW}
+                          />
                         </div>
                         {/* Message text with clickable links. Trusted carded
                             links are suppressed in clean mode (the card is the
@@ -5272,14 +5221,25 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                           <path d="M4.146.146A.5.5 0 0 1 4.5 0h7a.5.5 0 0 1 .5.5c0 .68-.342 1.174-.646 1.479-.126.125-.25.224-.354.298v4.431l.078.048c.203.127.476.314.751.555C12.36 7.775 13 8.527 13 9.5a.5.5 0 0 1-.5.5h-4v4.5a.5.5 0 0 1-1 0V10h-4A.5.5 0 0 1 3 9.5c0-.973.64-1.725 1.17-2.189A5.921 5.921 0 0 1 5 6.708V2.277a2.77 2.77 0 0 1-.354-.298C4.342 1.674 4 1.179 4 .5a.5.5 0 0 1 .146-.354z"/>
                         </svg>
                         {pin.pinned_by_avatar && (
-                          <img
+                          <SevenTvAvatar
+                            cosmeticsId={provider === 'twitch' ? pin.pinned_by_id : `${provider}:${pin.pinned_by_id}`}
                             src={pin.pinned_by_avatar}
+                            px={16}
                             alt={pin.pinned_by}
                             className="w-4 h-4 rounded-full object-cover border border-white/10"
                           />
                         )}
                         <span className="text-[11px] text-textSecondary uppercase tracking-wide font-medium">
-                          Pinned by <span className="font-bold text-textPrimary/80 ml-0.5 capitalize">{pin.pinned_by}</span>
+                          Pinned by{' '}
+                          <span className="inline-flex items-center gap-1 align-middle ml-0.5">
+                            <PinnedChatter
+                              variant="line"
+                              provider={provider}
+                              userId={pin.pinned_by_id}
+                              name={pin.pinned_by}
+                              nameClassName="font-bold text-textPrimary/80"
+                            />
+                          </span>
                         </span>
                       </div>
                     )}
@@ -5311,11 +5271,23 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     <svg className="w-3.5 h-3.5 text-accent flex-shrink-0" fill="currentColor" viewBox="0 0 16 16">
                       <path d="M4.146.146A.5.5 0 0 1 4.5 0h7a.5.5 0 0 1 .5.5c0 .68-.342 1.174-.646 1.479-.126.125-.25.224-.354.298v4.431l.078.048c.203.127.476.314.751.555C12.36 7.775 13 8.527 13 9.5a.5.5 0 0 1-.5.5h-4v4.5a.5.5 0 0 1-1 0V10h-4A.5.5 0 0 1 3 9.5c0-.973.64-1.725 1.17-2.189A5.921 5.921 0 0 1 5 6.708V2.277a2.77 2.77 0 0 1-.354-.298C4.342 1.674 4 1.179 4 .5a.5.5 0 0 1 .146-.354z"/>
                     </svg>
-                    <span
-                      className="text-[13px] font-bold flex-shrink-0 max-w-[35%] truncate"
-                      style={{ color: readableNameColor(pin.sender_color), textShadow: '0 1px 2px rgba(0,0,0,0.8)' }}
-                    >
-                      {pin.sender_name}
+                    {/* Sender: the name in its paint and at most the role
+                        badge, so the name and preview keep the line. The cap
+                        only stops a very long name from eating the preview. */}
+                    <span className="text-[13px] flex items-center gap-1.5 min-w-0 max-w-[50%] shrink">
+                      <PinnedChatter
+                        variant="bar"
+                        provider={provider}
+                        userId={pin.sender_id}
+                        name={pin.sender_name}
+                        login={pin.sender_login}
+                        shownName={pin.sender_shown_name}
+                        color={pin.sender_color}
+                        badges={pin.sender_badges}
+                        channelId={currentStream?.user_id}
+                        nameClassName="font-bold min-w-0 truncate"
+                        plainNameStyle={PIN_NAME_SHADOW}
+                      />
                     </span>
                     <span className="text-[13px] text-textPrimary/85 truncate min-w-0 flex-1">
                       {renderPinTextWithEmotes(pin.message_text, `pinbar-${pin.id}`, 'h-5 max-w-[80px] -my-0.5')}
@@ -5346,6 +5318,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               broadcasterId={currentStream.user_id}
               channelLogin={currentStream.user_login}
               onUsernameClick={handleUsernameClick}
+              onClose={() => setActiveView('chat')}
             />
           </div>
         )}
@@ -5454,6 +5427,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             hoveringRef={isHoveringChatRef}
             headerSpaceReserved={blendEnabled}
             headerInset={chromeHeight}
+            pinnedIds={pinnedIds}
           />
         )}
         {/* AutoMod held-message queue (moderators, Twitch). Rust owns the
@@ -5465,7 +5439,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         {/* Chat Paused indicator - positioned above input */}
         {activeView === 'chat' && isPaused && (
           <div className="absolute bottom-[60px] left-1/2 transform -translate-x-1/2 z-50 pointer-events-auto">
-            <button onClick={handleResume} className="flex items-center gap-2 px-4 py-2 glass-button text-white text-sm font-medium rounded-full shadow-lg">
+            <button onClick={handleResume} className="flex items-center gap-2 whitespace-nowrap px-4 py-2 glass-button text-white text-sm font-medium rounded-full shadow-lg">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
               <span>Chat Paused<PausedNewCount sliceKeys={pausedCountKeys} isPaused={isPaused} /></span>
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
@@ -5486,6 +5460,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               <EmotePickerPanel
                 open={showEmotePicker}
                 onClose={() => setShowEmotePicker(false)}
+                ignoreRef={emoteButtonRef}
                 emotes={emotes}
                 isTwitch={isTwitch}
                 isKick={provider === 'kick'}
@@ -5493,8 +5468,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                 channelId={channelOverride?.user_id ?? currentStream?.user_id}
                 channelLogin={channelOverride?.user_login ?? currentStream?.user_login}
                 isLoadingEmotes={isLoadingEmotes}
-                channelNameCache={channelNameCache}
                 onInsert={insertEmote}
+                onPopOut={
+                  popOutEmotes
+                    ? () => {
+                        setShowEmotePicker(false);
+                        popOutEmotes();
+                      }
+                    : undefined
+                }
                 onManageEmotes={
                   // The overlay this opens is scoped to a Twitch user id, so it
                   // only ever made sense on a Twitch pane.
@@ -5505,31 +5487,39 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       }
                     : undefined
                 }
+                // The menu's Commands section: every command, with the ones
+                // this channel does not allow you dimmed and locked.
+                commands={{
+                  commands: browsableCommands,
+                  isModerator,
+                  isBroadcaster: !!isBroadcaster,
+                  onPick: (cmd) => {
+                    setShowEmotePicker(false);
+                    insertCommand(cmd);
+                  },
+                  onInsertText: (text) => {
+                    setShowEmotePicker(false);
+                    setShowCommandAutocomplete(false);
+                    flowReplaceFromRef.current = null;
+                    setMessageInput(text);
+                    inputRef.current?.focus({ preventScroll: true });
+                    setTimeout(() => inputRef.current?.setSelectionRange(text.length, text.length), 0);
+                  },
+                }}
               />
 
-              {/* / Command Autocomplete (Dominated Width) */}
-              <CommandMenu
-                open={showCommandMenu}
-                onClose={() => setShowCommandMenu(false)}
-                commands={browsableCommands}
-                isModerator={isModerator}
-                isBroadcaster={!!isBroadcaster}
-                ignoreRef={commandMenuButtonRef}
-                onPick={(cmd) => {
-                  setShowCommandMenu(false);
-                  insertCommand(cmd);
-                }}
-                onInsertText={(text) => {
-                  setShowCommandMenu(false);
-                  setShowCommandAutocomplete(false);
-                  flowReplaceFromRef.current = null;
-                  setMessageInput(text);
-                  inputRef.current?.focus({ preventScroll: true });
-                  setTimeout(() => inputRef.current?.setSelectionRange(text.length, text.length), 0);
-                }}
-              />
+              {/* While the message cheers: what Send will spend, live, and a
+                  way to take the cheer out. Send is the yes. */}
+              {isTwitch && (
+                <CheerBar
+                  channelLogin={channelOverride?.user_login ?? currentStream?.user_login}
+                  channelId={channelOverride?.user_id ?? currentStream?.user_id}
+                  text={messageInput}
+                  onSetText={setComposerText}
+                />
+              )}
               <AnimatePresence>
-                {showCommandAutocomplete && !showCommandMenu && (
+                {showCommandAutocomplete && (
                   <CommandAutocomplete
                     commands={matchingCommands}
                     selectedIndex={commandSelectedIndex}
@@ -5542,22 +5532,37 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               {composerKind && currentStream?.user_id && (
                 <PollPredictionComposer
                   broadcasterId={currentStream.user_id}
+                  channelLogin={currentStream.user_login}
                   initialKind={composerKind}
                   onClose={() => setComposerKind(null)}
+                  onOutcome={streamManager.apply}
                 />
               )}
-              {showChannelPointsMenu && currentStream && (
-                <ChannelPointsMenu
-                  channelLogin={currentStream.user_login}
-                  channelId={currentStream.user_id}
-                  currentBalance={channelPoints}
-                  customPointsName={customPointsName}
-                  customPointsIconUrl={customPointsIconUrl}
-                  onClose={() => setShowChannelPointsMenu(false)}
-                  onBalanceUpdate={fetchChannelPoints}
-                  onEmotesChange={() => loadEmotes(currentStream.user_login, currentStream.user_id)}
+              {managerPanel && streamManager.view && (
+                <StreamManagerPanel
+                  kind={managerPanel}
+                  view={streamManager.view}
+                  queue={streamManager.queue}
+                  onQueue={streamManager.setQueue}
+                  onOutcome={streamManager.apply}
+                  onClose={() => setManagerPanel(null)}
                 />
               )}
+              <AnimatePresence>
+                {showChannelPointsMenu && currentStream && walletHasAny(walletPoints, channelState?.bits) && (
+                  <WalletMenu
+                    channelLogin={currentStream.user_login}
+                    channelId={currentStream.user_id}
+                    points={walletPoints}
+                    bits={channelState?.bits}
+                    onClose={() => setShowChannelPointsMenu(false)}
+                    ignoreRef={pointsButtonRef}
+                    onPointsRefresh={fetchChannelPoints}
+                    onEmotesChange={() => loadEmotes(currentStream.user_login, currentStream.user_id)}
+                    onInsert={insertEmote}
+                  />
+                )}
+              </AnimatePresence>
               {/* Resub Notification Banner - shows when user has a shareable resub */}
               {resubNotification && !resubDismissed && currentStream && (
                 <ResubNotificationBanner
@@ -5602,6 +5607,9 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                   }}
                 />
               )}
+              {isTwitch && currentStream?.user_login && (
+                <ChatBurstStatus key={currentStream.user_login} channelLogin={currentStream.user_login} />
+              )}
               {/* /nuke dry run. Transient — it only exists while the command is
                   in the box, so it can't add permanent height to this shelf. */}
               {nukePreview && (
@@ -5627,17 +5635,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       </>
                     )}
                   </span>
-                </div>
-              )}
-              {/* Active chat modes on a provider channel. Twitch shows none of
-                  these today, so this is provider-only. Informational: the
-                  platform enforces the rules, and a refused send now explains
-                  itself rather than being silently swallowed. */}
-              {providerRoomModes.length > 0 && (
-                <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-textSecondary">
-                  {providerRoomModes.map((mode) => (
-                    <span key={mode}>{mode}</span>
-                  ))}
                 </div>
               )}
               {replyingTo && !isResubMode && !isWatchStreakMode && (
@@ -5681,151 +5678,68 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                 </div>
               )}
 
-              <div className="flex items-center gap-2 min-w-0">
-                {/* Channel Points button. Opens the rewards menu, balance on
-                    hover. While the watched channel has a bonus chest ready
-                    and auto-claim is off, it becomes the claim control.
-                    Stays visible while a chest is waiting even if the balance
-                    is hidden, so hiding the number never costs you points. */}
-                {(showPointsBalance || (availableClaim && !autoClaimWatching)) && (
-                <div
-                  ref={channelPointsRef}
-                  className="relative flex-shrink-0 self-center flex items-center"
-                  onMouseEnter={() => setChannelPointsHovered(true)}
-                  onMouseLeave={() => setChannelPointsHovered(false)}
-                >
-                  {availableClaim && !autoClaimWatching ? (
-                    <Tooltip content="Claim bonus points" side="top">
-                      <button
-                        onClick={() => claimWatchedChest(availableClaim.id, availableClaim.channelId)}
-                        disabled={claimingChest}
-                        aria-label="Claim channel points bonus"
-                        className="chest-attention flex items-center justify-center w-9 h-9 text-accent-neon transition-opacity duration-200 disabled:opacity-50"
-                      >
-                        <svg width={18} height={18} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                          <path fillRule="evenodd" clipRule="evenodd" d="M2 22v-9l2.417-4.029A2 2 0 0 1 6.132 8h11.736a2 2 0 0 1 1.715.971L22 13v9H2Zm18-2v-5h-7v2h-2v-2H4v5h16Zm-2.132-10 1.8 3H4.332l1.8-3h11.736Z" />
-                        </svg>
-                      </button>
-                    </Tooltip>
-                  ) : (
-                    <button
-                      onClick={() => setShowChannelPointsMenu(!showChannelPointsMenu)}
-                      className={`group flex items-center justify-center w-9 h-9 transition-all duration-200 ${showChannelPointsMenu ? 'text-accent-neon' : channelPoints !== null ? 'text-accent-neon' : 'text-textSecondary hover:text-accent-neon'}`}
-                    >
-                      {customPointsIconUrl ? (
-                        <img
-                          src={customPointsIconUrl}
-                          alt={customPointsName || "Channel Points"}
-                          className="w-[18px] h-[18px] transition-all duration-200 group-hover:drop-shadow-[0_0_6px_color-mix(in_srgb,var(--color-accent-neon)_85%,transparent)]"
-                        />
-                      ) : (
-                        <ChannelPointsIcon size={18} className="transition-all duration-200 group-hover:drop-shadow-[0_0_6px_color-mix(in_srgb,var(--color-accent-neon)_85%,transparent)]" />
-                      )}
-                    </button>
-                  )}
-                  {/* "+N" pop after a chest collect, manual or auto */}
-                  <AnimatePresence>
-                    {claimCelebration !== null && (
-                      <motion.span
-                        initial={{ opacity: 0, x: '-50%', y: 4, scale: 0.85 }}
-                        animate={{ opacity: 1, x: '-50%', y: -16, scale: 1 }}
-                        exit={{ opacity: 0, x: '-50%', y: -24 }}
-                        transition={{ duration: 0.8, ease: 'easeOut' }}
-                        className="absolute left-1/2 top-0 text-[11px] font-semibold text-accent-neon pointer-events-none whitespace-nowrap select-none"
-                      >
-                        +{claimCelebration.toLocaleString()}
-                      </motion.span>
-                    )}
-                  </AnimatePresence>
-                  {/* Points tooltip - fixed position to escape overflow-hidden parents */}
-                  {channelPointsHovered && !showChannelPointsMenu && !(availableClaim && !autoClaimWatching) && (
-                    <ChannelPointsTooltip
-                      anchorRef={channelPointsRef}
-                      customPointsIconUrl={customPointsIconUrl}
-                      customPointsName={customPointsName}
-                      isLoadingChannelPoints={isLoadingChannelPoints}
-                      channelPoints={channelPoints}
-                    />
-                  )}
-                </div>
+              {/* In a narrow chat column the tools compress in place so the
+                  field keeps a usable width (utils/composerNarrow.ts). */}
+              <div ref={trackComposerWidth} className="sn-composer-row flex items-center gap-2 min-w-0">
+                {/* The channel wallet: points and bits, balances on the
+                    button or on hover. While the watched channel has a bonus
+                    chest ready and auto-collect is off, it becomes the claim
+                    control. Stays visible while a chest is waiting even if the
+                    balance is hidden, so hiding the number never costs you
+                    points. */}
+                {currentStream && (walletHasAny(walletPoints, channelState?.bits) || chestWaiting) && (showPointsBalance || chestWaiting) && (
+                  <WalletFace
+                    key={currentStream.user_login}
+                    points={walletPoints}
+                    bits={channelState?.bits}
+                    mode={pointsBalanceInline ? 'always' : 'hover'}
+                    gains={walletGains}
+                    open={showChannelPointsMenu}
+                    onToggle={() => setShowChannelPointsMenu(!showChannelPointsMenu)}
+                    chest={
+                      availableClaim && chestWaiting
+                        ? { onClaim: () => claimWatchedChest(availableClaim.id, availableClaim.channelId), claiming: claimingChest }
+                        : null
+                    }
+                    buttonRef={pointsButtonRef}
+                  />
                 )}
-                {/* Poll / prediction builder. Twitch scopes both create
-                    endpoints to the channel owner, so this only appears on
-                    your own channel. */}
-                {isBroadcaster && isTwitch && !isVodReplay && (
-                  <Tooltip content="Start a poll or prediction" side="top">
-                    <button
-                      onClick={() => setComposerKind((k) => (k ? null : 'poll'))}
-                      className={`flex items-center justify-center w-9 h-9 flex-shrink-0 self-center transition-colors duration-200 ${
-                        composerKind ? 'text-accent-neon' : 'text-textSecondary hover:text-accent-neon'
-                      }`}
-                      aria-label="Start a poll or prediction"
-                    >
-                      <BarChart3 size={18} />
-                    </button>
-                  </Tooltip>
-                )}
-                {/* Drops automation button: only when a drops automation plugin is installed
-                    and the current game has active drops. Without the plugin, core
-                    earns natively on the watched channel with no automation control. */}
-                {dropsCampaign && externalDropsProvider && (
-                  <Tooltip content={isDropProgressing ? `Stop collecting drops for ${dropsCampaign.game_name}` : `Start collecting drops for ${dropsCampaign.game_name}`} side="top">
-                  <button
-                    onClick={handleToggleAutomation}
-                    disabled={isLoadingDrops}
-                    className={`group flex-shrink-0 flex items-center justify-center self-center w-9 h-9 transition-all duration-200 ${isDropProgressing
-                      ? 'text-green-400 hover:text-red-400'
-                      : 'text-textSecondary hover:text-accent'
-                      }`}
-                  >
-                    <Pickaxe size={18} className={`transition-all duration-200 group-hover:drop-shadow-[0_0_6px_color-mix(in_srgb,var(--color-accent-neon)_85%,transparent)] ${isDropProgressing ? 'animate-pulse' : ''}`} />
-                  </button>
-                  </Tooltip>
-                )}
-                {/* Moderator Dashboard */}
-                {isModerator && currentStream && (
-                  <div className="flex-shrink-0 self-center z-20">
-                    {/* currentStream is synthesized from channelOverride in a
-                        MultiChat pane, so these are this pane's channel, not
-                        the main window's. */}
-                    <ModeratorMenu
-                      broadcasterId={currentStream.user_id}
-                      channelLogin={currentStream.user_login}
-                      isBroadcaster={!!isBroadcaster}
-                      roomState={roomState}
-                    />
-                  </div>
-                )}
-                {/* Input container with emoji button inset on the left */}
-                <div className="relative flex-1 min-w-0 flex items-center">
-                  {/* Command menu button, first inset on the left */}
-                  {showCommandButton && (
-                  <Tooltip content={showCommandMenu ? 'Close commands' : 'Commands'} side="top">
-                  <button
-                    ref={commandMenuButtonRef}
-                    type="button"
-                    aria-label="Chat commands"
-                    aria-expanded={showCommandMenu}
-                    onClick={() => {
-                      const next = !showCommandMenu;
-                      if (next) setShowEmotePicker(false);
-                      setShowCommandMenu(next);
+                {/* Tools: what you can do to the channel (drops, polls and
+                    predictions, chat modes, moderation) behind one button that
+                    shows only when something applies here. currentStream is
+                    synthesized from channelOverride in a MultiChat pane, so the
+                    ids are this pane's channel, not the main window's. */}
+                {currentStream && toolSections.any && (
+                  <ChannelToolsMenu
+                    broadcasterId={currentStream.user_id}
+                    channelLogin={currentStream.user_login}
+                    isBroadcaster={!!isBroadcaster}
+                    canModerate={toolSections.moderate}
+                    canRunPolls={toolSections.polls}
+                    onStartPoll={(kind) => {
+                      setManagerPanel(null);
+                      setComposerKind(kind);
                     }}
-                    className="group absolute left-1 top-1/2 -translate-y-1/2 z-10 flex items-center justify-center w-7 h-7 text-textSecondary hover:text-textPrimary transition-colors duration-200"
-                  >
-                    <SquareSlash
-                      size={16}
-                      className={`transition-all duration-200 group-hover:drop-shadow-[0_0_5px_color-mix(in_srgb,var(--color-accent-neon)_80%,transparent)] ${showCommandMenu ? 'text-accent' : ''}`}
-                    />
-                  </button>
-                  </Tooltip>
-                  )}
+                    pollBuilderOpen={!!composerKind || !!managerPanel}
+                    manager={streamManager.view}
+                    onOpenManager={(kind) => {
+                      setComposerKind(null);
+                      setManagerPanel(kind);
+                    }}
+                    onManagerOutcome={streamManager.apply}
+                    drops={dropsTool}
+                    roomState={roomState}
+                  />
+                )}
+                {/* Input container with emoji button inset on the left and
+                    the room's chat-mode chip inset on the right. */}
+                <div className="sn-composer-field relative flex-1 min-w-0 flex items-center">
                   {/* Emoji button — inset left inside the input */}
                   {showEmoteButton && (
-                  <Tooltip content={showEmotePicker ? "Close Emotes" : "Emotes"} side="top">
+                  <Tooltip content={showEmotePicker ? 'Close' : isTwitch ? 'Emotes, GIFs and commands' : 'Emotes and commands'} side="top">
                   <button
+                    ref={emoteButtonRef}
                     onClick={() => {
-                      if (!showEmotePicker) setShowCommandMenu(false);
                       // Twitch only. A non-Twitch pane legitimately has an empty
                       // `twitch` slot, so without this gate every picker open on
                       // a Kick or YouTube pane refetched the MAIN window's Twitch
@@ -5840,7 +5754,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       setShowEmotePicker(!showEmotePicker);
                     }}
                     onMouseLeave={smiley.cycleEmoteSmiley}
-                    className={`group absolute ${showCommandButton ? 'left-8' : 'left-1'} top-1/2 -translate-y-1/2 z-10 flex items-center justify-center w-7 h-7 text-textSecondary hover:text-textPrimary transition-colors duration-200`}
+                    className={`group absolute left-1 top-1/2 -translate-y-1/2 z-10 flex items-center justify-center w-7 h-7 text-textSecondary hover:text-textPrimary transition-colors duration-200`}
                   >
                     {showEmotePicker ? (
                       <svg className="w-4 h-4 transition-all duration-200 text-accent group-hover:drop-shadow-[0_0_5px_color-mix(in_srgb,var(--color-accent-neon)_80%,transparent)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>
@@ -5861,7 +5775,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                   )}
                   {/* Send-as account picker, just right of the emote button */}
                   {showSendAsPicker && (
-                    <div className={`absolute ${showCommandButton ? 'left-[60px]' : 'left-8'} top-1/2 -translate-y-1/2 z-10`}>
+                    <div className="absolute left-8 top-1/2 -translate-y-1/2 z-10">
                       <SendAsPicker />
                     </div>
                   )}
@@ -5917,7 +5831,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                         paddingTop: '8px',
                         paddingBottom: '8px',
                         paddingLeft: composerPaddingLeft,
-                        paddingRight: '12px',
+                        paddingRight: 'var(--sn-room-pad, 12px)',
                         color: 'var(--color-text-primary)',
                         wordSpacing: '0.4em',
                       }}
@@ -5964,7 +5878,10 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       }
                     }}
                     placeholder={visiblePlaceholder}
-                    className={`relative w-full text-sm placeholder-textSecondary resize-none overflow-hidden scrollbar-thin leading-[1.4] self-center transition-all duration-300 ${remindOverlayActive ? '' : 'glass-input'} ${
+                    data-placeholder-wide={visiblePlaceholder}
+                    data-placeholder-narrow={visiblePlaceholderNarrow}
+                    // glass-exempt: the input is clear on purpose; the highlight layer under it carries the surface.
+                    className={`sn-composer-input relative w-full text-sm placeholder-textSecondary resize-none overflow-hidden scrollbar-thin leading-[1.4] self-center transition-all duration-300 ${remindOverlayActive ? '' : 'glass-input'} ${
                       isWatchStreakMode 
                         ? 'ring-2 ring-amber-500/50 bg-amber-500/5 shadow-[0_0_15px_color-mix(in_srgb,var(--color-warning)_15%,transparent)] placeholder-amber-500/60 text-textPrimary'
                         : (commandState.isValid && !remindOverlayActive)
@@ -5977,7 +5894,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       paddingTop: '8px',
                       paddingBottom: '8px',
                       paddingLeft: composerPaddingLeft,
-                      paddingRight: '12px',
+                      paddingRight: 'var(--sn-room-pad, 12px)',
                       ...(remindOverlayActive ? {
                         // The backdrop above renders the surface + chipped text;
                         // the textarea goes transparent and only carries the caret
@@ -6021,13 +5938,15 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       if (emoteList) closeEmoteList();
                     }}
                   />
-                  {/* Length label and slow-mode countdown, bottom-right of the field. */}
-                  {(messageInput.length > 0 || slowRemaining > 0) && (
-                    <span className="pointer-events-none absolute bottom-1 right-2 z-10 flex items-center gap-1.5 text-[10px] tabular-nums text-textSecondary/70">
-                      {slowRemaining > 0 && <span className="text-amber-300/80">slow {slowRemaining}s</span>}
-                      {messageInput.length > 0 && (
-                        <span className={messageInput.length > 500 ? 'text-error' : ''}>{messageInput.length}/500</span>
-                      )}
+                  {/* The room's chat modes as one chip at the field's right edge. */}
+                  {roomModes && !roomModesAsPrompt && <RoomModeIndicator view={roomModes} />}
+                  {/* Length label, bottom-right of the field, clear of the chip. */}
+                  {messageInput.length > 0 && (
+                    <span
+                      className="pointer-events-none absolute bottom-1 z-10 flex items-center text-[10px] tabular-nums text-textSecondary/70"
+                      style={{ right: 'calc(var(--sn-room-pad, 12px) - 4px)' }}
+                    >
+                      <span className={messageInput.length > 500 ? 'text-error' : ''}>{messageInput.length}/500</span>
                     </span>
                   )}
                   {/* Squiggles go over the textarea, not under it — the input's
@@ -6043,27 +5962,66 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                         paddingTop: '8px',
                         paddingBottom: '8px',
                         paddingLeft: composerPaddingLeft,
-                        paddingRight: '12px',
+                        paddingRight: 'var(--sn-room-pad, 12px)',
                       }}
                     />
                   )}
                 </div>
-                <Tooltip content={isWatchStreakMode ? "Share Watch Streak" : "Send message"} side="top">
+                <Tooltip
+                  content={
+                    isWatchStreakMode
+                      ? "Share Watch Streak"
+                      : slowRemaining > 0
+                        ? `Slow mode: you can send again in ${slowRemaining}s`
+                        : composerCheer
+                          ? `Cheer ${composerCheer.total.toLocaleString()} ${composerCheer.total === 1 ? 'bit' : 'bits'}`
+                          : "Send message"
+                  }
+                  side="top"
+                >
                 <button
                   onClick={() => handleSendMessage()}
-                  disabled={(!messageInput.trim() && !isWatchStreakMode && !isResubMode) || isInputDisabled} 
-                  className={`flex-shrink-0 flex items-center justify-center self-center w-9 h-9 text-white rounded transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed ${
+                  aria-label={composerCheer ? `Cheer ${composerCheer.total.toLocaleString()} bits` : undefined}
+                  disabled={(!messageInput.trim() && !isWatchStreakMode && !isResubMode) || isInputDisabled || (!!composerCheer && composerCheer.problems.length > 0)} 
+                  className={`sn-composer-tool flex-shrink-0 flex items-center justify-center self-center w-9 h-9 text-white rounded transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed ${
                     isWatchStreakMode 
                       ? 'bg-amber-500 hover:bg-amber-400 shadow-[0_0_12px_color-mix(in_srgb,var(--color-warning)_30%,transparent)]'
                       : 'glass-button'
                   }`}
                 >
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                  {/* While a slow-mode wait runs, the seconds left stand in for
+                      the arrow, in the same 36px button. fitSeconds keeps it to
+                      three characters, which the button always fits. */}
+                  {slowRemaining > 0 && !isWatchStreakMode ? (
+                    <span className="sn-send-count text-[13px] font-semibold tabular-nums leading-none text-textPrimary" aria-label={`Send again in ${slowRemaining} seconds`}>
+                      {fitSeconds(slowRemaining)}
+                    </span>
+                  ) : composerCheer?.icon_url && !isWatchStreakMode ? (
+                    // The message cheers: Send spends, so it wears the gem.
+                    <img src={composerCheer.icon_url} alt="" className="h-5 w-5 object-contain" />
+                  ) : (
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" /></svg>
+                  )}
                 </button>
                 </Tooltip>
               </div>
             </div>
             {!isConnected && <p className="text-xs text-yellow-400 mt-2">Chat is not connected. Messages cannot be sent.</p>}
+            {/* Why Twitch sends are off, beside the same sign-in Home runs.
+                Main app only, like the connect chips below. */}
+            {isMainSurface && twitchSignInOwedFor && (
+              <div className="mt-2 flex items-center justify-end gap-2.5">
+                <span className="min-w-0 text-right text-[11px] leading-[14px] text-textMuted">
+                  {signInReasonText(twitchSignInOwedFor)}
+                </span>
+                <PlatformLoginButton
+                  provider="twitch"
+                  onClick={() => void useAppStore.getState().loginToTwitch()}
+                  label="Sign in"
+                  size="sm"
+                />
+              </div>
+            )}
             {/* Connect chips only in the MAIN app — either watching Twitch (no
                 override at all) or watching a provider stream in the main window
                 (`context: 'main'`). In a MultiChat popout sign-in lives in Account

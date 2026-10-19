@@ -13,6 +13,7 @@
   flex-direction: column;
   overflow: hidden;
   font-size: 14px;
+  /* 56: icons only (five tabs left no room for labels), a 44 px pill inside. */
   --sn-tabbar-h: 56px;
   --sn-safe-t: var(--sn-inset-t, env(safe-area-inset-top, 0px));
   --sn-safe-r: var(--sn-inset-r, env(safe-area-inset-right, 0px));
@@ -20,11 +21,73 @@
   --sn-safe-l: var(--sn-inset-l, env(safe-area-inset-left, 0px));
 }
 
+/* One device pixel, the iPhone's hairline (1 / scale). A 1px CSS line is four
+   device pixels on a 4x phone and reads as an outline, not an edge. */
+.sn-mobile {
+  --sn-hairline: 1px;
+}
+@media (min-resolution: 2dppx) {
+  .sn-mobile { --sn-hairline: 0.5px; }
+}
+@media (min-resolution: 3dppx) {
+  .sn-mobile { --sn-hairline: 0.34px; }
+}
+@media (min-resolution: 4dppx) {
+  .sn-mobile { --sn-hairline: 0.25px; }
+}
+
 /* Touch surfaces scroll with overlay scrolling; the 8px hover-styled desktop
-   scrollbar is noise on a phone. */
-.sn-mobile ::-webkit-scrollbar {
+   scrollbar is noise on a phone. Sheets and menus portal into <body>, outside
+   .sn-mobile, so the rule reaches them through `body:has(.sn-mobile)`: a sheet
+   showed a scrollbar the screens behind it did not. */
+.sn-mobile ::-webkit-scrollbar,
+body:has(.sn-mobile) ::-webkit-scrollbar {
   width: 0;
   height: 0;
+}
+
+/* Fields on the phone (search, the composer, the command box): the theme's
+   raised surface (its surface over its background), the pair the text floors
+   are measured on, with the glass family's edge, a lit rim fading inward and a
+   dark hairline outside. The desktop's field is a neumorphic trench (a 1px
+   border plus soft inner shadows) that read on a phone as a light bordered
+   box. Corners stay the field's own: the composer and text areas grow to
+   several lines, so only the search field (`ui/SearchField`) is a capsule. */
+body:has(.sn-mobile) .glass-input,
+body:has(.sn-mobile) .glass-input:focus {
+  border: none;
+  background: linear-gradient(var(--color-surface), var(--color-surface)), var(--color-background);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow:
+    inset 0 0 0 0.33px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 0.67px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 2px rgba(255, 255, 255, 0.02),
+    0 0 0 0.5px rgba(0, 0, 0, 0.4);
+}
+/* The secondary button (`ui/Button`): a light glass capsule, about 10% white
+   over what is behind it with the rim's top light and a dark hairline, solid
+   tertiary at Glassiness 0. Unscoped, because buttons also live in sheets. */
+.sn-button-secondary {
+  background-color: color-mix(
+    in srgb,
+    var(--color-background-tertiary) calc((1 - var(--glass-strength)) * 100%),
+    rgb(255 255 255 / 0.1)
+  );
+  box-shadow:
+    inset 0 0.5px 0 0 rgba(255, 255, 255, 0.14),
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.06),
+    0 0 0 0.5px rgba(0, 0, 0, 0.4);
+}
+
+/* Focus is a brighter rim, not a trench. */
+body:has(.sn-mobile) .glass-input:focus-within,
+body:has(.sn-mobile) .glass-input:focus {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--color-accent) 45%, transparent),
+    inset 0 0 0 2px rgba(255, 255, 255, 0.03),
+    0 0 0 0.5px rgba(0, 0, 0, 0.4);
 }
 
 /* Screen container between the safe top and the tab bar. */
@@ -37,10 +100,106 @@
   padding-right: var(--sn-safe-r);
 }
 
+/* A scrolling list that ends against a bar (the emote grid above the
+   Emotes/GIFs switch): the last 16px fade out instead of being cut, so the list
+   reads as running on under the bar. Unscoped, because such lists also live in
+   sheets. */
+.sn-fade-bottom {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 16px), transparent);
+}
+
+/* A sheet's content once it has scrolled under the handle (MobileSheet adds
+   it), and a list that scrolls up under a header or the status bar (the Chats
+   tab): the top 24px fade out, so nothing meets the edge with a hard line.
+   The iPhone's fitted sheets fade the same way. */
+.sn-fade-top {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 24px);
+  mask-image: linear-gradient(to bottom, transparent, #000 24px);
+}
+
+/* An identity's Atmosphere glow (`AtmosphereGlow` in profile/IdentityParts):
+   the chat wash at 70%, faded in from both sides and down from just under the
+   top to nothing well before the bottom, so no edge of the art ever shows.
+   The two masks multiply. Unscoped, because a chatter's profile sheet portals
+   into <body>. */
+.sn-atm-glow {
+  overflow: hidden;
+  opacity: 0.7;
+  -webkit-mask-image:
+    linear-gradient(to right, transparent 0%, #000 18%, #000 62%, transparent 100%),
+    linear-gradient(to bottom, transparent 0%, #000 20%, rgba(0, 0, 0, 0.75) 50%, transparent 100%);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(to right, transparent 0%, #000 18%, #000 62%, transparent 100%),
+    linear-gradient(to bottom, transparent 0%, #000 20%, rgba(0, 0, 0, 0.75) 50%, transparent 100%);
+  mask-composite: intersect;
+}
+/* The curtains breathe in opacity only (the chat drift's opacity curve and
+   periods, no travel): the compositor runs it at full frame rate with nothing
+   to repaint. */
+@keyframes sn-atm-breathe-1 {
+  0%, 100% { opacity: 0.78; }
+  50% { opacity: 1; }
+}
+@keyframes sn-atm-breathe-2 {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 0.92; }
+}
+.sn-atm-breathe-1 {
+  opacity: 0.78;
+  animation: sn-atm-breathe-1 9s ease-in-out infinite;
+}
+.sn-atm-breathe-2 {
+  opacity: 0.6;
+  animation: sn-atm-breathe-2 12s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sn-atm-breathe-1,
+  .sn-atm-breathe-2 {
+    animation: none;
+  }
+}
+
 /* Minimum touch target for interactive rows/buttons in the mobile tree. */
 .sn-touch {
   min-height: 44px;
   min-width: 44px;
+}
+
+/* The stream manager's forms are the desktop builders' own; on the phone
+   their fields and buttons get finger-sized targets and text. */
+.sn-manage-touch .glass-input,
+.sn-manage-touch .glass-button,
+.sn-manage-touch .glass-button-secondary {
+  min-height: 44px;
+  font-size: 15px;
+}
+.sn-manage-touch .sm-btn {
+  min-height: 40px;
+  padding-left: 14px;
+  padding-right: 14px;
+  border-radius: 12px;
+  font-size: 14px;
+}
+/* A reward's Pause and Complete all serve its heading: a step quieter than the
+   row actions. */
+.sn-manage-touch .sm-btn.sm-head {
+  min-height: 34px;
+  padding-left: 12px;
+  padding-right: 12px;
+  border-radius: 10px;
+  font-size: 13.5px;
+}
+/* A redemption's actions go on their own line under its text, so the text
+   keeps the row's width. */
+.sn-manage-touch .sm-row {
+  flex-wrap: wrap;
+}
+.sn-manage-touch .sm-acts {
+  flex-basis: 100%;
+  gap: 8px;
+  padding-left: 34px;
 }
 
 /* Bottom clearance for scroll content that runs behind the floating pill tab
@@ -81,6 +240,27 @@
   width: 40px;
   width: clamp(22px, 18cqh, 60px);
   height: auto;
+  /* The mark's mass leans left of its box, so box-centered it reads off
+     center; it moves right by 6 percent of its width. */
+  transform: translateX(6%);
+}
+
+/* Concentric corners on the stream cards. The preview sits 8px inside the
+   card, so its corner is the card's minus 8px in the same corner shape, and
+   the two curves share a center. A 4px preview inside an 8px (or 24px
+   squircle) card read as two unrelated shapes. Round cards are 18px here, a
+   step softer than desktop's 8px; the squircle keeps desktop's 24px. */
+.sn-mobile .media-card {
+  --media-card-radius: 18px;
+}
+@supports (corner-shape: squircle) {
+  .sn-mobile .media-card {
+    --media-card-radius: 24px;
+  }
+}
+.sn-mobile .media-card .sn-card-thumb {
+  border-radius: calc(var(--media-card-radius) - 8px);
+  corner-shape: var(--media-card-corner);
 }
 
 /* One tile of the badge wall. Several hundred of these mount at once; with
@@ -100,15 +280,96 @@
   backdrop-filter: none;
 }
 
-/* A popover that sits OVER SCROLLING CHAT (the drop bar, the pinned banner).
-   The house popover blurs 64px of whatever is behind it, and behind these two
-   is a chat that repaints on every message, so the blur was recomputed on
-   every frame for the whole watch. A firmer tint carries the legibility the
-   blur was providing. */
+/* A popover with no blur behind it (the drop bar, the pinned banner, the You
+   card's picture note). The house popover blurs 64px of whatever is behind
+   it, and behind the first two is a chat that repaints on every message, so
+   the blur was recomputed every frame. With no blur the tint is all there is,
+   and any tint short of solid leaves the text behind crisp (at 97% a white
+   line still showed as a ghost on the phone), so a static popover is fully
+   opaque: the glass contract's "never crisp". The page background it mixes
+   is opaque on a phone (phoneFloors), and the theme's popover light still
+   rides the image layers on top. */
 .sn-mobile .sn-popover--static {
-  --sn-popover-tint: calc(90% + (1 - var(--glass-strength)) * 10%);
+  --sn-popover-tint: 100%;
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
+}
+
+/* One menu for the phone: the platform menu, the badge sort and any other
+   short list hung from a control. Menus portal into <body>, outside
+   .sn-mobile, so these are not scoped under it. The surface is near-opaque
+   (92% of the tertiary floor, solid at Glassiness 0) over a light blur: the
+   house popover's thin tint went muddy over red box art. Rows are 44px, the
+   label 15px in the primary color for every option, the chosen one semibold
+   with an accent check, the way the iPhone's system menus read. */
+.sn-menu {
+  border-radius: 14px;
+  background-color: color-mix(
+    in srgb,
+    var(--color-background-tertiary) calc(92% + (1 - var(--glass-strength)) * 8%),
+    transparent
+  );
+  /* 20px: at 92% fill the radius barely shows, and it keeps the menu out of
+     globals.css's one-blur-per-stack lists (light up to 16px, heavy from 24px),
+     which it never nests in anyway: it portals into <body>. */
+  -webkit-backdrop-filter: blur(calc(20px * var(--glass-strength))) saturate(120%);
+  backdrop-filter: blur(calc(20px * var(--glass-strength))) saturate(120%);
+  box-shadow:
+    inset 0 0 0 0.5px rgba(255, 255, 255, 0.08),
+    0 0 0 0.5px rgba(0, 0, 0, 0.4),
+    0 12px 32px -8px rgba(0, 0, 0, 0.6);
+  padding: 6px 0;
+}
+.sn-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  height: 44px;
+  padding: 0 12px 0 14px;
+  text-align: left;
+  font-size: 15px;
+  color: var(--color-text-primary);
+  outline: none;
+}
+.sn-menu-row[aria-checked='true'] {
+  font-weight: 600;
+}
+.sn-menu-row:active,
+.sn-menu-row:focus-visible {
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+/* The grouped card (mobile/ui/GroupedList): the settings pages' sections and
+   any other list of rows on a page. Solid at every Glassiness, the way a
+   static popover is: the theme's raised surface over its background, the pair
+   the segment track uses, so the text floors hold and nothing behind the card
+   reads through. The corner is the phone menu's 14px. Not scoped under
+   .sn-mobile, so a card inside a sheet (portaled into <body>) gets it too. */
+.sn-group-card {
+  border-radius: 14px;
+  background: linear-gradient(var(--color-surface), var(--color-surface)), var(--color-background);
+  overflow: hidden;
+}
+/* Each row draws the hairline above itself, starting after the icon column
+   (16px inset, 24px icon, 12px gap) and running to the card's trailing edge.
+   The body is lifted a pixel under the card's clipped top, so the first row's
+   line never shows whatever wrappers the rows sit in. */
+.sn-group-body {
+  margin-top: -1px;
+}
+.sn-group-row {
+  position: relative;
+}
+.sn-group-row::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 52px;
+  right: 0;
+  height: 1px;
+  background: var(--color-border-subtle);
+  pointer-events: none;
 }
 
 /* Chat floating over landscape video on a phone. The desktop overlay's
@@ -130,4 +391,75 @@
   box-shadow:
     inset -1px 0 0 0 rgba(255, 255, 255, 0.1),
     0 0 40px -10px rgba(0, 0, 0, 0.6);
+}
+
+/* The segment track (SegmentedControl): the theme's own raised surface, its
+   surface over its background, which is the very pair the theme's text floors
+   are measured on, so the secondary labels' contrast holds on what the phone
+   draws. Opaque, so a list scrolling under it never shows through. The edge is
+   the glass family's: a lit rim all the way round that fades inward over about
+   four pixels (nested inset strokes adding up to roughly 0.26 white at the
+   outer pixel), and a dark hairline just outside it. The rim stays at the edge,
+   clear of the labels. */
+.sn-mobile .sn-segment-track {
+  border-radius: 9999px;
+  background: linear-gradient(var(--color-surface), var(--color-surface)), var(--color-background);
+  box-shadow:
+    inset 0 0 0 0.33px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 0.67px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.08),
+    inset 0 0 0 2px rgba(255, 255, 255, 0.02),
+    inset 0 0 0 4px rgba(255, 255, 255, 0.025),
+    0 0 0 0.5px rgba(0, 0, 0, 0.4);
+}
+
+/* The tab bar's glass. It rides over its own floor (below), which is nearly the
+   page background, so the desktop dock's black film made it darker than the
+   page and it read as a hole. A light glass instead: about 12% white over the
+   blur, the lift the iPhone's bar shows over the same page (#2B2B2C on
+   #0C0C0D), with the chosen tab's pill at half black so it reads as sunk into
+   the glass. The opaque floor still fades in as Glassiness drops, so at 0
+   nothing is see-through. */
+.sn-mobile .chrome-glaze--dock {
+  background-color: color-mix(
+    in srgb,
+    var(--color-background-tertiary) calc((1 - var(--glass-strength)) * 100%),
+    rgb(255 255 255 / 0.12)
+  );
+  -webkit-backdrop-filter: blur(calc(20px * var(--glass-strength))) saturate(140%);
+  backdrop-filter: blur(calc(20px * var(--glass-strength))) saturate(140%);
+}
+.sn-mobile .chrome-glaze--dock .glaze-selected {
+  background-color: rgb(0 0 0 / 0.5);
+}
+/* On a light theme a dark pill sinks the theme's dark text into it, so the
+   chosen item is a tint of that text instead. */
+:root[data-theme-tone='light'] .sn-mobile .glaze-selected {
+  background-color: color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+}
+
+/* The floor under the floating tab bar: the page's own background rising from
+   clear on an eased curve (smoothstep, to 92%), so content scrolling down fades
+   out under the bar instead of showing through its glass, with no visible
+   start line and no bare strip below it. It covers the bar, the gesture inset
+   under it, and a 28px lead-in above it; content higher up stays at full
+   strength. It never takes a touch. */
+.sn-mobile .sn-tabbar-floor {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(var(--sn-safe-b, 0px) + 14px + var(--sn-tabbar-h, 56px) + 28px);
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent 0%,
+    color-mix(in srgb, var(--color-background) 5.6%, transparent) 15%,
+    color-mix(in srgb, var(--color-background) 19.9%, transparent) 30%,
+    color-mix(in srgb, var(--color-background) 39.1%, transparent) 45%,
+    color-mix(in srgb, var(--color-background) 59.6%, transparent) 60%,
+    color-mix(in srgb, var(--color-background) 77.6%, transparent) 75%,
+    color-mix(in srgb, var(--color-background) 89.4%, transparent) 90%,
+    color-mix(in srgb, var(--color-background) 92%, transparent) 100%
+  );
 }

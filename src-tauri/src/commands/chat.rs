@@ -382,6 +382,8 @@ pub async fn kick_disconnect(app: crate::rt::AppHandle, state: State<'_, AppStat
     // a profile directory. Expire only Kick's cookies so Twitch stays signed in.
     #[cfg(target_os = "android")]
     crate::twitch_login_plugin::expire_cookies(&app, &["https://kick.com", "https://id.kick.com"]);
+    #[cfg(target_os = "ios")]
+    crate::services::ios_sheet::expire_cookies(&app, &["https://kick.com", "https://id.kick.com"]);
     if let Err(e) = crate::commands::provider_browse::clear_imported_follows("kick", &state) {
         log::warn!("[Kick] could not clear imported follows: {}", e);
     }
@@ -467,6 +469,7 @@ pub async fn kick_chat_history(
                 None
             } else {
                 m.metadata.from_backfill = true;
+                crate::services::chat_row_view::stamp(&mut m);
                 Some(m)
             }
         })
@@ -479,10 +482,16 @@ pub async fn kick_can_moderate(channel: String) -> bool {
 }
 
 /// A Kick channel's 7TV emotes (channel set + 7TV globals) as an EmoteSet, for the
-/// emote picker — parity with Twitch's `fetch_channel_emotes`.
+/// emote picker — parity with Twitch's `fetch_channel_emotes`, disk-cache paths
+/// included for the page's `tier`.
 #[tauri::command]
-pub async fn get_kick_channel_emotes(slug: String) -> crate::services::emote_service::EmoteSet {
-    crate::services::providers::kick_emotes::channel_emote_set(&slug).await
+pub async fn get_kick_channel_emotes(
+    slug: String,
+    tier: Option<String>,
+) -> crate::services::emote_service::EmoteSet {
+    let mut set = crate::services::providers::kick_emotes::channel_emote_set(&slug).await;
+    super::emotes::stamp_set_paths(&mut set, super::emotes::render_tier(tier.as_deref()));
+    set
 }
 
 /// A YouTube channel's 7TV emotes (channel set + 7TV globals) as an EmoteSet,
@@ -491,13 +500,16 @@ pub async fn get_kick_channel_emotes(slug: String) -> crate::services::emote_ser
 #[tauri::command]
 pub async fn get_youtube_channel_emotes(
     channel: String,
+    tier: Option<String>,
 ) -> crate::services::emote_service::EmoteSet {
-    crate::services::providers::youtube_emotes::channel_emote_set(&channel).await
+    let mut set = crate::services::providers::youtube_emotes::channel_emote_set(&channel).await;
+    super::emotes::stamp_set_paths(&mut set, super::emotes::render_tier(tier.as_deref()));
+    set
 }
 
 #[tauri::command]
-pub async fn stop_chat() -> Result<(), String> {
-    ChatService::stop().await.map_err(|e| e.to_string())
+pub async fn stop_chat(window: crate::rt::Window) -> Result<bool, String> {
+    ChatService::stop(window.label()).await.map_err(|e| e.to_string())
 }
 
 /// Who is signed in on a platform: display name, profile picture, and the id
@@ -560,6 +572,16 @@ pub async fn platform_account_info(provider: String) -> PlatformAccountInfo {
         }
         _ => PlatformAccountInfo::default(),
     }
+}
+
+/// Every account StreamNook is signed into, ready to render. Changes arrive on
+/// `account-roster-changed`; this is the first read.
+#[tauri::command]
+pub async fn get_account_roster() -> crate::services::account_roster::AccountRoster {
+    let roster = crate::services::account_roster::build().await;
+    // Every read reports what changed (linked accounts dedupe on their own).
+    crate::services::linked_accounts::on_roster(&roster);
+    roster
 }
 
 /// Which StreamNook member, if any, is behind each of these chat identities.
@@ -630,6 +652,10 @@ pub async fn validate_platform_sessions(app: crate::rt::AppHandle) -> Vec<String
     // poll of its own.
     if !signed_out.is_empty() {
         let _ = app.emit("platform-account-changed", signed_out.clone());
+        // Revoked, not signed out: the title bar offers a reconnect.
+        for provider in &signed_out {
+            crate::services::account_roster::mark_expired(provider);
+        }
     }
     signed_out
 }
@@ -686,14 +712,42 @@ pub async fn nudge_chat_channels() -> Result<usize, String> {
 
 #[tauri::command]
 pub async fn send_chat_message(
+    state: State<'_, AppState>,
     message: String,
     reply_parent_msg_id: Option<String>,
     target_channel: Option<String>,
     broadcaster_id: Option<String>,
     sender_id: Option<String>,
     sender_account_id: Option<String>,
-) -> Result<SendResult, String> {
-    ChatService::send_message(
+    pin_after_send: Option<bool>,
+) -> Result<SentMessage, String> {
+    // A typed message that cheers is never sent as chat: that would spend
+    // nothing and show as plain text. It comes back held, with the total and
+    // anything in the way, for the page to confirm (bits::send then sends it).
+    // Paced and scripted sends do not come through here and are untouched.
+    if let Some(channel) = target_channel.as_deref() {
+        let main_id = crate::services::account_store::AccountStore::primary().map(|a| a.user_id);
+        let sender_is_main = match (sender_account_id.as_deref(), main_id.as_deref()) {
+            (Some(acc), Some(main)) => acc == main,
+            _ => true,
+        };
+        if let Some(cheer) = crate::services::bits::typed_cheer(
+            &state.twitch_auth,
+            &message,
+            channel,
+            broadcaster_id.as_deref(),
+            sender_is_main,
+        )
+        .await
+        {
+            return Ok(SentMessage {
+                sent: SendResult { message_id: None, is_sent: false, drop_reason: None },
+                pin_error: None,
+                cheer: Some(cheer),
+            });
+        }
+    }
+    let sent = ChatService::send_message(
         &message,
         reply_parent_msg_id.as_deref(),
         target_channel.as_deref(),
@@ -702,7 +756,52 @@ pub async fn send_chat_message(
         sender_account_id.as_deref(),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    // The picker offers the emotes you just used first.
+    if sent.is_sent {
+        if let Some(channel) = target_channel.as_deref() {
+            crate::services::recent_emotes::record(channel, &message).await;
+        }
+    }
+    let pin_error = if pin_after_send.unwrap_or(false) {
+        pin_sent(&sent, broadcaster_id.as_deref()).await.err()
+    } else {
+        None
+    };
+    Ok(SentMessage { sent, pin_error, cheer: None })
+}
+
+/// A send's outcome, plus why the pin failed when one was asked for. Without a
+/// pin or a held cheer the wire shape is exactly `SendResult`.
+#[derive(serde::Serialize)]
+pub struct SentMessage {
+    #[serde(flatten)]
+    sent: SendResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_error: Option<String>,
+    /// The message cheers, so it was held rather than sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cheer: Option<crate::services::bits::CheerCheck>,
+}
+
+/// Pins a message this app just sent (`/pin <text>`). A dropped message is not
+/// pinned and is no pin error: the send outcome already says why it was
+/// dropped. Pinning needs the id Helix returns; a send that fell back to IRC
+/// has none.
+async fn pin_sent(sent: &SendResult, broadcaster_id: Option<&str>) -> Result<(), String> {
+    if !sent.is_sent {
+        return Ok(());
+    }
+    let broadcaster_id = broadcaster_id
+        .filter(|id| !id.is_empty())
+        .ok_or("Sent, but not pinned: the channel is unknown")?;
+    let message_id = sent
+        .message_id
+        .as_deref()
+        .ok_or("Sent, but not pinned: Twitch did not return the message id")?;
+    crate::commands::twitch::pin_chat_message(broadcaster_id.to_string(), message_id.to_string(), None)
+        .await
+        .map_err(|e| format!("Sent, but not pinned: {e}"))
 }
 
 #[tauri::command]
@@ -788,6 +887,9 @@ pub async fn parse_historical_messages(
 const HISTORY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Mirror page size; robotty caps at 800.
 const HISTORY_DEFAULT_LIMIT: u32 = 100;
+/// How long history waits for its channel's emote table to seed before
+/// parsing. The seed is a cached broadcaster lookup plus a disk read.
+const HISTORY_EMOTE_SEED_WAIT: Duration = Duration::from_secs(3);
 const HISTORY_MAX_LIMIT: u32 = 800;
 const RECENT_MESSAGES_BASE: &str = "https://recent-messages.robotty.de/api/v2/recent-messages";
 
@@ -874,9 +976,12 @@ async fn fetch_recent_messages(
         .unwrap_or_default()
 }
 
-/// The join backfill, fetched and parsed by Rust in one call: the recent
-/// messages mirror (recent-messages.robotty.de) tagged `historical=1`, then
-/// the same parse the live path uses. Until 2026-09-07 the page fetched the
+/// The join backfill, fetched and parsed by Rust in one call: Twitch's own
+/// recent chat when the viewer is signed in to twitch.tv
+/// (`twitch_chat_history`), else the recent messages mirror
+/// (recent-messages.robotty.de), as lines tagged `historical=1`, then the same
+/// parse the live path uses. A reconnect's windowed backfill always uses the
+/// mirror, since Twitch's answer has no time window. Until 2026-09-07 the page fetched the
 /// mirror itself, serially after the badge cache init, so history landed one
 /// to two seconds after the first live rows and visibly prepended; now the
 /// store starts this call at acquire time, in parallel with the IRC join,
@@ -901,23 +1006,54 @@ pub async fn load_channel_history(
     let raw = match if windowed { None } else { cached_history(&key) } {
         Some(lines) => lines,
         None => {
-            let lines =
-                fetch_recent_messages(&key, limit.unwrap_or(HISTORY_DEFAULT_LIMIT), after_ms, before_ms)
-                    .await;
+            let from_twitch = if windowed {
+                None
+            } else {
+                crate::services::twitch_chat_history::fetch(&key, &state.twitch_auth)
+                    .await
+                    .filter(|lines| !lines.is_empty())
+            };
+            let lines = match from_twitch {
+                Some(lines) => lines,
+                None => {
+                    fetch_recent_messages(&key, limit.unwrap_or(HISTORY_DEFAULT_LIMIT), after_ms, before_ms)
+                        .await
+                }
+            };
             if !windowed {
                 store_history(&key, lines.clone());
             }
             lines
         }
     };
-    // Same background emote warm as parse_historical_messages: never in front
-    // of the rows, a down provider must not blank the chat.
-    let emote_service = state.emote_service.clone();
-    let warm = key.clone();
-    tokio::spawn(async move {
-        IrcService::fetch_and_store_emotes(&warm, emote_service).await;
-    });
-    let parsed = IrcService::parse_historical_messages(raw).await;
+    // Rust decides which words are emotes when it parses, and a row parsed as
+    // text stays text, so the channel's table must be in place first. The JOIN
+    // that normally seeds it can wait in the join window behind other chats,
+    // so history seeds it here: the broadcaster lookup and the saved
+    // dictionary, never the providers (the refresh follows in the background,
+    // so a down provider still cannot blank the chat). Bounded, because a
+    // backlog with names beats no backlog.
+    use crate::services::irc_service::with_channel_emotes;
+    let mut seeded = with_channel_emotes(&key, |_| ()).await.is_some();
+    if !seeded {
+        let seed = IrcService::seed_emotes_deferring_refresh(&key, state.emote_service.clone());
+        if tokio::time::timeout(HISTORY_EMOTE_SEED_WAIT, seed).await.is_err() {
+            log::debug!("[ChatHistory] {key}: emote seed slower than the wait, parsing without it");
+        }
+        seeded = with_channel_emotes(&key, |_| ()).await.is_some();
+    }
+    // A first visit has no saved dictionary, so the backlog parses before the
+    // providers answer. It shows now and is re-stamped when the table lands
+    // (`spawn_history_restamp`), rather than waiting for a slow provider.
+    let restamp_lines = (!seeded).then(|| raw.clone());
+    let parsed = IrcService::parse_historical_messages(raw.clone()).await;
+    // A native shell draws each row from its stamped view and only has these
+    // rows once this answer returns, so the backlog waits briefly for its
+    // authors' cosmetics and patches in the rest (`history_cosmetics`).
+    let parsed = crate::services::history_cosmetics::decorate(&key, &raw, parsed).await;
+    if let Some(lines) = restamp_lines {
+        IrcService::spawn_history_restamp(&key, lines, &parsed);
+    }
     log::debug!(
         "[ChatHistory] {key}: {} rows in {} ms{}",
         parsed.len(),
@@ -994,4 +1130,31 @@ pub async fn build_own_chat_message(
     message: crate::services::irc_service::OwnMessage,
 ) -> Option<ChatMessage> {
     IrcService::build_own_message(message).await
+}
+
+/// The chat commands a composer lists for the room: the built-in table with
+/// each row's lock for the viewer's role there, then the viewer's own slash
+/// commands, filtered by `query`. `platform` "desktop" keeps the
+/// desktop-only commands a phone leaves out.
+#[tauri::command]
+pub fn command_catalog(
+    channel: String,
+    platform: Option<String>,
+    query: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::services::command_catalog::CatalogRow>, String> {
+    use crate::services::chat_send_limiter::Role;
+    let own = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        crate::services::command_catalog::user_commands(settings.extra.get("chat_commands"))
+    };
+    let key = channel.trim().trim_start_matches('#').to_lowercase();
+    let role = crate::services::chat_send_limiter::budget(&key).role;
+    Ok(crate::services::command_catalog::catalog(
+        platform.as_deref() != Some("desktop"),
+        matches!(role, Role::Moderator | Role::Broadcaster),
+        matches!(role, Role::Broadcaster),
+        &own,
+        query.as_deref().unwrap_or_default(),
+    ))
 }

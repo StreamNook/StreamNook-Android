@@ -1,5 +1,6 @@
-import React, { useRef, useEffect, useCallback, useMemo, memo } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useCallback, useMemo, useState, memo } from 'react';
 import ChatMessage from './ChatMessage';
+import HeldMessageRow from './chat/HeldMessageRow';
 import { isHiddenEvent } from '../utils/chatEvents';
 import { EmoteSet } from '../services/emoteService';
 import { BackendChatMessage } from '../services/twitchChat';
@@ -7,8 +8,43 @@ import { ModerationContext } from '../hooks/useTwitchChat';
 import { useAppStore } from '../stores/AppStore';
 import { useStreamerMode } from '../utils/streamerMode';
 import { useChatUserStore } from '../stores/chatUserStore';
-import { ProviderLogo } from './ProviderLogo';
 import type { ProviderId } from '../types/providers';
+import { ScrollbarMarks } from './chat/ScrollbarMarks';
+import { holdChatRow, moderateWithToast, ROW_HOLD_EVENT, useLineConfig, useModSliderSteps } from '../services/moderation';
+import { lineButtons, type LineButton } from './chat/modLine';
+import { bindLineStrips, isOnLineStrip, useLineArt } from './chat/lineArt';
+import { collectMarks, FALLBACK_MARK_KINDS } from './chat/scrollbarMarkLayout';
+import { IS_MAC, IS_MOBILE } from '../utils/platform';
+
+/**
+ * How many of the newest rows always paint (see MessageRow). Enough to fill
+ * a tall chat column at the smallest text size.
+ */
+const NEWEST_ROWS_PAINTED = 40;
+
+/** On the phone the list meets the player band at its top edge: rows fade in
+ *  over 24px there instead of being cut by a hard line. On the list's box, so
+ *  the scroller inside keeps its own composited scrolling. */
+const PHONE_TOP_FADE: React.CSSProperties = {
+  WebkitMaskImage: 'linear-gradient(to bottom, transparent 0, #000 24px)',
+  maskImage: 'linear-gradient(to bottom, transparent 0, #000 24px)',
+};
+
+/**
+ * How long the pointer can be off a mod target (a line's buttons, a row with
+ * the hover dock, the slider grip) before the hover hold lets go: long enough
+ * to cross the gap between one line's buttons and the next, short enough that
+ * leaving them feels immediate.
+ */
+const MOD_HOLD_GRACE_MS = 250;
+
+/** Where a mod action starts, besides the line buttons: a row that offers the
+ *  hover dock (ChatMessage marks it), and the slider grip or tile handle. */
+const MOD_TARGET_SELECTOR = '[data-mod-dock], [data-mod-edge]';
+
+function isOnModTarget(target: EventTarget | null): boolean {
+  return target instanceof Element && (isOnLineStrip(target) || target.closest(MOD_TARGET_SELECTOR) !== null);
+}
 
 /**
  * Per-row wrapper carrying the native-virtualization styles, with one
@@ -29,9 +65,11 @@ interface MessageRowProps {
   messageId: string | null;
   userId: string | undefined;
   isModFocus: boolean;
+  /** One of the newest rows, which are on screen whenever the list follows. */
+  isNewest: boolean;
   intrinsicSizeCSS: string;
+  /** Blended feed: the platform logo ChatMessage draws in the name line. */
   sourceProvider: ProviderId | undefined;
-  sourceLogoSize: number;
   message: string | BackendChatMessage;
   isHighlighted: boolean;
   moderationContext: ModerationContext | null;
@@ -41,6 +79,8 @@ interface MessageRowProps {
   /** The platform being watched, so a row from one of the streamer's OTHER
    *  platforms can be told apart from this channel's own. */
   homeProvider?: ProviderId;
+  /** The line buttons, one shared array for every row (null when off). */
+  modLine: LineButton[] | null;
   onUsernameClick: ChatMessageListProps['onUsernameClick'];
   onReplyClick: ChatMessageListProps['onReplyClick'];
   onMessageCopy?: ChatMessageListProps['onMessageCopy'];
@@ -60,13 +100,17 @@ const messageRowAreEqual = (prev: MessageRowProps, next: MessageRowProps): boole
   if (prev.messageId !== next.messageId) return false;
   if (prev.userId !== next.userId) return false;
   if (prev.isModFocus !== next.isModFocus) return false;
+  if (prev.isNewest !== next.isNewest) return false;
   if (prev.intrinsicSizeCSS !== next.intrinsicSizeCSS) return false;
   if (prev.sourceProvider !== next.sourceProvider) return false;
-  if (prev.sourceLogoSize !== next.sourceLogoSize) return false;
   if (prev.message !== next.message) {
     if (typeof prev.message === 'string' || typeof next.message === 'string') return false;
     if (!prev.message.id || !next.message.id) return false;
     if (prev.message.id !== next.message.id) return false;
+    // Same row re-stamped by Rust with new segments (see chatMessageAreEqual).
+    if (prev.message.segments !== next.message.segments) return false;
+    // A held AutoMod row folds in place once decided.
+    if (prev.message.automodHeld !== next.message.automodHeld) return false;
   }
   if (prev.isHighlighted !== next.isHighlighted) return false;
   if (prev.moderationContext?.type !== next.moderationContext?.type ||
@@ -75,6 +119,7 @@ const messageRowAreEqual = (prev: MessageRowProps, next: MessageRowProps): boole
   if (prev.isModerator !== next.isModerator) return false;
   if (prev.broadcasterId !== next.broadcasterId) return false;
   if (prev.homeProvider !== next.homeProvider) return false;
+  if (prev.modLine !== next.modLine) return false;
   return true;
 };
 
@@ -82,9 +127,9 @@ const MessageRow = memo(function MessageRow({
   messageId,
   userId,
   isModFocus,
+  isNewest,
   intrinsicSizeCSS,
   sourceProvider,
-  sourceLogoSize,
   message,
   isHighlighted,
   moderationContext,
@@ -92,6 +137,7 @@ const MessageRow = memo(function MessageRow({
   isModerator,
   broadcasterId,
   homeProvider,
+  modLine,
   onUsernameClick,
   onReplyClick,
   onMessageCopy,
@@ -106,33 +152,22 @@ const MessageRow = memo(function MessageRow({
     // they need the same always-paint treatment to dodge the ghost bug.
     return !u?.themeHiddenInChat && !!(u?.atmosphereId || u?.cologne);
   });
+  // Native virtualization for normal rows. Atmosphere rows paint always to
+  // dodge the content-visibility compositing-ghost bug (see above). The newest
+  // rows paint always too: a row lands below the fold, and under `auto` it is
+  // laid out at the size hint until the browser marks it relevant, so a
+  // wrapped row arrived at the hint and grew a frame later, jolting the list
+  // a second time while the row slid in. They are on screen whenever the list
+  // follows, so skipping them never saved anything.
+  const paintAlways = hasAtmosphere || isNewest;
   const style = useMemo(
     () => ({
-      // Native virtualization for normal rows; atmosphere rows paint always
-      // to dodge the content-visibility compositing-ghost bug (see above).
-      contentVisibility: hasAtmosphere ? ('visible' as const) : ('auto' as const),
+      contentVisibility: paintAlways ? ('visible' as const) : ('auto' as const),
       // Off-screen size hint, computed per-user from font size, spacing, and
       // whether timestamps are on. Ignored when content-visibility is visible.
-      containIntrinsicBlockSize: hasAtmosphere ? undefined : intrinsicSizeCSS,
+      containIntrinsicBlockSize: paintAlways ? undefined : intrinsicSizeCSS,
     }),
-    [hasAtmosphere, intrinsicSizeCSS],
-  );
-  const chatMessageEl = (
-    <ChatMessage
-      message={message}
-      onUsernameClick={onUsernameClick}
-      onReplyClick={onReplyClick}
-      onMessageCopy={onMessageCopy}
-      isHighlighted={isHighlighted}
-      moderationContext={moderationContext}
-      onEmoteRightClick={onEmoteRightClick}
-      onUsernameRightClick={onUsernameRightClick}
-      onBadgeClick={onBadgeClick}
-      emotes={emotes}
-      isModerator={isModerator}
-      broadcasterId={broadcasterId}
-      homeProvider={homeProvider}
-    />
+    [paintAlways, intrinsicSizeCSS],
   );
   return (
     <div
@@ -142,13 +177,26 @@ const MessageRow = memo(function MessageRow({
       }`}
       style={style}
     >
-      {sourceProvider ? (
-        <div className="flex items-center gap-1.5 pl-1">
-          <ProviderLogo provider={sourceProvider} size={sourceLogoSize} />
-          <div className="min-w-0 flex-1">{chatMessageEl}</div>
-        </div>
+      {typeof message !== 'string' && message.automodHeld ? (
+        <HeldMessageRow row={message.automodHeld} />
       ) : (
-        chatMessageEl
+      <ChatMessage
+        message={message}
+        onUsernameClick={onUsernameClick}
+        onReplyClick={onReplyClick}
+        onMessageCopy={onMessageCopy}
+        isHighlighted={isHighlighted}
+        moderationContext={moderationContext}
+        onEmoteRightClick={onEmoteRightClick}
+        onUsernameRightClick={onUsernameRightClick}
+        onBadgeClick={onBadgeClick}
+        emotes={emotes}
+        isModerator={isModerator}
+        broadcasterId={broadcasterId}
+        homeProvider={homeProvider}
+        sourceMark={sourceProvider}
+        modLine={modLine}
+      />
       )}
     </div>
   );
@@ -214,6 +262,8 @@ interface ChatMessageListProps {
   /** How tall the floating header over this list is, measured by the host (a
    *  hype train makes it much taller). Defaults to the plain header's 40px. */
   headerInset?: number;
+  /** Ids of this channel's pinned messages, for the scrollbar's pinned marks. */
+  pinnedIds?: ReadonlySet<string>;
 }
 
 /**
@@ -228,7 +278,7 @@ interface ChatMessageListProps {
  * - Simpler architecture: Just render messages, browser does the rest
  */
 const ChatMessageList = memo(function ChatMessageList({
-  messages,
+  messages: liveMessages,
   isPaused,
   onScroll,
   onPauseIntent,
@@ -251,7 +301,34 @@ const ChatMessageList = memo(function ChatMessageList({
   showSource,
   headerSpaceReserved,
   headerInset = 40,
+  pinnedIds,
 }: ChatMessageListProps) {
+  // While a moderator points where a mod action starts (the hover effect
+  // below), or presses a row to slide or drag it, the list keeps drawing the
+  // rows that were on screen, so nothing moves and nothing is trimmed away
+  // however fast chat runs; it catches up to live when the pointer leaves and
+  // the press ends. The frozen array is the store's own copy-on-write
+  // snapshot, so holding it costs one reference. Everything below draws
+  // `messages`.
+  const [frozenView, setFrozenView] = useState<ChatMessageListProps['messages'] | null>(null);
+  const messages = frozenView ?? liveMessages;
+  const shownRef = useRef(messages);
+  useLayoutEffect(() => {
+    shownRef.current = messages;
+  });
+  const viewFrozenRef = useRef(false);
+  // Why the view is held: the pointer rests on a mod target, a press holds a
+  // row, or both. It thaws only when neither is left.
+  const freezeRef = useRef({ hover: false, press: false });
+  // A wheel scroll lets go of the hover hold, which then waits for the
+  // pointer to move again, so scrolling never fights it.
+  const hoverMutedRef = useRef(false);
+  const syncFreeze = useCallback(() => {
+    const want = freezeRef.current.hover || freezeRef.current.press;
+    if (want === viewFrozenRef.current) return;
+    viewFrozenRef.current = want;
+    setFrozenView(want ? shownRef.current : null);
+  }, []);
   const containerRef = useRef<HTMLDivElement>(null);
   // Inner messages-wrapper div. We observe its size with a ResizeObserver so
   // that any height change (badge/emote/cosmetic images settling in after a
@@ -271,6 +348,78 @@ const ChatMessageList = memo(function ChatMessageList({
   // resume (or unmount) can cancel it.
   const isResumeAnimatingRef = useRef(false);
   const resumeRafRef = useRef<number | null>(null);
+  // The row a moderator is pressing to slide or drag (ModSlider, the drag
+  // pickup), and where it sat on screen. A press also freezes the view, so the
+  // 100-row buffer cannot trim the held row away mid-slide (which cancels the
+  // slide). While it is held the list stops following new messages and, after
+  // every update, scrolls by however far the row moved, so the row stays under
+  // the pointer. The browser's own scroll anchoring was not enough: it let go
+  // after a few hundred milliseconds of trimming. The hold ends on its own
+  // when the button comes up or the row leaves the list, so it can never
+  // stick; then the list catches up to the live bottom unless it was paused.
+  const rowHoldRef = useRef<{ row: HTMLElement; top: number } | null>(null);
+  const isPausedRef = useRef(isPaused);
+  useEffect(() => {
+    isPausedRef.current = isPaused;
+  }, [isPaused]);
+  const isRowHeld = () => {
+    const held = rowHoldRef.current;
+    if (held && !held.row.isConnected) rowHoldRef.current = null;
+    return rowHoldRef.current !== null;
+  };
+  /** Scroll by however far the held row moved, so it stays put on screen. */
+  const keepHeldRowStill = () => {
+    const held = rowHoldRef.current;
+    const el = containerRef.current;
+    if (!held || !el) return;
+    const drift = held.row.getBoundingClientRect().top - held.top;
+    if (Math.abs(drift) < 0.5) return;
+    isScrollingProgrammatically.current = true;
+    el.scrollTop += drift;
+    setTimeout(() => {
+      isScrollingProgrammatically.current = false;
+    }, 60);
+  };
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const freeze = freezeRef.current;
+    const release = () => {
+      window.removeEventListener('pointerup', release, true);
+      window.removeEventListener('pointercancel', release, true);
+      freeze.press = false;
+      syncFreeze();
+      if (!rowHoldRef.current) return;
+      rowHoldRef.current = null;
+      if (isPausedRef.current || userScrolledUpRef.current) return;
+      isScrollingProgrammatically.current = true;
+      el.scrollTop = el.scrollHeight;
+      wasAtBottomRef.current = true;
+      setTimeout(() => {
+        isScrollingProgrammatically.current = false;
+      }, 150);
+    };
+    const onHold = (e: Event) => {
+      if ((e as CustomEvent<{ on?: boolean }>).detail?.on !== true) {
+        release();
+        return;
+      }
+      const row = e.target as HTMLElement;
+      rowHoldRef.current = { row, top: row.getBoundingClientRect().top };
+      freeze.press = true;
+      syncFreeze();
+      window.addEventListener('pointerup', release, true);
+      window.addEventListener('pointercancel', release, true);
+    };
+    el.addEventListener(ROW_HOLD_EVENT, onHold);
+    return () => {
+      el.removeEventListener(ROW_HOLD_EVENT, onHold);
+      window.removeEventListener('pointerup', release, true);
+      window.removeEventListener('pointercancel', release, true);
+      freeze.press = false;
+      syncFreeze();
+    };
+  }, [syncFreeze]);
 
   // Per-row CSS `contain-intrinsic-block-size` placeholder size. The browser
   // uses this for off-screen messages (content-visibility: auto). Picking a
@@ -296,11 +445,96 @@ const ChatMessageList = memo(function ChatMessageList({
     return `auto ${total}px`;
   }, [chatDesign?.font_size, chatDesign?.message_spacing, chatDesign?.show_timestamps]);
 
-  // Source provider logo (blended feed): a touch larger than the text and scaling
-  // with the chat font size — like inline emotes — so it stays legible as the user
-  // sizes the chat up.
-  const sourceLogoSize = Math.round((chatDesign?.font_size ?? 14) * 1.2);
-  
+  // Line buttons. Rust's steps for the viewer's line list are resolved here,
+  // once for the whole list, and every row gets the same array: no per-row
+  // hooks or subscriptions on the hot path. Nothing is asked for unless the
+  // viewer moderates this channel and has them on.
+  const lineOn = !!isModerator && chatDesign?.mod_line_buttons === true;
+  const lineConfig = useLineConfig();
+  const lineSteps = useModSliderSteps(homeProvider ?? 'twitch', lineConfig, lineOn);
+  const modLine = useMemo(
+    () => (lineOn && lineSteps && lineSteps.length > 0 ? lineButtons(lineSteps) : null),
+    [lineOn, lineSteps],
+  );
+  const lineActive = modLine !== null;
+  // The buttons' picture, drawn once for the list; every strip shows it.
+  const lineArt = useLineArt(modLine, chatDesign?.font_size ?? 14);
+  const lineArtRef = useRef<{ art: NonNullable<typeof lineArt>; buttons: LineButton[] } | null>(null);
+  useLayoutEffect(() => {
+    lineArtRef.current = lineArt && modLine ? { art: lineArt, buttons: modLine } : null;
+  });
+  // Pointing where a mod action starts freezes the view (mouse and pen; a
+  // touch has no hover), so a fast chat cannot pull the target away while you
+  // aim, however fast it runs: a line's buttons, a row that offers the hover
+  // dock (from the row itself: by the time the pointer reaches the dock above
+  // it, a fast chat has already moved the row), the slider grip or tile
+  // handle. Moving between lines passes through the gap below each strip, so
+  // the view thaws only after the pointer has been off every target for
+  // MOD_HOLD_GRACE_MS, or at once on a wheel scroll; then the list catches up
+  // to live.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !isModerator) return;
+    let graceTimer: number | undefined;
+    const thaw = () => {
+      window.clearTimeout(graceTimer);
+      freezeRef.current.hover = false;
+      syncFreeze();
+    };
+    const onOver = (e: PointerEvent) => {
+      if (e.pointerType === 'touch' || hoverMutedRef.current || !isOnModTarget(e.target)) return;
+      window.clearTimeout(graceTimer);
+      freezeRef.current.hover = true;
+      syncFreeze();
+    };
+    const onOut = (e: PointerEvent) => {
+      if (!freezeRef.current.hover || !isOnModTarget(e.target) || isOnModTarget(e.relatedTarget)) return;
+      window.clearTimeout(graceTimer);
+      graceTimer = window.setTimeout(thaw, MOD_HOLD_GRACE_MS);
+    };
+    // After a wheel scroll, a real move of the pointer aims again.
+    const onMove = (e: PointerEvent) => {
+      if (!hoverMutedRef.current || (e.movementX === 0 && e.movementY === 0)) return;
+      hoverMutedRef.current = false;
+      onOver(e);
+    };
+    const onLeave = () => {
+      hoverMutedRef.current = false;
+    };
+    el.addEventListener('pointerover', onOver);
+    el.addEventListener('pointerout', onOut);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerleave', onLeave);
+    return () => {
+      el.removeEventListener('pointerover', onOver);
+      el.removeEventListener('pointerout', onOut);
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerleave', onLeave);
+      thaw();
+    };
+  }, [isModerator, syncFreeze]);
+  // One set of listeners on the list serves every row's line buttons.
+  // - The button under the pointer lights up (`bindLineStrips`).
+  // - A press without the hover hold (touch) holds the row until it lifts.
+  // - A press keeps the composer's focus and starts no text selection.
+  // - A click picks the button under the pointer and sends it through
+  //   `moderate_chatter`, with Undo in the toast for a timeout or ban.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !lineActive) return;
+    const onDown = (e: PointerEvent) => {
+      if (!isOnLineStrip(e.target) || e.button !== 0 || viewFrozenRef.current) return;
+      holdChatRow(e.target as HTMLElement, true);
+    };
+    el.addEventListener('pointerdown', onDown);
+    const unbind = bindLineStrips(el, () => lineArtRef.current, (hit) => void moderateWithToast(hit.request));
+    return () => {
+      el.removeEventListener('pointerdown', onDown);
+      unbind();
+    };
+  }, [lineActive]);
+
+
   // Track if user explicitly scrolled UP via wheel (negative deltaY = scroll up)
   // This is the ONLY reliable way to detect user scroll intent
   // Flag persists until user scrolls DOWN or reaches bottom
@@ -323,7 +557,16 @@ const ChatMessageList = memo(function ChatMessageList({
       // Scrolling DOWN (toward bottom) - clear the flag
       userScrolledUpRef.current = false;
     }
-  }, [onPauseIntent]);
+    // Scrolling is not aiming: a wheel over a mod target lets go of the hover
+    // hold at once, so the wheel scrolls the live feed (up pauses it as
+    // usual), and the hold waits for the pointer to move again. A press still
+    // holds its row.
+    hoverMutedRef.current = true;
+    if (freezeRef.current.hover) {
+      freezeRef.current.hover = false;
+      syncFreeze();
+    }
+  }, [onPauseIntent, syncFreeze]);
 
   // Handle touch scrolling - track direction via Y position change
   const handleTouchStart = useCallback((e: React.TouchEvent) => {
@@ -370,6 +613,11 @@ const ChatMessageList = memo(function ChatMessageList({
       // paused state has committed — otherwise a height change landing in that
       // window would re-pin to bottom and fight the pause.
       if (userScrolledUpRef.current) return;
+      // A row is being slid; it must stay under the pointer.
+      if (isRowHeld()) {
+        keepHeldRowStill();
+        return;
+      }
       // Only re-pin when the user was already at bottom — never YANK them
       // down if they've scrolled up to read history.
       if (!wasAtBottomRef.current) return;
@@ -389,7 +637,10 @@ const ChatMessageList = memo(function ChatMessageList({
   // SIMPLE RULE: If not paused, always scroll to bottom
   const lastMessageId = messages.length > 0 ? getMessageId(messages[messages.length - 1]) : null;
 
-  useEffect(() => {
+  // A layout effect, so the pin lands before the new row is painted: pinned
+  // after paint, the row first drew below the fold and the list jumped to it a
+  // frame later, mid-entrance.
+  useLayoutEffect(() => {
     if (!containerRef.current) return;
     
     const prevCount = prevMessageCountRef.current;
@@ -411,19 +662,17 @@ const ChatMessageList = memo(function ChatMessageList({
     // A resume glide owns the scroll position until it lands; let it run
     // rather than instant-jumping on every message and stuttering it.
     if (isResumeAnimatingRef.current) return;
+    // A row being slid stays put; the hold's release catches up.
+    if (!isChannelLoad && isRowHeld()) {
+      keepHeldRowStill();
+      return;
+    }
 
-    // NOT PAUSED: Always scroll to bottom
-    // Use double-scroll pattern to ensure we catch the final height after content-visibility resolves
-
-    // First scroll: immediate RAF to catch initial render
-    requestAnimationFrame(() => {
-      if (!containerRef.current) return;
-      if (!isChannelLoad && userScrolledUpRef.current) return;
-      if (isResumeAnimatingRef.current) return;
-      isScrollingProgrammatically.current = true;
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
-      wasAtBottomRef.current = true;
-    });
+    // NOT PAUSED: Always scroll to bottom, now (before paint), then once more
+    // after content-visibility resolves for anything further up.
+    isScrollingProgrammatically.current = true;
+    containerRef.current.scrollTop = containerRef.current.scrollHeight;
+    wasAtBottomRef.current = true;
 
     // Second scroll: short delay to catch content-visibility final height calculation
     // This fixes the issue where new messages appear partially behind the input box
@@ -431,6 +680,7 @@ const ChatMessageList = memo(function ChatMessageList({
       if (!containerRef.current || isPaused) return;
       if (!isChannelLoad && userScrolledUpRef.current) return;
       if (isResumeAnimatingRef.current) return;
+      if (isRowHeld()) return;
       isScrollingProgrammatically.current = true;
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
       wasAtBottomRef.current = true;
@@ -600,139 +850,162 @@ const ChatMessageList = memo(function ChatMessageList({
   // Fresh per render.
   const renderedIds = new Set<string>();
 
+  // Scrollbar marks: Rust stamps which rows are marked; this keeps the ones the
+  // viewer chose to see. One pass per feed change, no row re-renders. A phone
+  // draws no scrollbar, so there is nothing for the ticks to sit on.
+  const marksOn = !IS_MOBILE && (chatDesign?.scrollbar_marks ?? true);
+  const markKinds = chatDesign?.scrollbar_mark_kinds;
+  const shownKinds = useMemo(
+    () => new Set<string>(marksOn ? (markKinds ?? FALLBACK_MARK_KINDS) : []),
+    [marksOn, markKinds],
+  );
+  const marks = useMemo(
+    () => collectMarks(messages, getMessageId, shownKinds, pinnedIds),
+    [messages, getMessageId, shownKinds, pinnedIds],
+  );
+
   return (
-    <div
-      ref={containerRef}
-      className="h-full overflow-y-auto overflow-x-hidden scrollbar-thin"
-      onScroll={handleScroll}
-      onWheel={handleWheel}
-      onTouchStart={handleTouchStart}
-      onTouchMove={handleTouchMove}
-      style={{
-        overflowAnchor: 'auto',
-        '--sn-emote-scale': emoteScale,
-        '--sn-emote-margin': `${emoteMargin}rem`,
-        '--sn-backfill-opacity': Math.max(0.3, Math.min(1, (chatDesign?.backfill_opacity ?? 100) / 100)),
-        '--sn-badge-scale': Math.max(0.5, Math.min(2.5, chatDesign?.badge_scale ?? 1)),
-      } as React.CSSProperties}
-    >
-      {/* Messages container with native virtualization. The top padding clears
-          the chat header, which floats OVER this column rather than sitting
-          above it, so the space has to be reserved here — inside the scroll
-          content — or the oldest message hides behind it at the top of
-          scrollback. When something above already reserved it (the
-          combined-chat bar sits below the header and pushes this list down),
-          reserving it twice leaves a dead gap instead.
-          data-entrance drives a CSS-only arrival animation on live rows
-          (history rows carry .is-backfill and are excluded by the selector). */}
+    <div className="relative h-full" style={IS_MOBILE ? PHONE_TOP_FADE : undefined}>
       <div
-        ref={contentRef}
-        className={`flex flex-col min-h-full justify-end${chatDesign?.alternating_backgrounds ? ' chat-striped' : ''}`}
-        style={headerSpaceReserved ? undefined : { paddingTop: headerInset }}
-        data-entrance={chatDesign?.message_entrance && chatDesign.message_entrance !== 'none' ? chatDesign.message_entrance : undefined}
+        ref={containerRef}
+        className="h-full overflow-y-auto overflow-x-hidden scrollbar-thin"
+        onScroll={handleScroll}
+        onWheel={handleWheel}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        style={{
+          overflowAnchor: 'auto',
+          '--sn-emote-scale': emoteScale,
+          // Chat GIF size (ChatMessage); Rust holds the saved value to 0.5-2.
+          '--sn-gif-scale': chatDesign?.gif_scale ?? 1,
+          '--sn-emote-margin': `${emoteMargin}rem`,
+          '--sn-backfill-opacity': Math.max(0.3, Math.min(1, (chatDesign?.backfill_opacity ?? 100) / 100)),
+          '--sn-badge-scale': Math.max(0.5, Math.min(2.5, chatDesign?.badge_scale ?? 1)),
+          ...lineArt?.vars,
+        } as React.CSSProperties}
       >
-        {messages.map((message, index) => {
-          const messageId = getMessageId(message);
-          // Event categories the viewer turned off for this platform.
-          if (typeof message !== 'string' && isHiddenEvent(message, hiddenEvents)) return null;
+        {/* Messages container with native virtualization. The top padding clears
+            the chat header, which floats OVER this column rather than sitting
+            above it, so the space has to be reserved here — inside the scroll
+            content — or the oldest message hides behind it at the top of
+            scrollback. When something above already reserved it (the
+            combined-chat bar sits below the header and pushes this list down),
+            reserving it twice leaves a dead gap instead.
+            data-entrance drives a CSS-only arrival animation on live rows
+            (history rows carry .is-backfill and are excluded by the selector). */}
+        <div
+          ref={contentRef}
+          className={`flex flex-col min-h-full justify-end${chatDesign?.alternating_backgrounds ? ' chat-striped' : ''}`}
+          style={headerSpaceReserved ? undefined : { paddingTop: headerInset }}
+          data-entrance={chatDesign?.message_entrance && chatDesign.message_entrance !== 'none' ? chatDesign.message_entrance : undefined}
+        >
+          {messages.map((message, index) => {
+            const messageId = getMessageId(message);
+            // Event categories the viewer turned off for this platform.
+            if (typeof message !== 'string' && isHiddenEvent(message, hiddenEvents)) return null;
 
-          // Render each id at most once. If the array somehow holds a duplicate
-          // (e.g. an own message present both as the stamped optimistic copy and
-          // a backfilled/echoed copy), drop the later one so React never sees a
-          // duplicate key. See renderedIds note above.
-          if (messageId) {
-            if (renderedIds.has(messageId)) return null;
-            renderedIds.add(messageId);
-          }
-
-          // /clearmessages — skip rendering entirely for messages snapshotted
-          // into the locally-hidden set. Distinct from the deleted/moderated
-          // path below, which renders strikethrough chrome.
-          if (messageId && hiddenMessageIds?.has(messageId)) {
-            return null;
-          }
-
-          // Sender user-id — used both for cleared-user moderation context and
-          // for the per-row Atmosphere lookup in MessageRow below.
-          const userId = typeof message !== 'string'
-            ? message.user_id
-            : message.match(/(?:^@|;)user-id=([^;]+)/)?.[1];
-
-          // Check if message is deleted/moderated
-          let moderationContext: ModerationContext | null = null;
-
-          if (messageId && deletedMessageIds.has(messageId)) {
-            // Single message deleted by mod
-            moderationContext = { type: 'deleted' };
-          } else if (messageId) {
-            if (userId && clearedUserContexts.has(userId)) {
-              const entry = clearedUserContexts.get(userId)!;
-              if (entry.affectedMessageIds.has(messageId)) {
-                moderationContext = entry.context;
-              }
+            // Render each id at most once. If the array somehow holds a duplicate
+            // (e.g. an own message present both as the stamped optimistic copy and
+            // a backfilled/echoed copy), drop the later one so React never sees a
+            // duplicate key. See renderedIds note above.
+            if (messageId) {
+              if (renderedIds.has(messageId)) return null;
+              renderedIds.add(messageId);
             }
-          }
 
-          // Deleted message style: 'hidden' suppresses the row entirely.
-          // Other styles (strikethrough/dimmed/keep) fall through to ChatMessage.
-          if (moderationContext && deletedStyle === 'hidden') {
-            return null;
-          }
-          if (
-            streamerModeActive &&
-            typeof message !== 'string' &&
-            message.metadata?.suspicious === 'restricted'
-          ) {
-            return null;
-          }
-          // Hide shared-chat-flagged messages if the user opted in.
-          if (hideSharedChat && typeof message !== 'string') {
-            const srcRoom = message.tags?.['source-room-id'] as string | undefined;
-            const curRoom = message.tags?.['room-id'] as string | undefined;
-            if (srcRoom && curRoom && srcRoom !== curRoom) {
+            // /clearmessages — skip rendering entirely for messages snapshotted
+            // into the locally-hidden set. Distinct from the deleted/moderated
+            // path below, which renders strikethrough chrome.
+            if (messageId && hiddenMessageIds?.has(messageId)) {
               return null;
             }
-          }
-          // 'keep' style nukes the moderation context so ChatMessage renders
-          // as if nothing happened.
-          if (moderationContext && deletedStyle === 'keep') {
-            moderationContext = null;
-          }
 
-          // Blended feed: prefix each message with its source platform's logo so
-          // a merged multi-source feed is readable at a glance. Only when
-          // showSource is on (and the row is a structured message carrying a
-          // provider) — otherwise render unchanged.
-          const sourceProvider =
-            showSource && typeof message !== 'string'
-              ? ((message as BackendChatMessage).provider as ProviderId | undefined)
-              : undefined;
-          return (
-            <MessageRow
-              key={messageId || `msg-${index}`}
-              messageId={messageId}
-              userId={userId}
-              isModFocus={!!modFocusId && messageId === modFocusId}
-              intrinsicSizeCSS={intrinsicSizeCSS}
-              sourceProvider={sourceProvider}
-              sourceLogoSize={sourceLogoSize}
-              message={message}
-              isHighlighted={highlightedMessageId === messageId}
-              moderationContext={moderationContext}
-              emotes={emotes}
-              isModerator={isModerator}
-              broadcasterId={broadcasterId}
-              homeProvider={homeProvider}
-              onUsernameClick={onUsernameClick}
-              onReplyClick={onReplyClick}
-              onMessageCopy={onMessageCopy}
-              onEmoteRightClick={onEmoteRightClick}
-              onUsernameRightClick={onUsernameRightClick}
-              onBadgeClick={onBadgeClick}
-            />
-          );
-        })}
+            // Sender user-id — used both for cleared-user moderation context and
+            // for the per-row Atmosphere lookup in MessageRow below.
+            const userId = typeof message !== 'string'
+              ? message.user_id
+              : message.match(/(?:^@|;)user-id=([^;]+)/)?.[1];
+
+            // Check if message is deleted/moderated
+            let moderationContext: ModerationContext | null = null;
+
+            if (messageId && deletedMessageIds.has(messageId)) {
+              // Single message deleted by mod
+              moderationContext = { type: 'deleted' };
+            } else if (messageId) {
+              if (userId && clearedUserContexts.has(userId)) {
+                const entry = clearedUserContexts.get(userId)!;
+                if (entry.affectedMessageIds.has(messageId)) {
+                  moderationContext = entry.context;
+                }
+              }
+            }
+
+            // Deleted message style: 'hidden' suppresses the row entirely.
+            // Other styles (strikethrough/dimmed/keep) fall through to ChatMessage.
+            if (moderationContext && deletedStyle === 'hidden') {
+              return null;
+            }
+            if (
+              streamerModeActive &&
+              typeof message !== 'string' &&
+              message.metadata?.suspicious === 'restricted'
+            ) {
+              return null;
+            }
+            // Hide shared-chat-flagged messages if the user opted in.
+            if (hideSharedChat && typeof message !== 'string') {
+              const srcRoom = message.tags?.['source-room-id'] as string | undefined;
+              const curRoom = message.tags?.['room-id'] as string | undefined;
+              if (srcRoom && curRoom && srcRoom !== curRoom) {
+                return null;
+              }
+            }
+            // 'keep' style nukes the moderation context so ChatMessage renders
+            // as if nothing happened.
+            if (moderationContext && deletedStyle === 'keep') {
+              moderationContext = null;
+            }
+
+            // Blended feed: each message leads its name line with its source
+            // platform's logo so a merged multi-source feed is readable at a
+            // glance. Only when showSource is on (and the row is a structured
+            // message carrying a provider); otherwise render unchanged.
+            const sourceProvider =
+              showSource && typeof message !== 'string'
+                ? ((message as BackendChatMessage).provider as ProviderId | undefined)
+                : undefined;
+            return (
+              <MessageRow
+                key={messageId || `msg-${index}`}
+                messageId={messageId}
+                userId={userId}
+                isModFocus={!!modFocusId && messageId === modFocusId}
+                isNewest={index >= messages.length - NEWEST_ROWS_PAINTED}
+                intrinsicSizeCSS={intrinsicSizeCSS}
+                sourceProvider={sourceProvider}
+                message={message}
+                isHighlighted={highlightedMessageId === messageId}
+                moderationContext={moderationContext}
+                emotes={emotes}
+                isModerator={isModerator}
+                broadcasterId={broadcasterId}
+                homeProvider={homeProvider}
+                modLine={modLine}
+                onUsernameClick={onUsernameClick}
+                onReplyClick={onReplyClick}
+                onMessageCopy={onMessageCopy}
+                onEmoteRightClick={onEmoteRightClick}
+                onUsernameRightClick={onUsernameRightClick}
+                onBadgeClick={onBadgeClick}
+              />
+            );
+          })}
+        </div>
       </div>
+      {marksOn && (
+        <ScrollbarMarks scrollerRef={containerRef} contentRef={contentRef} marks={marks} overlay={IS_MAC} />
+      )}
     </div>
   );
 });

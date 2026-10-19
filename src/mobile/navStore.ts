@@ -8,7 +8,14 @@ import { useAppStore } from '../stores/AppStore';
 import { startTab } from './phonePrefs';
 import type { TwitchCategory } from '../types';
 
-export type MobileTab = 'following' | 'browse' | 'rewards' | 'you';
+export type MobileTab = 'following' | 'browse' | 'chats' | 'rewards' | 'you';
+
+/** Where an opened settings page should land: a section by its heading, and
+ *  the row inside it when the page draws one by that title. */
+export interface SettingsTarget {
+  section: string;
+  title?: string;
+}
 
 interface MobileNavState {
   activeTab: MobileTab;
@@ -16,6 +23,12 @@ interface MobileNavState {
   sheetStack: string[];
   /** Settings panel: the open tab id, or null (the section list lives on You). */
   settingsView: string | null;
+  /** The section the open settings page scrolls to once it has drawn. Cleared
+   *  by the page when it lands (or gives up on a page without anchors). */
+  settingsTarget: SettingsTarget | null;
+  /** The settings page a page was opened FROM (Changed settings opening a
+   *  row's page), so back returns there instead of out to the You tab. */
+  settingsReturn: string | null;
   /** Browse category drill: the open category's streams screen, or null. */
   browseCategory: TwitchCategory | null;
   /** The cosmetics (equip) screen. */
@@ -27,6 +40,11 @@ interface MobileNavState {
   /** Campaign the Activity screen should scroll to and flash, set when you
    *  tap the live drop progress while watching. Cleared once consumed. */
   focusDropCampaignId: string | null;
+  /** The tab Chats was opened from: Chats is a full-screen surface with no
+   *  tab bar, and leaving it (the grabber, a slide down, back) returns here. */
+  chatsReturnTab: MobileTab;
+  /** Leaves Chats for the tab it was opened from. */
+  exitChats: () => void;
   setTab: (tab: MobileTab) => void;
   /** Tap-through from the watch surface: shrink the player so playback (and
    *  the drop you are earning) keeps running, then land on that campaign. */
@@ -34,8 +52,11 @@ interface MobileNavState {
   clearDropFocus: () => void;
   pushSheet: (id: string) => void;
   popSheet: (id?: string) => void;
-  openSettings: (tab: string) => void;
+  openSettings: (tab: string, target?: SettingsTarget) => void;
+  /** Back out of the open settings page: to the page it was opened from, if
+   *  any, else to the You tab. */
   closeSettings: () => void;
+  clearSettingsTarget: () => void;
   openBrowseCategory: (category: TwitchCategory | null) => void;
   setCosmeticsOpen: (open: boolean) => void;
   setPlayerMode: (mode: 'full' | 'mini') => void;
@@ -51,12 +72,23 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
   activeTab: startTab(),
   sheetStack: [],
   settingsView: null,
+  settingsTarget: null,
+  settingsReturn: null,
   browseCategory: null,
   cosmeticsOpen: false,
   playerMode: 'full',
   focusDropCampaignId: null,
+  chatsReturnTab: startTab() === 'chats' ? 'following' : startTab(),
 
-  setTab: (tab) => set({ activeTab: tab }),
+  setTab: (tab) =>
+    set((s) =>
+      tab === 'chats' && s.activeTab !== 'chats'
+        ? { activeTab: tab, chatsReturnTab: s.activeTab }
+        : { activeTab: tab },
+    ),
+
+  exitChats: () =>
+    set((s) => (s.activeTab === 'chats' ? { activeTab: s.chatsReturnTab } : s)),
 
   openDropCampaign: (campaignId) =>
     set({
@@ -74,8 +106,17 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
       sheetStack: id ? s.sheetStack.filter((x) => x !== id) : s.sheetStack.slice(0, -1),
     })),
 
-  openSettings: (tab) => set({ settingsView: tab }),
-  closeSettings: () => set({ settingsView: null }),
+  openSettings: (tab, target) =>
+    set((s) => ({
+      settingsView: tab,
+      settingsTarget: target ?? null,
+      // One step of return is all the pages need: only Changed settings opens
+      // another page from inside the layer.
+      settingsReturn: s.settingsView && s.settingsView !== tab ? s.settingsView : null,
+    })),
+  closeSettings: () =>
+    set((s) => ({ settingsView: s.settingsReturn, settingsReturn: null, settingsTarget: null })),
+  clearSettingsTarget: () => set({ settingsTarget: null }),
   openBrowseCategory: (category) => set({ browseCategory: category }),
   setCosmeticsOpen: (open) => set({ cosmeticsOpen: open }),
   setPlayerMode: (mode) => set({ playerMode: mode }),
@@ -89,7 +130,7 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
       return true;
     }
     if (settingsView) {
-      set({ settingsView: null });
+      get().closeSettings();
       return true;
     }
     if (cosmeticsOpen) {
@@ -105,6 +146,11 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
     }
     if (browseCategory) {
       set({ browseCategory: null });
+      return true;
+    }
+    // Chats is a surface over the tabs: back leaves it for the tab it came from.
+    if (activeTab === 'chats') {
+      get().exitChats();
       return true;
     }
     // Back unwinds to the tab the app OPENS on, not to Following: someone who

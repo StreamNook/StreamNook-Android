@@ -5,15 +5,29 @@ import { Bell, Radio, MessageCircle, User, Download, Award, Check, CheckCheck, I
 import { X, SpeakerSlash, Trash, PuzzlePiece, Package, Gift, Sparkle } from 'phosphor-react';
 import { listen, emit } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore } from '../stores/AppStore';
+import { useAppStore, type SettingsTab } from '../stores/AppStore';
+import { useTitleBarLifted } from '../hooks/useTitleBarAutoHide';
+import { exitPlayerFullscreenForBarAction } from '../utils/windowFullscreen';
 import { requestChangelog } from '../utils/changelogEvents';
+import { requestWallet } from '../utils/walletRequest';
 import { Logger } from '../utils/logger';
 import { formatBadgeDateInfo } from '../utils/badgeWindow';
 import { windowStatusAt, type WindowRun } from '../services/badgeStanding';
 import { playNotificationSound as playGatedNotificationSound } from '../utils/notificationSound';
 import { liveActivityText } from '../utils/liveActivity';
+import { IS_MOBILE } from '../utils/platform';
+import {
+    MIRRORED_NOTIFICATION_ACTIVATE_EVENT,
+    type MirroredNotice,
+    type MirroredNoticeKind,
+    NOTICE_ACTION_PENDING_EVENT,
+    type NoticeAction,
+    type NoticeReply,
+} from '../utils/notificationMirror';
 import { Tooltip } from './ui/Tooltip';
 import { ProviderIcon } from './overlay/ProviderIcon';
+import { SevenTvAvatar } from './SevenTvAvatar';
+import { islandSurfaceGeometry } from '../utils/islandGeometry';
 import type { ProviderId } from '../types/providers';
 import type {
     DynamicIslandNotification,
@@ -37,6 +51,8 @@ const CACHE_EXPIRY_DAYS = 7;
 // center before it auto-removes, so previews don't pile up with real ones.
 // Kept >= the live preview hold (8s) so the entry outlasts its own preview.
 const TEST_NOTIFICATION_TTL_MS = 8000;
+// Click actions kept for notifications shown in a MultiChat window.
+const MAX_MIRRORED_ACTIONS = 12;
 
 
 interface TwitchRewardFromBackend {
@@ -78,6 +94,8 @@ interface LiveNotificationFromBackend {
     notification_id: string;
     providers: ProviderId[];
     merge_into: string | null;
+    /** The streamer's 7TV cosmetics id, keyed by Rust for their platform. */
+    seventv_id?: string | null;
 }
 
 interface BundleUpdateStatus {
@@ -98,14 +116,27 @@ interface DropClaimedEvent {
 }
 
 /** A burst of channel-points earns, gathered by Rust
- *  (services/channel_points_summary.rs). Channels are busiest first. */
+ *  (services/channel_points_summary.rs). Channels are busiest first, each with
+ *  its face, its own name for its points and its points icon when Rust knows
+ *  them (services/points_notify.rs). Rust also raises the system notification
+ *  for it, so this only presents the app's own toast and list row. */
 interface ChannelPointsSummary {
     total_points: number;
-    channels: Array<{ name: string; points: number }>;
+    channels: Array<{
+        name: string;
+        points: number;
+        avatar_url?: string;
+        points_name?: string;
+        icon_url?: string;
+    }>;
     reasons: Array<{ name: string; points: number }>;
     first_reason: string;
     last_balance: number | null;
 }
+
+/** Settings tabs a notification may open (a notification link can come from
+ *  anywhere, so only these). */
+const SETTINGS_TABS_FROM_NOTICES: SettingsTab[] = ['Notifications'];
 
 // Cache helpers
 const loadCachedNotifications = (): DynamicIslandNotification[] => {
@@ -154,7 +185,7 @@ const getPreviewText = (n: DynamicIslandNotification): string => {
             return 'Drop claimed';
         case 'channel_points': {
             const d = n.data as ChannelPointsNotificationData;
-            const base = `+${d.points_earned.toLocaleString()} Channel Points`;
+            const base = `+${d.points_earned.toLocaleString()} ${d.points_name || 'Channel Points'}`;
             // channel_name can hold a reason summary like "+20 (watching)" rather
             // than a real channel; only append it when it's a real channel.
             const isReasonSummary = !!d.channel_name && d.channel_name.includes('(');
@@ -175,6 +206,28 @@ const getPreviewText = (n: DynamicIslandNotification): string => {
     }
 };
 
+// Twitch's channel points mark, for a burst with no single face to show.
+const PointsGlyph = ({ size }: { size: number }) => (
+    <svg width={size} height={size} viewBox="0 0 24 24" className="text-orange-400 flex-shrink-0" fill="currentColor">
+        <path d="M12 5v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Z"></path>
+        <path fillRule="evenodd" d="M1 12C1 5.925 5.925 1 12 1s11 4.925 11 11-4.925 11-11 11S1 18.075 1 12Zm11 9a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z" clipRule="evenodd"></path>
+    </svg>
+);
+
+// A channel's face with its points icon attached at the corner, the same
+// seal the level uses (a dark outline, no chip). Without a custom icon the
+// seal is Twitch's own mark.
+const PointsFace = ({ avatarUrl, iconUrl }: { avatarUrl: string; iconUrl?: string }) => (
+    <div className="relative flex-shrink-0 w-[34px] h-[34px]">
+        <img src={avatarUrl} alt="" className="w-[34px] h-[34px] rounded-full object-cover" />
+        <span className="sn-notif-seal">
+            {iconUrl
+                ? <img src={iconUrl} alt="" className="w-4 h-4 object-contain" />
+                : <PointsGlyph size={14} />}
+        </span>
+    </div>
+);
+
 // The leading mark for the collapsed preview AND for the stacked faces on the
 // trigger, which is why it has to agree with the rows in the list below: a
 // profile picture wherever there is one (a streamer, a whisper sender, you), the
@@ -185,26 +238,26 @@ const renderPreviewIcon = (n: DynamicIslandNotification): React.ReactNode => {
         case 'live': {
             const d = n.data as LiveNotificationData;
             return d.streamer_avatar
-                ? <img src={d.streamer_avatar} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />
+                ? <SevenTvAvatar cosmeticsId={d.seventv_id} px={16} src={d.streamer_avatar} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />
                 : <div className="w-1.5 h-1.5 bg-red-500 rounded-full flex-shrink-0" />;
         }
         case 'whisper': {
             const d = n.data as WhisperNotificationData;
+            // Whispers are Twitch's, so the sender id is a bare Twitch id.
             return d.profile_image_url
-                ? <img src={d.profile_image_url} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />
+                ? <SevenTvAvatar cosmeticsId={d.from_user_id} px={16} src={d.profile_image_url} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />
                 : <MessageCircle size={11} className="text-purple-400 flex-shrink-0" />;
         }
         case 'update':
             return <Download size={11} className="text-yellow-400 flex-shrink-0" />;
         case 'drops':
             return <Package size={11} className="text-green-400 flex-shrink-0" />;
-        case 'channel_points':
-            return (
-                <svg width="11" height="11" viewBox="0 0 24 24" className="text-orange-400 flex-shrink-0" fill="currentColor">
-                    <path d="M12 5v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Z"></path>
-                    <path fillRule="evenodd" d="M1 12C1 5.925 5.925 1 12 1s11 4.925 11 11-4.925 11-11 11S1 18.075 1 12Zm11 9a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z" clipRule="evenodd"></path>
-                </svg>
-            );
+        case 'channel_points': {
+            const d = n.data as ChannelPointsNotificationData;
+            return d.avatar_url
+                ? <img src={d.avatar_url} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />
+                : <PointsGlyph size={11} />;
+        }
         case 'badge':
             return <Award size={11} className="text-cyan-400 flex-shrink-0" />;
         case 'gift_sub': {
@@ -230,7 +283,7 @@ const renderPreviewIcon = (n: DynamicIslandNotification): React.ReactNode => {
             // faces on the trigger and the pop-up preview, so the two can never
             // disagree with the list they came from.
             if (d.avatar_url) {
-                return <img src={d.avatar_url} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />;
+                return <SevenTvAvatar cosmeticsId={d.avatar_seventv_id} px={16} src={d.avatar_url} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />;
             }
             if (d.source === 'plugin') return <PuzzlePiece size={11} className="text-accent flex-shrink-0" />;
             if (d.level === 'success') return <CheckCircle2 size={11} className="text-green-400 flex-shrink-0" />;
@@ -286,6 +339,11 @@ const DynamicIsland = () => {
     const { startStream, openWhisperWithUser, openSettings, addToast, setShowDropsOverlay, setShowBadgesOverlay } = useAppStore.getState();
     const settings = useAppStore((s) => s.settings);
     const isSettingsOpen = useAppStore((s) => s.isSettingsOpen);
+    const isPlayerFullscreen = useAppStore((s) => s.isPlayerFullscreen);
+    // The bar lifts over the player in its tucking modes and in the player's
+    // full screen; the surface grows out of the bar's door, so it lifts with
+    // it or the door would draw over it.
+    const barLifted = useTitleBarLifted();
 
     // Two homes, and which one is right changes as you navigate.
     //
@@ -325,6 +383,16 @@ const DynamicIsland = () => {
             const gap = bar ? parseFloat(getComputedStyle(bar).columnGap) || 0 : 0;
             const roomLeft = leftCluster ? leftCluster.getBoundingClientRect().right + gap : 8;
             const roomRight = rightCluster ? rightCluster.getBoundingClientRect().left - gap : window.innerWidth - 8;
+            // The title bar slides up out of sight while it is tucked, and a rect
+            // read then carries that slide, which opened the surface above the
+            // window. Measure against where the bar rests instead: its layout box
+            // (offsetTop ignores transforms) against where it is painted now.
+            const titleBar = slot.closest<HTMLElement>('[data-titlebar]');
+            const barShift = titleBar
+                ? titleBar.getBoundingClientRect().top
+                    - titleBar.offsetTop
+                    - (titleBar.offsetParent?.getBoundingClientRect().top ?? 0)
+                : 0;
             // Joined into the strip, the thing being filled is the STRIP, so the
             // geometry is the strip's pill and not the trigger's own box: same
             // top, same height, and `cover` is its full width. Anchoring to the
@@ -342,7 +410,7 @@ const DynamicIsland = () => {
             const pillR = pill?.getBoundingClientRect();
             if (pillR && pillR.width > 0) {
                 setAnchor({
-                    left: pillR.left, top: pillR.top,
+                    left: pillR.left, top: pillR.top - barShift,
                     width: Math.max(0, r.right - pillR.left),
                     height: pillR.height,
                     cover: pillR.width,
@@ -356,7 +424,7 @@ const DynamicIsland = () => {
                 return;
             }
             setAnchor({
-                left: r.left, top: r.top,
+                left: r.left, top: r.top - barShift,
                 width: r.width || 72, height: r.height || 34,
                 cover: 0,
                 radius: 0,
@@ -476,13 +544,126 @@ const DynamicIsland = () => {
     // toast path uses) so the notification-center sound honors the user's chosen
     // Sound Style instead of a hardcoded tone, and reuses one AudioContext.
     const playNotificationSound = useCallback(() => {
-        playGatedNotificationSound(settings.live_notifications?.sound_type);
-    }, [settings.live_notifications?.sound_type]);
+        playGatedNotificationSound(settings.live_notifications?.sound_type, settings.live_notifications?.sound_volume);
+    }, [settings.live_notifications?.sound_type, settings.live_notifications?.sound_volume]);
 
-    // Send native Windows desktop notification (disabled - plugin not installed)
-    const sendNativeNotification = useCallback(async (_title: string, _body: string) => {
-        // Native notifications are disabled - the tauri-plugin-notification is not installed
-        // To re-enable, add the plugin to Cargo.toml and re-import the functions
+    // Every notification below is announced here once, in plain words, after
+    // its settings gates passed. Rust shows it in a MultiChat window while this
+    // window is hidden or minimized, and drops it otherwise; the sound stays
+    // ours. A click on that card comes back as an activate event with the id,
+    // and the action runs here, the window that can perform it.
+    const mirroredActionsRef = useRef(new Map<string, () => void>());
+    const mirrorNotification = useCallback((notice: {
+        kind: MirroredNoticeKind;
+        title: string;
+        body?: string;
+        imageUrl?: string | null;
+        roundImage?: boolean;
+        action?: { label: string; run: () => void };
+        /** The action as data, for a Windows notification used after a restart. */
+        target?: NoticeAction;
+        /** A reply box on the Windows notification. */
+        reply?: NoticeReply;
+    }) => {
+        if (IS_MOBILE) return;
+        const id = `mirror-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const actions = mirroredActionsRef.current;
+        if (notice.action) {
+            actions.set(id, notice.action.run);
+            // Only cards still on screen can be clicked, so a handful is plenty.
+            while (actions.size > MAX_MIRRORED_ACTIONS) {
+                actions.delete(actions.keys().next().value as string);
+            }
+        }
+        const payload: MirroredNotice = {
+            id,
+            kind: notice.kind,
+            title: notice.title,
+            body: notice.body ?? '',
+            imageUrl: notice.imageUrl || null,
+            roundImage: !!notice.roundImage,
+            actionLabel: notice.action?.label ?? null,
+            action: notice.target ?? null,
+            reply: notice.reply ?? null,
+        };
+        invoke<string | null>('mirror_notification', { notice: payload })
+            .then((target) => { if (!target) actions.delete(id); })
+            .catch((e) => {
+                actions.delete(id);
+                Logger.debug('[DynamicIsland] mirror_notification failed:', e);
+            });
+    }, []);
+
+    // A notification used after a restart (or one Rust raised itself, like a
+    // chat mention) leaves its action in Rust. It is taken once, on the event
+    // or on mount when the click started the app, and run here.
+    useEffect(() => {
+        if (IS_MOBILE) return;
+        const run = (action: NoticeAction) => {
+            const store = useAppStore.getState();
+            switch (action.type) {
+                case 'watch': {
+                    const go = () => { void useAppStore.getState().startStream(action.channel); };
+                    if (!store.isBooting) { go(); return; }
+                    const stop = useAppStore.subscribe((s) => {
+                        if (!s.isBooting) { stop(); go(); }
+                    });
+                    return;
+                }
+                case 'whisper':
+                    store.openWhisperWithUser({
+                        id: action.userId,
+                        login: action.login,
+                        display_name: action.name,
+                        profile_image_url: action.avatar ?? undefined,
+                    });
+                    return;
+                case 'drops':
+                    store.setShowDropsOverlay(true);
+                    return;
+                case 'badges':
+                    store.setShowBadgesOverlay(true);
+                    return;
+                case 'changelog':
+                    requestChangelog(action.version ?? undefined);
+                    return;
+                case 'rewards': {
+                    // The chat showing that channel opens its wallet once it is up.
+                    requestWallet(action.channel);
+                    const current = store.currentStream?.user_login?.toLowerCase();
+                    if (current === action.channel.toLowerCase()) return;
+                    const go = () => { void useAppStore.getState().startStream(action.channel); };
+                    if (!store.isBooting) { go(); return; }
+                    const stop = useAppStore.subscribe((s) => {
+                        if (!s.isBooting) { stop(); go(); }
+                    });
+                    return;
+                }
+                case 'settings':
+                    if (SETTINGS_TABS_FROM_NOTICES.includes(action.tab as SettingsTab)) {
+                        store.openSettings(action.tab as SettingsTab);
+                    }
+                    return;
+            }
+        };
+        const take = () => {
+            invoke<NoticeAction | null>('take_notice_action')
+                .then((action) => { if (action) run(action); })
+                .catch((e) => Logger.debug('[DynamicIsland] take_notice_action failed:', e));
+        };
+        take();
+        const unlisten = listen(NOTICE_ACTION_PENDING_EVENT, take);
+        return () => { unlisten.then((fn) => fn()); };
+    }, []);
+
+    useEffect(() => {
+        const unlisten = listen<string>(MIRRORED_NOTIFICATION_ACTIVATE_EVENT, (event) => {
+            const actions = mirroredActionsRef.current;
+            const run = actions.get(event.payload);
+            actions.delete(event.payload);
+            run?.();
+        });
+        return () => { unlisten.then((fn) => fn()); };
     }, []);
 
     // Add notification
@@ -518,17 +699,18 @@ const DynamicIsland = () => {
             text: string;
             level?: SystemNotificationData['level'];
             avatarUrl?: string;
+            avatarSevenTvId?: string;
             source?: SystemNotificationData['source'];
         }>('action-notification', (event) => {
             if (!notificationsEnabled || !useDynamicIsland) return;
-            const { text, level, avatarUrl, source } = event.payload;
+            const { text, level, avatarUrl, avatarSevenTvId, source } = event.payload;
             if (!text) return;
             addNotification({
                 id: `system-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 type: 'system',
                 timestamp: Date.now(),
                 read: false,
-                data: { title: '', message: text, level, avatar_url: avatarUrl, source } as SystemNotificationData,
+                data: { title: '', message: text, level, avatar_url: avatarUrl, avatar_seventv_id: avatarSevenTvId, source } as SystemNotificationData,
             });
         });
         return () => { unlisten.then((fn) => fn()); };
@@ -560,12 +742,18 @@ const DynamicIsland = () => {
             if (soundEnabled) {
                 playNotificationSound();
             }
-            sendNativeNotification('Update Available', `StreamNook v${status.latest_version} is ready to download`);
+            mirrorNotification({
+                kind: 'update',
+                title: 'Update available',
+                body: `StreamNook v${status.latest_version} is ready to download`,
+                action: { label: 'See what\'s new', run: () => requestChangelog(status.latest_version) },
+                target: { type: 'changelog', version: status.latest_version },
+            });
         });
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [notificationsEnabled, showUpdateNotifications, addNotification, soundEnabled, playNotificationSound, useDynamicIsland, sendNativeNotification]);
+    }, [notificationsEnabled, showUpdateNotifications, addNotification, soundEnabled, playNotificationSound, useDynamicIsland, mirrorNotification]);
 
     // Listen for live notifications
     useEffect(() => {
@@ -653,6 +841,7 @@ const DynamicIsland = () => {
                             stream_title: data.stream_title,
                             is_live: true,
                             providers: data.providers,
+                            seventv_id: data.seventv_id ?? undefined,
                         } as LiveNotificationData,
                     });
                 }
@@ -670,17 +859,25 @@ const DynamicIsland = () => {
                 playNotificationSound();
             }
 
-            // Send native notification (note: backend also sends one, but this ensures frontend settings are respected)
-            sendNativeNotification(
-                `${data.streamer_name} is now live!`,
-                liveActivityText(data.game_name) || data.stream_title || 'Streaming now'
-            );
+            // Another platform's go-live for an entry already announced is not
+            // news; the card for the first one said it.
+            if (!data.merge_into) {
+                mirrorNotification({
+                    kind: 'live',
+                    title: `${data.streamer_name} is live`,
+                    body: liveActivityText(data.game_name) || data.stream_title || '',
+                    imageUrl: data.streamer_avatar,
+                    roundImage: true,
+                    action: { label: 'Watch', run: () => { void startStream(data.streamer_login); } },
+                    target: { type: 'watch', channel: data.streamer_login },
+                });
+            }
         });
 
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [addNotification, notificationsEnabled, showLiveNotifications, showFavoriteLiveNotifications, useDynamicIsland, useToast, addToast, startStream, soundEnabled, playNotificationSound, sendNativeNotification]);
+    }, [addNotification, notificationsEnabled, showLiveNotifications, showFavoriteLiveNotifications, useDynamicIsland, useToast, addToast, startStream, soundEnabled, playNotificationSound, mirrorNotification]);
 
     // Listen for whisper notifications
     useEffect(() => {
@@ -719,10 +916,13 @@ const DynamicIsland = () => {
                 };
 
                 addNotification(notification);
+            }
 
-                if (soundEnabled) {
-                    playNotificationSound();
-                }
+            // The sound follows its own toggle, not the surface: inside the
+            // notification-centre branch it went quiet whenever the centre was off,
+            // and the toast for these events never plays one.
+            if (soundEnabled) {
+                playNotificationSound();
             }
 
             // Show toast if enabled
@@ -744,17 +944,42 @@ const DynamicIsland = () => {
                 );
             }
 
-            // Send native notification for whispers
-            sendNativeNotification(
-                `Whisper from ${data.from_user_name}`,
-                data.text.length > 100 ? `${data.text.substring(0, 100)}...` : data.text
-            );
+            mirrorNotification({
+                kind: 'whisper',
+                title: `Whisper from ${data.from_user_name}`,
+                body: data.text,
+                imageUrl: profileImageUrl,
+                roundImage: true,
+                action: {
+                    label: 'Open',
+                    run: () => openWhisperWithUser({
+                        id: data.from_user_id,
+                        login: data.from_user_login,
+                        display_name: data.from_user_name,
+                        profile_image_url: profileImageUrl,
+                    }),
+                },
+                target: {
+                    type: 'whisper',
+                    userId: data.from_user_id,
+                    login: data.from_user_login,
+                    name: data.from_user_name,
+                    avatar: profileImageUrl ?? null,
+                },
+                reply: {
+                    type: 'whisper',
+                    userId: data.from_user_id,
+                    login: data.from_user_login,
+                    name: data.from_user_name,
+                    avatar: profileImageUrl ?? null,
+                },
+            });
         });
 
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [addNotification, playNotificationSound, notificationsEnabled, showWhisperNotifications, soundEnabled, useDynamicIsland, useToast, addToast, openWhisperWithUser, sendNativeNotification]);
+    }, [addNotification, playNotificationSound, notificationsEnabled, showWhisperNotifications, soundEnabled, useDynamicIsland, useToast, addToast, openWhisperWithUser, mirrorNotification]);
 
     // Rewards Twitch names for your account (a badge earned, a drop reward
     // waiting), off its own notification feed, polled and classified in Rust.
@@ -784,23 +1009,36 @@ const DynamicIsland = () => {
                 };
 
                 addNotification(notification);
+            }
 
-                if (soundEnabled) {
-                    playNotificationSound();
-                }
+            // The sound follows its own toggle, not the surface: inside the
+            // notification-centre branch it went quiet whenever the centre was off,
+            // and the toast for these events never plays one.
+            if (soundEnabled) {
+                playNotificationSound();
             }
 
             if (useToast) {
                 addToast(data.body_plain, 'success', undefined, { skipIsland: true });
             }
 
-            sendNativeNotification(title, data.body_plain);
+            mirrorNotification({
+                kind: 'twitch_reward',
+                title,
+                body: data.body_plain,
+                imageUrl: data.thumbnail_url,
+                action: {
+                    label: 'View',
+                    run: () => (data.kind === 'badge' ? setShowBadgesOverlay(true) : setShowDropsOverlay(true)),
+                },
+                target: { type: data.kind === 'badge' ? 'badges' : 'drops' },
+            });
         });
 
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [addNotification, playNotificationSound, notificationsEnabled, showTwitchRewardNotifications, soundEnabled, useDynamicIsland, useToast, addToast, sendNativeNotification]);
+    }, [addNotification, playNotificationSound, notificationsEnabled, showTwitchRewardNotifications, soundEnabled, useDynamicIsland, useToast, addToast, setShowBadgesOverlay, setShowDropsOverlay, mirrorNotification]);
 
     // Gift subs you received. The only source for these is Twitch's own
     // notification feed, polled in Rust; the event arrives already filtered to
@@ -830,49 +1068,63 @@ const DynamicIsland = () => {
                 };
 
                 addNotification(notification);
+            }
 
-                if (soundEnabled) {
-                    playNotificationSound();
-                }
+            // The sound follows its own toggle, not the surface: inside the
+            // notification-centre branch it went quiet whenever the centre was off,
+            // and the toast for these events never plays one.
+            if (soundEnabled) {
+                playNotificationSound();
             }
 
             if (useToast) {
                 addToast(data.body_plain, 'success', undefined, { skipIsland: true });
             }
 
-            sendNativeNotification('Gift subscription', data.body_plain);
+            const giftChannel = data.channel_login;
+            mirrorNotification({
+                kind: 'gift_sub',
+                title: 'Gift subscription',
+                body: data.body_plain,
+                // The thumbnail is the gifter's avatar.
+                imageUrl: data.thumbnail_url,
+                roundImage: true,
+                action: giftChannel
+                    ? { label: 'Open channel', run: () => { void startStream(giftChannel); } }
+                    : undefined,
+                target: giftChannel ? { type: 'watch', channel: giftChannel } : undefined,
+            });
         });
 
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [addNotification, playNotificationSound, notificationsEnabled, showGiftSubNotifications, soundEnabled, useDynamicIsland, useToast, addToast, sendNativeNotification]);
+    }, [addNotification, playNotificationSound, notificationsEnabled, showGiftSubNotifications, soundEnabled, useDynamicIsland, useToast, addToast, startStream, mirrorNotification]);
 
-    // Somebody gave this member a StreamNook membership. Raised by
-    // supabaseService off the cosmetics realtime channel, which already carries
-    // the grant, so there is no extra connection or poll behind this.
+    // Somebody gave this member a StreamNook membership. Raised by Rust's
+    // gift poll (services/membership_gifts.rs), once per gift, already worded.
     //
     // Gated on the master switch alone, with no per-type toggle: being given a
     // membership is rare and never unwanted, and a row nobody would turn off
     // does not earn a line in Settings.
     useEffect(() => {
-        const unlisten = listen<{ grantedAt: string; permanent: boolean }>(
+        const unlisten = listen<MembershipGiftNotificationData>(
             'membership-gift-received',
             (event) => {
                 if (!notificationsEnabled) return;
-                const { grantedAt, permanent } = event.payload;
+                const data = event.payload;
 
                 if (useDynamicIsland) {
                     addNotification({
-                        id: `membership-gift-${grantedAt}`,
+                        id: `membership-gift-${data.id ?? data.grantedAt}`,
                         type: 'membership_gift',
-                        timestamp: Date.parse(grantedAt) || Date.now(),
+                        timestamp: Date.parse(data.grantedAt) || Date.now(),
                         read: false,
-                        data: { grantedAt, permanent } as MembershipGiftNotificationData,
+                        data,
                     });
-                    if (soundEnabled) {
-                        playNotificationSound();
-                    }
+                }
+                if (soundEnabled) {
+                    playNotificationSound();
                 }
 
                 if (useToast) {
@@ -884,16 +1136,18 @@ const DynamicIsland = () => {
                     );
                 }
 
-                sendNativeNotification(
-                    'StreamNook membership',
-                    'Somebody gave you a membership. Your perks are already active.',
-                );
+                mirrorNotification({
+                    kind: 'membership_gift',
+                    title: 'You were given a StreamNook membership',
+                    body: data.bodyPlain ?? 'Your perks are already active.',
+                    action: { label: 'View', run: () => openSettings('Profile') },
+                });
             },
         );
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [addNotification, playNotificationSound, notificationsEnabled, soundEnabled, useDynamicIsland, useToast, addToast, sendNativeNotification]);
+    }, [addNotification, playNotificationSound, notificationsEnabled, soundEnabled, useDynamicIsland, useToast, addToast, openSettings, mirrorNotification]);
 
     // Listen for drop claimed notifications
     useEffect(() => {
@@ -918,10 +1172,13 @@ const DynamicIsland = () => {
                 };
 
                 addNotification(notification);
+            }
 
-                if (soundEnabled) {
-                    playNotificationSound();
-                }
+            // The sound follows its own toggle, not the surface: inside the
+            // notification-centre branch it went quiet whenever the centre was off,
+            // and the toast for these events never plays one.
+            if (soundEnabled) {
+                playNotificationSound();
             }
 
             // Show toast if enabled
@@ -939,17 +1196,20 @@ const DynamicIsland = () => {
                 );
             }
 
-            // Send native notification for drops
-            sendNativeNotification(
-                'Drop Claimed',
-                data.game_name ? `${data.drop_name} - ${data.game_name}` : data.drop_name
-            );
+            mirrorNotification({
+                kind: 'drops',
+                title: 'Drop claimed',
+                body: data.game_name ? `${data.drop_name} (${data.game_name})` : data.drop_name,
+                imageUrl: data.benefit_image_url,
+                action: { label: 'View', run: () => setShowDropsOverlay(true) },
+                target: { type: 'drops' },
+            });
         });
 
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [addNotification, notificationsEnabled, showDropsNotifications, useDynamicIsland, useToast, addToast, soundEnabled, playNotificationSound, setShowDropsOverlay, sendNativeNotification]);
+    }, [addNotification, notificationsEnabled, showDropsNotifications, useDynamicIsland, useToast, addToast, soundEnabled, playNotificationSound, setShowDropsOverlay, mirrorNotification]);
 
     // Channel points: Rust gathers a burst of earns and announces it once
     // (services/channel_points_summary.rs); this presents the summary.
@@ -959,7 +1219,7 @@ const DynamicIsland = () => {
         const reasonMap: Record<string, string> = {
             'WATCH': 'watching',
             'WATCH_STREAK': 'watch streak',
-            'CLAIM': 'bonus claim',
+            'CLAIM': 'bonus chest',
             'AUTOMATION': 'automation',
             'RAID': 'raid',
             'PREDICTION': 'prediction',
@@ -994,6 +1254,9 @@ const DynamicIsland = () => {
         });
         const firstReason = formatReasonCode(summary.first_reason || 'watch');
         const lastBalance = summary.last_balance ?? undefined;
+        // One channel: its face, and its own name for its points ("Goldwig").
+        const only = summary.channels.length === 1 ? summary.channels[0] : undefined;
+        const currency = only?.points_name || 'Channel Points';
 
         // Create notification data - we'll store the breakdown for expanded view
         const reasonSummary = Object.entries(reasonCounts)
@@ -1030,14 +1293,20 @@ const DynamicIsland = () => {
                     total_points: uniqueChannels.length > 1 ? undefined : lastBalance,
                     // Mark if this is a reason summary (not a real channel name)
                     is_reason_summary: !channelNameDisplay,
+                    avatar_url: only?.avatar_url,
+                    points_name: only?.points_name,
+                    icon_url: only?.icon_url,
                 } as ChannelPointsNotificationData,
             };
 
             addNotification(notification);
+        }
 
-            if (soundEnabled) {
-                playNotificationSound();
-            }
+        // The sound follows its own toggle, not the surface: inside the
+        // notification-centre branch it went quiet whenever the centre was off,
+        // and the toast for these events never plays one.
+        if (soundEnabled) {
+            playNotificationSound();
         }
 
         // Show toast if enabled - show rich formatted version
@@ -1046,24 +1315,26 @@ const DynamicIsland = () => {
                 <div className="flex items-center gap-3 w-full">
                     {/* Free-standing, same as the notification centre. The toast is
                         already a surface; a filled disc inside it was a box in a box,
-                        and ToastManager's own icons never had one. */}
-                    <span className="sn-notif-glyph">
-                        <svg width="22" height="22" viewBox="0 0 24 24" className="text-orange-400" fill="currentColor">
-                            <path d="M12 5v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Z"></path>
-                            <path fillRule="evenodd" d="M1 12C1 5.925 5.925 1 12 1s11 4.925 11 11-4.925 11-11 11S1 18.075 1 12Zm11 9a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z" clipRule="evenodd"></path>
-                        </svg>
-                    </span>
+                        and ToastManager's own icons never had one. One channel
+                        shows its face with its points icon attached instead. */}
+                    {only?.avatar_url ? (
+                        <PointsFace avatarUrl={only.avatar_url} iconUrl={only.icon_url} />
+                    ) : (
+                        <span className="sn-notif-glyph">
+                            <PointsGlyph size={22} />
+                        </span>
+                    )}
 
                     {/* Text Content */}
                     <div className="flex-1 min-w-0">
                         <div className="text-base font-semibold text-textPrimary">
-                            +{totalPoints.toLocaleString()} Channel Points
+                            +{totalPoints.toLocaleString()} {currency}
                         </div>
                         <div className="text-xs text-textSecondary">
                             {uniqueChannels.length === 1 && uniqueChannels[0] ? (
                                 // Single channel - show channel name, reason, and new balance
                                 lastBalance
-                                    ? `${uniqueChannels[0]} • ${firstReason} • ${lastBalance.toLocaleString()} points`
+                                    ? `${uniqueChannels[0]} • ${firstReason} • ${lastBalance.toLocaleString()} ${only?.points_name || 'points'}`
                                     : `${uniqueChannels[0]} • ${firstReason}`
                             ) : uniqueChannels.length > 1 ? (
                                 // Multiple channels - name the streamers + each earn
@@ -1082,18 +1353,9 @@ const DynamicIsland = () => {
             addToast(toastContent, 'channel_points');
         }
 
-        // Send native notification for channel points
-        const channelInfo = uniqueChannels.length === 1 && uniqueChannels[0]
-            ? uniqueChannels[0]
-            : uniqueChannels.length > 1
-                ? (channelListDisplay ?? `${uniqueChannels.length} channels`)
-                : firstReason;
-        sendNativeNotification(
-            `+${totalPoints.toLocaleString()} Channel Points`,
-            channelInfo
-        );
-
-    }, [useDynamicIsland, useToast, addNotification, addToast, soundEnabled, playNotificationSound, sendNativeNotification]);
+        // No mirrorNotification here: Rust raises the system notification and
+        // the MultiChat card for the same burst (services/points_notify.rs).
+    }, [useDynamicIsland, useToast, addNotification, addToast, soundEnabled, playNotificationSound]);
 
     useEffect(() => {
         const unlisten = listen<ChannelPointsSummary>('channel-points-summary', (event) => {
@@ -1178,13 +1440,16 @@ const DynamicIsland = () => {
                     );
                 }
 
-                // Send native notification for badges
-                const nativeStatusText = effectiveStatus === 'new' ? 'New badge available' :
+                const statusLine = effectiveStatus === 'new' ? 'New badge available' :
                     effectiveStatus === 'available' ? 'Badge available now' : 'Badge coming soon';
-                sendNativeNotification(
-                    badge.badge_name,
-                    `${nativeStatusText}${when ? ` - ${when}` : ''}`
-                );
+                mirrorNotification({
+                    kind: 'badge',
+                    title: badge.badge_name,
+                    body: `${statusLine}${when ? ` (${when})` : ''}`,
+                    imageUrl: badge.badge_image_url,
+                    action: { label: 'View', run: () => setShowBadgesOverlay(true) },
+                    target: { type: 'badges' },
+                });
 
                 if (soundEnabled) {
                     playNotificationSound();
@@ -1195,7 +1460,7 @@ const DynamicIsland = () => {
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [notificationsEnabled, showBadgeNotifications, useDynamicIsland, useToast, addNotification, addToast, soundEnabled, playNotificationSound, setShowBadgesOverlay, sendNativeNotification]);
+    }, [notificationsEnabled, showBadgeNotifications, useDynamicIsland, useToast, addNotification, addToast, soundEnabled, playNotificationSound, setShowBadgesOverlay, mirrorNotification]);
 
     // Listen for new drops in favorited categories (on app startup)
     useEffect(() => {
@@ -1246,13 +1511,16 @@ const DynamicIsland = () => {
                 );
             }
 
-            // Send native notification
-            sendNativeNotification(
-                `New drops for ${data.game_name}!`,
-                data.new_count === 1 
-                    ? data.campaign_names[0] 
-                    : `${data.new_count} new campaigns available`
-            );
+            mirrorNotification({
+                kind: 'drops',
+                title: `New drops for ${data.game_name}`,
+                body: data.new_count === 1
+                    ? data.campaign_names[0]
+                    : `${data.new_count} new campaigns available`,
+                imageUrl: data.game_image,
+                action: { label: 'View', run: () => setShowDropsOverlay(true) },
+                target: { type: 'drops' },
+            });
 
             if (soundEnabled) {
                 playNotificationSound();
@@ -1262,9 +1530,9 @@ const DynamicIsland = () => {
         return () => {
             unlisten.then((fn) => fn());
         };
-    }, [notificationsEnabled, showFavoriteDropsNotifications, useDynamicIsland, useToast, addNotification, addToast, soundEnabled, playNotificationSound, setShowDropsOverlay, sendNativeNotification]);
+    }, [notificationsEnabled, showFavoriteDropsNotifications, useDynamicIsland, useToast, addNotification, addToast, soundEnabled, playNotificationSound, setShowDropsOverlay, mirrorNotification]);
 
-    // Click outside to close
+    // Click outside, or Esc, to close
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
             // The trigger lives in the title bar now, outside islandRef, so
@@ -1276,12 +1544,34 @@ const DynamicIsland = () => {
             }
         };
 
+        // Esc closes it too, unless the key belongs to a text field outside
+        // the panel. Marked handled, so nothing else that answers Esc (leaving
+        // the player's full screen) takes the same press.
+        const handleKeyDown = (event: KeyboardEvent) => {
+            if (event.key !== 'Escape' || event.defaultPrevented) return;
+            const target = event.target;
+            const inPanel = target instanceof Node && !!islandRef.current?.contains(target);
+            if (
+                !inPanel &&
+                target instanceof HTMLElement &&
+                (target.isContentEditable || !!target.closest('input, textarea, select'))
+            ) {
+                return;
+            }
+            event.preventDefault();
+            setIsExpanded(false);
+            // Keyboard focus inside the panel goes back to the door it opened from.
+            if (islandRef.current?.contains(document.activeElement)) triggerRef.current?.focus();
+        };
+
         if (isExpanded) {
             document.addEventListener('mousedown', handleClickOutside);
+            document.addEventListener('keydown', handleKeyDown);
         }
 
         return () => {
             document.removeEventListener('mousedown', handleClickOutside);
+            document.removeEventListener('keydown', handleKeyDown);
         };
     }, [isExpanded]);
 
@@ -1478,26 +1768,32 @@ const DynamicIsland = () => {
         const t = setTimeout(() => setSurfaceShown(false), 340);
         return () => clearTimeout(t);
     }, [wantsSurface]);
-    // The surface never runs over the title bar's icon clusters. Covering the
-    // strip it already has the strip's bounds. Standalone it grows from the
-    // door's centre, so its width is capped at the room between the clusters,
-    // and when the door sits off-centre in that room (a wide left cluster
-    // pushes it right) the surface slides back inside rather than shrinking to
-    // twice the short side.
+    // In the bar row the surface never runs over the title bar's icon
+    // clusters. Covering the strip it already has the strip's bounds.
+    // Standalone it grows from the door's centre, so its width is capped at the
+    // room between the clusters, and when the door sits off-centre in that room
+    // (a wide left cluster pushes it right) the surface slides back inside
+    // rather than shrinking to twice the short side. Open as a list where that
+    // room is too narrow to read (a narrow window, Compact View), it drops below
+    // the bar row at a usable width instead (utils/islandGeometry.ts).
     const surfaceTargetWidth = isExpanded
         ? (anchor?.cover || expandedWidth)
         : wantsSurface
             ? getCollapsedWidth()
             : (anchor?.width ?? 72);
-    let surfaceWidth = surfaceTargetWidth;
-    let surfaceShift = 0;
-    if (anchor && !anchor.cover) {
-        const room = Math.max(anchor.width, anchor.roomRight - anchor.roomLeft);
-        surfaceWidth = Math.min(surfaceTargetWidth, room);
-        const centredLeft = anchor.left + anchor.width / 2 - surfaceWidth / 2;
-        const left = Math.max(anchor.roomLeft, Math.min(centredLeft, anchor.roomRight - surfaceWidth));
-        surfaceShift = left - centredLeft;
-    }
+    const {
+        width: surfaceWidth,
+        shift: surfaceShift,
+        drop: surfaceDrop,
+        maxHeight: surfaceMaxHeight,
+    } = islandSurfaceGeometry({
+        anchor,
+        targetWidth: surfaceTargetWidth,
+        expanded: isExpanded,
+        panelWidth: expandedWidth,
+        viewportWidth: windowSize.width,
+        viewportHeight: windowSize.height,
+    });
 
     const shown = notifications.slice(0, 3);
     const hasSeveralDays = new Set(notifications.map((n) => groupLabel(n.timestamp))).size > 1;
@@ -1513,6 +1809,7 @@ const DynamicIsland = () => {
                         ref={triggerRef}
                         type="button"
                         aria-label="Notifications"
+                        aria-expanded={isExpanded}
                         data-tauri-drag-region="false"
                         onClick={() => setIsExpanded((v) => !v)}
                         className={
@@ -1572,7 +1869,14 @@ const DynamicIsland = () => {
                 // trapped in the title bar's stacking context, and still lifted
                 // to z-[55] over the settings blur overlay.
                 className={`fixed ${isSettingsOpen ? 'z-[55]' : 'z-50'}`}
+                // While the bar is lifted over the player the surface takes the
+                // bar's menu layer, above the door it grows from. Over the
+                // player's full screen only the open panel does (previews stay
+                // under the video), and anything in it that navigates leaves
+                // full screen first, like the bar itself.
+                onClickCapture={isPlayerFullscreen ? (e) => exitPlayerFullscreenForBarAction(e.target) : undefined}
                 style={{
+                    zIndex: barLifted && (isExpanded || !isPlayerFullscreen) ? 'var(--sn-z-titlebar-menu)' : undefined,
                     // Anchored to the trigger's LEFT edge only when there is a
                     // nav to the right of it to take over: that is the whole
                     // point of growing that way. In a stream view Home is
@@ -1621,14 +1925,16 @@ const DynamicIsland = () => {
                         // shrinks back INTO it rather than blinking out.
                         width: surfaceWidth,
                         // Only ever non-zero standalone, where the surface is
-                        // held inside the room between the clusters. The same
-                        // spring as the width, so the two travel as one.
+                        // held inside the room between the clusters, or for a
+                        // list that opens below the bar row. The same spring as
+                        // the width, so they travel as one.
                         x: surfaceShift,
+                        y: surfaceDrop,
                         // Collapsed pill sits centered in the title bar. The bar is
                         // h-[40px] (less a 1px bottom border); container at top-1.5 (6px)
                         // + a 28px pill leaves an even gap above and below.
                         height: isExpanded
-                            ? Math.min(maxHeight, 64 + notifications.length * itemHeight)
+                            ? Math.min(maxHeight, surfaceMaxHeight ?? Infinity, 64 + notifications.length * itemHeight)
                             : (anchor?.height ?? 28),
                     }}
                     // One spring, both directions. The collapse was never the
@@ -1755,6 +2061,9 @@ const DynamicIsland = () => {
                                                 }}
                                                 className="sn-notif-action"
                                                 aria-label="Mark all read"
+                                                // Changes nothing on screen behind the
+                                                // panel, so it keeps the player's full screen.
+                                                data-keeps-player-fullscreen
                                             >
                                                 <CheckCheck size={15} />
                                             </button>
@@ -1770,6 +2079,7 @@ const DynamicIsland = () => {
                                                 }}
                                                 className="sn-notif-action sn-notif-action--danger"
                                                 aria-label="Clear all"
+                                                data-keeps-player-fullscreen
                                             >
                                                 <Trash size={15} />
                                             </button>
@@ -1808,6 +2118,17 @@ const DynamicIsland = () => {
                                                     animate={{ opacity: 1, y: 0 }}
                                                     exit={{ opacity: 0, x: -100 }}
                                                     onClick={() => handleNotificationClick(notification)}
+                                                    // A row is a control: it opens what it
+                                                    // announces. As a button it is reachable
+                                                    // by keyboard, and a click on it leaves
+                                                    // the player's full screen first.
+                                                    role="button"
+                                                    tabIndex={0}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key !== 'Enter' && e.key !== ' ') return;
+                                                        e.preventDefault();
+                                                        void handleNotificationClick(notification);
+                                                    }}
                                                     className={`sn-notif-row group ${
                                                         notification.read ? '' : 'sn-notif-row--unread'
                                                     }`}
@@ -1817,7 +2138,10 @@ const DynamicIsland = () => {
                                                             {/* Live notification */}
                                                             <div className="relative flex-shrink-0">
                                                                 {(notification.data as LiveNotificationData).streamer_avatar ? (
-                                                                    <img
+                                                                    <SevenTvAvatar
+                                                                        cosmeticsId={(notification.data as LiveNotificationData).seventv_id}
+                                                                        px={34}
+                                                                        motion="hover"
                                                                         src={(notification.data as LiveNotificationData).streamer_avatar}
                                                                         alt=""
                                                                         className="w-[34px] h-[34px] rounded-full object-cover"
@@ -1861,7 +2185,10 @@ const DynamicIsland = () => {
                                                             {/* Whisper notification */}
                                                             <div className="relative flex-shrink-0">
                                                                 {(notification.data as WhisperNotificationData).profile_image_url ? (
-                                                                    <img
+                                                                    <SevenTvAvatar
+                                                                        cosmeticsId={(notification.data as WhisperNotificationData).from_user_id}
+                                                                        px={34}
+                                                                        motion="hover"
                                                                         src={(notification.data as WhisperNotificationData).profile_image_url}
                                                                         alt=""
                                                                         className="w-[34px] h-[34px] rounded-full object-cover"
@@ -1962,10 +2289,11 @@ const DynamicIsland = () => {
                                                                         StreamNook membership
                                                                     </span>
                                                                 </div>
-                                                                <p className="text-white/50 text-sm truncate mt-0.5">
-                                                                    {(notification.data as MembershipGiftNotificationData).permanent
-                                                                        ? 'Somebody gave you a membership. It does not expire.'
-                                                                        : 'Somebody gave you a membership. Your perks are active now.'}
+                                                                <p className="text-white/50 text-sm line-clamp-2 mt-0.5">
+                                                                    {(notification.data as MembershipGiftNotificationData).bodyPlain
+                                                                        ?? ((notification.data as MembershipGiftNotificationData).permanent
+                                                                            ? 'Somebody gave you a membership. It does not expire.'
+                                                                            : 'Somebody gave you a membership. Your perks are active now.')}
                                                                 </p>
                                                             </div>
                                                         </>
@@ -2027,22 +2355,28 @@ const DynamicIsland = () => {
                                                         </>
                                                     ) : notification.type === 'channel_points' ? (
                                                         <>
-                                                            {/* Channel Points notification */}
-                                                            <div className="relative flex-shrink-0">
-                                                                <div className="sn-notif-glyph">
-                                                                    <svg width="18" height="18" viewBox="0 0 24 24" className="text-orange-400" fill="currentColor">
-                                                                        <path d="M12 5v2a5 5 0 0 1 5 5h2a7 7 0 0 0-7-7Z"></path>
-                                                                        <path fillRule="evenodd" d="M1 12C1 5.925 5.925 1 12 1s11 4.925 11 11-4.925 11-11 11S1 18.075 1 12Zm11 9a9 9 0 1 1 0-18 9 9 0 0 1 0 18Z" clipRule="evenodd"></path>
-                                                                    </svg>
+                                                            {/* Channel Points notification: one channel shows its
+                                                                face with its points icon attached; a mixed burst
+                                                                keeps the plain mark. */}
+                                                            {(notification.data as ChannelPointsNotificationData).avatar_url ? (
+                                                                <PointsFace
+                                                                    avatarUrl={(notification.data as ChannelPointsNotificationData).avatar_url as string}
+                                                                    iconUrl={(notification.data as ChannelPointsNotificationData).icon_url}
+                                                                />
+                                                            ) : (
+                                                                <div className="relative flex-shrink-0">
+                                                                    <div className="sn-notif-glyph">
+                                                                        <PointsGlyph size={18} />
+                                                                    </div>
                                                                 </div>
-                                                            </div>
+                                                            )}
                                                             <div className="flex-1 min-w-0">
                                                                 {/* One points mark per row. The leading glyph already
                                                                     says what this is; a second copy beside the title was
                                                                     the same icon twice on one line. */}
                                                                 <div className="flex items-center gap-2">
                                                                     <span className="text-white text-sm font-semibold truncate">
-                                                                        Channel Points +{(notification.data as ChannelPointsNotificationData).points_earned.toLocaleString()}
+                                                                        {(notification.data as ChannelPointsNotificationData).points_name || 'Channel Points'} +{(notification.data as ChannelPointsNotificationData).points_earned.toLocaleString()}
                                                                     </span>
                                                                 </div>
                                                                 <p className="text-white/50 text-sm truncate mt-0.5">
@@ -2057,7 +2391,7 @@ const DynamicIsland = () => {
                                                                             return channelName;
                                                                         } else if (channelName && totalPoints) {
                                                                             // Real channel name with total - show "channelname: total points"
-                                                                            return `${channelName}: ${totalPoints.toLocaleString()} points`;
+                                                                            return `${channelName}: ${totalPoints.toLocaleString()} ${data.points_name || 'points'}`;
                                                                         } else if (channelName) {
                                                                             // Real channel name without total - just show channel name
                                                                             return channelName;
@@ -2140,7 +2474,10 @@ const DynamicIsland = () => {
                                                                         <div className="relative flex-shrink-0">
                                                                             {d.avatar_url ? (
                                                                                 <>
-                                                                                    <img
+                                                                                    <SevenTvAvatar
+                                                                                        cosmeticsId={d.avatar_seventv_id}
+                                                                                        px={34}
+                                                                                        motion="hover"
                                                                                         src={d.avatar_url}
                                                                                         alt=""
                                                                                         className="w-[34px] h-[34px] rounded-full object-cover"

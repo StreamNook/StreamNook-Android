@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo, Fragment, useSyncExternalStore } from 'react';
+import { flushSync } from 'react-dom';
 import type { ReactNode, MouseEvent, CSSProperties, ChangeEvent, ClipboardEvent, KeyboardEvent } from 'react';
 import { ShieldCheck, Paperclip, X, CornerUpLeft, Pencil } from 'lucide-react';
 import { EmotePickerPanel, useSwappingSmiley } from '../chat/EmotePickerPanel';
@@ -23,6 +24,8 @@ import { StreamNookBadge, MemberReveal, MEMBER_REVEAL_CARD_CLASS } from '../Stre
 import { Tooltip } from '../ui/Tooltip';
 import SpellcheckUnderlay from '../chat/SpellcheckUnderlay';
 import { useSpellcheck } from '../../hooks/useSpellcheck';
+import { useEmotePalette, type PaletteChannel } from '../../hooks/useEmotePalette';
+import { insertAtCaret } from '../../utils/chatInputWord';
 import { warmSpellcheck } from '../../utils/spellcheck';
 import { AtmosphereBackground } from '../AtmosphereBackground';
 import { MajorCologneChrome } from '../MajorCologneChrome';
@@ -329,7 +332,7 @@ const ModRoomMessageRow = ({
           <span className="mr-1.5 align-middle text-[10px] tabular-nums text-textSecondary">{time}</span>
           {isSN && (
             <span className="mr-1 inline-flex align-middle">
-              <StreamNookBadge userId={m.userId} />
+              <StreamNookBadge userId={m.userId} className="sn-chat-badge--sn block h-[18px] w-[18px] object-contain" />
             </span>
           )}
           {onUsernameClick ? (
@@ -385,7 +388,7 @@ const ModRoomMessageRow = ({
       {!locked && !pending && (
         <div
           className="absolute right-1 top-0 z-20 hidden items-center gap-0.5 rounded-md group-hover:flex"
-          style={{ background: 'rgba(20,20,22,0.92)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.06)' }}
+          style={{ background: 'color-mix(in srgb, rgb(20 20 22) calc(92% + (1 - var(--glass-strength, 1)) * 8%), transparent)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.06)' }}
         >
           <button
             onClick={onReply}
@@ -419,6 +422,7 @@ const ModRoomPane = ({ channelId, channelLogin, emotes, onStatus, onUsernameClic
   const [connecting, setConnecting] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [showEmotes, setShowEmotes] = useState(false);
+  const emoteButtonRef = useRef<HTMLButtonElement>(null);
   const [replyingTo, setReplyingTo] = useState<ReplyRef | null>(null);
   const [editing, setEditing] = useState<{ id: string; attachment?: string; reply?: ReplyRef } | null>(null);
   const [showJump, setShowJump] = useState(false);
@@ -463,6 +467,28 @@ const ModRoomPane = ({ channelId, channelLogin, emotes, onStatus, onUsernameClic
     (value: string) => storeSetDraft(channelId, value),
     [channelId, storeSetDraft],
   );
+  // An emote at the caret. Reads the live text, not the render's `draft`, so
+  // picks landing back to back from the popped-out menu each see the last one.
+  const insertEmote = useCallback(
+    (name: string) => {
+      const ta = textareaRef.current;
+      const value = ta?.value ?? useModRoomStore.getState().drafts[channelId] ?? '';
+      const { text, caret } = insertAtCaret(value, ta?.selectionStart ?? value.length, ta?.selectionEnd ?? value.length, name);
+      // Committed before the caret is placed: a pick from the popped-out menu
+      // is a Tauri event, whose render would otherwise land after the caret
+      // moved and put it back at the end.
+      flushSync(() => setDraft(text));
+      const el = textareaRef.current;
+      el?.focus();
+      el?.setSelectionRange(caret, caret);
+    },
+    [channelId, setDraft],
+  );
+  const paletteChannel = useMemo<PaletteChannel | null>(
+    () => (channelLogin ? { login: channelLogin, id: channelId, name: channelLogin, provider: 'twitch' } : null),
+    [channelLogin, channelId],
+  );
+  const popOutEmotes = useEmotePalette(paletteChannel, insertEmote);
 
   // The room connection outlives this pane (the manager holds it for unread
   // tracking); mounting just adds a reference and flags the room as viewed.
@@ -878,7 +904,7 @@ const ModRoomPane = ({ channelId, channelLogin, emotes, onStatus, onUsernameClic
               setShowJump(false);
             }}
             className="absolute bottom-2 right-3 z-20 rounded-full px-2.5 py-1 text-[11px] font-medium text-textPrimary transition-colors hover:text-accent"
-            style={{ background: 'rgba(24,24,26,0.92)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.08)' }}
+            style={{ background: 'color-mix(in srgb, rgb(24 24 26) calc(92% + (1 - var(--glass-strength, 1)) * 8%), transparent)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.08)' }}
           >
             Jump to latest
           </button>
@@ -895,20 +921,29 @@ const ModRoomPane = ({ channelId, channelLogin, emotes, onStatus, onUsernameClic
         <EmotePickerPanel
           open={showEmotes}
           onClose={() => setShowEmotes(false)}
+          ignoreRef={emoteButtonRef}
           emotes={emotes ?? null}
           isTwitch
           isKick={false}
           channelId={channelId}
           channelLogin={channelLogin}
-          onInsert={(name) => {
-            setDraft(draft + (draft && !draft.endsWith(' ') ? ' ' : '') + name + ' ');
-            textareaRef.current?.focus();
-          }}
+          onInsert={insertEmote}
+          onPopOut={
+            popOutEmotes
+              ? () => {
+                  setShowEmotes(false);
+                  popOutEmotes();
+                }
+              : undefined
+          }
+          // A GIF posts straight to the channel's public chat, which is not
+          // where a mod-room message goes.
+          gifs={false}
         />
         {mentionOpen && (
           <div
             className="absolute bottom-full left-2 z-30 mb-1 min-w-[160px] overflow-hidden rounded-lg py-1"
-            style={{ background: 'rgba(18,18,20,0.98)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.08)' }}
+            style={{ background: 'color-mix(in srgb, rgb(18 18 20) calc(98% + (1 - var(--glass-strength, 1)) * 2%), transparent)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.08)' }}
           >
             {mentionCandidates.map((c, i) => (
               <button
@@ -961,6 +996,7 @@ const ModRoomPane = ({ channelId, channelLogin, emotes, onStatus, onUsernameClic
             <Paperclip size={16} />
           </button>
           <button
+            ref={emoteButtonRef}
             onClick={() => setShowEmotes((v) => !v)}
             onMouseLeave={smiley.cycleEmoteSmiley}
             disabled={state !== 'connected' || !key}

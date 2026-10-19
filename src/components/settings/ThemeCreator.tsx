@@ -130,7 +130,9 @@ const ThemeCreator = ({ editingTheme, onClose, onSave, onDelete }: ThemeCreatorP
   const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set(['core', 'accent']));
   const [hasChanges, setHasChanges] = useState(false);
 
-  // Apply live preview when palette changes
+  // Apply live preview when palette changes. It paints at once; applyTheme then
+  // takes Rust's floors (muted and secondary text, the accent on cards), the
+  // same ones saving applies, so the preview is the theme as it will be saved.
   useEffect(() => {
     const previewTheme: CustomTheme = {
       id: 'preview',

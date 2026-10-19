@@ -31,6 +31,12 @@ export interface ThirdPartyBadge {
   image4x: string;
   provider: string;
   link?: string;
+  /** What the badge is for, when its provider says (Moltorino does). */
+  description?: string;
+  /** The wear category (the Rust badge's `set_id`): what the provider treats
+   *  as one separate thing. A chatter wears one badge per category. Absent
+   *  on badges built outside the Rust index; see `wearCategory`. */
+  category?: string;
 }
 
 export interface UserBadgesResponse {
@@ -119,7 +125,10 @@ export async function getAllUserBadges(
         image2x: b.badge_info.image_2x || imageUrl,
         image4x: b.badge_info.image_4x || imageUrl,
         provider: b.provider,
+        category: b.badge_info.set_id,
         link: b.badge_info.click_url,
+        // Only Moltorino writes descriptions; the rest send "".
+        description: b.badge_info.description || undefined,
       };
     });
 
@@ -175,7 +184,10 @@ export async function getAllUserBadgesWithEarned(
         image2x: b.badge_info.image_2x || imageUrl,
         image4x: b.badge_info.image_4x || imageUrl,
         provider: b.provider,
+        category: b.badge_info.set_id,
         link: b.badge_info.click_url,
+        // Only Moltorino writes descriptions; the rest send "".
+        description: b.badge_info.description || undefined,
       };
     });
 
@@ -220,7 +232,10 @@ export async function getGlobalThirdPartyBadges(userId: string): Promise<ThirdPa
         image2x: b.badge_info.image_2x || imageUrl,
         image4x: b.badge_info.image_4x || imageUrl,
         provider: b.provider,
+        category: b.badge_info.set_id,
         link: b.badge_info.click_url,
+        // Only Moltorino writes descriptions; the rest send "".
+        description: b.badge_info.description || undefined,
       };
     });
   } catch (error) {
@@ -275,3 +290,36 @@ export async function clearChannelBadgeCache(channelId: string): Promise<void> {
 // Legacy type aliases for backwards compatibility
 export type BadgeInfo = TwitchBadge;
 export type UserBadge = TwitchBadge;
+
+/** What the badge spotlight shows for a third-party badge (Rust
+ *  `get_badge_detail`). A null field is one Rust does not know; the clicked
+ *  badge's own art and title stand in for those. */
+export interface BadgeDetail {
+  provider: string;
+  provider_label: string;
+  title: string | null;
+  description: string | null;
+  image_1x: string | null;
+  image_2x: string | null;
+  image_4x: string | null;
+  click_url: string | null;
+  homepage: string;
+  holder_count: number | null;
+  owned: boolean | null;
+}
+
+/** Look up a clicked third-party badge in the provider feeds Rust holds. Any
+ *  badge id space works (`ffz-3`, `ffz:ffz-3`); Rust normalises it. */
+export async function getBadgeDetail(
+  provider: string,
+  id: string,
+  title: string | undefined,
+  viewerUserId: string | null | undefined,
+): Promise<BadgeDetail> {
+  return invoke<BadgeDetail>('get_badge_detail', {
+    provider,
+    id,
+    title: title ?? null,
+    viewerUserId: viewerUserId ?? null,
+  });
+}

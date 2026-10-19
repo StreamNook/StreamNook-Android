@@ -3,12 +3,34 @@
 
 /** 1234567 -> "1.2M", 12300 -> "12.3K", 999 -> "999". */
 export function formatViewerCount(count: number): string {
-    if (count >= 1000000) {
+    if (count < 1000) return count.toString();
+    // The unit is picked after rounding: 999,999 rounds to "1000.0K", which
+    // is "1.0M".
+    const thousands = (count / 1000).toFixed(1);
+    if (count >= 1000000 || thousands === '1000.0') {
         return (count / 1000000).toFixed(1) + 'M';
-    } else if (count >= 1000) {
-        return (count / 1000).toFixed(1) + 'K';
     }
-    return count.toString();
+    return thousands + 'K';
+}
+
+/** formatViewerCount without a zero tenth: 136000 -> "136K", 136400 -> "136.4K". */
+export function formatShortCount(count: number): string {
+    return formatViewerCount(count).replace(/\.0(?=[KM]$)/, '');
+}
+
+/**
+ * The start time a chat header's uptime counts from. Rust's channel state
+ * (`rustStartedAt`, Twitch only, polled with the viewer count) wins. The
+ * stream's own value covers the wait for Rust's first answer, except while a
+ * recording plays, where it is the video's date rather than a live start.
+ * '' means no uptime is shown.
+ */
+export function pickLiveStartedAt(
+    rustStartedAt: string | null | undefined,
+    streamStartedAt: string | null | undefined,
+    playingRecording: boolean,
+): string {
+    return rustStartedAt || (playingRecording ? '' : streamStartedAt) || '';
 }
 
 /**

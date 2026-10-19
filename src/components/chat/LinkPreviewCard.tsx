@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState, memo } from 'react';
-import { Play, ExternalLink, Eye, ShieldCheck, Instagram } from 'lucide-react';
+import { Play, ExternalLink, Eye, ShieldCheck } from 'lucide-react';
 import { Tooltip, type TooltipChildProps } from '../ui/Tooltip';
 import { DiscordGlyph } from '../ui/DiscordGlyph';
+import { SocialLogo } from '../ui/SocialLogo';
 import { useAppStore, type MediaInfo } from '../../stores/AppStore';
 import { playTwitchMediaInMain } from '../../utils/playTwitchMediaInMain';
 // Shared helper, not a local copy. The local copy this replaced used
@@ -134,7 +135,9 @@ function formatViews(n: number): string {
 /**
  * A single inline link-preview card. Resolves lazily (only fetches once the row
  * scrolls near the viewport) and renders a fixed-height skeleton while loading.
- * Card chrome reuses `.glass-panel` (subtle inset bevel, no outer glow).
+ * Card chrome reuses `.glass-panel` (subtle inset bevel, no outer glow) with
+ * `.no-live-blur`: a backdrop filter inside a `content-visibility: auto` chat
+ * row leaves stale copies of the card behind as the list scrolls in WebView2.
  *
  * `showChip` controls the no-preview fallback: in "clean" mode (inline link
  * suppressed) it's true, so a failed/empty preview falls back to a compact link
@@ -145,21 +148,27 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
   url,
   showChip = true,
   trusted = true,
+  resolved,
 }: {
   url: string;
   showChip?: boolean;
   trusted?: boolean;
+  /** An already-fetched preview. The card renders it and fetches nothing. */
+  resolved?: LinkPreview;
 }) {
   // undefined = unresolved, null = no preview, object = card. Nothing is cached
   // (chat links are ephemeral), so every card starts unresolved and fetches once.
-  const [preview, setPreview] = useState<LinkPreview | null | undefined>(undefined);
+  const [preview, setPreview] = useState<LinkPreview | null | undefined>(resolved);
   const [imageFailed, setImageFailed] = useState(false);
+  // The Reddit card holds the image's full box until it loads, so the card
+  // does not grow by the image's height when it arrives.
+  const [imageLoaded, setImageLoaded] = useState(false);
   // Trusted links fetch automatically; untrusted links wait for an explicit
   // click (the click-to-load chip below) so an arbitrary pasted link is never
   // fetched passively — that would reveal the user's IP to the linked host.
   const [loadRequested, setLoadRequested] = useState(trusted);
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const requested = useRef(false);
+  const requested = useRef(resolved !== undefined);
 
   useEffect(() => {
     // Untrusted links don't auto-fetch; loadPreview() drives them on click.
@@ -276,7 +285,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     ? wrap(
         <div
           {...cardProps}
-          className="glass-panel mt-1 inline-flex max-w-md cursor-pointer items-center gap-1.5 px-2.5 py-1.5 align-middle transition-colors hover:bg-white/[0.03]"
+          className="glass-panel no-live-blur mt-1 inline-flex max-w-md cursor-pointer items-center gap-1.5 px-2.5 py-1.5 align-middle transition-colors hover:bg-white/[0.03]"
         >
           <ExternalLink size={13} className="flex-shrink-0 text-textSecondary" />
           <span className="truncate text-xs text-blue-400">{prettyUrlLabel(url)}</span>
@@ -303,7 +312,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
                 loadPreview();
               }
             }}
-            className="glass-panel inline-flex min-w-0 cursor-pointer items-center gap-1.5 px-2.5 py-1.5 align-middle transition-colors hover:bg-white/[0.03]"
+            className="glass-panel no-live-blur inline-flex min-w-0 cursor-pointer items-center gap-1.5 px-2.5 py-1.5 align-middle transition-colors hover:bg-white/[0.03]"
           >
             <Eye size={13} className="flex-shrink-0 text-textSecondary" />
             <span className="truncate text-xs text-textSecondary">Load preview · {hostOf(url)}</span>
@@ -314,7 +323,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
             type="button"
             onClick={trustHostAndLoad}
             aria-label={`Always trust ${hostOf(url)}`}
-            className="glass-panel flex flex-shrink-0 cursor-pointer items-center justify-center p-1.5 text-textSecondary transition-colors hover:bg-white/[0.03] hover:text-textPrimary"
+            className="glass-panel no-live-blur flex flex-shrink-0 cursor-pointer items-center justify-center p-1.5 text-textSecondary transition-colors hover:bg-white/[0.03] hover:text-textPrimary"
           >
             <ShieldCheck size={14} />
           </button>
@@ -328,7 +337,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return (
       <div
         ref={containerRef}
-        className="glass-panel mt-1 w-full max-w-md overflow-hidden"
+        className="glass-panel no-live-blur mt-1 w-full max-w-md overflow-hidden"
         style={{ height: 56, opacity: 0.5 }}
         aria-hidden
       >
@@ -350,7 +359,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     if (!trusted) {
       return (
         <Tooltip content={url} side="top">
-          <div className="glass-panel mt-1 inline-flex max-w-md items-center gap-1.5 px-2.5 py-1.5 align-middle text-xs text-textSecondary">
+          <div className="glass-panel no-live-blur mt-1 inline-flex max-w-md items-center gap-1.5 px-2.5 py-1.5 align-middle text-xs text-textSecondary">
             <Eye size={13} className="flex-shrink-0 opacity-50" />
             <span className="truncate">No preview available · {hostOf(url)}</span>
           </div>
@@ -367,7 +376,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
       >
         <div className="relative w-full bg-black/40" style={{ aspectRatio: '16 / 9' }}>
           <img
@@ -407,7 +416,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
       >
         <div className="flex items-center gap-2.5">
           {preview.author_avatar && !imageFailed && (
@@ -444,7 +453,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
       >
         <div className="flex items-center gap-2.5">
           {preview.author_avatar && !imageFailed && (
@@ -459,7 +468,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
           )}
           <div className="min-w-0 flex-1 leading-tight">
             <div className="mb-0.5 flex items-center gap-1.5 text-[11px] text-textSecondary">
-              <Instagram size={13} />
+              <SocialLogo platform="instagram" size={13} />
               <span className="font-semibold">Instagram</span>
               {typeof preview.member_count === 'number' && (
                 <span className="text-textSecondary/70">· {formatViews(preview.member_count)} followers</span>
@@ -480,6 +489,55 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     );
   }
 
+  // --- Reddit: r/sub · u/author, the post title, Reddit's preview image ------
+  // Rust writes every label (site_name is "Reddit" when no subreddit applies).
+  if (preview.kind === 'reddit') {
+    const showImage = !!preview.image && !imageFailed;
+    // A share or video link that did not resolve knows only where it goes:
+    // the same compact chip as the other link chips, not an empty card.
+    if (!preview.title && !showImage) {
+      return wrap(
+        <div
+          {...cardProps}
+          className="glass-panel no-live-blur mt-1 inline-flex max-w-md cursor-pointer items-center gap-1.5 px-2.5 py-1.5 align-middle transition-colors hover:bg-white/[0.03]"
+        >
+          <SocialLogo platform="reddit" size={13} />
+          <span className="truncate text-xs font-semibold text-textPrimary">{preview.site_name}</span>
+          {preview.author && <span className="min-w-0 truncate text-xs text-textSecondary/80">· {preview.author}</span>}
+        </div>,
+      );
+    }
+    return wrap(
+      <div
+        {...cardProps}
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
+      >
+        <div className="flex min-w-0 items-center gap-1.5 text-[11px] leading-tight text-textSecondary">
+          <SocialLogo platform="reddit" size={13} />
+          {/* The subreddit keeps its width; the author gives way first. */}
+          <span className="max-w-full flex-shrink-0 truncate font-semibold">{preview.site_name}</span>
+          {preview.author && <span className="min-w-0 truncate text-textSecondary/80">· {preview.author}</span>}
+        </div>
+        {preview.title && (
+          <div className="mt-1 text-sm font-semibold leading-snug text-textPrimary" style={clamp(3)}>
+            {preview.title}
+          </div>
+        )}
+        {showImage && (
+          <img
+            src={preview.image as string}
+            alt=""
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            className={`mt-2 w-full rounded-md bg-white/[0.04] object-cover ${imageLoaded ? 'max-h-72' : 'h-72'}`}
+            onLoad={() => setImageLoaded(true)}
+            onError={() => setImageFailed(true)}
+          />
+        )}
+      </div>,
+    );
+  }
+
   // --- Twitch clip / VOD: 16:9 thumbnail + duration badge + channel/views ----
   // Opens in the in-app player (see activate()).
   if ((preview.kind === 'clip' || preview.kind === 'vod') && preview.image && !imageFailed) {
@@ -487,7 +545,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
       >
         <div className="relative w-full bg-black/40" style={{ aspectRatio: '16 / 9' }}>
           <img
@@ -504,7 +562,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
             </span>
           </span>
           {typeof preview.duration === 'number' && preview.duration > 0 && (
-            <span className="absolute bottom-1.5 right-1.5 rounded bg-black/75 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-white">
+            <span className="absolute bottom-1.5 right-1.5 rounded bg-glass-ink/75 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-white">
               {formatMediaDuration(preview.duration)}
             </span>
           )}
@@ -544,7 +602,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 flex w-full max-w-md cursor-pointer items-center gap-3 p-3 text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 flex w-full max-w-md cursor-pointer items-center gap-3 p-3 text-left transition-colors hover:bg-white/[0.03]"
       >
         <div className="h-11 w-11 flex-shrink-0 overflow-hidden rounded-2xl bg-white/[0.04]">
           {preview.image && !imageFailed ? (
@@ -607,7 +665,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
       >
         {showImage && (
           <div className="relative w-full bg-black/40" style={{ aspectRatio: '460 / 215' }}>
@@ -620,7 +678,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
               onError={() => setImageFailed(true)}
             />
             {preview.author && (
-              <span className="absolute bottom-1.5 right-1.5 rounded bg-black/75 px-1.5 py-0.5 text-[11px] font-semibold text-white">
+              <span className="absolute bottom-1.5 right-1.5 rounded bg-glass-ink/75 px-1.5 py-0.5 text-[11px] font-semibold text-white">
                 {preview.author}
               </span>
             )}
@@ -659,7 +717,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 flex w-full max-w-md cursor-pointer items-center overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 flex w-full max-w-md cursor-pointer items-center overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
       >
         {showImage && (
           <img
@@ -696,7 +754,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 inline-block max-w-md cursor-pointer overflow-hidden transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 inline-block max-w-md cursor-pointer overflow-hidden transition-colors hover:bg-white/[0.03]"
       >
         <img
           src={preview.image}
@@ -716,7 +774,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden p-3 text-left transition-colors hover:bg-white/[0.03]"
       >
         <div className="flex items-center gap-2">
           {preview.author_avatar && (
@@ -777,7 +835,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
     return wrap(
       <div
         {...cardProps}
-        className="glass-panel mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
+        className="glass-panel no-live-blur mt-1 block w-full max-w-md cursor-pointer overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
       >
         {showImage && (
           <img
@@ -811,7 +869,7 @@ export const LinkPreviewCard = memo(function LinkPreviewCard({
   return wrap(
     <div
       {...cardProps}
-      className="glass-panel mt-1 flex w-full max-w-md cursor-pointer items-center overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
+      className="glass-panel no-live-blur mt-1 flex w-full max-w-md cursor-pointer items-center overflow-hidden text-left transition-colors hover:bg-white/[0.03]"
     >
       {showImage && (
         <img

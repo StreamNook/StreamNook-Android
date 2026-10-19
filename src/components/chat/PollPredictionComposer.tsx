@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { managerAct, type ActOutcome } from '../../services/streamManager';
 import { BarChart3, Trophy, Plus, X, ChevronUp, ChevronDown, History } from 'lucide-react';
 import { useAppStore } from '../../stores/AppStore';
 import { Tooltip } from '../ui/Tooltip';
-import { OverlayBanner } from './OverlayBanner';
+import { BannerStatus, OverlayBanner, ShareRow } from './OverlayBanner';
 import { ChannelPointsIcon } from '../ChannelPointsIcon';
 import { Logger } from '../../utils/logger';
+import { useOutsidePress } from '../../hooks/useOutsidePress';
 
 /**
  * Builder for a Twitch poll or prediction, anchored above the chat input.
@@ -41,12 +42,25 @@ interface RecentEntry {
 
 interface Props {
   broadcasterId: string;
+  channelLogin: string;
   /** Pre-selects a tab when opened from /poll or /prediction. */
   initialKind?: Kind;
   onClose: () => void;
+  /** The stream manager's answer, so the Tools menu shows the running poll. */
+  onOutcome?: (outcome: ActOutcome) => void;
+  /** Drawn in a page (the phone's Manage channel sheet) rather than as a
+   *  popover above the message box: no frame, no outside-press close. */
+  inline?: boolean;
 }
 
-export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', onClose }: Props) {
+export function PollPredictionComposer({
+  broadcasterId,
+  channelLogin,
+  initialKind = 'poll',
+  onClose,
+  onOutcome,
+  inline = false,
+}: Props) {
   const settings = useAppStore((s) => s.settings);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const addToast = useAppStore((s) => s.addToast);
@@ -68,10 +82,12 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
   );
 
   useEffect(() => {
-    titleRef.current?.focus();
-  }, []);
+    // On a phone the keyboard would cover the form the moment it opens.
+    if (!inline) titleRef.current?.focus();
+  }, [inline]);
 
   // Escape closes; click-away closes. Matches the emote picker and mod menu.
+  const markInside = useOutsidePress(!inline, [rootRef], onClose);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -79,15 +95,8 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
         onClose();
       }
     };
-    const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) onClose();
-    };
     document.addEventListener('keydown', onKey);
-    document.addEventListener('mousedown', onDown);
-    return () => {
-      document.removeEventListener('keydown', onKey);
-      document.removeEventListener('mousedown', onDown);
-    };
+    return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
 
   // Switching tabs keeps what you've typed but trims to the new maximum, so
@@ -138,24 +147,25 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
     if (problem || busy) return;
     setBusy(true);
     try {
-      if (kind === 'poll') {
-        await invoke('create_poll', {
-          broadcasterId,
-          title: title.trim(),
-          choices: filled,
-          duration,
-          pointsPerVote: pointsPerVote > 0 ? pointsPerVote : null,
-        });
-      } else {
-        await invoke('create_prediction', {
-          broadcasterId,
-          title: title.trim(),
-          outcomes: filled,
-          window: duration,
-        });
-      }
+      // One Rust door: Helix for the broadcaster, Twitch's own GQL for a
+      // moderator or editor, with Twitch's limits checked first.
+      const outcome = await managerAct(
+        broadcasterId,
+        channelLogin,
+        kind === 'poll'
+          ? {
+              kind: 'create_poll',
+              title: title.trim(),
+              choices: filled,
+              seconds: duration,
+              points_per_vote: pointsPerVote > 0 ? pointsPerVote : null,
+            }
+          : { kind: 'create_prediction', title: title.trim(), outcomes: filled, seconds: duration },
+      );
+      onOutcome?.(outcome);
+      addToast(outcome.message, outcome.ok ? 'success' : 'error');
+      if (!outcome.ok) return;
       rememberRecent({ title: title.trim(), options: filled });
-      addToast(kind === 'poll' ? 'Poll started' : 'Prediction started', 'success');
       onClose();
     } catch (err) {
       Logger.error(`[Composer] create ${kind} failed:`, err);
@@ -172,10 +182,15 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
   return (
     <div
       ref={rootRef}
-      className="sn-popover absolute bottom-full left-0 right-0 mb-2 z-50 flex flex-col max-h-[70vh] overflow-hidden"
+      onPointerDownCapture={markInside}
+      className={
+        inline
+          ? 'flex flex-col'
+          : 'sn-popover absolute bottom-full left-0 right-0 mb-2 z-50 flex flex-col max-h-[70vh] overflow-hidden'
+      }
     >
       {/* Kind switch */}
-      <div className="flex items-center gap-1 p-2">
+      <div className={`flex items-center gap-1 ${inline ? 'pb-2' : 'p-2'}`}>
         {(['poll', 'prediction'] as const).map((k) => {
           const active = kind === k;
           const Icon = k === 'poll' ? BarChart3 : Trophy;
@@ -194,18 +209,21 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
             </button>
           );
         })}
-        <Tooltip content="Close" side="top">
-          <button
-            onClick={onClose}
-            className="p-1.5 text-textSecondary hover:text-textPrimary transition-colors"
-            aria-label="Close"
-          >
-            <X size={14} />
-          </button>
-        </Tooltip>
+        {/* In a page the sheet's Back closes it. */}
+        {!inline && (
+          <Tooltip content="Close" side="top">
+            <button
+              onClick={onClose}
+              className="p-1.5 text-textSecondary hover:text-textPrimary transition-colors"
+              aria-label="Close"
+            >
+              <X size={14} />
+            </button>
+          </Tooltip>
+        )}
       </div>
 
-      <div className="overflow-y-auto scrollbar-thin px-3 pb-3 space-y-3">
+      <div className={`overflow-y-auto scrollbar-thin pb-3 space-y-3 ${inline ? '' : 'px-3'}`}>
         {/* Title */}
         <div>
           <div className="flex items-baseline justify-between mb-1">
@@ -370,27 +388,21 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
             <OverlayBanner
               icon={
                 kind === 'poll' ? (
-                  <BarChart3 className="w-4 h-4 text-accent" />
+                  <BarChart3 className="w-4 h-4 text-accent-on-surface" />
                 ) : (
-                  <Trophy className="w-4 h-4 text-accent" />
+                  <Trophy className="w-4 h-4 text-accent-on-surface" />
                 )
               }
+              kind={kind === 'poll' ? 'Poll' : 'Prediction'}
               title={title.trim() || (kind === 'poll' ? 'Your question' : 'Your prediction')}
               isExpanded
               onToggleExpanded={() => {}}
-              badges={
-                <span className="text-xs font-mono font-bold text-warning bg-warning/20 border border-warning/40 px-1.5 py-1 rounded-md">
-                  {durationLabel}
-                </span>
-              }
+              badges={<BannerStatus>{durationLabel}</BannerStatus>}
             >
-              <div className="p-3 space-y-2">
+              <div className="px-3 pb-3 space-y-2">
                 {(filled.length ? filled : ['Option 1', 'Option 2']).map((o, i) => (
-                  <div
-                    key={i}
-                    className="w-full relative p-2.5 rounded-lg border bg-backgroundSecondary border-border"
-                  >
-                    <span className="font-semibold text-textPrimary text-sm">{o}</span>
+                  <div key={i} className="block">
+                    <ShareRow title={o} percent={0} />
                   </div>
                 ))}
               </div>
@@ -400,7 +412,7 @@ export function PollPredictionComposer({ broadcasterId, initialKind = 'poll', on
       </div>
 
       {/* Commit */}
-      <div className="p-3 pt-0">
+      <div className={inline ? 'pt-0' : 'p-3 pt-0'}>
         <button
           onClick={submit}
           disabled={!!problem || busy}

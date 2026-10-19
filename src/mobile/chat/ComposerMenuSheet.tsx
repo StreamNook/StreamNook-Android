@@ -1,11 +1,36 @@
 // The menu behind the composer's trailing button when there is nothing to send.
 // Send and this share one slot, so the composer never carries a dead button.
-import React from 'react';
-import { ArrowsClockwise, ChatsCircle, Heart, HeartBreak, Lock, ShieldCheck, Star, Terminal, X } from 'phosphor-react';
+import React, { useState } from 'react';
+import { ArrowsClockwise, BookmarkSimple, CaretRight, ChatsCircle, Heart, HeartBreak, PencilSimpleLine, ShieldCheck, Star, Terminal, X } from 'phosphor-react';
+import {
+  Fingerprint as ModeUnique,
+  Heart as ModeFollowers,
+  Smile as ModeEmotes,
+  Star as ModeSubs,
+  Timer as ModeSlow,
+  type LucideIcon,
+} from 'lucide-react';
 import { MobileSheet } from '../ui/MobileSheet';
+import { GroupCard, GroupFooter, GroupLabel, GroupRow } from '../ui/GroupedList';
 import { useChannelSocial } from '../../hooks/useChannelSocial';
 import { platformTerms } from '../../utils/platformTerms';
-import type { ProviderId } from '../../types/providers';
+import { PROVIDERS, type ProviderId } from '../../types/providers';
+import type { RoomModeKind, RoomModeView } from '../../stores/chatConnectionStore';
+import { useChatTabsStore } from './chatTabsStore';
+
+// The same glyph per mode as the composer's room-mode icon, so the icon you
+// tapped is the one you find named here.
+const MODE_ICONS: Record<RoomModeKind, LucideIcon> = {
+  subs_only: ModeSubs,
+  emote_only: ModeEmotes,
+  followers_only: ModeFollowers,
+  slow: ModeSlow,
+  unique: ModeUnique,
+};
+
+// Every action row's glyph: phosphor's outline weight, one size, centered in
+// the same 24px box, so no row's icon out-pulls another.
+const ICON = 22;
 
 interface Props {
   open: boolean;
@@ -18,14 +43,18 @@ interface Props {
   /** Broadcaster id, for follow/unfollow. Null when no chat is open. */
   channelId: string | null;
   isModerator: boolean;
-  /** Active room restrictions, shown as context. Empty when unrestricted. */
-  gatingLabels: string[];
+  /** The room's modes in Rust's words, shown as context. Null when the room
+   *  has none. */
+  roomModes: RoomModeView | null;
   modToolsOn: boolean;
   onToggleModTools: () => void;
   onAddChat: () => void;
   onReload: () => void;
   /** Opens the chat command browser. Absent when no chat is open. */
   onBrowseCommands?: () => void;
+  /** Opens the stream manager. Absent where there is nothing to manage
+   *  (not a Twitch chat you moderate or own). */
+  onManageChannel?: () => void;
   /** Absent for the stream-following tab, which is not closable. */
   onCloseChat?: () => void;
 }
@@ -38,16 +67,22 @@ export const ComposerMenuSheet: React.FC<Props> = ({
   activeLabel,
   channelId,
   isModerator,
-  gatingLabels,
+  roomModes,
   modToolsOn,
   onToggleModTools,
   onAddChat,
   onReload,
   onBrowseCommands,
+  onManageChannel,
   onCloseChat,
 }) => {
-  const row =
-    'sn-touch flex items-center gap-3 px-2 text-[15px] text-textPrimary active:opacity-70 disabled:opacity-45';
+  // The stream's own chat closes with the player unless you keep it; every
+  // other open chat is already one of yours.
+  const streamTab = useChatTabsStore((s) => {
+    const t = s.tabs.find((tab) => tab.channel === s.activeChannel);
+    return t?.pinnedToStream ? t : null;
+  });
+  const keep = useChatTabsStore((s) => s.keep);
 
   // The desktop client's follow logic, ported rather than reimplemented: this
   // hook lives in hooks/ precisely so several surfaces can share it, and it
@@ -79,138 +114,190 @@ export const ComposerMenuSheet: React.FC<Props> = ({
   const terms = platformTerms(provider);
   const canSubscribe = !!activeChannel && (provider === 'twitch' || provider === 'kick');
 
+  // Follow sits at the top; Unfollow at the bottom with the other row that
+  // takes something away. Where the row sits is decided once per opening, so
+  // a tap flips its label in place (the confirmation) instead of moving it.
+  const [lastOpen, setLastOpen] = useState(open);
+  const [followSlot, setFollowSlot] = useState<'top' | 'bottom' | null>(null);
+  if (open !== lastOpen) {
+    setLastOpen(open);
+    if (open) setFollowSlot(null);
+  }
+  if (open && followSlot === null && isFollowing !== null) setFollowSlot(isFollowing ? 'bottom' : 'top');
+  // Held back until the status is known (`isFollowing` is null while
+  // checking) rather than guessing a label and flipping it a moment later.
+  // The sheet stays open on tap.
+  const followRow =
+    channelId && isFollowing !== null && followSlot !== null ? (
+      <GroupRow
+        onClick={() => void handleFollowClick()}
+        disabled={followLoading}
+        className={isFollowing ? '!text-error' : ''}
+        icon={isFollowing ? <HeartBreak size={ICON} /> : <Heart size={ICON} className="text-success" />}
+      >
+        {isFollowing ? 'Unfollow' : 'Follow'}
+        {activeLabel ? ` ${activeLabel}` : ''}
+      </GroupRow>
+    ) : null;
+
   return (
     <MobileSheet open={open} onClose={onClose} title={activeLabel ?? 'Chat'} maxHeightFraction={0.5}>
-      <div className="flex flex-col">
+      {/* The same grouped pieces as the settings pages, as the iPhone menu
+          draws them: the room's modes above, the actions on one card. */}
         {/* Room state lives here rather than above the composer. Followers-only
             while you can still talk is context worth having, not a warning worth
-            a permanent line over chat. */}
-        {gatingLabels.length > 0 && (
-          <div className="flex items-start gap-3 px-2 pb-2 mb-1 border-b border-borderSubtle">
-            <Lock size={17} className="text-textSecondary shrink-0 mt-0.5" />
-            <div className="flex-1 min-w-0">
-              <div className="text-[13.5px] text-textSecondary">This chat is in</div>
-              <div className="text-[14px] text-textPrimary">{gatingLabels.join(' · ')}</div>
+            a permanent line over chat. Status, not actions: one quiet block, its
+            lines closer together than the rows below, so it never reads as a
+            set of buttons. Each mode carries the composer's glyph for it, its
+            name and what it means; the footer says where you stand when every
+            mode spares you. */}
+        {roomModes && roomModes.modes.length > 0 && (
+          <div className="px-4 pb-3">
+            <GroupLabel className="mb-2">This chat is in</GroupLabel>
+            <div className="flex flex-col gap-2">
+              {roomModes.modes.map((mode) => {
+                const Icon = MODE_ICONS[mode.kind];
+                return (
+                  <div key={mode.kind} className="flex items-start gap-3">
+                    <span className="flex w-[19px] h-[19px] shrink-0 items-center justify-center" aria-hidden>
+                      <Icon size={14} strokeWidth={2.2} className="text-textMuted" />
+                    </span>
+                    <p className="flex-1 min-w-0 text-[13px] leading-[19px]">
+                      <span className="font-medium text-textSecondary">{mode.compact}</span>{' '}
+                      <span className="text-textMuted">{mode.detail}</span>
+                    </p>
+                  </div>
+                );
+              })}
             </div>
+            {roomModes.standing && (
+              <div className="mt-2 pl-[31px] text-[12px] leading-snug text-textSecondary">
+                {roomModes.standing}
+              </div>
+            )}
           </div>
         )}
-        {/* Follow / unfollow. Green heart to follow, red broken heart to
-            unfollow, matching the desktop overlay's Heart / HeartBreak pair.
-            Held back until the status is known (`isFollowing` is null while
-            checking) rather than guessing a label and flipping it a moment
-            later. The sheet stays open on tap: the row reflects the new state
-            in place, which is the confirmation. */}
-        {channelId && isFollowing !== null && (
-          <button
-            onClick={() => void handleFollowClick()}
-            disabled={followLoading}
-            className={`${row} ${isFollowing ? '!text-error' : '!text-success'}`}
-          >
-            {isFollowing ? (
-              <HeartBreak size={19} weight="fill" className="shrink-0" />
-            ) : (
-              <Heart size={19} weight="fill" className="shrink-0" />
-            )}
-            <span className="flex-1 text-left">
-              {isFollowing ? 'Unfollow' : 'Follow'}
-              {activeLabel ? ` ${activeLabel}` : ''}
-            </span>
-          </button>
-        )}
+      <GroupCard>
+        {/* Follow, at the top when you do not follow yet. */}
+        {followRow && followSlot === 'top' && followRow}
 
         {/* Subscribe, or resubscribe, or gift once subscribed: the same three
             states the desktop control shows, in the platform's own words. The
             sheet closes because the checkout opens over it. */}
         {canSubscribe && (
-          <button
+          <GroupRow
             onClick={() => {
               onClose();
               void handleSubscribeClick();
             }}
-            className={row}
+            icon={
+              subscriberBadgeUrl ? (
+                <img src={subscriberBadgeUrl} alt="" draggable={false} className="w-[22px] h-[22px]" />
+              ) : (
+                <Star size={ICON} style={{ color: PROVIDERS[provider].color }} />
+              )
+            }
+            value={isSubscribed ? 'Subscribed' : undefined}
           >
-            {subscriberBadgeUrl ? (
-              <img src={subscriberBadgeUrl} alt="" draggable={false} className="w-[19px] h-[19px] shrink-0" />
-            ) : (
-              <Star size={19} weight="fill" className="text-accent shrink-0" />
-            )}
-            <span className="flex-1 text-left">
-              {isSubscribed ? terms.paidGift : hasSubHistory ? terms.paidAgain : terms.paid}
-              {!isSubscribed && activeLabel ? ` to ${activeLabel}` : ''}
-            </span>
-            {isSubscribed && <span className="text-[12.5px] text-textMuted">Subscribed</span>}
-          </button>
+            {isSubscribed ? terms.paidGift : hasSubHistory ? terms.paidAgain : terms.paid}
+            {!isSubscribed && activeLabel ? ` to ${activeLabel}` : ''}
+          </GroupRow>
         )}
 
-        <button
+        <GroupRow
           onClick={() => {
             onAddChat();
             onClose();
           }}
-          className={row}
+          icon={<ChatsCircle size={ICON} className="text-textSecondary" />}
         >
-          <ChatsCircle size={19} className="text-textSecondary shrink-0" />
-          <span className="flex-1 text-left">Add a chat</span>
-        </button>
+          Add a chat
+        </GroupRow>
 
-        <button
+        <GroupRow
           onClick={() => {
             onReload();
             onClose();
           }}
           disabled={!activeChannel}
-          className={row}
+          icon={<ArrowsClockwise size={ICON} className="text-textSecondary" />}
         >
-          <ArrowsClockwise size={19} className="text-textSecondary shrink-0" />
-          <span className="flex-1 text-left">Reload this chat</span>
-        </button>
+          Reload this chat
+        </GroupRow>
+
+        {streamTab && (
+          <GroupRow
+            onClick={() => keep(streamTab.channel, !streamTab.kept)}
+            icon={
+              <BookmarkSimple
+                size={ICON}
+                weight={streamTab.kept ? 'fill' : 'regular'}
+                className={streamTab.kept ? 'text-accent' : 'text-textSecondary'}
+              />
+            }
+            value={streamTab.kept ? 'On' : 'Off'}
+          >
+            Keep this chat
+          </GroupRow>
+        )}
 
         {onBrowseCommands && (
-          <button
+          <GroupRow
             onClick={() => {
               onClose();
               onBrowseCommands();
             }}
-            className={row}
+            icon={<Terminal size={ICON} className="text-textSecondary" />}
           >
-            <Terminal size={19} className="text-textSecondary shrink-0" />
-            <span className="flex-1 text-left">Chat commands</span>
-          </button>
+            Chat commands
+          </GroupRow>
+        )}
+
+        {onManageChannel && (
+          <GroupRow
+            onClick={() => {
+              onClose();
+              onManageChannel();
+            }}
+            icon={<PencilSimpleLine size={ICON} className="text-textSecondary" />}
+            trailing={<CaretRight size={16} className="text-textMuted" />}
+          >
+            Manage channel
+          </GroupRow>
         )}
 
         {/* Only offered where the actions would actually succeed: Helix rejects
-            them without mod powers in this specific channel. */}
+            them without mod powers in this specific channel. On or off reads
+            from the color and the trailing word; the glyph keeps its weight. */}
         {isModerator && (
-          <button onClick={onToggleModTools} className={row}>
-            <ShieldCheck
-              size={19}
-              weight={modToolsOn ? 'fill' : 'regular'}
-              className={modToolsOn ? 'text-accent shrink-0' : 'text-textSecondary shrink-0'}
-            />
-            <span className="flex-1 text-left">Moderator tools</span>
-            <span className="text-[12.5px] text-textMuted">{modToolsOn ? 'On' : 'Off'}</span>
-          </button>
+          <GroupRow
+            onClick={onToggleModTools}
+            icon={<ShieldCheck size={ICON} className={modToolsOn ? 'text-accent' : 'text-textSecondary'} />}
+            value={modToolsOn ? 'On' : 'Off'}
+          >
+            Moderator tools
+          </GroupRow>
         )}
 
+        {/* The rows that take something away come last. */}
         {onCloseChat && (
-          <button
+          <GroupRow
             onClick={() => {
               onCloseChat();
               onClose();
             }}
-            className={`${row} !text-error`}
+            className="!text-error"
+            icon={<X size={ICON} />}
           >
-            <X size={19} className="shrink-0" />
-            <span className="flex-1 text-left">Close this chat</span>
-          </button>
+            Close this chat
+          </GroupRow>
         )}
 
-        {isModerator && modToolsOn && (
-          <div className="mt-2 px-2 text-[12.5px] text-textMuted leading-snug">
-            Long-press any message for delete, timeout and ban.
-          </div>
-        )}
-      </div>
+        {followRow && followSlot === 'bottom' && followRow}
+      </GroupCard>
+      {isModerator && modToolsOn && (
+        <GroupFooter className="px-4 pt-2">Long-press any message for delete, timeout and ban.</GroupFooter>
+      )}
     </MobileSheet>
   );
 };

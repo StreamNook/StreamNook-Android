@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::rt::AppHandle;
@@ -13,6 +13,22 @@ use tauri::Emitter;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
 use uuid::Uuid;
+
+/// Channels per `campaign_eligible_channels` request: one alias each.
+pub(crate) const ELIGIBILITY_BATCH: usize = crate::services::twitch_limits::GQL_MAX_ALIASES;
+/// Eligibility requests in flight at once.
+const ELIGIBILITY_PARALLEL: usize = 4;
+
+/// One eligibility request: each `cN` alias reads the campaigns channel N
+/// offers. Ids are numeric (checked by the caller), so they go in as text.
+pub(crate) fn eligibility_query(ids: &[String]) -> String {
+    let fields: String = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| format!("c{i}: channel(id: \"{id}\") {{ id viewerDropCampaigns {{ id }} }} "))
+        .collect();
+    format!("query {{ {fields}}}")
+}
 
 // Use Twitch ANDROID APP client ID for GQL operations (required for drops API access)
 // This is what the Twitch web client uses - it works with NO SCOPES
@@ -219,6 +235,9 @@ pub struct DropsService {
     /// claimed), mapped to when that was decided. Persisted, so a restart
     /// does not re-attempt every finished drop.
     attempted_claims: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
+    /// Which drops were announced as ready and which Twitch would not grant,
+    /// kept across watch sessions and launches (see `DropNotices`).
+    drop_notices: Arc<RwLock<DropNotices>>,
     device_id: String,
     session_id: String,
 }
@@ -234,6 +253,106 @@ const ATTEMPTED_CLAIMS_FILE: &str = "drops_attempted_claims.json";
 /// anything older than this can never come back as claimable and would only
 /// grow the file forever.
 const ATTEMPTED_CLAIMS_RETAIN_DAYS: i64 = 60;
+
+/// Drops already announced as ready, and drops Twitch accepted a claim for
+/// but did not grant (a game account not linked). Every watch start runs a
+/// fresh monitoring loop, so while these lived in the loop each new stream
+/// announced every earned-but-ungrantable drop as "ready to claim" again and
+/// reset its hourly retry. Kept per account, on disk, pruned like the
+/// settled-claims file.
+const DROP_NOTICES_FILE: &str = "drops_notices.json";
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct DropNotices {
+    /// Drop id -> when it was announced as ready.
+    #[serde(default)]
+    announced: HashMap<String, DateTime<Utc>>,
+    /// Drop id -> when Twitch last accepted a claim without granting it.
+    #[serde(default)]
+    ungranted: HashMap<String, DateTime<Utc>>,
+}
+
+impl DropNotices {
+    /// True exactly once per drop: the first time it is found earned. A later
+    /// stream, tick or launch never announces it again.
+    fn take_announcement(&mut self, drop_id: &str, now: DateTime<Utc>) -> bool {
+        if self.announced.contains_key(drop_id) {
+            return false;
+        }
+        self.announced.insert(drop_id.to_string(), now);
+        true
+    }
+
+    /// An ungranted drop still waiting out its retry spacing at `now`.
+    fn resting(&self, drop_id: &str, now: DateTime<Utc>, retry_secs: i64) -> bool {
+        self.ungranted
+            .get(drop_id)
+            .is_some_and(|at| now.signed_duration_since(*at).num_seconds() < retry_secs)
+    }
+
+    fn pruned(self, now: DateTime<Utc>) -> Self {
+        Self {
+            announced: prune_attempted_claims(self.announced, now),
+            ungranted: prune_attempted_claims(self.ungranted, now),
+        }
+    }
+}
+
+fn drop_notices_path() -> Option<std::path::PathBuf> {
+    crate::services::cache_service::get_app_data_dir()
+        .ok()
+        .map(|dir| dir.join(DROP_NOTICES_FILE))
+}
+
+/// Absent or unreadable means no notices yet: at worst one drop is announced
+/// once more.
+fn load_drop_notices_from(path: &std::path::Path) -> DropNotices {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<DropNotices>(&contents).ok())
+        .unwrap_or_default()
+        .pruned(Utc::now())
+}
+
+fn load_drop_notices() -> DropNotices {
+    drop_notices_path().map(|path| load_drop_notices_from(&path)).unwrap_or_default()
+}
+
+/// Best-effort persist, like the settled-claims file.
+fn save_drop_notices_to(path: &std::path::Path, notices: &DropNotices) {
+    if let Ok(json) = serde_json::to_string(notices) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+fn save_drop_notices(notices: &DropNotices) {
+    if let Some(path) = drop_notices_path() {
+        save_drop_notices_to(&path, notices);
+    }
+}
+
+/// Announce a ready drop once for this account, persisting the answer.
+async fn announce_once(notices: &RwLock<DropNotices>, drop_id: &str) -> bool {
+    let mut notices = notices.write().await;
+    let first = notices.take_announcement(drop_id, Utc::now());
+    if first {
+        save_drop_notices(&notices);
+    }
+    first
+}
+
+async fn mark_ungranted(notices: &RwLock<DropNotices>, drop_id: String, at: DateTime<Utc>) {
+    let mut notices = notices.write().await;
+    notices.ungranted.insert(drop_id, at);
+    save_drop_notices(&notices);
+}
+
+async fn forget_ungranted(notices: &RwLock<DropNotices>, drop_id: &str) {
+    let mut notices = notices.write().await;
+    if notices.ungranted.remove(drop_id).is_some() {
+        save_drop_notices(&notices);
+    }
+}
 
 fn attempted_claims_path() -> Option<std::path::PathBuf> {
     crate::services::cache_service::get_app_data_dir()
@@ -276,11 +395,14 @@ fn save_attempted_claims(claims: &HashMap<String, DateTime<Utc>>) {
     }
 }
 
-/// Forget every settled drop. Called on drops logout: the set is per ACCOUNT,
-/// and carrying it into a different one would suppress claims that account has
-/// genuinely not made.
+/// Forget every settled drop and every drop notice. Called on drops logout:
+/// both are per ACCOUNT, and carrying them into a different one would suppress
+/// claims and announcements that account has genuinely not had.
 pub fn clear_attempted_claims() {
     if let Some(path) = attempted_claims_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(path) = drop_notices_path() {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -344,6 +466,7 @@ impl DropsService {
             cached_active_campaigns_count: Arc::new(RwLock::new(0)),
             cached_campaigns: Arc::new(RwLock::new(None)),
             attempted_claims: Arc::new(RwLock::new(load_attempted_claims())),
+            drop_notices: Arc::new(RwLock::new(load_drop_notices())),
             device_id,
             session_id,
         }
@@ -1276,8 +1399,15 @@ impl DropsService {
     /// under Special Events and Twitch offers it on her channel whatever she is
     /// playing. Guessing either way is wrong for the other case, so ask.
     ///
+    /// Asked signed out, because the signed-in answer is per viewer: once the
+    /// viewer has earned a campaign, Twitch reports it offered nowhere, and the
+    /// question here is about the channel. Whether the viewer still needs the
+    /// drop is the caller's to decide. Signed out keeps the category rule
+    /// (participants live in another game are offered nothing).
+    ///
     /// One aliased document covers a whole chunk of channels, so a roster costs
-    /// a request per 50 live channels rather than one per channel.
+    /// a request per `ELIGIBILITY_BATCH` live channels rather than one per
+    /// channel; up to `ELIGIBILITY_PARALLEL` chunks are asked at once.
     pub async fn campaign_eligible_channels(
         &self,
         campaign_id: &str,
@@ -1293,30 +1423,40 @@ impl DropsService {
             return Ok(Vec::new());
         }
 
-        let token = DropsAuthService::get_token().await?;
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
         let mut eligible = Vec::new();
 
-        for chunk in ids.chunks(50) {
-            let fields: String = chunk
-                .iter()
-                .enumerate()
-                .map(|(i, id)| format!("c{i}: channel(id: \"{id}\") {{ id viewerDropCampaigns {{ id }} }} "))
-                .collect();
-            let query = format!("query {{ {fields}}}");
+        // Owned chunks: a borrowed one makes the future not `Send` for the
+        // spawned tasks that await it.
+        let chunks: Vec<Vec<String>> = ids
+            .chunks(ELIGIBILITY_BATCH)
+            .map(|c| c.iter().map(|id| (*id).clone()).collect())
+            .collect();
+        let bodies: Vec<serde_json::Value> = stream::iter(chunks.clone())
+            .map(|chunk| async move {
+                let response = self
+                    .client
+                    .post("https://gql.twitch.tv/gql")
+                    .header(
+                        "Client-ID",
+                        crate::services::auth_proxy::TWITCH_WEB_CLIENT_ID,
+                    )
+                    .json(&serde_json::json!({ "query": eligibility_query(&chunk) }))
+                    .send()
+                    .await?;
 
-            let response = self
-                .client
-                .post("https://gql.twitch.tv/gql")
-                .headers(self.create_gql_headers(&token))
-                .json(&serde_json::json!({ "query": query }))
-                .send()
-                .await?;
+                let body: serde_json::Value = response.json().await?;
+                if let Some(errors) = body.get("errors") {
+                    return Err(anyhow::anyhow!("GraphQL errors: {:?}", errors));
+                }
+                Ok::<_, anyhow::Error>(body)
+            })
+            .buffered(ELIGIBILITY_PARALLEL)
+            .try_collect()
+            .await?;
 
-            let body: serde_json::Value = response.json().await?;
-            if let Some(errors) = body.get("errors") {
-                return Err(anyhow::anyhow!("GraphQL errors: {:?}", errors));
-            }
-
+        for (chunk, body) in chunks.iter().zip(&bodies) {
             for (i, id) in chunk.iter().enumerate() {
                 let campaigns = &body["data"][format!("c{i}")]["viewerDropCampaigns"];
                 let offered = campaigns
@@ -1324,7 +1464,7 @@ impl DropsService {
                     .map(|list| list.iter().any(|c| c["id"].as_str() == Some(campaign_id)))
                     .unwrap_or(false);
                 if offered {
-                    eligible.push((*id).clone());
+                    eligible.push(id.clone());
                 }
             }
         }
@@ -1922,6 +2062,7 @@ impl DropsService {
         let monitoring_active = self.monitoring_active.clone();
         let current_channel = self.current_channel.clone();
         let attempted_claims = self.attempted_claims.clone();
+        let drop_notices = self.drop_notices.clone();
         let cached_campaigns = self.cached_campaigns.clone();
         let client = self.client.clone();
         let device_id = self.device_id.clone();
@@ -1946,19 +2087,15 @@ impl DropsService {
             const CLAIM_MAX_ATTEMPTS: u32 = 3;
             const CLAIM_RETRY_SECS: i64 = 600;
             let mut failed_claims: HashMap<String, (u32, DateTime<Utc>)> = HashMap::new();
-            // Drops already announced as ready, so the drop-ready event fires
-            // once per drop instead of on every check tick.
-            let mut notified_ready: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
             // Claims Twitch answered ELIGIBLE_FOR_ALL for, waiting for a
             // refreshed inventory to show whether the drop was really granted
             // before anything is announced or settled (see `claim_confirmed`).
             let mut unconfirmed: HashMap<String, (DateTime<Utc>, ClaimedDrop)> = HashMap::new();
             // Drops Twitch called eligible but did not grant (a game account
-            // not linked): retried hourly, so linking the account later lets
-            // the next try through, and never announced until one is granted.
+            // not linked) are retried hourly, so linking the account later lets
+            // the next try through. The spacing and the once-only "ready"
+            // announcement live in `drop_notices`, shared by every session.
             const UNGRANTED_RETRY_SECS: i64 = 3600;
-            let mut ungranted: HashMap<String, DateTime<Utc>> = HashMap::new();
 
             loop {
                 // Check if monitoring should continue
@@ -1975,9 +2112,9 @@ impl DropsService {
                 // Get current channel info
                 let channel_info = current_channel.read().await.clone();
                 if channel_info.is_some() {
-                    // The watched channel's bonus chest is claimed by the
-                    // frontend (ChatWidget, `auto_claim_points_watching`), the
-                    // single user-present surface. The background multi-channel
+                    // The watched channel's bonus chest is claimed by
+                    // services::watched_chest (`auto_claim_points_watching`),
+                    // whichever chat is on screen. The background multi-channel
                     // sweep lives in the opt-in automation plugin. This loop only
                     // keeps drop progress fresh and claims finished drops below.
 
@@ -2051,10 +2188,10 @@ impl DropsService {
                                     "[Auto] Twitch accepted the claim for {} ({}) but has not granted it; the game account is probably not linked. Retrying hourly.",
                                     claimed.drop_name, drop_id
                                 );
-                                ungranted.insert(drop_id, now);
+                                mark_ungranted(&drop_notices, drop_id, now).await;
                                 continue;
                             }
-                            ungranted.remove(&drop_id);
+                            forget_ungranted(&drop_notices, &drop_id).await;
                             {
                                 let mut settled = attempted_claims.write().await;
                                 settled.insert(drop_id.clone(), now);
@@ -2077,14 +2214,13 @@ impl DropsService {
                     let claimable_drops: Vec<DropProgress> = {
                         let progress_map = drop_progress.read().await;
                         let attempted = attempted_claims.read().await;
+                        let notices = drop_notices.read().await;
                         let now = Utc::now();
                         progress_map
                             .values()
                             .filter(|p| {
                                 let resting = unconfirmed.contains_key(&p.drop_id)
-                                    || ungranted.get(&p.drop_id).is_some_and(|at| {
-                                        now.signed_duration_since(*at).num_seconds() < UNGRANTED_RETRY_SECS
-                                    });
+                                    || notices.resting(&p.drop_id, now, UNGRANTED_RETRY_SECS);
                                 !p.is_claimed
                                     && drop_earned(p)
                                     && !attempted.contains_key(&p.drop_id) // Skip already-settled
@@ -2095,9 +2231,10 @@ impl DropsService {
                     };
 
                     for progress in claimable_drops {
-                        // Announce a ready drop once, not on every check tick.
+                        // Announce a ready drop once for the account: not on
+                        // every check tick, and not again on the next stream.
                         if current_settings.notify_on_drop_available
-                            && notified_ready.insert(progress.drop_id.clone())
+                            && announce_once(&drop_notices, &progress.drop_id).await
                         {
                             let _ = app_handle.emit("drop-ready", &progress);
                         }
@@ -2135,7 +2272,7 @@ impl DropsService {
                                     // cleared profile, or a drop claimed on
                                     // another device.
                                     if outcome == ClaimOutcome::AlreadyClaimed {
-                                        ungranted.remove(&progress.drop_id);
+                                        forget_ungranted(&drop_notices, &progress.drop_id).await;
                                         let mut settled = attempted_claims.write().await;
                                         settled.insert(progress.drop_id.clone(), Utc::now());
                                         save_attempted_claims(&settled);
@@ -2707,5 +2844,64 @@ mod attempted_claims_tests {
         let mut claims = HashMap::new();
         claims.insert("ahead".to_string(), now + chrono::Duration::days(3));
         assert_eq!(prune_attempted_claims(claims, now).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod drop_notices_tests {
+    use super::*;
+
+    fn temp_file() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("sn-drop-notices-{}.json", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn starting_a_stream_twice_announces_a_ready_drop_once() {
+        let file = temp_file();
+        // First stream: the monitoring loop loads the notices and finds the drop earned.
+        let mut first = load_drop_notices_from(&file);
+        assert!(first.take_announcement("d15d", Utc::now()));
+        assert!(!first.take_announcement("d15d", Utc::now()), "a later tick stays quiet");
+        save_drop_notices_to(&file, &first);
+        // Second stream: a fresh loop, the same drop still earned and unclaimed.
+        let mut second = load_drop_notices_from(&file);
+        assert!(!second.take_announcement("d15d", Utc::now()));
+        // A different drop that became ready is still news.
+        assert!(second.take_announcement("other", Utc::now()));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn an_ungranted_drop_keeps_its_retry_spacing_across_streams() {
+        let file = temp_file();
+        let now = Utc::now();
+        let mut first = DropNotices::default();
+        first.ungranted.insert("rsi".into(), now);
+        save_drop_notices_to(&file, &first);
+        let second = load_drop_notices_from(&file);
+        assert!(second.resting("rsi", now + chrono::Duration::minutes(10), 3600));
+        assert!(!second.resting("rsi", now + chrono::Duration::minutes(61), 3600));
+        assert!(!second.resting("never-tried", now, 3600));
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn a_missing_or_garbled_file_means_no_notices() {
+        let file = temp_file();
+        assert!(load_drop_notices_from(&file).announced.is_empty());
+        std::fs::write(&file, "not json").unwrap();
+        assert!(load_drop_notices_from(&file).announced.is_empty());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn old_notices_are_forgotten() {
+        let now = Utc::now();
+        let mut notices = DropNotices::default();
+        notices.announced.insert("old".into(), now - chrono::Duration::days(ATTEMPTED_CLAIMS_RETAIN_DAYS + 1));
+        notices.announced.insert("recent".into(), now - chrono::Duration::days(1));
+        let kept = notices.pruned(now);
+        assert!(!kept.announced.contains_key("old"));
+        assert!(kept.announced.contains_key("recent"));
     }
 }

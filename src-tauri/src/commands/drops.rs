@@ -8,7 +8,7 @@ use crate::models::settings::AppState;
 use crate::services::drops_auth_service::{DropsAuthService, DropsDeviceCodeInfo};
 use log::{debug, error, warn};
 use crate::rt::AppHandle;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 /// The Drops page model (services/drops_overview.rs): campaigns joined with
 /// live progress and the inventory, per game, with ownership worked out.
@@ -69,6 +69,39 @@ pub async fn get_drops_overview(
         drops_overview::announce_new_favorite_campaigns(&app, &overview.games, &favorites, announce);
     }
     Ok(overview)
+}
+
+/// The phones' Drops segment (services/rewards_drops.rs): in progress,
+/// available now and recently earned, grouped by game, every line worked out.
+/// `refresh` reads Twitch again; otherwise the last read is re-filtered.
+#[tauri::command]
+pub async fn get_rewards_drops(
+    state: State<'_, AppState>,
+    query: Option<String>,
+    refresh: bool,
+) -> Result<crate::services::rewards_drops::RewardsDrops, String> {
+    Ok(crate::services::rewards_drops::get(&state.drops_service, query.as_deref().unwrap_or(""), refresh).await)
+}
+
+/// The drop being earned on the watched stream, for the phones' bar in the
+/// player (services/watch_drop.rs). None when there is nothing to show; the
+/// inventory is only read when a campaign counts on this channel.
+#[tauri::command]
+pub async fn get_watch_drop(
+    state: State<'_, AppState>,
+    channel_id: Option<String>,
+    login: String,
+    game_id: Option<String>,
+    game_name: Option<String>,
+) -> Result<Option<crate::services::watch_drop::WatchDrop>, String> {
+    Ok(crate::services::watch_drop::get(
+        &state.drops_service,
+        channel_id.as_deref().unwrap_or(""),
+        &login,
+        game_id.as_deref().unwrap_or(""),
+        game_name.as_deref().unwrap_or(""),
+    )
+    .await)
 }
 
 #[tauri::command]
@@ -163,6 +196,7 @@ async fn save_drops_settings(
         .await;
 
     let _ = app.emit(DROPS_SETTINGS_UPDATED_EVENT, &settings);
+    state.plugin_host.push_drops_settings();
     Ok(())
 }
 
@@ -176,6 +210,119 @@ pub async fn get_active_drop_campaigns(
         .get_all_active_campaigns_cached()
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Games for a game picker: the ones running drops now first, then Twitch's
+/// category search. Names come back exactly as Twitch writes them, which is
+/// what a games list must hold for a drop campaign to match it.
+#[tauri::command]
+pub async fn suggest_drop_games(
+    query: String,
+    limit: u32,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::services::game_suggest::GameSuggestion>, String> {
+    // Every drop game that matches is listed (an empty query lists them all);
+    // `limit` caps the whole list, Twitch's search adds at most 25 more.
+    let limit = limit.clamp(1, 300);
+    let drop_games = drop_games(&state).await;
+    let searched = if query.trim().chars().count() >= 2 {
+        crate::services::twitch_service::TwitchService::search_categories(query.trim(), 25)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| crate::services::game_suggest::GameSuggestion {
+                box_art_url: crate::services::game_suggest::sized_box_art(&c.box_art_url),
+                id: c.id,
+                name: c.name,
+                drop_campaigns: 0,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(crate::services::game_suggest::rank(&query, &drop_games, searched, limit as usize))
+}
+
+/// The games a saved list names, in its order, with art and drop counts, so a
+/// picker can draw what is already picked. A name that is neither a drop game
+/// nor a Twitch category comes back with no id.
+#[tauri::command]
+pub async fn describe_games(
+    names: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::services::game_suggest::GameSuggestion>, String> {
+    let drop_games = drop_games(&state).await;
+    let unmatched: Vec<String> = names
+        .iter()
+        .filter(|n| !drop_games.iter().any(|g| g.name.eq_ignore_ascii_case(n)))
+        .cloned()
+        .collect();
+    let found: Vec<_> = if unmatched.is_empty() {
+        Vec::new()
+    } else {
+        crate::services::twitch_service::TwitchService::categories_by_name(&unmatched)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(category_suggestion)
+            .collect()
+    };
+    Ok(crate::services::game_suggest::describe(&names, &drop_games, &found))
+}
+
+/// Every game running drop campaigns now, one entry each, with the box art
+/// Twitch lists on its campaigns. Both of Twitch's drop lists count: a
+/// campaign without a category of its own (the Pokémon balls) is listed under
+/// the name the engine matches it by. Reads the campaign cache as it is, so a
+/// picker never refreshes the live progress the title bar shows; only an empty
+/// cache is filled.
+async fn drop_games(state: &State<'_, AppState>) -> Vec<crate::services::game_suggest::GameSuggestion> {
+    use crate::services::game_suggest::{sized_box_art, GameSuggestion};
+    let campaigns = {
+        let drops_service = state.drops_service.lock().await;
+        match drops_service.cached_campaigns_snapshot().await {
+            Some(c) if !c.is_empty() => c,
+            _ => match drops_service.fetch_all_active_campaigns_from_api().await {
+                Ok(c) => {
+                    drops_service.prime_campaign_cache(&c).await;
+                    c
+                }
+                Err(_) => Vec::new(),
+            },
+        }
+    };
+    let mut games: Vec<GameSuggestion> = Vec::new();
+    for c in campaigns.iter().filter(|c| !c.game_name.trim().is_empty()) {
+        match games.iter_mut().find(|g| g.name.eq_ignore_ascii_case(&c.game_name)) {
+            Some(g) => {
+                g.drop_campaigns += 1;
+                if g.box_art_url.is_empty() {
+                    g.box_art_url = sized_box_art(&c.image_url);
+                }
+            }
+            None => games.push(GameSuggestion {
+                // A category-less campaign's game_id only groups it for
+                // display; it still needs an id here to read as a real game.
+                id: if c.game_id.is_empty() { c.id.clone() } else { c.game_id.clone() },
+                name: c.game_name.clone(),
+                box_art_url: sized_box_art(&c.image_url),
+                drop_campaigns: 1,
+            }),
+        }
+    }
+    games
+}
+
+/// A Helix category (`{id, name, box_art_url}`) as a suggestion.
+fn category_suggestion(v: &serde_json::Value) -> Option<crate::services::game_suggest::GameSuggestion> {
+    Some(crate::services::game_suggest::GameSuggestion {
+        id: v.get("id")?.as_str()?.to_string(),
+        name: v.get("name")?.as_str()?.to_string(),
+        box_art_url: crate::services::game_suggest::sized_box_art(
+            v.get("box_art_url").and_then(|u| u.as_str()).unwrap_or_default(),
+        ),
+        drop_campaigns: 0,
+    })
 }
 
 /// Re-fetch active campaigns to pick up a fresh `is_account_connected` after the user connects
@@ -262,41 +409,10 @@ pub async fn claim_channel_points(
     channel_name: String,
     claim_id: String,
     app: AppHandle,
-    state: State<'_, AppState>,
 ) -> Result<BonusClaimResult, String> {
-    let result = {
-        let drops_service = state.drops_service.lock().await;
-        drops_service
-            .claim_channel_points(&channel_id, &channel_name, &claim_id)
-            .await
-            .map_err(|e| e.to_string())?
-    };
-
-    // Report the watched channel's claim as a channel-points notification unless
-    // the realtime socket already did: Twitch pushes the same claim as a
-    // points-earned (reason CLAIM) on community-points-user-v1, and either can
-    // land first. Keeping this emit, deduped, means the claim is still reported
-    // when the socket is down or mid-reconnect. DynamicIsland's listener (gated
-    // by show_channel_points_notifications) and the lifetime/history accumulator
-    // in background_service consume the event either way. Background-collected
-    // channels are covered separately by the GQL balance poll in background_service.
-    if result.points_earned > 0
-        && crate::services::channel_points_websocket_service::claim_emit_is_first(&channel_id)
-    {
-        let _ = app.emit(
-            "channel-points-earned",
-            serde_json::json!({
-                "channel_id": channel_id,
-                "channel_login": channel_name,
-                "channel_display_name": channel_name,
-                "points": result.points_earned,
-                "reason": "claim",
-                "balance": result.new_balance,
-            }),
-        );
-    }
-
-    Ok(result)
+    // A click on the chest button. Automatic claims take the same path from
+    // services::watched_chest, which also reports the claim.
+    crate::services::watched_chest::claim(&app, &channel_id, &channel_name, &claim_id).await
 }
 
 #[tauri::command]
@@ -535,7 +651,7 @@ pub async fn refresh_followed_channel_points(
 /// Shared active-channel chokepoint: points the parity heartbeat at the
 /// channel now on screen and forwards the matching stream event to plugins.
 /// Every caller of start/update monitoring funnels through here, including
-/// the chat hot-swap that tracks the focused tile in the multi-stream grid.
+/// MultiNook's focused tile (`watch_session::set_grid_focus`).
 async fn report_active_channel(state: &State<'_, AppState>, channel_id: &str, login: &str) {
     let previous = state
         .watch_heartbeat
@@ -569,17 +685,23 @@ async fn report_active_channel(state: &State<'_, AppState>, channel_id: &str, lo
 pub async fn start_drops_monitoring(
     channel_id: String,
     channel_name: String,
-    state: State<'_, AppState>,
     app_handle: AppHandle,
 ) -> Result<(), String> {
+    monitor_watched_channel(&app_handle, channel_id, channel_name).await;
+    Ok(())
+}
+
+/// Point drops monitoring and the active-channel chokepoint at a channel
+/// now on screen. `start_drops_monitoring`, for callers inside Rust.
+pub async fn monitor_watched_channel(app: &AppHandle, channel_id: String, login: String) {
+    let state = app.state::<AppState>();
     {
         let drops_service = state.drops_service.lock().await;
         drops_service
-            .start_monitoring(channel_id.clone(), channel_name.clone(), app_handle)
+            .start_monitoring(channel_id.clone(), login.clone(), app.clone())
             .await;
     }
-    report_active_channel(&state, &channel_id, &channel_name).await;
-    Ok(())
+    report_active_channel(&state, &channel_id, &login).await;
 }
 
 #[tauri::command]
@@ -619,14 +741,14 @@ pub async fn update_monitoring_channel(
     Ok(())
 }
 
-/// Player playback state for the parity heartbeat: minute-watched events
-/// only send while the video is actually playing.
+/// What a player's video is doing, for the earning gate
+/// (services/earning_gate.rs): `playing`, `paused`, `paused_now`, `hidden` or
+/// `teardown`. `slot` names a MultiNook tile's player instead of the main one.
 #[tauri::command]
-pub async fn report_player_playing(
-    playing: bool,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
-    state.watch_heartbeat.set_playing(playing);
+pub async fn report_player_state(app: AppHandle, state: String, slot: Option<String>) -> Result<(), String> {
+    let parsed = crate::services::earning_gate::PlayerState::parse(&state)
+        .ok_or_else(|| format!("Unknown player state: {state}"))?;
+    crate::services::earning_gate::report(&app, slot, parsed);
     Ok(())
 }
 
@@ -699,6 +821,7 @@ pub async fn get_streams_in_categories(
     .map_err(|e| e.to_string())
 }
 
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 pub async fn open_drop_details(app_handle: AppHandle, url: String) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
@@ -707,6 +830,63 @@ pub async fn open_drop_details(app_handle: AppHandle, url: String) -> Result<(),
         .opener()
         .open_url(url, None::<String>)
         .map_err(|e| format!("Failed to open drops details: {}", e))
+}
+
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub async fn open_drop_details(_app_handle: AppHandle, url: String) -> Result<(), String> {
+    crate::ios_ffi::open_url(&url)
+}
+
+/// The prediction card for a channel a shell just opened (`{ channel_id,
+/// view }`, view null when none runs). `channel_login` lets Rust word it in
+/// the channel's points name.
+#[tauri::command]
+pub async fn get_channel_prediction(
+    channel_id: String,
+    channel_login: Option<String>,
+) -> crate::services::predictions::PredictionPush {
+    crate::services::predictions::current(channel_id.trim(), channel_login.as_deref()).await
+}
+
+/// What a bet of `amount` (digits as typed) on `outcome_id` would say: the
+/// clamped amount, the button, the confirm's words. Spends nothing.
+#[tauri::command]
+pub async fn prediction_bet(
+    channel_id: String,
+    outcome_id: String,
+    amount: Option<String>,
+) -> Option<crate::services::predictions::BetView> {
+    crate::services::predictions::bet(channel_id.trim(), &outcome_id, amount.as_deref()).await
+}
+
+/// The confirm's yes: put `amount` channel points on `outcome_id`.
+#[tauri::command]
+pub async fn predict(
+    channel_id: String,
+    outcome_id: String,
+    amount: i64,
+) -> crate::services::predictions::PredictOutcome {
+    crate::services::predictions::predict(channel_id.trim(), &outcome_id, amount).await
+}
+
+/// The top of a chat column: which of the poll, prediction and drop cards show, the one
+/// that is open, and the most height they may take (`services/chat_top_stack.rs`).
+#[tauri::command]
+pub fn chat_top_stack(
+    request: crate::services::chat_top_stack::StackRequest,
+) -> crate::services::chat_top_stack::StackLayout {
+    crate::services::chat_top_stack::layout(&request)
+}
+
+/// The poll card for `channel_id` now, read from Twitch when Rust has none,
+/// and followed until the poll ends (`poll-state` pushes).
+#[tauri::command]
+pub async fn watch_channel_poll_view(
+    channel_id: String,
+) -> Result<Option<crate::services::poll_view::PollView>, String> {
+    let poll = crate::services::slash_commands::watch_poll_now(channel_id.trim(), None).await?;
+    Ok(poll.and_then(|p| crate::services::poll_view::view_of(&p, chrono::Utc::now().timestamp_millis())))
 }
 
 // Prediction commands
@@ -817,6 +997,13 @@ pub async fn vote_on_poll(
     const VOTE_IN_POLL_HASH: &str =
         "1280e27b0f3c7ae60b5714bd569771ea50635778473182e6e959e2dcfcc16e3c";
 
+    // This sends the free vote, which Twitch allows once per poll (more votes
+    // cost channel points, not offered here). A second one is refused here
+    // rather than sent.
+    if crate::services::slash_commands::my_poll_vote(&poll_id).is_some() {
+        return Err("You already voted in this poll".into());
+    }
+
     let token = DropsAuthService::get_token()
         .await
         .map_err(|e| format!("Failed to get token: {}", e))?;
@@ -901,6 +1088,9 @@ pub async fn vote_on_poll(
         "Poll vote cast on channel {}: poll {} choice {}",
         channel_id, poll_id, choice_id
     );
+    // The banner and `/vote` both read this, so either way of voting marks
+    // the choice in every banner showing the poll.
+    crate::services::slash_commands::announce_my_vote(&channel_id, &poll_id, &choice_id);
 
     Ok(result)
 }
@@ -1117,7 +1307,7 @@ pub async fn get_channel_points_for_channel(
 
 // Persisted query hash for ChannelPointsContext - captured from Twitch's network traffic
 // This should return communityPointsSettings including customRewards
-const CHANNEL_POINTS_CONTEXT_HASH: &str =
+pub(crate) const CHANNEL_POINTS_CONTEXT_HASH: &str =
     "374314de591e69925fce3ddc2bcf085796f56ebb8cad67a0daa3165c03adc345";
 
 // Captured GQL hashes for channel points redemptions
@@ -1163,42 +1353,11 @@ fn parse_reward(
     let is_in_stock = reward["isInStock"].as_bool().unwrap_or(true);
     let is_user_input_required = reward["isUserInputRequired"].as_bool().unwrap_or(false);
     let cooldown_expires_at = reward["cooldownExpiresAt"].as_str().map(|s| s.to_string());
-
-    // Parse max per stream setting
-    let max_per_stream = if reward["maxPerStreamSetting"]["isEnabled"]
-        .as_bool()
-        .unwrap_or(false)
-    {
-        reward["maxPerStreamSetting"]["maxPerStream"]
-            .as_i64()
-            .map(|v| v as i32)
-    } else {
-        None
-    };
-
-    // Parse max per user per stream setting
-    let max_per_user_per_stream = if reward["maxPerUserPerStreamSetting"]["isEnabled"]
-        .as_bool()
-        .unwrap_or(false)
-    {
-        reward["maxPerUserPerStreamSetting"]["maxPerUserPerStream"]
-            .as_i64()
-            .map(|v| v as i32)
-    } else {
-        None
-    };
-
-    // Parse global cooldown setting
-    let global_cooldown_seconds = if reward["globalCooldownSetting"]["isEnabled"]
-        .as_bool()
-        .unwrap_or(false)
-    {
-        reward["globalCooldownSetting"]["globalCooldownSeconds"]
-            .as_i64()
-            .map(|v| v as i32)
-    } else {
-        None
-    };
+    let max_per_stream = enabled_setting(reward, "maxPerStreamSetting", "maxPerStream");
+    let max_per_user_per_stream =
+        enabled_setting(reward, "maxPerUserPerStreamSetting", "maxPerUserPerStream");
+    let global_cooldown_seconds =
+        enabled_setting(reward, "globalCooldownSetting", "globalCooldownSeconds");
 
     Some(crate::models::drops::ChannelReward {
         id,
@@ -1215,8 +1374,33 @@ fn parse_reward(
         max_per_stream,
         max_per_user_per_stream,
         global_cooldown_seconds,
+        reward_type: None,
+        redemptions_redeemed_current_stream: redemptions_this_stream(reward),
+        is_sub_only: reward["isSubOnly"].as_bool().unwrap_or(false),
+        is_hidden_for_subs: false,
+        description: None,
+        availability: Default::default(),
+        view: Default::default(),
     })
 }
+
+/// A reward limit Twitch sends as `{ isEnabled, <field> }`; None when the
+/// streamer has it switched off.
+fn enabled_setting(reward: &serde_json::Value, setting: &str, field: &str) -> Option<i32> {
+    if reward[setting]["isEnabled"].as_bool().unwrap_or(false) {
+        reward[setting][field].as_i64().map(|v| v as i32)
+    } else {
+        None
+    }
+}
+
+fn redemptions_this_stream(reward: &serde_json::Value) -> Option<i32> {
+    reward["redemptionsRedeemedCurrentStream"]
+        .as_i64()
+        .map(|v| v as i32)
+}
+
+use crate::services::channel_rewards::{built_in_description, HIGHLIGHTED_MESSAGE_REWARD, SUB_MODE_BYPASS_REWARD};
 
 /// Parse an automatic (built-in) reward from the GQL response
 fn parse_automatic_reward(
@@ -1290,57 +1474,112 @@ fn parse_automatic_reward(
         is_enabled,
         is_paused: false,
         is_in_stock: reward["isInStock"].as_bool().unwrap_or(true),
-        is_user_input_required: reward_type == "SEND_HIGHLIGHTED_MESSAGE"
-            || reward_type == "SINGLE_MESSAGE_BYPASS_SUB_MODE",
-        cooldown_expires_at: None,
-        max_per_stream: None,
-        max_per_user_per_stream: None,
-        global_cooldown_seconds: reward["globalCooldownSeconds"].as_i64().map(|v| v as i32),
+        is_user_input_required: reward_type == HIGHLIGHTED_MESSAGE_REWARD
+            || reward_type == SUB_MODE_BYPASS_REWARD,
+        cooldown_expires_at: reward["cooldownExpiresAt"].as_str().map(|s| s.to_string()),
+        max_per_stream: enabled_setting(reward, "maxPerStreamSetting", "maxPerStream"),
+        max_per_user_per_stream: enabled_setting(
+            reward,
+            "maxPerUserPerStreamSetting",
+            "maxPerUserPerStream",
+        ),
+        global_cooldown_seconds: enabled_setting(
+            reward,
+            "globalCooldownSetting",
+            "globalCooldownSeconds",
+        ),
+        reward_type: Some(reward_type.to_string()),
+        redemptions_redeemed_current_stream: redemptions_this_stream(reward),
+        is_sub_only: false,
+        is_hidden_for_subs: reward["isHiddenForSubs"].as_bool().unwrap_or(false),
+        description: built_in_description(reward_type).map(str::to_string),
+        availability: Default::default(),
+        view: Default::default(),
     })
+}
+
+/// The last reward list read for a channel, judged now, or `None`. The menu
+/// paints this at once and fetches a fresh list beside it.
+#[tauri::command]
+pub async fn get_cached_channel_rewards(
+    channel_login: String,
+) -> Result<Option<crate::models::drops::ChannelRewardsSnapshot>, String> {
+    Ok(crate::services::channel_rewards::cached(&channel_login).await)
+}
+
+/// `body` sent with `token` under `client_id`, or `None` when Twitch refused
+/// it (a dead token, a client id it does not take) or named no channel.
+async fn points_gql(client_id: &str, token: &str, body: &serde_json::Value) -> Option<serde_json::Value> {
+    let resp = HTTP_CLIENT
+        .post("https://gql.twitch.tv/gql")
+        .header("Client-Id", client_id)
+        .header("Authorization", format!("OAuth {token}"))
+        .header("X-Device-Id", crate::services::twitch_service::gql_device_id())
+        .json(body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let answer: serde_json::Value = resp.json().await.ok()?;
+    let has_channel = ["/data/community/channel", "/data/channel"]
+        .iter()
+        .any(|p| answer.pointer(p).is_some_and(|c| !c.is_null()));
+    has_channel.then_some(answer)
+}
+
+/// The channel's `ChannelPointsContext`. The reward list is public, so it
+/// never waits on a sign-in: the Drops token first (the one redemptions use),
+/// then the twitch.tv session the app is signed in with (still the viewer's own
+/// balance), then an anonymous read that carries the list alone.
+async fn points_context(
+    body: &serde_json::Value,
+    auth: &crate::services::twitch_auth_service::TwitchAuthService,
+) -> Result<serde_json::Value, String> {
+    use crate::services::drops_auth_service::DropsAuthService;
+
+    if let Ok(token) = DropsAuthService::get_token().await {
+        if let Some(answer) = points_gql(env!("TWITCH_ANDROID_CLIENT_ID"), &token, body).await {
+            return Ok(answer);
+        }
+    }
+    let session = tokio::time::timeout(std::time::Duration::from_secs(2), auth.get_token()).await;
+    if let Ok(Ok(token)) = session {
+        if !token.is_empty() {
+            let web = crate::services::auth_proxy::TWITCH_WEB_CLIENT_ID;
+            if let Some(answer) = points_gql(web, &token, body).await {
+                return Ok(answer);
+            }
+        }
+    }
+    crate::services::twitch_service::TwitchService::gql_public_read(body.clone())
+        .await
+        .map_err(|e| format!("Failed to fetch channel rewards: {e}"))
 }
 
 #[tauri::command]
 pub async fn get_channel_rewards(
     channel_id: String, // Actually channel login (username)
-) -> Result<Vec<crate::models::drops::ChannelReward>, String> {
-    use crate::services::drops_auth_service::DropsAuthService;
+    state: State<'_, AppState>,
+) -> Result<crate::models::drops::ChannelRewardsSnapshot, String> {
     use serde_json::json;
 
-    // Use mobile client ID for persisted queries (same as predictions)
-    const CLIENT_ID: &str = env!("TWITCH_ANDROID_CLIENT_ID");
-
-    let token = DropsAuthService::get_token()
-        .await
-        .map_err(|e| format!("Failed to get token: {}", e))?;
-
-    let client = HTTP_CLIENT.clone();
-
     // Use ChannelPointsContext with includeGoalTypes (captured from Twitch)
-    let response = client
-        .post("https://gql.twitch.tv/gql")
-        .header("Client-Id", CLIENT_ID)
-        .header("Authorization", format!("OAuth {}", token))
-        .json(&json!({
-            "operationName": "ChannelPointsContext",
-            "variables": {
-                "channelLogin": channel_id.to_lowercase(),
-                "includeGoalTypes": ["CREATOR", "BOOST"]
-            },
-            "extensions": {
-                "persistedQuery": {
-                    "version": 1,
-                    "sha256Hash": CHANNEL_POINTS_CONTEXT_HASH
-                }
+    let body = json!({
+        "operationName": "ChannelPointsContext",
+        "variables": {
+            "channelLogin": channel_id.to_lowercase(),
+            "includeGoalTypes": ["CREATOR", "BOOST"]
+        },
+        "extensions": {
+            "persistedQuery": {
+                "version": 1,
+                "sha256Hash": CHANNEL_POINTS_CONTEXT_HASH
             }
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch channel rewards: {}", e))?;
-
-    let result: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse channel rewards response: {}", e))?;
+        }
+    });
+    let result = points_context(&body, &state.twitch_auth).await?;
 
     debug!(
         "[ChannelRewards] Raw response: {}",
@@ -1378,7 +1617,44 @@ pub async fn get_channel_rewards(
     // Sort rewards by cost (cheapest first)
     rewards.sort_by(|a, b| a.cost.cmp(&b.cost));
 
-    Ok(rewards)
+    // The same answer carries the viewer's balance under the channel's `self`
+    // edge (null when points are off for this viewer).
+    let balance = ["/data/community/channel", "/data/channel"]
+        .iter()
+        .find_map(|base| result.pointer(&format!("{base}/self/communityPoints/balance")))
+        .and_then(|b| b.as_i64());
+    let points_name = settings
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    let fetched_at_ms = chrono::Utc::now().timestamp_millis();
+
+    // Judged against the room (sub-only mode, the viewer's sub badge) and the
+    // stream, and re-judged and pushed when those change.
+    Ok(crate::services::channel_rewards::judge_fetched(
+        &channel_id,
+        rewards,
+        balance,
+        points_name,
+        fetched_at_ms,
+    )
+    .await)
+}
+
+/// Redeem a reward by id, for every shell (services/reward_redeem.rs): Rust
+/// looks it up in its judged list, refuses one the verdict blocks, routes it
+/// by its built-in type and keeps the retry-safe transaction id. `text` is the
+/// typed answer or message; `emote_id` / `emote_name` an emote unlock's pick.
+#[tauri::command]
+pub async fn redeem_reward(
+    channel_login: String,
+    channel_id: String,
+    reward_id: String,
+    text: Option<String>,
+    emote_id: Option<String>,
+    emote_name: Option<String>,
+) -> Result<crate::services::reward_redeem::RedeemOutcome, String> {
+    Ok(crate::services::reward_redeem::redeem(&channel_login, &channel_id, &reward_id, text, emote_id, emote_name).await)
 }
 
 #[tauri::command]
@@ -1388,6 +1664,8 @@ pub async fn redeem_channel_reward(
     cost: i32,
     title: String,
     prompt: Option<String>,
+    text_input: Option<String>,
+    transaction_id: Option<String>,
 ) -> Result<crate::models::drops::RedemptionResult, String> {
     use crate::services::drops_auth_service::DropsAuthService;
     use serde_json::json;
@@ -1406,9 +1684,25 @@ pub async fn redeem_channel_reward(
 
     let client = HTTP_CLIENT.clone();
 
-    let transaction_id = uuid::Uuid::new_v4().to_string().replace("-", "");
+    // The menu's id for this redeem, so a retry is recognised by Twitch.
+    let transaction_id = crate::services::channel_rewards::transaction_id_or_new(transaction_id);
     let device_id = uuid::Uuid::new_v4().to_string().replace("-", "");
     let session_id = uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string();
+
+    let mut input = json!({
+        "channelID": channel_id,
+        "cost": cost,
+        "pricingType": "POINTS",
+        "prompt": prompt.unwrap_or_default(),
+        "rewardID": reward_id,
+        "title": title,
+        "transactionID": transaction_id,
+    });
+    // `prompt` is the streamer's question, echoed back for the properties
+    // check; the viewer's answer to it travels as `textInput`.
+    if let Some(text) = text_input.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()) {
+        input["textInput"] = json!(text);
+    }
 
     let response = client
         .post("https://gql.twitch.tv/gql")
@@ -1418,17 +1712,7 @@ pub async fn redeem_channel_reward(
         .header("Client-Session-Id", &session_id)
         .json(&json!({
             "operationName": "RedeemCustomReward",
-            "variables": {
-                "input": {
-                    "channelID": channel_id,
-                    "cost": cost,
-                    "pricingType": "POINTS",
-                    "prompt": prompt.unwrap_or_default(),
-                    "rewardID": reward_id,
-                    "title": title,
-                    "transactionID": transaction_id,
-                }
-            },
+            "variables": { "input": input },
             "extensions": {
                 "persistedQuery": {
                     "version": 1,
@@ -1451,7 +1735,7 @@ pub async fn redeem_channel_reward(
         status,
         channel_id,
         reward_id,
-        &response_text[..response_text.len().min(2000)]
+        response_text.chars().take(2000).collect::<String>()
     );
 
     let result: serde_json::Value = match serde_json::from_str(&response_text) {
@@ -1460,7 +1744,7 @@ pub async fn redeem_channel_reward(
             log::error!(
                 "redeem_channel_reward: failed to parse body as JSON: {} | body: {}",
                 e,
-                &response_text[..response_text.len().min(2000)]
+                response_text.chars().take(2000).collect::<String>()
             );
             return Err(format!("Failed to parse redemption response: {}", e));
         }
@@ -1500,6 +1784,16 @@ pub async fn redeem_channel_reward(
                 .get("code")
                 .and_then(|v| v.as_str())
                 .unwrap_or("UNKNOWN");
+            // A retry of a redeem that already went through.
+            if error_code == crate::services::channel_rewards::ALREADY_COMMITTED {
+                return Ok(crate::models::drops::RedemptionResult {
+                    success: true,
+                    error_code: None,
+                    error_message: None,
+                    new_balance: None,
+                    unlocked_emote: None,
+                });
+            }
             return Ok(crate::models::drops::RedemptionResult {
                 success: false,
                 error_code: Some(error_code.to_string()),
@@ -1513,7 +1807,7 @@ pub async fn redeem_channel_reward(
                         "You've already redeemed this reward".to_string()
                     }
                     "COOLDOWN" => "Reward is on cooldown".to_string(),
-                    "PROPERTIES_MISMATCH" => "Reward changed — refresh and try again".to_string(),
+                    "PROPERTIES_MISMATCH" => "The reward changed. Reopen rewards and try again".to_string(),
                     _ => format!("Redemption failed: {}", error_code),
                 }),
                 new_balance: None,
@@ -1557,6 +1851,7 @@ pub async fn send_highlighted_message(
     channel_id: String,
     message: String,
     cost: i32,
+    transaction_id: Option<String>,
 ) -> Result<crate::models::drops::RedemptionResult, String> {
     use crate::services::drops_auth_service::DropsAuthService;
     use serde_json::json;
@@ -1570,8 +1865,9 @@ pub async fn send_highlighted_message(
 
     let client = HTTP_CLIENT.clone();
 
-    // Generate transaction ID and device/session IDs (UUID without dashes, lowercase)
-    let transaction_id = uuid::Uuid::new_v4().to_string().replace("-", "");
+    // The menu's id for this message, so a retry is recognised by Twitch; the
+    // device and session ids are fresh (UUID without dashes, lowercase).
+    let transaction_id = crate::services::channel_rewards::transaction_id_or_new(transaction_id);
     let device_id = uuid::Uuid::new_v4().to_string().replace("-", "");
     let session_id = uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string();
 
@@ -1636,6 +1932,16 @@ pub async fn send_highlighted_message(
             .get("code")
             .and_then(|v| v.as_str())
             .unwrap_or("UNKNOWN");
+        // A retry of a message that already went through.
+        if error_code == crate::services::channel_rewards::ALREADY_COMMITTED {
+            return Ok(crate::models::drops::RedemptionResult {
+                success: true,
+                error_code: None,
+                error_message: None,
+                new_balance: None,
+                unlocked_emote: None,
+            });
+        }
         return Ok(crate::models::drops::RedemptionResult {
             success: false,
             error_code: Some(error_code.to_string()),
@@ -1676,6 +1982,97 @@ pub async fn send_highlighted_message(
         new_balance: None,
         unlocked_emote: None,
     })
+}
+
+/// Send one message through sub-only mode with the channel's built-in
+/// "Send a Message in Sub-Only Mode" reward. `channel_id` is numeric,
+/// `channel_login` the Twitch login whose room state gates it.
+#[tauri::command]
+pub async fn send_sub_mode_message(
+    channel_id: String,
+    channel_login: String,
+    message: String,
+    cost: i32,
+    transaction_id: Option<String>,
+) -> Result<crate::models::drops::RedemptionResult, String> {
+    use crate::services::channel_rewards as rewards;
+    use crate::services::drops_auth_service::DropsAuthService;
+
+    let refuse = |code: &str, text: &str| crate::models::drops::RedemptionResult {
+        success: false,
+        error_code: Some(code.to_string()),
+        error_message: Some(text.to_string()),
+        new_balance: None,
+        unlocked_emote: None,
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return Ok(refuse("EMPTY", "Type a message first"));
+    }
+    if message.chars().count() > rewards::CHAT_MESSAGE_MAX {
+        return Ok(refuse("TOO_LONG", "That message is longer than 500 characters"));
+    }
+    // Twitch only takes it while chat is sub-only and the viewer cannot
+    // already chat there; a stale view never spends.
+    if let Some((code, text)) = rewards::sub_mode_send_refusal(&channel_login) {
+        return Ok(refuse(code, text));
+    }
+
+    // Same client and credential as the other built-in reward redeems.
+    const CLIENT_ID: &str = env!("TWITCH_ANDROID_CLIENT_ID");
+    let token = DropsAuthService::get_token()
+        .await
+        .map_err(|e| format!("Failed to get token: {}", e))?;
+    // The menu keeps one id per message, so a retry after a lost answer is
+    // recognised by Twitch instead of posting and charging twice.
+    let transaction_id = rewards::transaction_id_or_new(transaction_id);
+    let device_id = uuid::Uuid::new_v4().to_string().replace("-", "");
+    let session_id = uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string();
+
+    let response = match HTTP_CLIENT
+        .clone()
+        .post("https://gql.twitch.tv/gql")
+        .header("Client-Id", CLIENT_ID)
+        .header("Authorization", format!("OAuth {}", token))
+        .header("X-Device-Id", &device_id)
+        .header("Client-Session-Id", &session_id)
+        .json(&rewards::sub_mode_message_request(&channel_id, message, cost, &transaction_id))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("send_sub_mode_message channel={} transport error: {}", channel_id, e);
+            return Ok(refuse("NETWORK", "Couldn't reach Twitch. Check your connection and try again"));
+        }
+    };
+    let status = response.status().as_u16();
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("send_sub_mode_message channel={} status={} unreadable body: {}", channel_id, status, e);
+            return Ok(refuse("NETWORK", "Couldn't reach Twitch. Check your connection and try again"));
+        }
+    };
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+
+    let points_name = rewards::points_name_of(&channel_login);
+    let outcome = rewards::sub_mode_message_outcome(status, &parsed, points_name.as_deref());
+    if outcome.success {
+        log::info!("send_sub_mode_message channel={} success=true status={}", channel_id, status);
+    } else {
+        // Twitch's own answer, for the report the toast cannot carry. It holds
+        // the balance and an error code, never the token.
+        let head: String = body.chars().take(2000).collect();
+        log::warn!(
+            "send_sub_mode_message channel={} success=false code={:?} status={}: {}",
+            channel_id,
+            outcome.error_code,
+            status,
+            head
+        );
+    }
+    Ok(outcome)
 }
 
 #[tauri::command]
@@ -2312,5 +2709,62 @@ mod tests {
         let mut patch = serde_json::Map::new();
         patch.insert("auto_claim_drops".to_string(), serde_json::json!("yes"));
         assert!(apply_drops_patch(&DropsSettings::default(), patch).is_err());
+    }
+
+    #[test]
+    fn parsed_rewards_carry_limits_cooldowns_and_type() {
+        let custom = serde_json::json!({
+            "id": "c1", "title": "Run an ad", "cost": 100,
+            "isEnabled": true, "isPaused": false, "isInStock": true,
+            "cooldownExpiresAt": "2023-11-14T22:14:20Z",
+            "redemptionsRedeemedCurrentStream": 3,
+            "maxPerStreamSetting": { "isEnabled": true, "maxPerStream": 3 },
+            "maxPerUserPerStreamSetting": { "isEnabled": false, "maxPerUserPerStream": 1 },
+            "globalCooldownSetting": { "isEnabled": true, "globalCooldownSeconds": 60 }
+        });
+        let c = parse_reward(&custom, false).unwrap();
+        assert_eq!(c.max_per_stream, Some(3));
+        assert_eq!(c.max_per_user_per_stream, None);
+        assert_eq!(c.global_cooldown_seconds, Some(60));
+        assert_eq!(c.redemptions_redeemed_current_stream, Some(3));
+        assert_eq!(c.reward_type, None);
+
+        let auto = serde_json::json!({
+            "id": "1:SEND_HIGHLIGHTED_MESSAGE", "type": "SEND_HIGHLIGHTED_MESSAGE",
+            "cost": null, "defaultCost": 100, "isEnabled": true, "isInStock": true,
+            "pricingType": "POINTS", "cooldownExpiresAt": "2023-11-14T22:14:20Z",
+            "globalCooldownSetting": { "isEnabled": true, "globalCooldownSeconds": 30 }
+        });
+        let a = parse_automatic_reward(&auto).unwrap();
+        assert_eq!(a.reward_type.as_deref(), Some(HIGHLIGHTED_MESSAGE_REWARD));
+        assert!(a.is_user_input_required);
+        assert_eq!(a.cooldown_expires_at.as_deref(), Some("2023-11-14T22:14:20Z"));
+        assert_eq!(a.global_cooldown_seconds, Some(30));
+        assert!(!a.is_hidden_for_subs);
+        assert_eq!(a.description, None, "the title says what it does");
+    }
+
+    #[test]
+    fn parsed_rewards_carry_sub_flags_and_descriptions() {
+        let custom = serde_json::json!({
+            "id": "c2", "title": "VIP for a day", "cost": 50000,
+            "isSubOnly": true, "prompt": "Pick a colour"
+        });
+        let c = parse_reward(&custom, false).unwrap();
+        assert!(c.is_sub_only);
+        assert_eq!(c.prompt.as_deref(), Some("Pick a colour"));
+        assert_eq!(c.description, None);
+
+        let bypass = serde_json::json!({
+            "id": "1:SINGLE_MESSAGE_BYPASS_SUB_MODE", "type": "SINGLE_MESSAGE_BYPASS_SUB_MODE",
+            "cost": 3000, "defaultCost": 350, "isEnabled": true, "isHiddenForSubs": true,
+            "pricingType": "POINTS"
+        });
+        let b = parse_automatic_reward(&bypass).unwrap();
+        assert_eq!(b.title, "Send a Message in Sub-Only Mode");
+        assert!(b.is_hidden_for_subs);
+        assert!(b.is_user_input_required);
+        assert_eq!(b.prompt, None);
+        assert_eq!(b.description, None, "the title says what it does");
     }
 }

@@ -6,7 +6,7 @@ import Plyr from 'plyr';
 // Plyr's CSS ships once, layered, via globals.css (@import ... layer(vendor));
 // a second unlayered copy here would beat the app's control-bar overrides.
 import { motion, AnimatePresence } from 'framer-motion';
-import { Loader2, RefreshCcw, Home, LayoutGrid, Shield, ShieldCheck, ShieldAlert, Clapperboard, Music, Share2, Check, VolumeX } from 'lucide-react';
+import { Loader2, RefreshCcw, LayoutGrid, Shield, ShieldCheck, ShieldAlert, Clapperboard, Music, Share2, Check, VolumeX } from 'lucide-react';
 import { Heart, HeartBreak, ArrowLeft, X as XIcon } from 'phosphor-react';
 import { useAppStore } from '../stores/AppStore';
 import { streamProvider } from '../utils/streamProvider';
@@ -16,12 +16,13 @@ import { useContentZoom } from '../utils/contentZoom';
 import { canGridProvider, gridRefusal } from '../types/providers';
 import { platformTerms } from '../utils/platformTerms';
 import { useContextMenuStore } from '../stores/contextMenuStore';
-import { buildShareUrl } from '../utils/shareLink';
+import { shareLinkFor } from '../utils/shareLink';
 import { playerOverlayButtonOn } from '../utils/playerOverlayButtons';
 import { usemultiNookStore } from '../stores/multiNookStore';
 import { useChannelSocial } from '../hooks/useChannelSocial';
 import StreamTitleWithEmojis from './StreamTitleWithEmojis';
 import PlayerStatsOverlay from './PlayerStatsOverlay';
+import OfflineRoomScreen, { OfflineRoomLivePill } from './OfflineRoomScreen';
 import { useVodProgressReporter } from '../hooks/useVodProgressReporter';
 import { useMutedSegmentNotice } from '../hooks/useMutedSegmentNotice';
 import { formatVodTime } from '../utils/vodProgress';
@@ -39,7 +40,7 @@ import { registerPlayerControls, type PlayerControls } from '../keybindings';
 import { qualitiesEquivalent } from '../utils/quality';
 
 import { Logger } from '../utils/logger';
-import { syncTauriWindowFullscreen } from '../utils/windowFullscreen';
+import { claimPlayerFullscreen, handOffPlayerFullscreen, syncTauriWindowFullscreen } from '../utils/windowFullscreen';
 import { startLatencyGovernor, DEFAULT_LATENCY_BAND } from '../utils/liveLatencyGovernor';
 import { behindLiveFromEdge, edgeTargetForGap, resolveLiveEdgeGap, type LivePath } from '../utils/latency';
 import { startLLDiagnostics, stopLLDiagnostics, llDiagNote, isLLDiagEnabled } from '../utils/llDiagnostics';
@@ -47,13 +48,13 @@ import {
   applyAudioBoost,
   releaseAudioGraphOnceGone,
   resolveAudioBoost,
-  audioBoostFaderDefs,
-  audioBoostResetPatch,
+  paintAudioBoostButton,
+  AUDIO_BOOST_BUTTON_HTML,
   AUDIO_GRAPH_SUPPORTED,
   AUDIO_GRAPH_REFUSAL,
 } from '../utils/audioBoost';
 import type { AudioBoostSettings, MutedRange, VodChapter } from '../types';
-import { Fader, Toggle } from './AudioBoostFaders';
+import { AudioBoostControls } from './AudioBoostFaders';
 
 /** A backward scrub on a live stream smaller than this is treated as a
  *  nudge, not a rewind request. */
@@ -89,23 +90,9 @@ const CHAPTERS_BUTTON_HTML =
   '<span class="sn-chapters-btn__label"></span>' +
   '<span class="plyr__tooltip" role="tooltip">Chapters</span>';
 
-type LiveButtonState = 'live' | 'behind' | 'catching-up';
-const LIVE_BUTTON_TIPS: Record<LiveButtonState, string> = {
-  live: 'Watching live',
-  behind: 'Behind live · click to catch up',
-  'catching-up': 'Catching up…',
-};
-/** Paints the injected LIVE control. Idempotent: returns at once when the
- *  state it shows already matches, so callers can be generous with it. */
-function paintLiveButton(btn: HTMLButtonElement, state: LiveButtonState) {
-  if (btn.dataset.state === state) return;
-  btn.dataset.state = state;
-  btn.setAttribute('aria-label', LIVE_BUTTON_TIPS[state]);
-  const tip = btn.querySelector('.plyr__tooltip');
-  if (tip) tip.textContent = LIVE_BUTTON_TIPS[state];
-}
 
 import { open as openExternalUrl } from '@tauri-apps/plugin-shell';
+import { LIVE_BUTTON_HTML, paintLiveButton, type LiveButtonState } from '../utils/liveButton';
 import { setActiveVideo } from '../utils/activeVideo';
 import { isWindowHidden } from '../utils/windowVisibility';
 import { recognizeNowPlaying, announceSong } from '../utils/songId';
@@ -120,32 +107,9 @@ import {
 } from '../utils/playerMouseControls';
 import { PlayerVolumeOsd } from './PlayerVolumeOsd';
 import { useVolumeOsd } from '../hooks/useVolumeOsd';
-
-// Paint the Audio Boost toggle that gets injected into Plyr's control bar so it
-// reflects on/off. The `is-active` class lights it up as an accent chip (fill +
-// inset rim, styled in globals.css, no outer glow); off falls back to the normal
-// control. Module-level so the inject and sync effects share one copy.
-function paintAudioBoostButton(btn: Element | null, on: boolean): void {
-  if (!btn) return;
-  const tip = btn.querySelector('.plyr__tooltip');
-
-  // Shown but inert where the audio graph cannot run, the same way the overlay
-  // buttons refuse a platform they cannot serve. A control that simply vanishes
-  // reads as a missing feature; a dimmed one with the reason reads as a limit.
-  if (!AUDIO_GRAPH_SUPPORTED) {
-    btn.classList.remove('is-active');
-    btn.setAttribute('aria-pressed', 'false');
-    btn.setAttribute('aria-disabled', 'true');
-    (btn as HTMLElement).style.opacity = '0.4';
-    (btn as HTMLElement).style.cursor = 'default';
-    if (tip) tip.textContent = 'Audio Boost: unavailable on macOS';
-    return;
-  }
-
-  btn.classList.toggle('is-active', on);
-  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
-  if (tip) tip.textContent = on ? 'Audio Boost: On' : 'Audio Boost: Off';
-}
+import { SevenTvAvatar } from './SevenTvAvatar';
+import { sevenTvIdForStream } from '../services/sevenTvPictures';
+import { recoverFromSequenceMismatch } from '../utils/hlsSequenceMismatch';
 
 // Per-channel learned cushion (LL path), relative to the viewer's chosen target. The
 // `base` is the user's target latency converted to the real (raw) cushion. The
@@ -237,8 +201,8 @@ const VideoPlayer = () => {
   // subscribing; state goes through a shallow-compared selector. This component
   // is mounted for the whole session, and a bare `useAppStore()` re-rendered it
   // on every unrelated store tick (toasts, mod logs, drops polling).
-  const { getAvailableQualities, changeStreamQuality, handleStreamOffline, reloadStreamAndChat, restartStream, exitStream, toggleHome, setHomeActiveTab, setHomeSelectedCategory, createClip, openStreamerMedia } = useAppStore.getState();
-  const { streamUrl, settings, activeQuality, adSource, isAutoSwitching, currentStream, isRestartingStream, isHomeActive, streamOriginCategory, isAuthenticated, currentMediaType, isCreatingClip, originalMediaUrl, vodPlayback, liveRewind, liveRewindAvailable, liveRewindAnchor } = useAppStore(
+  const { getAvailableQualities, changeStreamQuality, handleStreamOffline, reloadStreamAndChat, restartStream, exitStream, toggleHome, setHomeActiveTab, setHomeSelectedCategory, createClip, openStreamerMedia, leaveOfflineRoomVod } = useAppStore.getState();
+  const { streamUrl, settings, activeQuality, adSource, isAutoSwitching, currentStream, isRestartingStream, isHomeActive, streamOriginCategory, isAuthenticated, currentMediaType, isCreatingClip, originalMediaUrl, vodPlayback, liveRewind, liveRewindAvailable, liveRewindAnchor, liveLeftOffSecs } = useAppStore(
     useShallow((s) => ({
       streamUrl: s.streamUrl,
       settings: s.settings,
@@ -257,6 +221,7 @@ const VideoPlayer = () => {
       liveRewind: s.liveRewind,
       liveRewindAvailable: s.liveRewindAvailable,
       liveRewindAnchor: s.liveRewindAnchor,
+      liveLeftOffSecs: s.liveLeftOffSecs,
     })),
   );
   // Which platform is playing. Twitch runs the full path below; the ad-source
@@ -360,8 +325,8 @@ const VideoPlayer = () => {
   // Route the live audio through the optional compressor + makeup-gain graph.
   // Re-applied whenever the audio-boost settings change. While the feature has
   // never been turned on, this is a no-op and playback is left completely
-  // untouched. Scoped to the main player; MultiNook tiles keep their own
-  // per-tile audio.
+  // untouched. MultiNook tiles apply the same setting to their own elements
+  // (MultiNookCell).
   //
   // This player is keyed by stream URL, so every channel switch builds a new
   // <video>. An element that played through the graph stays alive until its
@@ -449,12 +414,7 @@ const VideoPlayer = () => {
       btn.className = 'plyr__controls__item plyr__control';
       btn.type = 'button';
       btn.setAttribute('data-streamnook-audioboost', '');
-      btn.innerHTML = `
-        <svg class="plyr__icon" aria-hidden="true" focusable="false" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2 13a2 2 0 0 0 2-2V7a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0V4a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0v-4a2 2 0 0 1 2-2"></path>
-        </svg>
-        <span class="plyr__tooltip" role="tooltip">Audio Boost</span>
-      `;
+      btn.innerHTML = AUDIO_BOOST_BUTTON_HTML;
       // Click opens the in-player popover (which holds the on/off toggle plus
       // all the faders), so everything is adjustable on the fly.
       btn.addEventListener('click', () => {
@@ -500,10 +460,7 @@ const VideoPlayer = () => {
     return injectPlyrControl(container, {
       attr: 'data-streamnook-live',
       className: 'sn-live-btn',
-      html:
-        '<span class="sn-live-btn__dot" aria-hidden="true"></span>' +
-        '<span class="sn-live-btn__label">LIVE</span>' +
-        '<span class="plyr__tooltip" role="tooltip"></span>',
+      html: LIVE_BUTTON_HTML,
       onClick: () => liveActionRef.current(),
       place: (controls) => {
         // After the LAST time node: a rewound recording also shows Plyr's
@@ -538,7 +495,10 @@ const VideoPlayer = () => {
   useEffect(() => {
     if (!audioPanelOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setAudioPanelOpen(false);
+      if (e.key !== 'Escape') return;
+      // Handled: the same press must not also leave full screen.
+      e.preventDefault();
+      setAudioPanelOpen(false);
     };
     const onDown = (e: MouseEvent) => {
       const panel = audioPanelRef.current;
@@ -659,13 +619,13 @@ const VideoPlayer = () => {
   const overlayButtonOn = (id: string) =>
     playerOverlayButtonOn(settings.player_overlay_buttons, id);
 
-  // Share the currently-playing channel. Copies the streamnook.app/w/<channel>
-  // link, then flips the button to a check for a beat as confirmation.
+  // Share the currently-playing stream. Copies its streamnook.app share link,
+  // then flips the button to a check for a beat as confirmation.
   const [shareCopied, setShareCopied] = useState(false);
   const handleSharePlayer = async () => {
     if (!currentStream?.user_login) return;
     try {
-      await navigator.clipboard.writeText(buildShareUrl(currentStream.user_login));
+      await navigator.clipboard.writeText(await shareLinkFor(currentStream));
       setShareCopied(true);
       window.setTimeout(() => setShareCopied(false), 1400);
     } catch (err) {
@@ -679,13 +639,6 @@ const VideoPlayer = () => {
   const nonFatalErrorCountRef = useRef<number>(0); // Track non-fatal errors like bufferStalled, fragParsing
   const lastErrorTimeRef = useRef<number>(0);
   const lastSuccessfulPlayRef = useRef<number>(0);
-  // Pending "playback paused" report. A `pause` event is debounced before it
-  // gates the minute-watched heartbeat off, because ad-bypass region pivots (and
-  // quality changes) reload the source via video.pause()/load(), which fires a
-  // transient `pause` immediately followed by `playing`. Reporting paused on that
-  // blip would stall channel-points/drops earning every ad break. Only a pause
-  // that outlives the grace window (a real user pause / dead playback) reports.
-  const playingPausedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastFragLoadedTimeRef = useRef<number>(0); // Track when we last received a fragment
   const maxFatalErrorsBeforeOffline = 5; // Increased from 3 - be more tolerant
   const maxManifestErrorsBeforeOffline = 4; // Increased from 2 - be more tolerant
@@ -694,14 +647,12 @@ const VideoPlayer = () => {
   const minPlayTimeBeforeOfflineMs = 5000; // Must have played at least 5 seconds before considering offline
   const noFragmentTimeoutMs = 15000; // If no fragments received for 15 seconds with errors, stream is likely offline
 
-  // Drop any pending paused-report on unmount so it can't fire after the player
-  // is gone and wrongly gate a newly opened stream's earning off.
+  // Drop any pending pause on unmount so it can't count after the player is
+  // gone and wrongly gate a newly opened stream's earning off (Rust's
+  // services/earning_gate.rs).
   useEffect(() => {
     return () => {
-      if (playingPausedTimerRef.current) {
-        clearTimeout(playingPausedTimerRef.current);
-        playingPausedTimerRef.current = null;
-      }
+      invoke('report_player_state', { state: 'teardown' }).catch(() => {});
     };
   }, []);
 
@@ -1051,6 +1002,8 @@ const VideoPlayer = () => {
     // different control layouts (progress bars vs none). Reusing instances breaks the UI
     // and can cause phantom black overlays.
     if (playerRef.current) {
+      // A new player follows right below unless the stream is offline.
+      handOffPlayerFullscreen(playerRef.current, { nextPlayerComing: streamUrl !== 'offline' });
       try {
         // CRITICAL: Clear video source BEFORE destroying Plyr.
         // Plyr.destroy() moves the <video> element out of its wrapper back to its
@@ -1685,6 +1638,7 @@ const VideoPlayer = () => {
 
           player.on('enterfullscreen', () => syncTauriWindowFullscreen(true));
           player.on('exitfullscreen', () => syncTauriWindowFullscreen(false));
+          claimPlayerFullscreen(player);
 
           // Set up live stream overrides
           isLiveRef.current = useAppStore.getState().currentMediaType === 'live' && !isVodPlayback;
@@ -1923,7 +1877,7 @@ const VideoPlayer = () => {
               manifestErrorCountRef.current = 0;
 
               // Trigger auto-switch
-              handleStreamOfflineRef.current();
+              handleStreamOfflineRef.current('player');
               return;
             }
           }
@@ -1947,6 +1901,14 @@ const VideoPlayer = () => {
 
         // Handle fatal errors
         if (data.fatal) {
+          // A rejected refresh on a live channel: accept the next one rather
+          // than stall against the stale playlist. Not a sign of an offline
+          // channel, so it does not count toward the offline threshold.
+          if (recoverFromSequenceMismatch(hls, data)) {
+            Logger.warn('[HLS] playlist refresh rejected for a sequence mismatch; accepting the next refresh');
+            return;
+          }
+
           const now = Date.now();
 
           // Reset error count if enough time has passed since last error
@@ -1967,7 +1929,7 @@ const VideoPlayer = () => {
             fatalErrorCountRef.current = 0;
 
             // Trigger auto-switch
-            handleStreamOfflineRef.current();
+            handleStreamOfflineRef.current('player');
             return;
           }
 
@@ -1999,7 +1961,7 @@ const VideoPlayer = () => {
                   Logger.debug(`[HLS] Has played: ${hasPlayedSuccessfully}, Time since start: ${timeSinceStart}ms`);
                   manifestErrorCountRef.current = 0;
                   fatalErrorCountRef.current = 0;
-                  handleStreamOfflineRef.current();
+                  handleStreamOfflineRef.current('player');
                   return;
                 }
               }
@@ -2325,6 +2287,7 @@ const VideoPlayer = () => {
 
       player.on('enterfullscreen', () => syncTauriWindowFullscreen(true));
       player.on('exitfullscreen', () => syncTauriWindowFullscreen(false));
+      claimPlayerFullscreen(player);
 
       // Persist volume/muted changes back to settings (Safari path)
       player.on('volumechange', () => {
@@ -2471,6 +2434,11 @@ const VideoPlayer = () => {
       // actively decoding when Plyr moves it in the DOM, WebView2's hardware decoder loses its
       // DirectComposition surface — resulting in audio-only playback (black/frozen frame).
       if (playerRef.current) {
+        // A switch to another stream builds the next player right after this
+        // cleanup (the player is keyed on its URL); stopping the stream (no
+        // URL) or going offline does not.
+        const nextUrl = useAppStore.getState().streamUrl;
+        handOffPlayerFullscreen(playerRef.current, { nextPlayerComing: !!nextUrl && nextUrl !== 'offline' });
         if (videoElement) {
           videoElement.pause();
           videoElement.removeAttribute('src');
@@ -2548,18 +2516,13 @@ const VideoPlayer = () => {
   useEffect(() => {
     if (prevLowLatencyRef.current === playerSettings.experimental_low_latency) return;
     prevLowLatencyRef.current = playerSettings.experimental_low_latency;
-    // Apply the new mode to the backend origin kill switch FIRST, then restart so the
-    // origin probe at stream start honors it (the parts path is gated by this).
-    invoke('set_experimental_low_latency', {
-      enabled: playerSettings.experimental_low_latency ?? true,
-    })
-      .catch(() => {})
-      .finally(() => {
-        if (currentStream && currentMediaType === 'live') {
-          Logger.debug('[HLS] Low Latency toggled — restarting stream to apply');
-          restartStream();
-        }
-      });
+    // Rust applied the new mode to the origin kill switch when the setting was
+    // saved (the store only updates after that write), so the restarted stream's
+    // origin probe already honors it.
+    if (currentStream && currentMediaType === 'live') {
+      Logger.debug('[HLS] Low Latency toggled — restarting stream to apply');
+      restartStream();
+    }
   }, [playerSettings.experimental_low_latency]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Expose an imperative control adapter to the keybinding engine. Methods read
@@ -2819,24 +2782,16 @@ const VideoPlayer = () => {
   // that, so restart the stream, which cold-starts at the edge. The threshold is 5
   // because a healthy promotion playlist legitimately declares ~2-4s the player
   // cannot fetch yet; only a gap beyond that means the pipeline is actually stuck.
-  // May this playback write a watch position? ONLY a VOD the viewer chose to
-  // open. `vodPlayback` has three writers (grep `vodPlayback:` in AppStore)
-  // and two of them are live sessions that must leave no trace, or Home's
-  // Continue Watching row fills up with every stream you ever watched:
-  //   - a live rewind (`rewound_from_live`), which the `seeking` handler in
-  //     this file triggers by itself for any backward scrub over 3 s, so a
-  //     casual "rewind ten seconds" would file a card;
-  //   - the offline-chat auto-play of a channel's latest broadcast, whose
-  //     dominant trigger is handleStreamOffline — the broadcast you were
-  //     watching ENDING — so every stream watched to the end would file a
-  //     card for itself.
-  // Anything new that sets `vodPlayback` must be audited against this.
-  const isDeliberateVod =
-    currentMediaType === 'video' && !!vodPlayback && !vodPlayback.rewound_from_live;
-  // A real VOD timeline, which unlike the above DOES include the offline-chat
-  // auto-play: it renders Plyr's full VOD bar and muted marks are useful
-  // there. A rewind is excluded because it always plays a RECORDING VOD, for
-  // which Twitch reports no mute info at all (probed 2026-09-12).
+  // Every VOD playback reports its playhead, and Rust decides what a report
+  // may write from the `play_id` it stamped on the start: only a VOD the
+  // viewer opened files a Continue Watching entry. A live rewind (which the
+  // `seeking` handler in this file starts by itself for any backward scrub
+  // over 3 s) only updates the live session's bookmark, in memory. The page
+  // must not grow its own "is this deliberate?" test again: a wrong answer
+  // here is what once filed a card for every stream watched.
+  // A real VOD timeline: Plyr's full VOD bar, where muted marks are useful.
+  // A rewind is excluded because it always plays a RECORDING VOD, for which
+  // Twitch reports no mute info at all (probed 2026-09-12).
   const isVodTimeline = !!vodPlayback && !vodPlayback.rewound_from_live;
   const mutedRanges = isVodTimeline ? (vodPlayback.muted_segments ?? NO_MUTED_RANGES) : NO_MUTED_RANGES;
   const activeMute = useMutedSegmentNotice(videoRef, mutedRanges);
@@ -2894,7 +2849,10 @@ const VideoPlayer = () => {
   useEffect(() => {
     if (!chaptersOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setChaptersOpen(false);
+      if (e.key !== 'Escape') return;
+      // Handled: the same press must not also leave full screen.
+      e.preventDefault();
+      setChaptersOpen(false);
     };
     const onDown = (e: MouseEvent) => {
       const panel = chaptersMenuRef.current;
@@ -2912,12 +2870,13 @@ const VideoPlayer = () => {
     };
   }, [chaptersOpen]);
   // VOD position checkpoints to Rust, the owner of the resume store. Null
-  // (live, clips, rewinds, offline auto-play, idle) attaches nothing.
+  // (live, clips, idle) attaches nothing.
   useVodProgressReporter(
     videoRef,
-    isDeliberateVod
+    vodPlayback
       ? {
           videoId: vodPlayback.video_id,
+          playId: vodPlayback.play_id,
           channelLogin: vodPlayback.channel_login ?? currentStream?.user_login,
           channelName: currentStream?.user_name,
           title: vodPlayback.title ?? currentStream?.title,
@@ -3184,79 +3143,26 @@ const VideoPlayer = () => {
           manifestErrorCountRef.current = 0;
           nonFatalErrorCountRef.current = 0;
 
-          // Parity heartbeat gate: minute-watched reporting runs only while
-          // the video is actually playing. Cancel any pending paused-report — a
-          // resumed playback (incl. an ad-pivot/quality reload finishing) means
-          // earning should keep running uninterrupted.
-          if (playingPausedTimerRef.current) {
-            clearTimeout(playingPausedTimerRef.current);
-            playingPausedTimerRef.current = null;
-          }
-          invoke('report_player_playing', { playing: true }).catch(() => {});
+          // The earning gate (services/earning_gate.rs): playing counts at
+          // once and cancels a pending pause, so an ad-pivot or quality reload
+          // finishing keeps earning uninterrupted.
+          invoke('report_player_state', { state: 'playing' }).catch(() => {});
         }}
         onPause={() => {
-          // Debounce: don't gate earning off on the transient pause that an
-          // ad-bypass region pivot / quality change emits while reloading the
-          // source. If playback resumes within the grace window, `onPlaying`
-          // cancels this; only a pause that persists actually reports paused.
-          if (playingPausedTimerRef.current) {
-            clearTimeout(playingPausedTimerRef.current);
-          }
-          playingPausedTimerRef.current = setTimeout(() => {
-            playingPausedTimerRef.current = null;
-            invoke('report_player_playing', { playing: false }).catch(() => {});
-          }, 6000);
+          // Rust counts a pause only once it outlives its grace window, so the
+          // transient pause of a source reload never gates earning off.
+          invoke('report_player_state', { state: 'paused' }).catch(() => {});
         }}
       />
 
-      {/* Offline Banner (Fallback when no VOD exists) */}
+      {/* A channel's offline room: its offline art and a card that says when
+          it was last live, offers the latest broadcast, and turns into the
+          stream when the channel goes live. */}
       <AnimatePresence>
-        {streamUrl === 'offline' && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 z-30 flex flex-col items-center justify-center pointer-events-none"
-          >
-            {/* Background blur/gradient */}
-            <div className="absolute inset-0 bg-gradient-to-br from-purple-900/10 to-black backdrop-blur-3xl" />
-            
-            {/* Content card */}
-            <div className="relative z-10 p-8 rounded-2xl glass-panel border border-white/10 shadow-2xl flex flex-col items-center max-w-md text-center bg-black/40">
-              <div className="w-24 h-24 mb-6 rounded-full bg-glass flex items-center justify-center border border-white/20 shadow-[0_0_16px_rgba(145,70,255,0.25)]">
-                <span className="text-5xl drop-shadow-lg">😴</span>
-              </div>
-              <h2 className="text-2xl font-bold text-white mb-3 drop-shadow-md tracking-wide">
-                Stream Offline
-              </h2>
-              <p className="text-white/70 text-sm leading-relaxed mb-8">
-                Welcome to the offline chat room. <span className="font-semibold text-white">{currentStream?.user_name || 'The broadcaster'}</span> has no recent videos available to display, but you can still hang out and chat.
-              </p>
-              
-              <div className="flex gap-4 pointer-events-auto">
-                <button 
-                  onClick={() => {
-                    setHomeActiveTab(isAuthenticated ? 'following' : 'recommended');
-                    toggleHome();
-                  }}
-                  className="px-6 py-2.5 glass-button bg-accent/20 border border-accent/40 text-white rounded-lg hover:bg-accent/40 hover:border-accent/60 shadow-[0_0_15px_rgba(145,70,255,0.2)] transition-colors flex items-center gap-2 font-medium"
-                >
-                  <Home size={16} strokeWidth={2.5} /> Keep Browsing
-                </button>
-                <button 
-                  onClick={async () => {
-                    setHomeActiveTab(isAuthenticated ? 'following' : 'recommended');
-                    await exitStream();
-                  }}
-                  className="px-6 py-2.5 glass-button text-white/80 rounded-lg border border-white/10 hover:bg-white/10 hover:text-white transition-colors flex items-center gap-2 font-medium"
-                >
-                  <XIcon size={16} weight="bold" /> Exit Chat
-                </button>
-              </div>
-            </div>
-          </motion.div>
-        )}
+        {streamUrl === 'offline' && currentMediaType === 'offline_chat' && <OfflineRoomScreen />}
       </AnimatePresence>
+      <OfflineRoomLivePill />
+      <StreamReconnectingPill />
 
       {/* Transient stream note — top-left. Replaces the per-stream toasts: how
           this stream is ad-free (your entitlement vs the proxy) plus any quality
@@ -3308,9 +3214,10 @@ const VideoPlayer = () => {
         )}
       </AnimatePresence>
 
-      {/* Stream Title Overlay — Top-left, shares hover timing with controls */}
+      {/* Stream Title Overlay — Top-left, shares hover timing with controls.
+          Not over the offline room's card, which already says who this is. */}
       <AnimatePresence>
-        {currentStream && showOverlay && (
+        {currentStream && showOverlay && !(currentMediaType === 'offline_chat' && streamUrl === 'offline') && (
           <motion.div
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
@@ -3323,7 +3230,18 @@ const VideoPlayer = () => {
           <div className="relative px-4 pt-3 pb-6 flex items-start gap-2">
             {/* Back Arrow or Home Button (Only visible when Home is not active) */}
             {!isHomeActive && (
-              currentMediaType === 'clip' || currentMediaType === 'video' ? (
+              currentMediaType === 'offline_chat' && streamUrl !== 'offline' ? (
+                // The room's latest broadcast: back to the room, chat untouched.
+                <Tooltip content={`Back to ${currentStream.user_name || currentStream.user_login}'s chat`} side="bottom" delay={200}>
+                  <button
+                    onClick={() => void leaveOfflineRoomVod()}
+                    className="shrink-0 mt-0.5 p-2 glass-button rounded-lg pointer-events-auto"
+                    style={{ backdropFilter: 'blur(16px)' }}
+                  >
+                    <ArrowLeft size={16} weight="bold" className="text-white" />
+                  </button>
+                </Tooltip>
+              ) : currentMediaType === 'clip' || currentMediaType === 'video' ? (
                 // Clips/VODs: always show back arrow — stop playback and return to category
                 <Tooltip content={streamOriginCategory ? `Back to ${streamOriginCategory.name}` : 'Back'} side="bottom" delay={200}>
                   <button
@@ -3371,7 +3289,10 @@ const VideoPlayer = () => {
                   VODs, clips, and offline chat, where it would be a lie. */}
               <div className="flex items-center gap-2 min-w-0">
                 {currentStream.profile_image_url ? (
-                  <img
+                  <SevenTvAvatar
+                    cosmeticsId={sevenTvIdForStream(currentStream)}
+                    px={28}
+                    motion="animate"
                     src={currentStream.profile_image_url}
                     alt=""
                     draggable={false}
@@ -3410,7 +3331,10 @@ const VideoPlayer = () => {
                     ? currentStream.game_name 
                     : streamUrl === 'offline' 
                       ? currentStream.game_name
-                      : `${currentStream.game_name} • ${currentStream.viewer_count?.toLocaleString() || 0} Views • ${new Date(currentStream.started_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`}
+                      : currentMediaType === 'offline_chat'
+                        // The room's latest broadcast carries no view count.
+                        ? [currentStream.game_name, currentStream.started_at && new Date(currentStream.started_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })].filter(Boolean).join(' • ')
+                        : `${currentStream.game_name} • ${currentStream.viewer_count?.toLocaleString() || 0} Views • ${new Date(currentStream.started_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}`}
                 </p>
               )}
             </div>
@@ -3482,6 +3406,7 @@ const VideoPlayer = () => {
           rewound={!!liveRewind}
           liveSeekWindowSecs={LIVE_DVR_MAX_BEHIND_SECS}
           visible={showOverlay}
+          leftOffSecs={liveLeftOffSecs}
           onSeekLive={(t) => {
             const v = videoRef.current;
             if (v) v.currentTime = t;
@@ -3638,7 +3563,7 @@ const VideoPlayer = () => {
             </Tooltip>
           )}
 
-          {/* Share button. Copies the streamnook.app/w/<channel> link; the icon
+          {/* Share button. Copies the stream's streamnook.app link; the icon
               pops to a check on copy, and the tooltip confirms. */}
           {overlayButtonOn('share') && currentStream && (
             <Tooltip content={shareCopied ? 'Link copied!' : `Share ${currentStream.user_name}`} side="bottom">
@@ -3732,7 +3657,7 @@ const VideoPlayer = () => {
           <button
             onClick={() => exitStream()}
             className="flex items-center justify-center p-2 glass-button rounded-lg"
-            style={{ backgroundColor: 'rgba(239, 68, 68, 0.25)', backdropFilter: 'blur(16px)' }}
+            style={{ backgroundColor: 'color-mix(in srgb, rgb(239 68 68) 25%, var(--glass-under, transparent))', backdropFilter: 'blur(16px)' }}
           >
             <XIcon weight="bold" className="w-4 h-4 text-red-400" />
           </button>
@@ -3759,51 +3684,24 @@ const VideoPlayer = () => {
             onMouseDown={(e) => e.stopPropagation()}
             onContextMenu={(e) => e.preventDefault()}
             data-no-wheel-volume
-            className="liquid-glass-panel absolute bottom-16 right-3 z-[60] rounded-xl p-4"
+            className="player-fs-popover liquid-glass-panel absolute bottom-16 right-3 z-[60] rounded-xl p-4"
             style={{ width: 'min(460px, calc(100% - 24px))' }}
           >
-            <div className="mb-3 flex items-center justify-between">
-              <span className="text-[13px] font-semibold text-textPrimary">Audio Boost</span>
-              <Toggle
-                enabled={audioBoostEnabled}
-                onChange={() => applyBoostPatch({ enabled: !audioBoostEnabled })}
-              />
-            </div>
-            <div className={audioBoostEnabled ? '' : 'opacity-50 pointer-events-none'}>
-              <div className="flex flex-wrap items-end justify-center gap-x-5 gap-y-4">
-                {audioBoostFaderDefs(resolvedBoost).map((d) => (
-                  <Fader
-                    key={d.key}
-                    label={d.label}
-                    display={d.display}
-                    value={d.value}
-                    min={d.min}
-                    max={d.max}
-                    step={d.step}
-                    hint={d.hint}
-                    onChange={(v) => applyBoostPatch(d.apply(v))}
-                  />
-                ))}
-              </div>
-            </div>
-            <div className="mt-3 flex items-center justify-center gap-4">
-              <button
-                onClick={() => applyBoostPatch(audioBoostResetPatch())}
-                style={{ borderRadius: 8 }}
-                className="glass-button text-textSecondary hover:text-textPrimary text-xs px-3 py-1.5"
-              >
-                Reset to defaults
-              </button>
-              <button
-                onClick={() => {
-                  setAudioPanelOpen(false);
-                  useAppStore.getState().openSettings('Player', 'settings-section-audio-boost');
-                }}
-                className="text-xs text-textSecondary underline-offset-2 hover:text-textPrimary hover:underline"
-              >
-                Open in Settings
-              </button>
-            </div>
+            <AudioBoostControls
+              boost={resolvedBoost}
+              onPatch={applyBoostPatch}
+              footer={
+                <button
+                  onClick={() => {
+                    setAudioPanelOpen(false);
+                    useAppStore.getState().openSettings('Player', 'settings-section-audio-boost');
+                  }}
+                  className="text-xs text-textSecondary underline-offset-2 hover:text-textPrimary hover:underline"
+                >
+                  Open in Settings
+                </button>
+              }
+            />
           </motion.div>
         )}
       </AnimatePresence>
@@ -3814,5 +3712,33 @@ const VideoPlayer = () => {
     </div>
   );
 };
+
+/** The streamer dropped and Rust is waiting it out on the same stream: say so
+ *  over the last frame, the way the platform's own player keeps you there. */
+function StreamReconnectingPill() {
+  const name = useAppStore((s) => {
+    const watching = s.currentStream;
+    if (!watching || !s.streamReconnecting || watching.user_login !== s.streamReconnecting) return null;
+    return watching.user_name || watching.user_login;
+  });
+  return (
+    <AnimatePresence>
+      {name && (
+        <motion.div
+          role="status"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2 }}
+          className="glass-flyout pointer-events-none absolute left-1/2 top-3 z-50 flex -translate-x-1/2 items-center gap-2 text-xs font-medium text-textPrimary"
+          style={{ borderRadius: 999, padding: '6px 12px' }}
+        >
+          <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-textSecondary" />
+          Waiting for {name} to reconnect
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
 
 export default VideoPlayer;

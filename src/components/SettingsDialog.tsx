@@ -49,6 +49,7 @@ import type { SettingsIndexEntry } from './settings/searchIndex';
 import { findSettingTarget, flashSettingRow } from './settings/settingsNavigation';
 import { Tooltip } from './ui/Tooltip';
 import { requestChangelog } from '../utils/changelogEvents';
+import { SevenTvAvatar } from './SevenTvAvatar';
 
 type TabMeta = {
   id: SettingsTab;
@@ -286,7 +287,9 @@ const SettingsDialog = () => {
                     }`}
                   >
                     {isAuthenticated && currentUser?.profile_image_url ? (
-                      <img
+                      <SevenTvAvatar
+                        cosmeticsId={currentUser.user_id}
+                        px={32}
                         // Twitch returns the upload at variants like
                         // {id}-profile_image-{size}x{size}.png. Force the
                         // 300x300 variant so a 32-px render has plenty of
@@ -579,7 +582,8 @@ const SettingsDialog = () => {
                 </div>
                 {/* Section rail: sticky beside the panel, spring indicator
                     follows the section being read (settings/SectionNav). */}
-                <SectionNav containerRef={contentRef} tabKey={activeTab} hidden={searching} />
+                {/* The overlay builder draws its own rail beside its controls. */}
+                <SectionNav containerRef={contentRef} tabKey={activeTab} hidden={searching || activeTab === 'Overlay'} />
                </div>
               </div>
             </section>

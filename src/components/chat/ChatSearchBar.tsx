@@ -13,6 +13,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { motion } from 'framer-motion';
 import { Search, X } from 'lucide-react';
 import { Logger } from '../../utils/logger';
+import { isImeComposing } from '../../utils/imeComposing';
 
 export interface ChatSearchHit {
   id: string;
@@ -126,6 +127,7 @@ export default function ChatSearchBar({ channelKey, onJumpTo, onClose }: ChatSea
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (isImeComposing(e)) return;
     if (e.key === 'Escape') {
       e.preventDefault();
       onClose();
@@ -164,7 +166,7 @@ export default function ChatSearchBar({ channelKey, onJumpTo, onClose }: ChatSea
       role="search"
     >
       {/* Header: label, scope, kbd hints, close */}
-      <div className="relative z-10 flex items-center justify-between border-b border-white/5 bg-background/[0.5] px-3 py-2 backdrop-blur-md">
+      <div className="relative z-10 flex items-center justify-between border-b border-white/5 bg-glass-base/50 px-3 py-2 backdrop-blur-md">
         <div className="flex min-w-0 items-baseline gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-white/50">Search chat</span>
           <span className="truncate text-[10px] text-white/35">{scopeLabel}</span>
@@ -243,7 +245,7 @@ export default function ChatSearchBar({ channelKey, onJumpTo, onClose }: ChatSea
                   : 'border-transparent hover:bg-white/[0.03]'
               } ${h.flags & F_DELETED ? 'opacity-50' : ''}`}
             >
-              <span className="w-[52px] flex-shrink-0 font-mono text-[10px] tabular-nums text-white/35">
+              <span className="min-w-[52px] flex-shrink-0 whitespace-nowrap font-mono text-[10px] tabular-nums text-white/35">
                 {formatTime(h.ts_ms)}
               </span>
               {channelKey === null && (

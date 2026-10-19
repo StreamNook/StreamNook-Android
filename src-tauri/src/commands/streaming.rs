@@ -118,8 +118,9 @@ pub struct StreamStartResult {
     #[serde(default)]
     pub available: Vec<String>,
     /// How the player should ingest `url`: absent (the default) and "hls" both
-    /// mean an HLS playlist, "flv" means an FLV stream needing the mpegts path.
-    /// Absent for every Twitch path, so existing consumers are unaffected.
+    /// mean an HLS playlist, "flv" means an FLV stream needing the mpegts path,
+    /// "cast" (Android) means a Cast device plays it and `url` is a placeholder.
+    /// Absent for every other Twitch path, so existing consumers are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// VOD starts only: status, length, timeline anchor, where to begin, and
@@ -156,6 +157,10 @@ pub struct VodStartInfo {
     /// True when the viewer rewound a live broadcast into this recording; the
     /// live session stays up and the player offers "Back to live".
     pub rewound_from_live: bool,
+    /// Stamp for this start. The player's position reports carry it back, so
+    /// Rust decides what each report may write (`live_bookmark::origin_of`).
+    /// 0 is never issued, so an unstamped start writes nothing.
+    pub play_id: u64,
     /// Audio ranges Twitch muted, for the seekbar marks. Empty when none are
     /// known; on a `recording` VOD that means not yet determined, not "none".
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -477,11 +482,20 @@ fn channel_from_url(url: &str) -> Option<String> {
 /// The localhost URL the player polls, with a cache-busting timestamp.
 pub(crate) fn local_player_url(port: u16) -> String {
     format!(
-        "http://localhost:{}/stream.m3u8?t={}",
+        "http://{}:{}/stream.m3u8?t={}",
+        LOOPBACK_HOST,
         port,
         chrono::Utc::now().timestamp_millis()
     )
 }
+
+/// The relay's host in player URLs. The webview players and their CSP name
+/// `localhost`; AVPlayer gets the address itself, so the iPhone never resolves
+/// a name or tries IPv6 first for a relay bound to IPv4.
+#[cfg(not(target_os = "ios"))]
+const LOOPBACK_HOST: &str = "localhost";
+#[cfg(target_os = "ios")]
+const LOOPBACK_HOST: &str = "127.0.0.1";
 
 /// Resolve a Twitch clip to its signed MP4 URL WITHOUT touching any global live-
 /// stream state (no solo-session reset, no proxy server, no `currentStream`
@@ -519,6 +533,21 @@ pub async fn start_stream(
     quality: String,
     state: State<'_, AppState>,
 ) -> Result<StreamStartResult, StartError> {
+    let result = start_stream_inner(url, quality, state).await;
+    // TV screen mode plays whatever the phone would: every start, restart and
+    // quality change passes through here.
+    #[cfg(target_os = "android")]
+    if let Ok(started) = &result {
+        crate::services::tv_screen::on_local_stream(Some(&started.url));
+    }
+    result
+}
+
+async fn start_stream_inner(
+    url: String,
+    quality: String,
+    state: State<'_, AppState>,
+) -> Result<StreamStartResult, StartError> {
     debug!("[Streaming] start_stream called for URL: {}", url);
 
     // Clear the prior solo session up front; only a live resolve below
@@ -529,6 +558,11 @@ pub async fn start_stream(
     // keeps this the single playback entry point, so quality changes, restarts
     // and session resume all keep working with no new command surface.
     if let WatchTarget::Provider { provider, channel } = watch_urls::classify(&url) {
+        crate::services::live_bookmark::starting(None);
+        #[cfg(target_os = "android")]
+        if crate::services::cast_session::takes_stream(provider) {
+            return Ok(cast_placeholder(provider, &channel, &quality));
+        }
         return start_provider_stream(provider, &channel, &quality).await;
     }
 
@@ -544,6 +578,7 @@ pub async fn start_stream(
 
     // Clip → signed MP4, loaded directly by the player (no HLS proxy).
     if let Some(slug) = tr::clip_slug_from_url(&url) {
+        crate::services::live_bookmark::starting(None);
         let r = tr::resolve_clip(&slug, oauth.as_deref(), &quality)
             .await
             .map_err(|e| e.to_string())?;
@@ -563,14 +598,29 @@ pub async fn start_stream(
 
     // VOD → HLS media playlist, relayed through the local stream server.
     if let Some(vod_id) = tr::vod_id_from_url(&url) {
-        return start_vod(&vod_id, oauth.as_deref(), &quality, &state, None)
+        crate::services::live_bookmark::starting(None);
+        let mut result = start_vod(&vod_id, oauth.as_deref(), &quality, &state, None)
             .await
-            .map_err(StartError::from);
+            .map_err(StartError::from)?;
+        if let Some(v) = result.vod.as_mut() {
+            v.play_id = crate::services::live_bookmark::register_play(
+                crate::services::live_bookmark::Origin::Deliberate,
+            );
+        }
+        return Ok(result);
     }
 
     // Live channel.
     let channel =
         channel_from_url(&url).ok_or_else(|| format!("Unrecognized Twitch URL: {}", url))?;
+    // A restart or quality change of the same channel keeps the live
+    // bookmark's session; any other channel ends it.
+    crate::services::live_bookmark::starting(Some(&channel));
+
+    #[cfg(target_os = "android")]
+    if crate::services::cast_session::takes_stream("twitch") {
+        return Ok(cast_placeholder("twitch", &channel, &quality));
+    }
     // retry_streams = delay between attempts, stream_timeout = total budget, so a
     // channel that just went live connects once its playlist appears.
     let core = tr::resolve_live_resilient(
@@ -593,11 +643,11 @@ pub async fn start_stream(
     )
     .await;
 
-    // Android can't host a resolution plugin (it would be a spawned native
+    // A phone can't host a resolution plugin (it would be a spawned native
     // process), so ad-free playback occupies the same seam in-core. It obeys
     // the same contract: it declines the entitled case and any failure, and
     // declining means the core resolution serves.
-    #[cfg(target_os = "android")]
+    #[cfg(mobile)]
     let resolved = match resolved {
         Some(r) => Some(r),
         None => {
@@ -627,15 +677,38 @@ pub async fn start_stream(
         r.available
     );
     auth_proxy::set_status(r.status.clone());
-    let port = StreamServer::start_proxy_server(r.url)
+    // On the phones the link decides the rung from here on ("Auto" only); a
+    // link that just failed to hold this rung starts lower.
+    let serve_url = crate::services::link_adapt::begin(
+        &tr::parse_master(&r.master),
+        &r.url,
+        r.quality == "best",
+    );
+    let port = StreamServer::start_proxy_server(serve_url)
         .await
         .map_err(|e| e.to_string())?;
     // Register the live solo session AFTER the relay is serving it, so the
     // plugin protocol's "solo" stream id (set_upstream, on_ad_window) always
     // addresses a live relay.
     crate::services::stream_server::set_solo_session(Some(channel.clone()));
+    // The iPhone plays the audio-only rendition through a master that says it
+    // is audio only (see `stream_server::AUDIO_PLAYLIST`).
+    #[cfg(target_os = "ios")]
+    let url = if r.quality.contains("audio") {
+        local_player_url(port).replacen("/stream.m3u8", "/audio.m3u8", 1)
+    } else {
+        local_player_url(port)
+    };
+    #[cfg(not(target_os = "ios"))]
+    let url = local_player_url(port);
+    let resume = state
+        .settings
+        .lock()
+        .map(|s| s.video_player.resume_vod_playback)
+        .unwrap_or(false);
+    crate::services::live_bookmark::begin_live(&channel, resume);
     Ok(StreamStartResult {
-        url: local_player_url(port),
+        url,
         quality: r.quality,
         mode: Some(r.status.mode),
         entitled: r.status.entitled,
@@ -647,6 +720,28 @@ pub async fn start_stream(
     })
 }
 
+/// A live stream that a Cast device is playing. Nothing is resolved or relayed
+/// on the phone: the watch session hands the channel to `cast_session`, which
+/// looks it up for the TV, and the page shows the casting card in place of the
+/// video. `kind: "cast"` is what tells it so.
+#[cfg(target_os = "android")]
+fn cast_placeholder(provider: &str, channel: &str, quality: &str) -> StreamStartResult {
+    StreamStartResult {
+        url: format!("cast://{}/{}", provider, channel.to_lowercase()),
+        quality: quality.to_string(),
+        mode: None,
+        entitled: false,
+        proxy_region: None,
+        available: Vec::new(),
+        clip_source: None,
+        vod: None,
+        kind: Some("cast".to_string()),
+    }
+}
+
+/// How long a VOD open waits for the viewer's Twitch-side position.
+const VOD_REMOTE_POSITION_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Resolve a VOD, relay it, and decide where it starts. `start_override`
 /// (a live rewind's mapped position) wins over the stored resume position;
 /// otherwise the progress store answers, when the resume setting is on.
@@ -657,15 +752,28 @@ async fn start_vod(
     state: &State<'_, AppState>,
     start_override: Option<f64>,
 ) -> Result<StreamStartResult, String> {
-    let (resolved, info) = tokio::join!(
+    let resume_enabled = state.settings.lock().unwrap().video_player.resume_vod_playback;
+    // A position saved on another device lands in the store while the VOD
+    // resolves, so the resume read below sees it. Bounded: a slow answer only
+    // means this device's own position wins.
+    let remote_read = async {
+        if resume_enabled && start_override.is_none() {
+            let _ = tokio::time::timeout(
+                VOD_REMOTE_POSITION_BUDGET,
+                crate::services::vod_sync::sync_on_open(vod_id),
+            )
+            .await;
+        }
+    };
+    let (resolved, info, ()) = tokio::join!(
         tr::resolve_vod(vod_id, oauth, quality),
-        tr::fetch_vod_info(vod_id)
+        tr::fetch_vod_info(vod_id),
+        remote_read
     );
     let r = resolved.map_err(|e| e.to_string())?;
     let port = StreamServer::start_proxy_server_with(r.url, false)
         .await
         .map_err(|e| e.to_string())?;
-    let resume_enabled = state.settings.lock().unwrap().video_player.resume_vod_playback;
     let start_position = match start_override {
         Some(p) => Some(p),
         None if resume_enabled => {
@@ -702,6 +810,7 @@ async fn start_vod(
             thumbnail_url: info.thumbnail_url,
             start_position_secs: start_position,
             rewound_from_live: false,
+            play_id: 0,
             muted_segments: info.muted_segments,
             chapters: info.chapters,
             storyboard: info.storyboard,
@@ -718,6 +827,10 @@ pub struct LiveRewindInfo {
     pub video_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recorded_at: Option<String>,
+    /// Where the viewer left this broadcast before this playback, for the
+    /// timeline's "you left here" mark. Never cached: it changes as they watch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left_off_secs: Option<f64>,
 }
 
 /// Per-channel answer cache so the player can ask at every live start
@@ -732,49 +845,81 @@ const LIVE_REWIND_CACHE_NEGATIVE: std::time::Duration = std::time::Duration::fro
 
 /// Can this live channel be rewound into its recording? Cached; a lookup
 /// failure reports `available: false` without caching, so the next ask
-/// retries.
+/// retries. Also hands the recording to the live bookmark, and says where the
+/// viewer left this broadcast before, for the timeline mark.
 #[tauri::command]
 pub async fn get_live_rewind_info(channel: String) -> Result<LiveRewindInfo, String> {
     let channel = channel.trim().trim_start_matches('#').to_lowercase();
     if channel.is_empty() {
         return Err("No channel".to_string());
     }
+    let mut info = live_rewind_lookup(&channel).await;
+    if let (true, Some(id)) = (info.available, info.video_id.clone()) {
+        crate::services::live_bookmark::note_archive(&channel, &id, info.recorded_at.as_deref());
+        info.left_off_secs = left_off_secs(&channel, &id, info.recorded_at.as_deref()).await;
+    }
+    Ok(info)
+}
+
+/// The "you left here" mark for this broadcast's recording, decided by
+/// `live_bookmark::mark_position`.
+async fn left_off_secs(channel: &str, video_id: &str, recorded_at: Option<&str>) -> Option<f64> {
+    let start = chrono::DateTime::parse_from_rfc3339(recorded_at?).ok()?;
+    let elapsed = (chrono::Utc::now() - start.with_timezone(&chrono::Utc)).num_milliseconds() as f64 / 1000.0;
+    let id = video_id.to_string();
+    let entry = tokio::task::spawn_blocking(move || crate::services::vod_progress_service::lookup(&id))
+        .await
+        .ok()
+        .flatten()
+        .filter(|e| !e.completed)?;
+    crate::services::live_bookmark::mark_position(
+        entry.position_secs,
+        entry.updated_at,
+        crate::services::live_bookmark::begun_ms(channel),
+        elapsed,
+    )
+}
+
+async fn live_rewind_lookup(channel: &str) -> LiveRewindInfo {
     if let Ok(cache) = LIVE_REWIND_CACHE.lock() {
-        if let Some((info, at)) = cache.get(&channel) {
+        if let Some((info, at)) = cache.get(channel) {
             let ttl = if info.available {
                 LIVE_REWIND_CACHE_POSITIVE
             } else {
                 LIVE_REWIND_CACHE_NEGATIVE
             };
             if at.elapsed() < ttl {
-                return Ok(info.clone());
+                return info.clone();
             }
         }
     }
-    let info = match tr::fetch_live_archive(&channel).await {
+    let info = match tr::fetch_live_archive(channel).await {
         Ok(Some(archive)) => LiveRewindInfo {
             available: true,
             video_id: Some(archive.video_id),
             recorded_at: archive.recorded_at,
+            left_off_secs: None,
         },
         Ok(None) => LiveRewindInfo {
             available: false,
             video_id: None,
             recorded_at: None,
+            left_off_secs: None,
         },
         Err(e) => {
             debug!("[Streaming] live rewind lookup for {} failed: {}", channel, e);
-            return Ok(LiveRewindInfo {
+            return LiveRewindInfo {
                 available: false,
                 video_id: None,
                 recorded_at: None,
-            });
+                left_off_secs: None,
+            };
         }
     };
     if let Ok(mut cache) = LIVE_REWIND_CACHE.lock() {
-        cache.insert(channel, (info.clone(), std::time::Instant::now()));
+        cache.insert(channel.to_string(), (info.clone(), std::time::Instant::now()));
     }
-    Ok(info)
+    info
 }
 
 /// Rewind a live broadcast: switch the solo relay onto the channel's
@@ -824,7 +969,11 @@ pub async fn rewind_live_stream(
     .await?;
     if let Some(v) = result.vod.as_mut() {
         v.rewound_from_live = true;
+        v.play_id = crate::services::live_bookmark::register_play(
+            crate::services::live_bookmark::Origin::Rewind,
+        );
     }
+    crate::services::live_bookmark::begin_rewind(&channel, &archive.video_id, archive.recorded_at.as_deref());
     log::info!(
         "[Streaming] rewind {} → vod {} at {:.0}s (behind={:?}, position={:?})",
         channel,
@@ -838,6 +987,11 @@ pub async fn rewind_live_stream(
 
 #[tauri::command]
 pub async fn stop_stream() -> Result<(), String> {
+    // Every close of a live stream comes through here, the tray close too
+    // (it stops the stream but not the watch session).
+    crate::services::live_bookmark::end(crate::services::live_bookmark::EndKind::Async);
+    #[cfg(target_os = "android")]
+    crate::services::tv_screen::on_local_stream(None);
     // Tear down the YouTube DASH relay for this stream too. Unconditional: it is
     // a no-op for an id it does not know, which is every non-YouTube stream.
     // Without it a stopped stream's session stayed registered, held its init
@@ -867,6 +1021,22 @@ pub fn get_stream_low_latency() -> bool {
 #[tauri::command]
 pub fn get_stream_prefetch_present() -> bool {
     crate::services::ll_origin::upstream_has_prefetch()
+}
+
+/// How far the player sits behind the relay's live edge, for a player that
+/// cannot measure it itself (AVPlayer): it passes the programme date of the
+/// frame it shows, in Unix milliseconds. With `target_ms` the answer carries a
+/// catch-up rate toward that distance. Also drains the relay's record of the
+/// player's requests since the previous call. `playlist_behind_ms` (how far the
+/// player sits behind its playlist's end) words the readout when the relay has
+/// no parts to measure against (the whole-segment route).
+#[tauri::command]
+pub fn get_relay_live_distance(
+    player_pdt_ms: Option<f64>,
+    target_ms: Option<i64>,
+    playlist_behind_ms: Option<f64>,
+) -> crate::services::relay_probe::LiveDistance {
+    crate::services::relay_probe::report(player_pdt_ms, target_ms, playlist_behind_ms)
 }
 
 /// Enable or disable the experimental parts-based low-latency origin at runtime.
@@ -912,6 +1082,38 @@ pub fn set_codec_preference(prefs: Vec<String>) {
 #[tauri::command]
 pub fn set_max_video_height(height: u32) {
     crate::services::twitch_resolver::set_max_video_height(height);
+}
+
+/// The phone player's view of the link, for `link_adapt`: the core decides
+/// the rendition and the cushion, the player only reports what it saw.
+///
+/// - `frag`: a whole segment the player downloaded itself (`bytes` in `ms`).
+///   Only the whole-segment path sends these; on the parts path the player
+///   reads from the relay over loopback and the origin's own reads count.
+/// - `stall`: playback has been frozen `ms` so far (sent while it lasts).
+/// - `stall_end`: a stall ended after `ms`.
+///
+/// Decisions come back as the `playback-adapt` event.
+#[tauri::command]
+pub fn report_playback_health(event: String, bytes: Option<u64>, ms: Option<f64>) {
+    let secs = ms.unwrap_or(0.0).max(0.0) / 1000.0;
+    match event.as_str() {
+        "frag" => {
+            if let Some(bytes) = bytes {
+                crate::services::link_adapt::note_throughput(bytes, secs);
+            }
+        }
+        "stall" => crate::services::link_adapt::note_stall(secs, false),
+        "stall_end" => crate::services::link_adapt::note_stall(secs, true),
+        _ => {}
+    }
+}
+
+/// Extra seconds behind the live edge the player should keep right now, read
+/// when a player is built (later changes arrive as `playback-adapt`).
+#[tauri::command]
+pub fn get_live_edge_cushion() -> f64 {
+    crate::services::link_adapt::extra_cushion()
 }
 
 /// Start a low-latency diagnostic recording session. Returns the full path of the

@@ -176,7 +176,7 @@ pub async fn open_seventv_login_window(app: AppHandle) -> Result<bool, String> {
 
             if let Some(win) = app_handle.get_webview_window(&label_clone) {
                 // Check the current URL
-                if let Ok(url) = win.url() {
+                if let Some(url) = crate::platform::webview_url::current_url(&win).await {
                     let url_str = url.to_string();
 
                     // Log occasionally
@@ -274,13 +274,25 @@ pub async fn receive_seventv_token(
     Ok(true)
 }
 
-/// Store a 7TV token
+/// Store a 7TV token. An empty `user_id` is read from the token itself (its
+/// `sub` claim) and an empty `twitch_id` is the primary account, so a native
+/// shell hands over only what the 7TV page wrote.
 #[tauri::command]
 pub async fn store_seventv_token(
     access_token: String,
     user_id: String,
     twitch_id: String,
 ) -> Result<bool, String> {
+    let user_id = if user_id.is_empty() {
+        SevenTVAuthService::token_user_id(&access_token).ok_or_else(|| "token captured but carried no user id".to_string())?
+    } else {
+        user_id
+    };
+    let twitch_id = if twitch_id.is_empty() {
+        crate::services::account_store::AccountStore::primary().map(|a| a.user_id).unwrap_or_default()
+    } else {
+        twitch_id
+    };
     SevenTVAuthService::store_token(access_token, user_id, twitch_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -361,15 +373,35 @@ pub async fn set_seventv_paint(
     paint_id: Option<String>,
 ) -> Result<SevenTVCosmeticsResult, String> {
     match SevenTVCosmeticsService::set_active_paint(&user_id, paint_id.as_deref()).await {
-        Ok(_) => Ok(SevenTVCosmeticsResult {
-            success: true,
-            message: match &paint_id {
-                Some(id) => format!("Paint changed to {}", id),
-                None => "Paint unequipped".to_string(),
-            },
-        }),
+        Ok(_) => {
+            own_pick_made(Some(paint_id.as_deref()), None).await;
+            Ok(SevenTVCosmeticsResult {
+                success: true,
+                message: match &paint_id {
+                    Some(id) => format!("Paint changed to {}", id),
+                    None => "Paint unequipped".to_string(),
+                },
+            })
+        }
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// Uploads a new 7TV profile picture for the primary account (`user_id` is the
+/// 7TV user id; the image as base64: PNG, JPG, GIF, WebP or AVIF up to 7 MB).
+/// 7TV processes it before it shows; answers the pending picture's id.
+#[tauri::command]
+pub async fn upload_seventv_profile_picture(user_id: String, data_base64: String) -> Result<String, String> {
+    use base64::Engine;
+    use crate::services::seventv_auth_service::{profile_picture_mime, SevenTVCosmeticsService};
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_base64.trim())
+        .map_err(|_| "That image could not be read.".to_string())?;
+    if bytes.len() > SevenTVCosmeticsService::PROFILE_PICTURE_MAX_BYTES {
+        return Err("That image is larger than 7 MB.".to_string());
+    }
+    let mime = profile_picture_mime(&bytes).ok_or_else(|| "Use a PNG, JPG, GIF, WebP or AVIF image.".to_string())?;
+    SevenTVCosmeticsService::upload_profile_picture(&user_id, bytes, mime).await.map_err(|e| e.to_string())
 }
 
 /// Set the user's active 7TV badge
@@ -379,14 +411,34 @@ pub async fn set_seventv_badge(
     badge_id: Option<String>,
 ) -> Result<SevenTVCosmeticsResult, String> {
     match SevenTVCosmeticsService::set_active_badge(&user_id, badge_id.as_deref()).await {
-        Ok(_) => Ok(SevenTVCosmeticsResult {
-            success: true,
-            message: match &badge_id {
-                Some(id) => format!("Badge changed to {}", id),
-                None => "Badge unequipped".to_string(),
-            },
-        }),
+        Ok(_) => {
+            own_pick_made(None, Some(badge_id.as_deref())).await;
+            Ok(SevenTVCosmeticsResult {
+                success: true,
+                message: match &badge_id {
+                    Some(id) => format!("Badge changed to {}", id),
+                    None => "Badge unequipped".to_string(),
+                },
+            })
+        }
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// After the primary account's paint or badge changed on 7TV: hold the pick over
+/// 7TV's lagging reads, and repaint the account's rows already on a native
+/// shell's screen.
+async fn own_pick_made(paint: Option<Option<&str>>, badge: Option<Option<&str>>) {
+    use crate::services::{chat_row_view, seventv_cosmetics_resolver as resolver};
+    let Some(twitch_id) = crate::services::account_store::AccountStore::primary().map(|a| a.user_id) else {
+        return;
+    };
+    resolver::note_own_pick(&twitch_id, paint, badge);
+    if chat_row_view::enabled() {
+        let worn = resolver::resolve(twitch_id.clone()).await;
+        let view = chat_row_view::worn_view(&worn.data.paints, &worn.data.badges);
+        let frame = chat_row_view::cosmetics_frame("", "twitch", &twitch_id, &view);
+        crate::services::irc_service::post_frame_to_all(frame).await;
     }
 }
 
@@ -570,7 +622,7 @@ pub async fn open_seventv_login_window_for_account(
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
             if let Some(win) = app_handle.get_webview_window(&label_clone) {
-                if let Ok(url) = win.url() {
+                if let Some(url) = crate::platform::webview_url::current_url(&win).await {
                     let url_str = url.to_string();
                     if poll_count % 20 == 0 {
                         debug!("[7TV] (account {}) poll #{}", target_twitch_id, poll_count);
@@ -678,8 +730,8 @@ pub async fn refresh_seventv_token_for_account(
     let mut captured = false;
     for _ in 0..24 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        match win.url() {
-            Ok(url) => {
+        match crate::platform::webview_url::current_url(&win).await {
+            Some(url) => {
                 let url_str = url.to_string();
                 if let Some(token_part) = url_str.split("#7TV_TOKEN=").nth(1) {
                     if let Ok(token) = urlencoding::decode(token_part) {
@@ -704,7 +756,8 @@ pub async fn refresh_seventv_token_for_account(
                     }
                 }
             }
-            Err(_) => break, // window closed/gone
+            // No URL yet, or the page is blocked: wait out the deadline.
+            None => {}
         }
     }
 

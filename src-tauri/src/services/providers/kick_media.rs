@@ -16,6 +16,7 @@
 //! at each call site.
 
 use crate::models::provider_stream::{CategoryPage, ProviderCategory, ProviderStream, StreamPage};
+use crate::services::browse_languages;
 use crate::services::kick_auth_service;
 use crate::services::providers::hls_master;
 use crate::services::providers::key::make_key;
@@ -160,6 +161,37 @@ struct UserRow {
 
 // --- Helpers ---------------------------------------------------------------
 
+/// `url` once per language in parallel, merged most-watched first, each
+/// channel once, cut to `limit`. Fails only when every language failed.
+async fn by_language(url: &str, languages: &[String], limit: usize) -> Result<Vec<ProviderStream>> {
+    let calls = languages.iter().map(|lang| {
+        let url = format!("{}&language={}", url, urlencoding::encode(lang));
+        async move { api_get::<V1LivestreamRow>(&url).await }
+    });
+    let mut rows: Vec<V1LivestreamRow> = Vec::new();
+    let mut failed = None;
+    for result in futures::future::join_all(calls).await {
+        match result {
+            Ok(mut r) => rows.append(&mut r),
+            Err(e) => failed = Some(e),
+        }
+    }
+    if rows.is_empty() {
+        if let Some(e) = failed {
+            return Err(e);
+        }
+    }
+    Ok(merge_by_viewers(rows.into_iter().filter_map(row_from_livestream).collect(), limit))
+}
+
+fn merge_by_viewers(mut streams: Vec<ProviderStream>, limit: usize) -> Vec<ProviderStream> {
+    streams.sort_by(|a, b| b.viewer_count.cmp(&a.viewer_count));
+    let mut seen = std::collections::HashSet::new();
+    streams.retain(|s| seen.insert(s.key.clone()));
+    streams.truncate(limit);
+    streams
+}
+
 fn watch_url(slug: &str) -> String {
     format!("https://kick.com/{}", slug)
 }
@@ -193,7 +225,10 @@ async fn api_get<T: for<'de> Deserialize<'de>>(url: &str) -> Result<Vec<T>> {
 
 fn row_from_channel(row: ChannelRow, avatar: Option<String>, name: Option<String>) -> ProviderStream {
     let slug = row.slug.to_lowercase();
-    let stream = row.stream;
+    // Kick's own live answer settles liveness. An ended stream's record lingers
+    // with its last viewer count and preview, which drew as a live card with
+    // stale numbers; an offline channel carries none of them.
+    let stream = row.stream.filter(|s| s.is_live);
     ProviderStream {
         provider: "kick".to_string(),
         key: make_key("kick", &slug),
@@ -218,7 +253,7 @@ fn row_from_channel(row: ChannelRow, avatar: Option<String>, name: Option<String
         thumbnail_url: stream.as_ref().and_then(|s| s.thumbnail.clone()).unwrap_or_default(),
         started_at: stream.as_ref().and_then(|s| s.start_time.clone()).unwrap_or_default(),
         profile_image_url: avatar,
-        is_live: stream.map(|s| s.is_live).unwrap_or(false),
+        is_live: stream.is_some(),
         watch_url: watch_url(&slug),
         tags: None,
     }
@@ -452,6 +487,16 @@ impl StreamSource for KickSource {
         let mut url = format!("{}/v1/livestreams?limit={}&sort=viewer_count", API, capped);
         if let Some(cat) = category.filter(|c| !c.is_empty()) {
             url.push_str(&format!("&category_id={}", urlencoding::encode(cat)));
+        }
+        // Kick ranks one worldwide list, so the viewer's languages are asked for
+        // here. It takes one `language` per request (a repeat keeps the first,
+        // `en,es` matches nothing), so each language is its own call, merged.
+        let languages = browse_languages::kick_codes(&browse_languages::current());
+        if !languages.is_empty() {
+            match by_language(&url, &languages, capped as usize).await {
+                Ok(streams) => return Ok(StreamPage { streams, cursor: None }),
+                Err(e) => log::warn!("[Kick] directory by language failed ({}); asking without", e),
+            }
         }
         // NOTE: v1 livestreams takes only broadcaster_user_id / category_id /
         // language / limit / sort — there is NO page or cursor parameter (checked
@@ -695,4 +740,51 @@ async fn v2_live_row(slug: &str) -> Option<ProviderStream> {
         watch_url: watch_url(slug),
         tags: None,
     })
+}
+
+#[cfg(test)]
+mod channel_row_tests {
+    use super::*;
+
+    fn channel(stream: serde_json::Value) -> ChannelRow {
+        serde_json::from_value(serde_json::json!({
+            "broadcaster_user_id": 7,
+            "slug": "Shroud",
+            "stream_title": "last title",
+            "stream": stream,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_ended_stream_is_an_offline_row_with_no_stale_numbers() {
+        let row = row_from_channel(
+            channel(serde_json::json!({ "is_live": false, "viewer_count": 812, "thumbnail": "old.webp", "start_time": "2026-10-16T10:00:00Z" })),
+            None,
+            None,
+        );
+        assert!(!row.is_live);
+        assert_eq!(row.viewer_count, 0);
+        assert_eq!(row.thumbnail_url, "");
+        assert_eq!(row.started_at, "");
+        assert_eq!(row.user_login, "shroud");
+    }
+
+    #[test]
+    fn a_live_stream_keeps_its_numbers() {
+        let row = row_from_channel(
+            channel(serde_json::json!({ "is_live": true, "viewer_count": 812, "thumbnail": "now.webp", "start_time": "2026-10-16T10:00:00Z" })),
+            None,
+            None,
+        );
+        assert!(row.is_live);
+        assert_eq!(row.viewer_count, 812);
+        assert_eq!(row.thumbnail_url, "now.webp");
+    }
+
+    #[test]
+    fn no_stream_record_is_offline() {
+        let row = row_from_channel(channel(serde_json::Value::Null), None, None);
+        assert!(!row.is_live);
+    }
 }

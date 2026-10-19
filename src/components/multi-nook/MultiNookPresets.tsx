@@ -22,13 +22,15 @@ import {
 } from 'lucide-react';
 import { Tooltip } from '../ui/Tooltip';
 import { useMultiNookPresetsStore, slotToPresetChannel } from '../../stores/multiNookPresetsStore';
-import { usemultiNookStore } from '../../stores/multiNookStore';
-import { MultiNookPreset, MultiNookPresetChannel, MultiNookPresetIcon } from '../../types';
+import { currentNookLayout, usemultiNookStore } from '../../stores/multiNookStore';
+import { MultiNookLayout, MultiNookPreset, MultiNookPresetChannel, MultiNookPresetIcon } from '../../types';
 import { ChannelItem, useChannelSearch, DEFAULT_AVATAR, itemKey, parseTypedChannel } from './channelSearch';
 import { ChannelResultRow } from './ChannelResultRow';
 import { Logger } from '../../utils/logger';
 import { makeKey } from '../../utils/providerKey';
 import { GRID_PICKER_PROVIDERS, gridRefusal } from '../../types/providers';
+import { SevenTvAvatar } from '../SevenTvAvatar';
+import { slotSevenTvId } from './slotSevenTvId';
 
 const MAX_NAME_LEN = 40;
 
@@ -67,6 +69,8 @@ type View =
       seed: MultiNookPresetChannel[];
       seedName: string;
       seedIcon?: MultiNookPresetIcon;
+      /** The live grid's layout, when the preset is being saved from it. */
+      seedLayout?: MultiNookLayout;
     };
 
 const MultiNookPresets: React.FC = () => {
@@ -113,7 +117,8 @@ const MultiNookPresets: React.FC = () => {
     // One definition of the preset-channel shape, so it cannot drift from
     // slotToPresetChannel and silently drop a field (it just did, with provider).
     const seed = usemultiNookStore.getState().slots.map(slotToPresetChannel);
-    setView({ mode: 'editor', editingId: null, seed, seedName: suggestNameFromSlots() });
+    // The grid as it looks now, layout included.
+    setView({ mode: 'editor', editingId: null, seed, seedName: suggestNameFromSlots(), seedLayout: currentNookLayout() });
   }, []);
 
   const openEdit = useCallback((preset: MultiNookPreset) => {
@@ -184,7 +189,7 @@ const MultiNookPresets: React.FC = () => {
         >
           <div
             className="liquid-glass-panel overflow-hidden"
-            style={{ backgroundColor: 'rgba(16, 16, 20, 0.92)' }}
+            style={{ backgroundColor: 'color-mix(in srgb, rgb(16 16 20) 92%, var(--glass-under, transparent))' }}
           >
             {view.mode === 'list' ? (
               <PresetListView
@@ -203,6 +208,7 @@ const MultiNookPresets: React.FC = () => {
                 seed={view.seed}
                 seedName={view.seedName}
                 seedIcon={view.seedIcon}
+                seedLayout={view.seedLayout}
                 onDone={() => setView({ mode: 'list' })}
               />
             )}
@@ -371,8 +377,10 @@ const PresetRow: React.FC<{
               </div>
             ) : (
               stack.map((ch, i) => (
-                <img
+                <SevenTvAvatar
                   key={ch.channelLogin + i}
+                  cosmeticsId={slotSevenTvId(ch)}
+                  px={28}
                   src={ch.profileImageUrl || DEFAULT_AVATAR}
                   alt=""
                   onError={(e) => {
@@ -496,8 +504,9 @@ const PresetEditorView: React.FC<{
   seed: MultiNookPresetChannel[];
   seedName: string;
   seedIcon?: MultiNookPresetIcon;
+  seedLayout?: MultiNookLayout;
   onDone: () => void;
-}> = ({ editingId, seed, seedName, seedIcon, onDone }) => {
+}> = ({ editingId, seed, seedName, seedIcon, seedLayout, onDone }) => {
   const { createPreset, updatePreset } = useMultiNookPresetsStore();
 
   const [name, setName] = useState(seedName);
@@ -611,7 +620,7 @@ const PresetEditorView: React.FC<{
       // null clears any removed icon; an object sets it.
       await updatePreset(editingId, { name, channels, icon: icon ?? null });
     } else {
-      await createPreset(name, channels, icon);
+      await createPreset(name, channels, icon, seedLayout);
     }
     setSaving(false);
     onDone();
@@ -802,7 +811,10 @@ const PresetEditorView: React.FC<{
                 key={makeKey(ch.provider ?? 'twitch', ch.channelLogin)}
                 className="group flex items-center gap-2.5 rounded-lg px-1.5 py-1.5 hover:bg-white/[0.05] transition-colors"
               >
-                <img
+                <SevenTvAvatar
+                  cosmeticsId={slotSevenTvId(ch)}
+                  px={28}
+                  motion="hover"
                   src={ch.profileImageUrl || DEFAULT_AVATAR}
                   alt=""
                   onError={(e) => {

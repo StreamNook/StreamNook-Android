@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '../../stores/AppStore';
 import { themes, themeCategories, getThemeById, applyTheme, customThemeToTheme, getThemeByIdWithCustom, applyGlassStrength, DEFAULT_GLASS_TRANSPARENCY, DEFAULT_GLASS_BLUR, applyFont, FONT_OPTIONS, DEFAULT_FONT_ID, CUSTOM_FONT_ID, SUGGESTED_FONTS, customFontStack, sanitizeFontFamily, loadSuggestionPreviews, Theme, OLED_THEME_ID, DEFAULT_OLED_ACCENT, OLED_ACCENT_PRESETS, getOledTheme } from '../../themes';
+import { ResetArrow, SettingsRow, SettingsSection } from './_primitives';
+import { thenRun, useSettingReset } from './settingReset';
+import { GroupFooter } from '../../mobile/ui/GroupedList';
 import { Check, Palette, Sparkles, Moon, Leaf, Code, Star, Plus, Edit2, PaintBucket, Droplets, Type } from 'lucide-react';
 import { Tooltip } from '../ui/Tooltip';
 import { Toggle } from '../ui/Toggle';
-import { IS_LINUX } from '../../utils/platform';
+import { IS_LINUX, IS_MOBILE } from '../../utils/platform';
 import ThemeCreator from './ThemeCreator';
 import ThemeColorPicker from '../ThemeColorPicker';
 import type { CustomTheme } from '../../types';
@@ -125,6 +128,7 @@ const ThemeCard = ({ theme, isSelected, onSelect, isCustom, onEdit }: ThemeCardP
 
             {/* Custom Badge */}
             {isCustom && (
+                /* glass-exempt: a label on the theme's own preview swatch. */
                 <div className="absolute bottom-2 right-2 px-1.5 py-0.5 rounded text-[10px] font-medium bg-accent/20 text-accent">
                     Custom
                 </div>
@@ -143,6 +147,7 @@ const ThemeCard = ({ theme, isSelected, onSelect, isCustom, onEdit }: ThemeCardP
 
 const ThemeSettings = () => {
     const { settings, updateSettings } = useAppStore();
+    const resetFor = useSettingReset();
     const currentThemeId = settings.theme || 'winters-glass';
     const customThemes = settings.custom_themes || [];
     
@@ -336,10 +341,204 @@ const ThemeSettings = () => {
         setEditingTheme(undefined);
     };
 
+    // Each reset goes through the same apply path as its control, so the
+    // window repaints at once rather than on the next launch.
+    const resetTheme = thenRun(resetFor(['theme', 'winters-glass']), (n) => {
+        const theme = getThemeByIdWithCustom(n.theme || 'winters-glass', n.custom_themes || []);
+        if (theme) applyTheme(theme);
+    });
+    const resetGlass = thenRun(resetFor(['glass_transparency', DEFAULT_GLASS_TRANSPARENCY]), (n) =>
+        applyGlassStrength(n.glass_transparency ?? DEFAULT_GLASS_TRANSPARENCY),
+    );
+    const resetBlur = resetFor(['glass_blur', DEFAULT_GLASS_BLUR]);
+    // These two reset through their own handlers, which also settle a pending
+    // debounced write, so only whether to show the arrow comes from the hook.
+    const fontChanged = !!resetFor(['font', DEFAULT_FONT_ID]);
+    const oledAccentChanged = !!resetFor(['oled_accent', DEFAULT_OLED_ACCENT]);
+
     const handleEditTheme = (theme: CustomTheme) => {
         setEditingTheme(theme);
         setIsCreating(true);
     };
+
+    // The controls both layouts draw: the desktop in its own cards, the phone
+    // inside its grouped rows.
+    const glassSlider = (
+        <>
+            <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={liveGlass}
+                onChange={(e) => handleGlassInput(parseInt(e.target.value, 10))}
+                onPointerUp={(e) => commitGlass(parseInt(e.currentTarget.value, 10))}
+                onKeyUp={(e) => commitGlass(parseInt(e.currentTarget.value, 10))}
+                className="w-full accent-accent cursor-pointer"
+            />
+            <div className="flex items-center justify-between text-[10px] text-textMuted">
+                <span>Solid</span>
+                <span>Frosted glass</span>
+            </div>
+        </>
+    );
+
+    const fontPicker = (
+        <>
+            <div className="grid grid-cols-2 gap-2">
+                {FONT_OPTIONS.map((font) => {
+                    const isSelected = currentFontId === font.id;
+                    return (
+                        <Tooltip key={font.id} content={font.description} side="top">
+                            <button
+                                onClick={() => handleFontChange(font.id)}
+                                // translateZ(0) lifts the tile onto its own compositor
+                                // layer so the dialog's heavy liquid-glass backdrop-filter
+                                // (blur 96px) + scale-in don't rasterize/soften the in-font
+                                // name. Same crispness workaround the profile avatar uses.
+                                style={{ transform: 'translateZ(0)' }}
+                                className={`flex items-center justify-between gap-2 w-full px-3 py-2 rounded-lg border transition-colors duration-200 text-left ${
+                                    isSelected
+                                        ? 'border-accent bg-accent/10'
+                                        : 'border-borderSubtle hover:border-borderLight'
+                                }`}
+                            >
+                                {/* Name rendered in its own face at weight 400 (each
+                                    font's true regular): the label is the preview. */}
+                                <span
+                                    className="text-[15px] leading-tight text-textPrimary truncate"
+                                    style={{ fontFamily: font.stack, fontWeight: 400 }}
+                                >
+                                    {font.label}
+                                </span>
+                                {isSelected && (
+                                    <Check size={14} className="text-accent flex-shrink-0" strokeWidth={3} />
+                                )}
+                            </button>
+                        </Tooltip>
+                    );
+                })}
+                {/* Custom: same tile language as the presets: once a name
+                    is typed, the tile label IS the preview, in that face. */}
+                <Tooltip content="Type any font name. Free fonts load automatically, and fonts installed on this PC work too." side="top">
+                    <button
+                        onClick={() => handleFontChange(CUSTOM_FONT_ID)}
+                        style={{ transform: 'translateZ(0)' }}
+                        className={`flex items-center justify-between gap-2 w-full px-3 py-2 rounded-lg border transition-colors duration-200 text-left ${
+                            isCustomFont
+                                ? 'border-accent bg-accent/10'
+                                : 'border-borderSubtle hover:border-borderLight'
+                        }`}
+                    >
+                        <span
+                            className="text-[15px] leading-tight text-textPrimary truncate"
+                            style={{
+                                fontFamily: isCustomFont && customFontDraft ? customFontStack(customFontDraft) : undefined,
+                                fontWeight: 400,
+                            }}
+                        >
+                            {isCustomFont && customFontDraft ? customFontDraft : 'Custom'}
+                        </span>
+                        {isCustomFont && (
+                            <Check size={14} className="text-accent flex-shrink-0" strokeWidth={3} />
+                        )}
+                    </button>
+                </Tooltip>
+            </div>
+            {isCustomFont && (
+                <div className="space-y-2.5 pt-0.5">
+                    <div>
+                        <label className="text-xs text-textMuted mb-1 block">Font name</label>
+                        <input
+                            value={customFontDraft}
+                            onChange={(e) => handleCustomFontChange(e.target.value)}
+                            placeholder="e.g. Poppins"
+                            aria-label="Custom font name"
+                            spellCheck={false}
+                            autoComplete="off"
+                            style={{ fontFamily: customFontDraft ? customFontStack(customFontDraft) : undefined }}
+                            className="w-full min-w-0 rounded-lg bg-glass border border-borderSubtle px-3 py-2 text-sm text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/60 transition-colors duration-200"
+                        />
+                    </div>
+                    {/* Quick fills. Borderless so they read as a list of
+                        names, not a row of buttons; each is drawn in its
+                        own face (all eight preload in one request). */}
+                    <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
+                        {SUGGESTED_FONTS.map((name) => (
+                            <button
+                                key={name}
+                                onClick={() => handleCustomFontChange(name)}
+                                style={{ fontFamily: customFontStack(name), transform: 'translateZ(0)' }}
+                                className={`px-2 py-1 rounded-md text-[13px] leading-tight text-left truncate transition-colors duration-200 hover:bg-white/5 ${
+                                    customFontDraft === name ? 'text-accent' : 'text-textSecondary'
+                                }`}
+                            >
+                                {name}
+                            </button>
+                        ))}
+                    </div>
+                    <p className="text-xs text-textMuted leading-relaxed">
+                        Any free font from fonts.google.com works, just type its exact name. Fonts installed on this PC work too, with no download.
+                    </p>
+                </div>
+            )}
+        </>
+    );
+
+    const oledPicker = (
+        <>
+            <div className="flex flex-wrap gap-2">
+                {OLED_ACCENT_PRESETS.map((preset) => {
+                    const isSel = liveOledAccent.toLowerCase() === preset.value.toLowerCase();
+                    return (
+                        <Tooltip key={preset.value} content={preset.name} side="top">
+                            <button
+                                onClick={() => handleOledAccentChange(preset.value)}
+                                className={`w-7 h-7 rounded-full border transition-transform hover:scale-110 ${
+                                    isSel ? 'border-textPrimary' : 'border-borderSubtle'
+                                }`}
+                                style={{ backgroundColor: preset.value }}
+                            />
+                        </Tooltip>
+                    );
+                })}
+            </div>
+            <ThemeColorPicker
+                label="Custom color"
+                color={{ value: liveOledAccent, opacity: 100 }}
+                showOpacity={false}
+                onChange={(c) => handleOledAccentChange(c.value)}
+            />
+        </>
+    );
+
+    const customThemeCards = customThemes.map((customTheme) => {
+        const runtimeTheme = customThemeToTheme(customTheme);
+        return (
+            <ThemeCard
+                key={customTheme.id}
+                theme={runtimeTheme}
+                isSelected={currentThemeId === customTheme.id}
+                onSelect={() => handleThemeChange(customTheme.id)}
+                isCustom={true}
+                onEdit={() => handleEditTheme(customTheme)}
+            />
+        );
+    });
+
+    const themeCardsFor = (list: Theme[]) =>
+        list.map((theme) => {
+            // Preview the OLED card in its chosen accent.
+            const display = theme.id === OLED_THEME_ID ? getOledTheme(liveOledAccent) : theme;
+            return (
+                <ThemeCard
+                    key={theme.id}
+                    theme={display}
+                    isSelected={currentThemeId === theme.id}
+                    onSelect={() => handleThemeChange(theme.id)}
+                />
+            );
+        });
 
     // Show creator view
     if (isCreating) {
@@ -356,13 +555,87 @@ const ThemeSettings = () => {
         );
     }
 
+    // The phone's page, in the settings pages' grouped style: the four settings
+    // as rows on one card under the section the settings catalog names, then
+    // each family of themes on its own card, two to a line so a name and its
+    // swatches stay readable at phone width.
+    if (IS_MOBILE) {
+        return (
+            <div className="space-y-6">
+                <SettingsSection label="Theme">
+                    <SettingsRow
+                        title="Theme"
+                        description={currentTheme?.name}
+                        onReset={resetTheme}
+                        control={
+                            <button
+                                onClick={() => setIsCreating(true)}
+                                className="flex items-center gap-1.5 px-3 py-1.5 glass-button text-[13px] font-medium"
+                            >
+                                <Plus size={14} />
+                                Create Theme
+                            </button>
+                        }
+                    />
+                    <SettingsRow
+                        title="Glassiness"
+                        description="How see-through and frosted every surface is, for every theme."
+                        help="100% is the signature glass; 0% removes all transparency and blur for a completely flat, solid look."
+                        onReset={resetGlass}
+                        control={<span className="text-[13px] text-textMuted font-mono">{liveGlass}%</span>}
+                    >
+                        {/* Held to the width a settings slider is capped at, so
+                            Solid and Frosted glass sit under its two ends. */}
+                        <div className="space-y-1.5 max-w-[15rem]">{glassSlider}</div>
+                    </SettingsRow>
+                    <SettingsRow
+                        title="Font"
+                        onReset={fontChanged ? () => handleFontChange(DEFAULT_FONT_ID) : undefined}
+                    >
+                        <div className="space-y-3">{fontPicker}</div>
+                    </SettingsRow>
+                    {currentThemeId === OLED_THEME_ID && (
+                        <SettingsRow
+                            title="OLED accent"
+                            description="The glow color on pure black"
+                            onReset={oledAccentChanged ? () => handleOledAccentChange(DEFAULT_OLED_ACCENT) : undefined}
+                        >
+                            <div className="space-y-3">{oledPicker}</div>
+                        </SettingsRow>
+                    )}
+                </SettingsSection>
+
+                {customThemes.length > 0 && (
+                    <SettingsSection label="Your Themes" description="Your own creations">
+                        <div className="grid grid-cols-2 gap-2.5 py-4">{customThemeCards}</div>
+                    </SettingsSection>
+                )}
+
+                {themeCategories.map((category) => {
+                    const categoryThemes = themes.filter((t) => t.category === category.id);
+                    if (categoryThemes.length === 0) return null;
+                    return (
+                        <SettingsSection key={category.id} label={category.name} description={category.description}>
+                            <div className="grid grid-cols-2 gap-2.5 py-4">{themeCardsFor(categoryThemes)}</div>
+                        </SettingsSection>
+                    );
+                })}
+
+                <GroupFooter className="px-4">Create a custom theme to match your setup exactly.</GroupFooter>
+            </div>
+        );
+    }
+
     return (
         <div className="space-y-5">
             {/* Header Row */}
             <div className="flex items-center justify-between gap-4">
                 <div className="flex items-center gap-2">
                     <Palette size={18} className="text-accent" />
-                    <h3 className="text-base font-semibold text-textPrimary">Theme</h3>
+                    <h3 className="text-base font-semibold text-textPrimary">
+                        Theme
+                        {resetTheme && <ResetArrow onReset={resetTheme} />}
+                    </h3>
                 </div>
                 <div className="flex items-center gap-3">
                     {currentTheme && (
@@ -390,25 +663,14 @@ const ThemeSettings = () => {
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
                         <Droplets size={16} className="text-accent" />
-                        <h4 className="text-sm font-semibold text-textPrimary">Glassiness</h4>
+                        <h4 className="text-sm font-semibold text-textPrimary">
+                            Glassiness
+                            {resetGlass && <ResetArrow onReset={resetGlass} />}
+                        </h4>
                     </div>
                     <span className="text-xs text-textMuted font-mono">{liveGlass}%</span>
                 </div>
-                <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    step="1"
-                    value={liveGlass}
-                    onChange={(e) => handleGlassInput(parseInt(e.target.value, 10))}
-                    onPointerUp={(e) => commitGlass(parseInt(e.currentTarget.value, 10))}
-                    onKeyUp={(e) => commitGlass(parseInt(e.currentTarget.value, 10))}
-                    className="w-full accent-accent cursor-pointer"
-                />
-                <div className="flex items-center justify-between text-[10px] text-textMuted">
-                    <span>Solid</span>
-                    <span>Frosted glass</span>
-                </div>
+                {glassSlider}
                 <p className="text-xs text-textMuted">
                     How see-through and frosted every surface is, for every theme. 100% is the signature glass; 0% removes all transparency and blur for a completely flat, solid look.
                 </p>
@@ -417,7 +679,10 @@ const ThemeSettings = () => {
                 {IS_LINUX && (
                     <div className="flex items-center justify-between gap-3 pt-1">
                         <div className="min-w-0">
-                            <p className="text-sm text-textPrimary">Blur behind glass</p>
+                            <p className="text-sm text-textPrimary">
+                                Blur behind glass
+                                {resetBlur && <ResetArrow onReset={resetBlur} />}
+                            </p>
                             <p className="text-xs text-textMuted">
                                 Frosts whatever shows through your glass. Turn it off if the app feels slow.
                             </p>
@@ -438,105 +703,12 @@ const ThemeSettings = () => {
             <div id="settings-section-font" className="settings-card p-4 space-y-3">
                 <div className="flex items-center gap-2">
                     <Type size={16} className="text-accent" />
-                    <h4 className="text-sm font-semibold text-textPrimary">Font</h4>
+                    <h4 className="text-sm font-semibold text-textPrimary">
+                        Font
+                        {fontChanged && <ResetArrow onReset={() => handleFontChange(DEFAULT_FONT_ID)} />}
+                    </h4>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
-                    {FONT_OPTIONS.map((font) => {
-                        const isSelected = currentFontId === font.id;
-                        return (
-                            <Tooltip key={font.id} content={font.description} side="top">
-                                <button
-                                    onClick={() => handleFontChange(font.id)}
-                                    // translateZ(0) lifts the tile onto its own compositor
-                                    // layer so the dialog's heavy liquid-glass backdrop-filter
-                                    // (blur 96px) + scale-in don't rasterize/soften the in-font
-                                    // name. Same crispness workaround the profile avatar uses.
-                                    style={{ transform: 'translateZ(0)' }}
-                                    className={`flex items-center justify-between gap-2 w-full px-3 py-2 rounded-lg border transition-colors duration-200 text-left ${
-                                        isSelected
-                                            ? 'border-accent bg-accent/10'
-                                            : 'border-borderSubtle hover:border-borderLight'
-                                    }`}
-                                >
-                                    {/* Name rendered in its own face at weight 400 (each
-                                        font's true regular) — the label is the preview. */}
-                                    <span
-                                        className="text-[15px] leading-tight text-textPrimary truncate"
-                                        style={{ fontFamily: font.stack, fontWeight: 400 }}
-                                    >
-                                        {font.label}
-                                    </span>
-                                    {isSelected && (
-                                        <Check size={14} className="text-accent flex-shrink-0" strokeWidth={3} />
-                                    )}
-                                </button>
-                            </Tooltip>
-                        );
-                    })}
-                    {/* Custom — same tile language as the presets: once a name
-                        is typed, the tile label IS the preview, in that face. */}
-                    <Tooltip content="Type any font name. Free fonts load automatically, and fonts installed on this PC work too." side="top">
-                        <button
-                            onClick={() => handleFontChange(CUSTOM_FONT_ID)}
-                            style={{ transform: 'translateZ(0)' }}
-                            className={`flex items-center justify-between gap-2 w-full px-3 py-2 rounded-lg border transition-colors duration-200 text-left ${
-                                isCustomFont
-                                    ? 'border-accent bg-accent/10'
-                                    : 'border-borderSubtle hover:border-borderLight'
-                            }`}
-                        >
-                            <span
-                                className="text-[15px] leading-tight text-textPrimary truncate"
-                                style={{
-                                    fontFamily: isCustomFont && customFontDraft ? customFontStack(customFontDraft) : undefined,
-                                    fontWeight: 400,
-                                }}
-                            >
-                                {isCustomFont && customFontDraft ? customFontDraft : 'Custom'}
-                            </span>
-                            {isCustomFont && (
-                                <Check size={14} className="text-accent flex-shrink-0" strokeWidth={3} />
-                            )}
-                        </button>
-                    </Tooltip>
-                </div>
-                {isCustomFont && (
-                    <div className="space-y-2.5 pt-0.5">
-                        <div>
-                            <label className="text-xs text-textMuted mb-1 block">Font name</label>
-                            <input
-                                value={customFontDraft}
-                                onChange={(e) => handleCustomFontChange(e.target.value)}
-                                placeholder="e.g. Poppins"
-                                aria-label="Custom font name"
-                                spellCheck={false}
-                                autoComplete="off"
-                                style={{ fontFamily: customFontDraft ? customFontStack(customFontDraft) : undefined }}
-                                className="w-full min-w-0 rounded-lg bg-glass border border-borderSubtle px-3 py-2 text-sm text-textPrimary placeholder:text-textMuted focus:outline-none focus:border-accent/60 transition-colors duration-200"
-                            />
-                        </div>
-                        {/* Quick fills. Borderless so they read as a list of
-                            names, not a row of buttons; each is drawn in its
-                            own face (all eight preload in one request). */}
-                        <div className="grid grid-cols-2 gap-x-2 gap-y-0.5">
-                            {SUGGESTED_FONTS.map((name) => (
-                                <button
-                                    key={name}
-                                    onClick={() => handleCustomFontChange(name)}
-                                    style={{ fontFamily: customFontStack(name), transform: 'translateZ(0)' }}
-                                    className={`px-2 py-1 rounded-md text-[13px] leading-tight text-left truncate transition-colors duration-200 hover:bg-white/5 ${
-                                        customFontDraft === name ? 'text-accent' : 'text-textSecondary'
-                                    }`}
-                                >
-                                    {name}
-                                </button>
-                            ))}
-                        </div>
-                        <p className="text-xs text-textMuted leading-relaxed">
-                            Any free font from fonts.google.com works, just type its exact name. Fonts installed on this PC work too, with no download.
-                        </p>
-                    </div>
-                )}
+                {fontPicker}
             </div>
 
             {/* Custom Themes Section */}
@@ -549,19 +721,7 @@ const ThemeSettings = () => {
                     </div>
 
                     <div className="grid grid-cols-3 gap-3">
-                        {customThemes.map((customTheme) => {
-                            const runtimeTheme = customThemeToTheme(customTheme);
-                            return (
-                                <ThemeCard
-                                    key={customTheme.id}
-                                    theme={runtimeTheme}
-                                    isSelected={currentThemeId === customTheme.id}
-                                    onSelect={() => handleThemeChange(customTheme.id)}
-                                    isCustom={true}
-                                    onEdit={() => handleEditTheme(customTheme)}
-                                />
-                            );
-                        })}
+                        {customThemeCards}
                     </div>
                 </div>
             )}
@@ -580,52 +740,25 @@ const ThemeSettings = () => {
                         </div>
 
                         <div className="grid grid-cols-3 gap-3">
-                            {categoryThemes.map((theme) => {
-                                // Preview the OLED card in its chosen accent.
-                                const display = theme.id === OLED_THEME_ID ? getOledTheme(liveOledAccent) : theme;
-                                return (
-                                    <ThemeCard
-                                        key={theme.id}
-                                        theme={display}
-                                        isSelected={currentThemeId === theme.id}
-                                        onSelect={() => handleThemeChange(theme.id)}
-                                    />
-                                );
-                            })}
+                            {themeCardsFor(categoryThemes)}
                         </div>
 
-                        {/* OLED accent chooser — shown only while OLED is the
+                        {/* OLED accent chooser, shown only while OLED is the
                             active theme. Preset swatches for one-click colors,
                             plus a full spectrum picker for any color. */}
                         {category.id === 'signature' && currentThemeId === OLED_THEME_ID && (
                             <div className="settings-card p-4 space-y-3">
                                 <div className="flex items-center gap-2">
                                     <Droplets size={16} className="text-accent" />
-                                    <h4 className="text-sm font-semibold text-textPrimary">OLED accent</h4>
+                                    <h4 className="text-sm font-semibold text-textPrimary">
+                                        OLED accent
+                                        {oledAccentChanged && (
+                                            <ResetArrow onReset={() => handleOledAccentChange(DEFAULT_OLED_ACCENT)} />
+                                        )}
+                                    </h4>
                                     <span className="text-xs text-textMuted">The glow color on pure black</span>
                                 </div>
-                                <div className="flex flex-wrap gap-2">
-                                    {OLED_ACCENT_PRESETS.map((preset) => {
-                                        const isSel = liveOledAccent.toLowerCase() === preset.value.toLowerCase();
-                                        return (
-                                            <Tooltip key={preset.value} content={preset.name} side="top">
-                                                <button
-                                                    onClick={() => handleOledAccentChange(preset.value)}
-                                                    className={`w-7 h-7 rounded-full border transition-transform hover:scale-110 ${
-                                                        isSel ? 'border-textPrimary' : 'border-borderSubtle'
-                                                    }`}
-                                                    style={{ backgroundColor: preset.value }}
-                                                />
-                                            </Tooltip>
-                                        );
-                                    })}
-                                </div>
-                                <ThemeColorPicker
-                                    label="Custom color"
-                                    color={{ value: liveOledAccent, opacity: 100 }}
-                                    showOpacity={false}
-                                    onChange={(c) => handleOledAccentChange(c.value)}
-                                />
+                                {oledPicker}
                             </div>
                         )}
                     </div>

@@ -12,7 +12,7 @@
 // memoized rows and the message list bail instead of re-rendering.
 
 import { useMemo, useRef } from 'react';
-import { useChatConnectionStore, sliceLookupKey, getActiveHistoryMax } from '../stores/chatConnectionStore';
+import { useChatConnectionStore, sliceLookupKey, getActiveHistoryMax, useSliceViewers } from '../stores/chatConnectionStore';
 import { mergedFeedLimit } from '../stores/chatBufferTrim';
 import { parseKey } from '../utils/providerKey';
 import { sourceKeyOf, sourceProviderOf, type ChatSource } from '../utils/sendToSource';
@@ -66,6 +66,8 @@ export function useBlendedChatSource<T extends ChatSource>(
       return sum + (s.revisionByChannel[sliceLookupKey(sourceProviderOf(c), c.channel)] ?? 0);
     }, 0),
   );
+  // Every source is on screen in the merged feed: none is held back.
+  useSliceViewers(channels.map((c) => sliceLookupKey(sourceProviderOf(c), c.channel)));
 
   // Incremental, append-only merge. The feed is ordered by FIRST-seen arrival and
   // only ever grows at the bottom (YouTube is polled, so a send-time sort would slot
@@ -198,8 +200,10 @@ export function useBlendedChatSource<T extends ChatSource>(
       for (let r = 0; r < order.length; r++) {
         if (idToMsg.has(order[r])) order[w++] = order[r];
       }
+      // Held ids outside the order (an absorbed backlog, rows the cap below cut
+      // earlier) leave without changing what renders.
+      if (w !== order.length) structuralChange = true;
       order.length = w;
-      structuralChange = true;
     }
 
     // Append newcomers as one send-time-ordered batch (Array.sort is stable, so
@@ -240,7 +244,12 @@ export function useBlendedChatSource<T extends ChatSource>(
     const cap = base + resume.overflow;
     if (order.length > cap) {
       const drop = order.length - cap;
-      for (let i = 0; i < drop; i++) forget(order[i]);
+      // A cut row leaves the order but stays held (already seen) until no slice
+      // has it; the removal pass above forgets it then. A slice can hold more
+      // than this cap: the event rows its trim rescues, a buffer setting above
+      // the ceiling, five or more sources. Forgetting a cut row made it a
+      // newcomer on the next tick, appended at the bottom again, and the row it
+      // pushed out came back the tick after: chat re-showing what it had shown.
       order.splice(0, drop);
       evictedRef.current += drop;
       structuralChange = true;

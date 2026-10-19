@@ -82,6 +82,95 @@ mod badge_order_tests {
     }
 }
 
+/// Twitch badge SET ids grouped into the categories a streamer can hide from
+/// the OBS overlay, by category id. A set listed here belongs to exactly one
+/// category. The overlay renderer carries the same table in
+/// `src/components/overlay/overlayConfig.ts` (`TWITCH_BADGE_CATEGORIES`),
+/// because the hosted overlay page runs without this backend; a vitest gate
+/// reads this table and fails when the two differ, so edit both together.
+pub const TWITCH_BADGE_CATEGORY_SETS: &[(&str, &[&str])] = &[
+    ("subscriber", &["subscriber", "founder"]),
+    ("predictions", &["predictions"]),
+    ("gifted-subs", &["sub-gifter", "sub-gift-leader"]),
+    ("bits", &["bits", "bits-leader", "bits-charity", "anonymous-cheerer"]),
+    ("blossom", &["blossom-badge"]),
+    ("bloom", &["bloom-badge"]),
+    ("roles", &["lead_moderator", "moderator", "vip"]),
+];
+
+/// The catch-all category: every other Twitch set (Prime, Turbo, event and
+/// game badges, hype train, clips leader, and the rest).
+pub const TWITCH_BADGE_CATEGORY_OTHER: &str = "other";
+
+/// Sets that never fall in a category, so no category switch can hide them:
+/// the channel owner and Twitch's own staff. They follow only the overlay's
+/// Badges switch.
+const TWITCH_BADGE_SETS_NEVER_CATEGORISED: &[&str] = &["broadcaster", "staff", "admin", "global_mod"];
+
+/// The hide category of one Twitch badge set id, or `None` for a set no
+/// category covers (the broadcaster and staff badges, or an empty id).
+pub fn twitch_badge_category(set_id: &str) -> Option<&'static str> {
+    if set_id.is_empty() || TWITCH_BADGE_SETS_NEVER_CATEGORISED.contains(&set_id) {
+        return None;
+    }
+    for (category, sets) in TWITCH_BADGE_CATEGORY_SETS {
+        if sets.contains(&set_id) {
+            return Some(category);
+        }
+    }
+    Some(TWITCH_BADGE_CATEGORY_OTHER)
+}
+
+#[cfg(test)]
+mod badge_category_tests {
+    use super::*;
+
+    #[test]
+    fn set_ids_map_to_their_category() {
+        let cases = [
+            ("subscriber", Some("subscriber")),
+            ("founder", Some("subscriber")),
+            ("predictions", Some("predictions")),
+            ("sub-gifter", Some("gifted-subs")),
+            ("sub-gift-leader", Some("gifted-subs")),
+            ("bits", Some("bits")),
+            ("bits-leader", Some("bits")),
+            ("bits-charity", Some("bits")),
+            ("anonymous-cheerer", Some("bits")),
+            ("blossom-badge", Some("blossom")),
+            ("bloom-badge", Some("bloom")),
+            ("lead_moderator", Some("roles")),
+            ("moderator", Some("roles")),
+            ("vip", Some("roles")),
+            ("premium", Some("other")),
+            ("turbo", Some("other")),
+            ("hype-train", Some("other")),
+            ("clips-leader", Some("other")),
+            ("glhf-pledge", Some("other")),
+            ("broadcaster", None),
+            ("staff", None),
+            ("admin", None),
+            ("global_mod", None),
+            ("", None),
+        ];
+        for (set_id, want) in cases {
+            assert_eq!(twitch_badge_category(set_id), want, "set id {set_id:?}");
+        }
+    }
+
+    #[test]
+    fn every_set_sits_in_one_category() {
+        let mut seen = std::collections::HashSet::new();
+        for (category, sets) in TWITCH_BADGE_CATEGORY_SETS {
+            assert_ne!(*category, TWITCH_BADGE_CATEGORY_OTHER);
+            for set in *sets {
+                assert!(seen.insert(*set), "{set} is listed twice");
+                assert!(!TWITCH_BADGE_SETS_NEVER_CATEGORISED.contains(set));
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EmotePos {
     pub id: String,
@@ -113,6 +202,15 @@ pub struct ReplyInfo {
     pub parent_msg_body: String,
     pub parent_user_id: String,
     pub parent_user_login: String,
+    /// The parent author's name as rows show it (`services::chatter_name`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub parent_shown_name: String,
+    /// The quoted parent tokenized the way its own row would be: with the
+    /// channel and platform it was said in. The page has only the home
+    /// channel's sets, so in combined chat it could not do this for a reply
+    /// on another platform's row. Absent on rows built before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_segments: Option<Vec<MessageSegment>>,
 }
 
 /// Pre-computed message metadata - THE ENDGAME
@@ -178,6 +276,34 @@ pub struct MessageMetadata {
     /// dim scrollback (`chat_design.backfill_opacity`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub from_backfill: bool,
+    /// The author's name as every row type shows it, before the viewer's own
+    /// nickname override (`services::chatter_name`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub shown_name: String,
+    /// The tick this row puts on the chat scrollbar, so a viewer scrolled away
+    /// can see where the pings, subs and announcements are. Stamped by the
+    /// rule engine with the rest of the highlight verdict; the page only draws.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollbar_mark: Option<ScrollbarMark>,
+    /// The row worked out for a native renderer (`services::chat_row_view`):
+    /// readable name colour, badge art, paint and the grouped body. Stamped
+    /// only while a native shell asked for it; the web renderers derive the
+    /// same things themselves and never see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<RowView>,
+}
+
+/// One row's scrollbar tick, stamped by the rule engine.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ScrollbarMark {
+    /// "mention" | "reply" | "highlight" | "announcement" | "sub" | "redeem"
+    /// | "raid" | "first_time". Pinned rows are marked by the page from the
+    /// channel's pinned-message ids, which arrive after the row does.
+    pub kind: String,
+    /// The colour the row itself is tinted with, where the user or the
+    /// message chose one. Absent means the kind's theme colour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
 }
 
 /// A matched highlight rule, stamped by the Rust rule engine.
@@ -191,6 +317,10 @@ pub struct HighlightStamp {
     pub sound_id: Option<String>,
     #[serde(default)]
     pub cooldown_ms: u64,
+    /// Keep tinted: the row holds the rule's color while on screen instead
+    /// of only flashing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
 }
 
 /// A built-in event highlight, stamped by the Rust rule engine.
@@ -299,4 +429,233 @@ pub struct ChatMessage {
     /// All message analysis done in Rust, frontend just renders
     #[serde(default)]
     pub metadata: MessageMetadata,
+}
+
+/// A chat row as a native renderer draws it, built once in Rust so the shell
+/// never re-derives colours, badge art or emote grouping.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct RowView {
+    /// The author colour after the readability pass (`chat_design.name_color_adjustment`).
+    pub name_color: String,
+    /// Badges in draw order, already filtered by the badge settings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<ViewBadge>,
+    /// The 7TV paint the author wears, when known at parse time. Later
+    /// answers arrive as a `ROW_COSMETICS` frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint: Option<PaintView>,
+    /// The body, grouped: overlays and modifiers ride their target emote.
+    #[serde(default)]
+    pub spans: Vec<ViewSpan>,
+    /// The quoted parent of a reply, grouped the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_spans: Option<Vec<ViewSpan>>,
+    /// The StreamNook Atmosphere the author's rows wear (an id in the catalog
+    /// `sn_atmospheres` serves), when known at parse time. Later answers and
+    /// changes arrive as a `ROW_MEMBER` frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atmosphere: Option<String>,
+    /// The CS2 Major Cologne look the author's rows wear instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cologne: Option<crate::services::member_theme::Cologne>,
+    /// A Shared Chat partner's row: the channel it came from (face, its own
+    /// color floored for the theme), when already known as the row is stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<crate::services::shared_chat_source::SharedSource>,
+    /// The viewer's own nickname for the author, shown in place of their
+    /// name (`chat_customization.user_overrides`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    /// Link preview cards under the body, in link order (`chat_design.link_previews`).
+    /// One still being read arrives as a `ROW_PREVIEW` frame.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previews: Vec<RowPreview>,
+}
+
+/// One link's card on a row.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct RowPreview {
+    pub url: String,
+    /// The card, or None while it is still being read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<crate::commands::link_preview::LinkPreview>,
+    /// While pending: this link's shape almost always has a card, so the shell
+    /// holds its room now.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reserve: bool,
+    /// Keep the link in the text beside its card (`chat_design.link_preview_keep_link`);
+    /// otherwise the card stands for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_link: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ViewBadge {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    /// "twitch" | "7tv" | another provider name.
+    pub provider: String,
+}
+
+/// One piece of a drawn body.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ViewSpan {
+    Text {
+        text: String,
+    },
+    /// `@name`; `color` is the named chatter's readable colour when they have
+    /// spoken in a room this app shows.
+    Mention {
+        text: String,
+        login: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<String>,
+    },
+    Link {
+        /// What the row prints (shortened per `chat_design.shorten_links`).
+        label: String,
+        url: String,
+    },
+    Emoji {
+        text: String,
+        url: String,
+    },
+    Emote {
+        #[serde(flatten)]
+        emote: ViewEmote,
+        /// Zero-width emotes stacked over this one, bottom first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        overlays: Vec<ViewEmote>,
+        /// Effect bits the attached modifiers lend the group (the modifier
+        /// table in `emote_service`, routing bits removed).
+        #[serde(default, skip_serializing_if = "is_zero")]
+        effects: u32,
+    },
+    Cheer {
+        text: String,
+        bits: u32,
+        color: String,
+        url: String,
+    },
+    Gif {
+        text: String,
+        url: String,
+    },
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ViewEmote {
+    pub code: String,
+    pub url: String,
+    /// The emote's size at 1x in CSS pixels, when the provider says, so the
+    /// row lays out once before the image arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub personal: bool,
+    /// A modifier that draws nothing itself and only lends its effect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+/// A 7TV paint reduced to what a renderer fills a name with.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PaintView {
+    pub id: String,
+    /// "linear" | "radial" | "image" | "solid"
+    pub kind: String,
+    /// Degrees, CSS convention (0 points up), for linear paints.
+    #[serde(default)]
+    pub angle: f32,
+    #[serde(default)]
+    pub repeating: bool,
+    /// Gradient stops, `at` from 0 to 1, colours as `#rrggbbaa`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stops: Vec<PaintStop>,
+    /// The animated image of an image paint, never the `_static` still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+    /// Drop shadows, outermost last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shadows: Vec<PaintShadow>,
+    /// The paint's name, for the surfaces that show it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Every gradient and image layer, top first as CSS stacks them, for
+    /// renderers that draw the whole paint rather than its first fill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<PaintLayerView>,
+    /// The first single colour layer, drawn under the layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_color: Option<String>,
+    /// The lowest layer opacity under 1, applied to the whole name.
+    #[serde(default = "full_opacity", skip_serializing_if = "is_full_opacity")]
+    pub opacity: f32,
+}
+
+impl Default for PaintView {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: String::new(),
+            angle: 0.0,
+            repeating: false,
+            stops: Vec::new(),
+            image_url: None,
+            shadows: Vec::new(),
+            name: String::new(),
+            layers: Vec::new(),
+            base_color: None,
+            opacity: 1.0,
+        }
+    }
+}
+
+fn full_opacity() -> f32 {
+    1.0
+}
+
+fn is_full_opacity(v: &f32) -> bool {
+    *v >= 1.0
+}
+
+/// One gradient or image layer of a paint. Each spans the whole name.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PaintLayerView {
+    /// "linear" | "radial" | "image"
+    pub kind: String,
+    #[serde(default)]
+    pub angle: f32,
+    #[serde(default)]
+    pub repeating: bool,
+    /// Radial only: true for a circle, else an ellipse.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub circle: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stops: Vec<PaintStop>,
+    /// The animated image whenever the layer animates, never the `_static` still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PaintStop {
+    pub at: f32,
+    pub color: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct PaintShadow {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub color: String,
 }

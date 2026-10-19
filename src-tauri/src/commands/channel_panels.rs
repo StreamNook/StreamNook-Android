@@ -1,4 +1,4 @@
-use log::debug;
+use log::{debug, warn};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -17,30 +17,53 @@ const GQL_URL: &str = "https://gql.twitch.tv/gql";
 /// the raw Twitch token too). Sanitizing HERE rather than in the component keeps one
 /// choke point: every consumer of this command gets the cleaned string.
 ///
-/// The allowlist is deliberately narrower than ammonia's default (no images, no
-/// tables, no class/style) because a panel only ever needs text plus links.
+/// The allowlist is narrower than ammonia's default (no tables, no class/style):
+/// text formatting, headings, quotes, code, rules, links and images, which is
+/// everything the panel editor's markdown can produce.
 fn panel_sanitizer() -> &'static ammonia::Builder<'static> {
     static SANITIZER: once_cell::sync::Lazy<ammonia::Builder<'static>> =
         once_cell::sync::Lazy::new(|| {
             let mut b = ammonia::Builder::empty();
             b.tags(std::collections::HashSet::from([
-                "a", "b", "strong", "i", "em", "u", "s", "br", "p", "span", "ul", "ol", "li",
+                "a", "b", "strong", "i", "em", "u", "s", "del", "br", "p", "span", "ul", "ol",
+                "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "code", "pre", "hr",
+                "img", "center", "sub", "sup", "small",
             ]))
             .link_rel(Some("noopener noreferrer"))
-            // href only, and url_schemes below restricts it to http/https, so
-            // javascript: and data: URLs cannot survive.
-            .tag_attributes(std::collections::HashMap::from([(
-                "a",
-                std::collections::HashSet::from(["href"]),
-            )]))
-            .url_schemes(std::collections::HashSet::from(["http", "https"]));
+            // href/src only, and url_schemes below restricts them to http/https,
+            // so javascript: and data: URLs cannot survive; relative URLs would
+            // resolve against the app's own origin, so they go too.
+            .tag_attributes(std::collections::HashMap::from([
+                ("a", std::collections::HashSet::from(["href"])),
+                ("img", std::collections::HashSet::from(["src", "alt"])),
+            ]))
+            .url_schemes(std::collections::HashSet::from(["http", "https"]))
+            .url_relative(ammonia::UrlRelative::Deny);
             b
         });
     &SANITIZER
 }
 
+/// Panel descriptions are markdown that may carry inline HTML, as twitch.tv
+/// renders them. A single newline is a line break there, not a soft wrap.
+fn panel_markdown_to_html(src: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser};
+    let options = Options::ENABLE_STRIKETHROUGH;
+    let events = Parser::new_ext(src, options).map(|e| match e {
+        Event::SoftBreak => Event::HardBreak,
+        other => other,
+    });
+    let mut out = String::with_capacity(src.len() * 3 / 2);
+    html::push_html(&mut out, events);
+    out
+}
+
 fn sanitize_panel_html(raw: Option<String>) -> Option<String> {
-    raw.map(|html| panel_sanitizer().clean(&html).to_string())
+    raw.map(|src| {
+        panel_sanitizer()
+            .clean(&panel_markdown_to_html(&src))
+            .to_string()
+    })
 }
 
 #[cfg(test)]
@@ -82,6 +105,38 @@ mod panel_sanitizer_tests {
         let out = clean("5 < 6 and 7 > 2");
         assert!(!out.contains("< 6"), "raw angle bracket survived: {out}");
     }
+
+    #[test]
+    fn renders_markdown() {
+        let out = clean("# Rules\n**Be kind** and *chill*\n[Discord](https://discord.gg/x)\n- one\n- two");
+        assert!(out.contains("<h1>Rules</h1>"), "lost heading: {out}");
+        assert!(out.contains("<strong>Be kind</strong>"), "lost bold: {out}");
+        assert!(out.contains("<em>chill</em>"), "lost italic: {out}");
+        assert!(out.contains(r#"href="https://discord.gg/x""#), "lost link: {out}");
+        assert!(out.contains("<li>one</li>"), "lost list: {out}");
+        assert!(!out.contains("**"), "markdown left raw: {out}");
+    }
+
+    #[test]
+    fn single_newlines_break_lines() {
+        let out = clean("line one\nline two");
+        assert!(out.contains("<br>"), "newline lost: {out}");
+    }
+
+    #[test]
+    fn inline_html_inside_markdown_survives_the_allowlist() {
+        let out = clean("Hello <b>there</b>\n\n<center>Schedule</center>");
+        assert!(out.contains("<b>there</b>"), "lost inline html: {out}");
+        assert!(out.contains("<center>Schedule</center>"), "lost block html: {out}");
+    }
+
+    #[test]
+    fn images_keep_only_https_sources() {
+        let out = clean("![logo](https://example.com/a.png) ![x](x.png) <img src=\"javascript:alert(1)\">");
+        assert!(out.contains(r#"src="https://example.com/a.png""#), "lost https image: {out}");
+        assert!(!out.contains("x.png"), "relative src survived: {out}");
+        assert!(!out.contains("javascript"), "javascript src survived: {out}");
+    }
 }
 
 /// Create headers for GQL requests (no auth required for read operations)
@@ -109,6 +164,11 @@ fn create_gql_headers() -> HeaderMap {
 #[derive(Debug, Deserialize)]
 struct GqlPanelsResponse {
     data: Option<GqlPanelsData>,
+    /// GQL answers partially on a resolver failure: `data` still arrives with the
+    /// failed field nulled (social links vanish without a trace), so these are
+    /// logged rather than ignored.
+    #[serde(default)]
+    errors: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +178,8 @@ struct GqlPanelsData {
 
 #[derive(Debug, Deserialize)]
 struct GqlPanelsUser {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     description: Option<String>,
     panels: Option<Vec<GqlPanel>>,
@@ -194,13 +256,164 @@ pub struct ChannelPanel {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocialMediaLink {
+    /// Twitch's own key, which is just the link's domain label (`linktr`,
+    /// `steamcommunity`, `sodapoppin`), so it cannot pick a logo.
     pub name: String,
+    /// The streamer's label, with a bare platform name ("twitter", "REDDIT")
+    /// replaced by the platform's proper name.
     pub title: String,
     pub url: String,
+    /// Which logo to draw, from [`social_platform`]: a brand key, or one of the
+    /// generic kinds `merch`, `tip`, `links`, `website`.
+    #[serde(default)]
+    pub platform: String,
+    /// The link preview has a dedicated card for this URL (a Discord invite, a
+    /// YouTube channel, an X or Instagram profile, ...), so it is worth showing
+    /// as one. Links without one stay a compact logo pill.
+    #[serde(default)]
+    pub card: bool,
+}
+
+/// Brand key, proper name, the hosts that belong to it, and the bare titles
+/// streamers type for it. Hosts match exactly or as a parent domain.
+const SOCIAL_BRANDS: &[(&str, &str, &[&str], &[&str])] = &[
+    ("x", "X", &["x.com", "twitter.com"], &["twitter", "x (twitter)", "twitter / x", "twitter/x", "x/twitter"]),
+    ("instagram", "Instagram", &["instagram.com", "instagr.am"], &["ig", "insta"]),
+    ("youtube", "YouTube", &["youtube.com", "youtu.be"], &["yt"]),
+    ("tiktok", "TikTok", &["tiktok.com"], &["tik tok"]),
+    ("discord", "Discord", &["discord.gg", "discord.com", "discordapp.com"], &[]),
+    ("reddit", "Reddit", &["reddit.com", "redd.it"], &["subreddit"]),
+    ("facebook", "Facebook", &["facebook.com", "fb.com", "fb.me"], &["fb"]),
+    ("twitch", "Twitch", &["twitch.tv"], &[]),
+    ("kick", "Kick", &["kick.com"], &[]),
+    ("snapchat", "Snapchat", &["snapchat.com"], &["snap"]),
+    ("steam", "Steam", &["steamcommunity.com", "steampowered.com"], &[]),
+    ("spotify", "Spotify", &["spotify.com", "spotify.link"], &[]),
+    ("linktree", "Linktree", &["linktr.ee"], &[]),
+    ("patreon", "Patreon", &["patreon.com"], &[]),
+    ("kofi", "Ko-fi", &["ko-fi.com"], &["kofi"]),
+    ("bluesky", "Bluesky", &["bsky.app"], &["bsky"]),
+    ("threads", "Threads", &["threads.net", "threads.com"], &[]),
+    ("github", "GitHub", &["github.com"], &[]),
+];
+
+/// Tip pages and link-in-bio pages carry no brand worth showing; they get a
+/// generic icon that says what the link is for.
+const TIP_HOSTS: &[&str] = &["streamlabs.com", "streamelements.com", "tipeeestream.com"];
+const LINK_HUB_HOSTS: &[&str] = &[
+    "beacons.ai", "snipfeed.co", "carrd.co", "bio.link", "allmylinks.com", "solo.to", "lnk.bio",
+];
+
+fn host_of(url: &str) -> Option<String> {
+    let host = reqwest::Url::parse(url.trim()).ok()?.host_str()?.to_ascii_lowercase();
+    Some(host.strip_prefix("www.").map(str::to_string).unwrap_or(host))
+}
+
+fn host_matches(host: &str, domains: &[&str]) -> bool {
+    domains
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
+}
+
+/// The logo key for a social link: its brand from the URL host, else a generic
+/// kind read from the host or the streamer's title.
+fn social_platform(url: &str, title: &str) -> &'static str {
+    if let Some(host) = host_of(url) {
+        if let Some((key, ..)) = SOCIAL_BRANDS.iter().find(|(_, _, hosts, _)| host_matches(&host, hosts)) {
+            return key;
+        }
+        if host_matches(&host, TIP_HOSTS) {
+            return "tip";
+        }
+        if host_matches(&host, LINK_HUB_HOSTS) {
+            return "links";
+        }
+    }
+    let title = title.to_lowercase();
+    if ["merch", "shop", "store"].iter().any(|w| title.contains(w)) {
+        "merch"
+    } else if ["tip", "donat"].iter().any(|w| title.contains(w)) {
+        "tip"
+    } else {
+        "website"
+    }
+}
+
+/// The label to show: the streamer's own title, unless it is only the
+/// platform's name in some spelling, which becomes the proper name.
+fn social_label(title: &str, platform: &str, url: &str) -> String {
+    let trimmed = title.trim();
+    let brand = SOCIAL_BRANDS.iter().find(|(key, ..)| *key == platform);
+    if let Some((key, proper, _, aliases)) = brand {
+        let lower = trimmed.to_lowercase();
+        if lower.is_empty() || lower == *key || lower == proper.to_lowercase() || aliases.contains(&lower.as_str()) {
+            return proper.to_string();
+        }
+    }
+    if trimmed.is_empty() {
+        return host_of(url).unwrap_or_else(|| url.to_string());
+    }
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod social_link_tests {
+    use super::{social_label, social_platform};
+
+    #[test]
+    fn platform_comes_from_the_host() {
+        assert_eq!(social_platform("https://twitter.com/KaiCenat", "twitter"), "x");
+        assert_eq!(social_platform("https://x.com/loltyler1?mx=2", "twitter"), "x");
+        assert_eq!(social_platform("https://Youtube.com/CohhCarnage", "Cohh on YouTube"), "youtube");
+        assert_eq!(social_platform("https://youtube.com/@kaicenatlive?si=x", "Youtube Live"), "youtube");
+        assert_eq!(social_platform("https://www.instagram.com/kaicenat/?hl=en", "Instagram"), "instagram");
+        assert_eq!(social_platform("https://steamcommunity.com/groups/x", "on Steam"), "steam");
+        assert_eq!(social_platform("https://linktr.ee/nmplol", "All links"), "linktree");
+        assert_eq!(social_platform("https://www.discord.gg/abc", "Discord"), "discord");
+    }
+
+    #[test]
+    fn unbranded_links_get_a_kind() {
+        assert_eq!(social_platform("https://streamlabs.com/fanumtv/tip#/", "TTS"), "tip");
+        assert_eq!(social_platform("https://snipfeed.co/amouranthtoo", "The BEST Links"), "links");
+        assert_eq!(social_platform("https://sodapoppin.shop", "Merch store"), "merch");
+        assert_eq!(social_platform("https://www.cohhilition.com", "The Cohhilition Website"), "website");
+        assert_eq!(social_platform("not a url", "Donate here"), "tip");
+    }
+
+    #[test]
+    fn bare_platform_titles_become_proper_names() {
+        assert_eq!(social_label("twitter", "x", ""), "X");
+        assert_eq!(social_label("REDDIT", "reddit", ""), "Reddit");
+        assert_eq!(social_label(" youtube ", "youtube", ""), "YouTube");
+        assert_eq!(social_label("", "kofi", ""), "Ko-fi");
+    }
+
+    #[test]
+    fn profile_links_with_a_card_are_flagged() {
+        use crate::commands::link_preview::has_dedicated_card;
+        assert!(has_dedicated_card("https://www.instagram.com/kaicenat/?hl=en"));
+        assert!(has_dedicated_card("https://twitter.com/KaiCenat"));
+        assert!(has_dedicated_card("https://www.youtube.com/c/KaiCenat"));
+        assert!(has_dedicated_card("https://youtube.com/@kaicenatlive?si=auACMqFfcaTcLJXl"));
+        assert!(has_dedicated_card("https://discord.gg/kaicenat"));
+        assert!(!has_dedicated_card("https://www.reddit.com/r/xqcow/"));
+        assert!(!has_dedicated_card("https://linktr.ee/nmplol"));
+    }
+
+    #[test]
+    fn streamer_titles_are_kept() {
+        assert_eq!(social_label("Youtube Live", "youtube", ""), "Youtube Live");
+        assert_eq!(social_label("🧡 Reddit", "reddit", ""), "🧡 Reddit");
+        assert_eq!(social_label("", "website", "https://www.tarik.gg/x"), "tarik.gg");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelAboutData {
+    /// The channel owner's Twitch user id (their 7TV cosmetics id).
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub display_name: Option<String>,
     pub description: Option<String>,
     pub profile_image_url: Option<String>,
@@ -232,6 +445,7 @@ pub async fn get_channel_about_data(channel_login: String) -> Result<ChannelAbou
     let query = r#"
         query ChannelPanels($login: String!) {
             user(login: $login) {
+                id
                 displayName
                 description
                 profileImageURL(width: 300)
@@ -301,6 +515,10 @@ pub async fn get_channel_about_data(channel_login: String) -> Result<ChannelAbou
         )
     })?;
 
+    if let Some(errors) = &gql_response.errors {
+        warn!("[ChannelPanels] GQL errors for {}: {}", channel_login, errors);
+    }
+
     let user = gql_response
         .data
         .and_then(|d| d.user)
@@ -334,8 +552,17 @@ pub async fn get_channel_about_data(channel_login: String) -> Result<ChannelAbou
         .filter_map(|s| {
             let name = s.name?;
             let url = s.url?;
-            let title = s.title.unwrap_or_else(|| name.clone());
-            Some(SocialMediaLink { name, title, url })
+            let raw_title = s.title.unwrap_or_default();
+            let platform = social_platform(&url, &raw_title);
+            let title = social_label(&raw_title, platform, &url);
+            let card = crate::commands::link_preview::has_dedicated_card(&url);
+            Some(SocialMediaLink {
+                name,
+                title,
+                url,
+                platform: platform.to_string(),
+                card,
+            })
         })
         .collect();
 
@@ -357,6 +584,7 @@ pub async fn get_channel_about_data(channel_login: String) -> Result<ChannelAbou
     );
 
     Ok(ChannelAboutData {
+        user_id: user.id,
         display_name: user.display_name,
         description: user.description,
         profile_image_url: user.profile_image_url,

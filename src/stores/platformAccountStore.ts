@@ -3,10 +3,8 @@ import * as platformAccounts from '../services/platformAccountService';
 import type { PlatformId } from '../services/platformAccountService';
 import { useAppStore } from './AppStore';
 import { useFollowsStore } from './followsStore';
-import { clearLinkedAccount, recordLinkedAccount } from '../services/supabaseService';
-import { invalidateMemberAliases } from '../services/memberAliasService';
-import { setMemberAliases } from '../utils/memberIdentity';
 import { Logger } from '../utils/logger';
+import { useAccountRosterStore, type AccountRoster, type RosterAccount } from './accountRosterStore';
 
 /**
  * Connection state for the platforms that have an account you can connect.
@@ -59,6 +57,8 @@ interface PlatformAccountStore {
   tiktok: PlatformAccountState;
   /** Re-read connection state from the backend for every platform. */
   refresh: () => Promise<void>;
+  /** Apply a roster Rust pushed on `account-roster-changed`. */
+  applyRoster: (roster: AccountRoster) => void;
   /** The one connect action for a platform. */
   connect: (provider: PlatformId) => Promise<void>;
   disconnect: (provider: PlatformId) => Promise<void>;
@@ -112,138 +112,73 @@ export const usePlatformAccountStore = create<PlatformAccountStore>((set, get) =
     }, STEP_CLEAR_MS);
   };
 
-  /**
-   * What we last told the backend about each platform. `null` means "nothing
-   * reported yet", which is also what a report that could not be sent falls
-   * back to, so the next read retries it.
-   */
-  const reported: Record<PlatformId, string | null> = { kick: null, youtube: null, tiktok: null };
+  // Telling StreamNook's account database which Kick and YouTube accounts are
+  // connected (so member cosmetics follow into those chats) is Rust's, on every
+  // roster it builds (services/linked_accounts.rs).
 
-  /**
-   * When a claim lost to somebody else's, the earliest we may ask again.
-   *
-   * The server protects a fresh claim for a short cooldown so two clients cannot
-   * trade an account back and forth. Without this, losing once would mark the
-   * claim as reported and it would never be retried until the app restarted —
-   * which is the real owner of an account being unable to take it back.
-   */
-  const retryNotBefore: Record<PlatformId, number> = { kick: 0, youtube: 0, tiktok: 0 };
-
-  /** Default wait when the server did not say how long, matching its cooldown. */
-  const CONFLICT_RETRY_MINUTES = 15;
-
-  /** Wait before retrying a claim that never reached the server. */
-  const UNREACHABLE_RETRY_MINUTES = 5;
-
-  /**
-   * Tell the account database that a platform was connected or disconnected.
-   *
-   * Reports CHANGES, never a heartbeat. `refreshOne` runs on every window focus
-   * and on the five-minute session check, and "still connected" is not news; the
-   * row's own `last_seen` moves whenever something real happens.
-   *
-   * Connecting Kick while signed out of Twitch records nothing, because the
-   * record is keyed on the Twitch identity. Leaving `reported` unset in that
-   * case means the next refresh tries again, so signing into Twitch afterwards
-   * backfills it with no extra wiring.
-   */
-  const report = (provider: PlatformId, connected: boolean, state: PlatformAccountState) => {
-    // TikTok's sign-in unlocks age-restricted LIVEs and claims nothing about who
-    // you are in its chat, so there is no linked account to record for it.
-    if (provider === 'tiktok') return;
-    // The account id is part of what we report, so a brand-channel switch has to
-    // count as news even though "connected" did not change.
-    const key = connected ? `on:${state.id ?? ''}` : 'off';
-    if (reported[provider] === key) return;
-    // A connected report that has LOST its id must never overwrite one we already
-    // sent. The id resolves lazily, and an account with no channel never has one,
-    // while this runs on every window focus and on a 30-second backstop. Treating
-    // an absent id as a change would release and re-take the claim twice a minute.
-    // Only an explicit disconnect releases it.
-    if (connected && !state.id && reported[provider]?.startsWith('on:')) return;
-    // Lost a claim recently: wait out the server's cooldown rather than asking
-    // on every focus and backstop tick, which it would only refuse again.
-    if (Date.now() < retryNotBefore[provider]) return;
-    const twitchUserId = useAppStore.getState().currentUser?.user_id;
-    if (!twitchUserId) return;
-    reported[provider] = key;
-    void (connected
-      ? recordLinkedAccount(twitchUserId, provider, state.name, state.avatarUrl, state.id)
-      : clearLinkedAccount(twitchUserId, provider)
-    ).then((result) => {
-      if (result.kind === 'conflict') {
-        // Somebody else claimed this account moments ago. Forget that we
-        // reported, so the next refresh after the cooldown takes it back.
-        reported[provider] = null;
-        const minutes = result.retryAfterMinutes ?? CONFLICT_RETRY_MINUTES;
-        retryNotBefore[provider] = Date.now() + minutes * 60_000;
-        Logger.info(`[platform] ${provider} claim is held by someone else; retrying in ${minutes} min`);
-        return;
-      }
-      if (result.kind === 'unavailable' || result.kind === 'failed') {
-        // Nothing was recorded — we were offline, the endpoint was not there
-        // yet, or the server failed. Marking it reported would mean it is never
-        // tried again until the app restarts, so forget it and let a refresh
-        // after a short wait try once more. Short enough to heal a blip, long
-        // enough that a missing endpoint is not asked every focus.
-        reported[provider] = null;
-        retryNotBefore[provider] = Date.now() + UNREACHABLE_RETRY_MINUTES * 60_000;
-        return;
-      }
-      // OUR OWN claim just moved, so every cached answer about it is stale —
-      // including the "nobody" that would have been cached for our own account
-      // before we connected it. Clearing both sides is what makes the badge
-      // appear on our own messages now rather than after a restart.
-      setMemberAliases(new Map());
-      void invalidateMemberAliases();
+  /** Take one platform's row from the roster Rust built. */
+  const applyRow = (provider: PlatformId, row: RosterAccount | undefined) => {
+    if (!row) return;
+    const connected = row.status === 'connected';
+    if (!connected) {
+      const wasConnected = get()[provider].connected;
+      patch(provider, { connected, name: null, avatarUrl: null, id: null, handle: null });
+      // Deliberately NOT clearProvider here. A session dying mid-run must not
+      // blank the sidebar: Kick liveness never needed the login (the sweep
+      // runs on an app token) and the follow list survives backend-side for
+      // both platforms. Re-reading it keeps the view honest either way — an
+      // explicit disconnect purged it backend-side, so hydrate empties the
+      // list then; a mere token death leaves it intact and live. The
+      // user-facing "your session expired" signal is the dedicated
+      // platform-session-expired event, not a vanished sidebar.
+      if (wasConnected) void useFollowsStore.getState().hydrate();
+      return;
+    }
+    patch(provider, {
+      connected,
+      name: row.name,
+      avatarUrl: row.avatar_url,
+      id: row.account_id,
+      handle: row.handle,
     });
   };
 
-  const refreshOne = async (provider: PlatformId) => {
-    try {
-      const connected = await platformAccounts.isConnected(provider);
-      if (!connected) {
-        const wasConnected = get()[provider].connected;
-        patch(provider, { connected, name: null, avatarUrl: null, id: null, handle: null });
-        // Deliberately NOT clearProvider here. A session dying mid-run must not
-        // blank the sidebar: Kick liveness never needed the login (the sweep
-        // runs on an app token) and the follow list survives backend-side for
-        // both platforms. Re-reading it keeps the view honest either way — an
-        // explicit disconnect purged it backend-side, so hydrate empties the
-        // list then; a mere token death leaves it intact and live. The
-        // user-facing "your session expired" signal is the dedicated
-        // platform-session-expired event, not a vanished sidebar.
-        if (wasConnected) void useFollowsStore.getState().hydrate();
-        report(provider, false, get()[provider]);
-        return;
-      }
-      const info = await platformAccounts.accountInfo(provider);
-      patch(provider, {
-        connected,
-        name: info.name,
-        avatarUrl: info.avatar_url,
-        id: info.id,
-        handle: info.handle ?? null,
-      });
-      report(provider, true, get()[provider]);
-    } catch (e) {
-      // Leave the previous state: an IPC failure is not evidence of a sign-out.
-      Logger.debug(`[platform] could not read ${provider} state:`, e);
+  /** The roster carries every platform at once, so one read serves all three
+   *  rows and the title bar alike. */
+  const applyRoster = (roster: AccountRoster) => {
+    useAccountRosterStore.getState().setRoster(roster);
+    for (const provider of ['kick', 'youtube', 'tiktok'] as const) {
+      applyRow(provider, roster.main.find((a) => a.id === provider));
     }
   };
+
+  const refreshAll = async () => {
+    try {
+      applyRoster(await platformAccounts.accountRoster());
+    } catch (e) {
+      // Leave the previous state: an IPC failure is not evidence of a sign-out.
+      Logger.debug('[platform] could not read the account roster:', e);
+    }
+  };
+
+  /** Kept by name for the connect/disconnect flows; the roster answers for
+   *  every platform in one read, so there is nothing per-provider left to ask. */
+  const refreshOne = (_provider: PlatformId) => refreshAll();
 
   return {
     kick: { ...IDLE },
     youtube: { ...IDLE },
     tiktok: { ...IDLE },
 
-    refresh: async () => {
-      await Promise.all([refreshOne('kick'), refreshOne('youtube'), refreshOne('tiktok')]);
-    },
+    refresh: refreshAll,
+    applyRoster,
 
     connect: async (provider) => {
       if (get()[provider].busy) return;
       patch(provider, { busy: true, step: 'Waiting for you to sign in…' });
+      // Set when the flow already said why it did not finish, so the check
+      // after the roster read never says it a second time.
+      let reported = false;
       try {
         if (provider === 'kick') {
           // ONE window takes consent and then promotes the login into a kick.com
@@ -281,8 +216,18 @@ export const usePlatformAccountStore = create<PlatformAccountStore>((set, get) =
         // and the Home empty state shows nothing at all, so a failure there read
         // as a click that did nothing. The toast reaches all of them.
         useAppStore.getState().addToast(reason, 'error');
+        reported = true;
       }
       await refreshOne(provider);
+      // Kick's sign-in is two steps in one window: the kick.com login, then
+      // Kick's Authorize page. Closing it after the login reads the follows and
+      // returns without error, yet holds no token, so the row would fall back
+      // to "Not signed in" with nothing said about why.
+      if (provider === 'kick' && !reported && !get().kick.connected) {
+        const reason = 'Sign-in was not completed';
+        transientStep(provider, reason);
+        useAppStore.getState().addToast(reason, 'error');
+      }
       // The follow list is only visible once connected, so paint it now rather
       // than leaving the Following tab empty until something else hydrates.
       await useFollowsStore.getState().hydrate();
