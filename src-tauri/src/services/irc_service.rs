@@ -1977,6 +1977,7 @@ impl IrcService {
 
         *get_own_identity().lock().await = Some((user_info.login.clone(), user_info.id.clone()));
         ChatRules::set_own_identity(&user_info.login, &user_info.id);
+        ChatRules::set_own_display_name(&user_info.display_name);
 
         // Bring up (or reuse) the local WS bridge that fans parsed messages to
         // the frontend. Extracted into ensure_local_ws_bridge so non-Twitch
@@ -2683,18 +2684,10 @@ impl IrcService {
                 let rules = ChatRules::snapshot();
                 let verdict = ChatRules::evaluate(&mut chat_msg, &rules);
                 if !verdict.drop {
-                    crate::services::mention_ping::on_live_message(
-                        &chat_msg,
-                        verdict.mentioned,
-                        verdict.reply_to_me,
-                    );
+                    // Inbox, mention sound and notification, all from one call.
+                    crate::services::mention_inbox::on_verdict(&chat_msg, &verdict);
                     crate::services::chat_row_view::stamp(&mut chat_msg);
-                    #[cfg(desktop)]
-                    crate::services::mention_notify::on_live_message(
-                        &chat_msg,
-                        verdict.mentioned,
-                        verdict.reply_to_me,
-                    );
+                    crate::services::late_third_party::note_if_early(&chat_msg, &enhanced_message);
                 }
 
                 // Deliver to the frontend FIRST (wire order is the only order
@@ -2776,6 +2769,7 @@ impl IrcService {
                 let verdict = ChatRules::evaluate(&mut chat_msg, &rules);
                 if !verdict.drop {
                     crate::services::chat_row_view::stamp(&mut chat_msg);
+                    crate::services::late_third_party::note_if_early(&chat_msg, trimmed);
                 }
 
                 // Frontend first, side effects on the ordered lane (no history:
@@ -2926,6 +2920,7 @@ impl IrcService {
                     ChatLoggerService::log_deleted_message(ch, &clear.login, clear.text.as_deref());
                     ChatHistory::mark_deleted(ch, &clear.target_msg_id);
                 }
+                crate::services::mention_inbox::on_message_deleted(&clear.target_msg_id);
                 // Send deletion event to frontend, tagged with channel for routing
                 send_to_bridge(BridgeFrame::maybe_channel(clear.channel.as_deref(), clear.frame().to_string()), false).await;
             }
@@ -4294,57 +4289,6 @@ impl IrcService {
         }
     }
 
-    /// Byte index in `content` right after a leading "@<name>" mention plus its
-    /// following whitespace run, or 0 when no alternative matches. The boundary
-    /// is REQUIRED (whitespace or end of message): with multiple alternatives, a
-    /// short name that prefixes a longer one must never partially strip
-    /// ("@foobarbaz" with login "foobar"). Case-folded per char; alternatives
-    /// are tried in order (login before display name).
-    fn reply_mention_end(content: &str, alts: &[&str]) -> usize {
-        let Some(rest) = content.strip_prefix('@') else {
-            return 0;
-        };
-        for alt in alts {
-            if alt.is_empty() {
-                continue;
-            }
-            let mut rest_chars = rest.char_indices();
-            let mut alt_chars = alt.chars();
-            let matched_end = loop {
-                match alt_chars.next() {
-                    // Name fully matched: the end is the next char's byte index
-                    // (offset by the leading '@'), or end of message.
-                    None => {
-                        break Some(
-                            rest_chars
-                                .next()
-                                .map(|(i, _)| 1 + i)
-                                .unwrap_or(content.len()),
-                        )
-                    }
-                    Some(ac) => match rest_chars.next() {
-                        Some((_, rc)) if rc.to_lowercase().eq(ac.to_lowercase()) => {}
-                        _ => break None,
-                    },
-                }
-            };
-            let Some(end) = matched_end else {
-                continue;
-            };
-            let tail = &content[end..];
-            if tail.is_empty() {
-                return content.len();
-            }
-            if tail.starts_with(char::is_whitespace) {
-                // Consume the whole whitespace run (the old pattern's greedy \s+).
-                return end + (tail.len() - tail.trim_start().len());
-            }
-            // Boundary violated - the name only prefixes a longer word; try the
-            // next alternative.
-        }
-        0
-    }
-
     fn parse_message_segments(
         content: &str,
         twitch_emotes: &[EmotePos],
@@ -4496,9 +4440,12 @@ impl IrcService {
             // the link becomes its own text run, so "see test.fr." does not
             // put the full stop inside the href.
             if let Some((link, trailing)) = link_detect::split_link(word) {
+                let url = link_detect::link_url(link);
+                let card = crate::commands::link_preview::expected_card(&url).map(String::from);
                 segments.push(MessageSegment::Link {
                     content: link.to_string(),
-                    url: link_detect::link_url(link),
+                    url,
+                    card,
                 });
                 if !trailing.is_empty() {
                     segments.push(MessageSegment::Text {
@@ -4750,14 +4697,10 @@ impl IrcService {
                 }
             }
 
-            let mut msg = result_msg;
-            // Check for ACTION wrapper: \x01ACTION message\x01
-            // Minimum valid: "\x01ACTION X\x01" = 10 chars (8 for header + 1 content + 1 closing)
-            if msg.len() >= 10 && msg.starts_with("\x01ACTION ") && msg.ends_with('\x01') {
-                is_action = true;
-                msg = msg[8..msg.len() - 1].to_string();
-            }
-            msg
+            // A /me arrives wrapped as \x01ACTION message\x01.
+            let (msg, action) = sn_mention_rule::normalize::unwrap_action(&result_msg);
+            is_action = action;
+            msg.to_string()
         } else {
             "".to_string()
         };
@@ -4909,36 +4852,14 @@ impl IrcService {
         let reply_parent_display_name = tag_map
             .get("reply-parent-display-name")
             .map(|s| s.to_string());
-        let (content_for_segments, stripped_codepoints) = {
-            let mut alts: Vec<&str> = Vec::new();
-            if let Some(ref login) = reply_parent_user_login {
-                if !login.is_empty() {
-                    alts.push(login);
-                }
-            }
-            if let Some(ref disp) = reply_parent_display_name {
-                if !disp.is_empty() {
-                    alts.push(disp);
-                }
-            }
-            if alts.is_empty() {
-                (content.clone(), 0usize)
-            } else {
-                let mention_end = Self::reply_mention_end(&content, &alts);
-                let rest = &content[mention_end..];
-                // Trim parity with the old regex path: whitespace is trimmed
-                // whether or not a mention matched (replies only).
-                let rest_no_lead = rest.trim_start();
-                // Emote positions are CODEPOINT indices (see char_to_byte in
-                // parse_message_segments), so the offset must count codepoints
-                // consumed from the FRONT - the old byte-length delta mis-shifted
-                // emotes whenever a localized display name was stripped, and
-                // wrongly counted trailing trim too.
-                let front_bytes = content.len() - rest_no_lead.len();
-                let front_codepoints = content[..front_bytes].chars().count();
-                (rest_no_lead.trim_end().to_string(), front_codepoints)
-            }
-        };
+        // Emote positions are CODEPOINT indices (see char_to_byte in
+        // parse_message_segments), so the strip reports how many codepoints it
+        // took from the front.
+        let (content_for_segments, stripped_codepoints) = sn_mention_rule::normalize::strip_reply_parent(
+            &content,
+            reply_parent_user_login.as_deref(),
+            reply_parent_display_name.as_deref(),
+        );
 
         // Also update emote positions if we stripped the @mention
         let emotes_adjusted = if stripped_codepoints > 0 {
@@ -5382,9 +5303,13 @@ impl IrcService {
 
                 // Same rules as live rows: a hidden user's backfill is hidden
                 // too, and highlights are stamped so the row needs no matcher.
-                if ChatRules::evaluate(&mut chat_msg, &rules).drop {
+                let verdict = ChatRules::evaluate(&mut chat_msg, &rules);
+                if verdict.drop {
                     continue;
                 }
+                // A mention from before you opened the chat still reaches the
+                // inbox (once: it dedupes by id), with no sound or notice.
+                crate::services::mention_inbox::on_backfill(&chat_msg, &verdict);
                 chat_msg.metadata.from_backfill = true;
                 crate::services::chat_row_view::stamp(&mut chat_msg);
                 results.push(chat_msg);
@@ -5437,6 +5362,16 @@ impl IrcService {
             debug!("[SharedChat] {home}: {} partner rows now wear their room's emotes and badges", rows.len());
             let frame = json!({ "type": "HISTORY_SEGMENTS", "channel": home, "rows": rows });
             send_to_bridge(BridgeFrame::channel(&home, frame.to_string()), false).await;
+        }
+    }
+
+    /// A live chat line (a message or a USERNOTICE) parsed as the read loop
+    /// parses it; None for any other command.
+    pub(crate) fn parse_live_line(raw: &str) -> Option<ChatMessage> {
+        match irc_command(raw) {
+            Some("PRIVMSG") => Self::parse_privmsg(raw),
+            Some("USERNOTICE") => Self::parse_usernotice(raw),
+            _ => None,
         }
     }
 
@@ -6766,17 +6701,17 @@ mod tests {
     #[test]
     fn reply_mention_strip_boundaries() {
         // Exact name + space: mention and the whole whitespace run consumed.
-        assert_eq!(IrcService::reply_mention_end("@foo  hi", &["foo"]), 6);
+        assert_eq!(sn_mention_rule::normalize::reply_mention_end("@foo  hi", &["foo"]), 6);
         // Name at end of message: everything consumed.
-        assert_eq!(IrcService::reply_mention_end("@foo", &["foo"]), 4);
+        assert_eq!(sn_mention_rule::normalize::reply_mention_end("@foo", &["foo"]), 4);
         // Boundary REQUIRED: a name prefixing a longer word must not strip.
-        assert_eq!(IrcService::reply_mention_end("@foobarbaz hi", &["foobar"]), 0);
+        assert_eq!(sn_mention_rule::normalize::reply_mention_end("@foobarbaz hi", &["foobar"]), 0);
         // Case-insensitive match.
-        assert_eq!(IrcService::reply_mention_end("@FoO hi", &["foo"]), 5);
+        assert_eq!(sn_mention_rule::normalize::reply_mention_end("@FoO hi", &["foo"]), 5);
         // Second alternative (display name) matches when login does not.
-        assert_eq!(IrcService::reply_mention_end("@ふー hi", &["foo", "ふー"]), 8);
+        assert_eq!(sn_mention_rule::normalize::reply_mention_end("@ふー hi", &["foo", "ふー"]), 8);
         // No leading @: untouched.
-        assert_eq!(IrcService::reply_mention_end("foo hi", &["foo"]), 0);
+        assert_eq!(sn_mention_rule::normalize::reply_mention_end("foo hi", &["foo"]), 0);
     }
 
     #[test]
@@ -7447,6 +7382,8 @@ mod chat_fixture_tests {
     const INPUTS: &str = include_str!("../../../ios/Tests/Fixtures/chat-inputs.json");
 
     fn frames() -> (Value, Vec<String>) {
+        // The rule tests set their own account; hold the identity until done.
+        let _own = crate::services::chat_rules::ChatRules::own_identity_test_lock();
         let inputs: Value = serde_json::from_str(INPUTS).expect("chat inputs parse");
         let channel = inputs["channel"].as_str().unwrap().to_string();
         let set: EmoteSet = serde_json::from_value(inputs["emotes"].clone()).expect("emote set");

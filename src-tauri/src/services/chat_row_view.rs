@@ -265,7 +265,7 @@ fn note_seen(login: &str, color: &str) {
     }
 }
 
-fn seen_color(login: &str) -> Option<String> {
+pub(crate) fn seen_color(login: &str) -> Option<String> {
     SEEN.lock().ok()?.as_mut()?.get(&login.to_lowercase()).cloned()
 }
 
@@ -278,6 +278,12 @@ struct BadgeIndex {
 }
 
 static TWITCH_BADGES: RwLock<Option<BadgeIndex>> = RwLock::new(None);
+
+/// Whether a channel's own badge set (its subscriber and bits art) has been
+/// noted. Until it is, its rows draw Twitch's default art for those badges.
+pub(crate) fn has_room_badges(room_id: &str) -> bool {
+    TWITCH_BADGES.read().ok().is_some_and(|g| g.as_ref().is_some_and(|i| i.rooms.contains_key(room_id)))
+}
 
 /// Records Twitch badge art from a Helix badge answer: the global sets when
 /// `room_id` is None, else that channel's own. Items are
@@ -987,7 +993,7 @@ fn spans_with(segments: &[MessageSegment], channel: &str, prefs: Prefs) -> Vec<V
                 }));
             }
             MessageSegment::Emoji { content, emoji_url } => items.push(Item::Emoji { text: content.clone(), url: emoji_url.clone() }),
-            MessageSegment::Link { content, url } => items.push(Item::Link {
+            MessageSegment::Link { content, url, .. } => items.push(Item::Link {
                 label: if prefs.shorten_links { link_label(content) } else { content.clone() },
                 url: url.clone(),
             }),
@@ -1296,12 +1302,130 @@ pub fn stamp_view(msg: &mut ChatMessage) {
         source,
         nickname: own.nickname,
         previews,
+        event_art: event_art(msg),
+        event: event_key(msg),
     });
+}
+
+/// What a Twitch subscription or gift notice leads with, as the desktop card
+/// draws it: Twitch's gift art (the Sub Gifter badge), except for a Prime sub,
+/// which leads with Twitch's Prime crown the shell draws itself.
+fn event_art(msg: &ChatMessage) -> Option<String> {
+    leads_with_gift_art(msg).then(|| twitch_badge_art(None, "sub-gifter", "1").map(|(url, _)| url)).flatten()
+}
+
+/// A Twitch subscription or gift notice that is not a Prime sub.
+fn leads_with_gift_art(msg: &ChatMessage) -> bool {
+    let twitch = msg.provider.is_empty() || msg.provider == "twitch";
+    let msg_type = msg.metadata.msg_type.as_deref().or_else(|| msg.tags.get("msg-id").map(String::as_str));
+    let sub_or_gift = msg_type.and_then(event_category).is_some_and(|kind| matches!(kind, "subscription" | "gift"));
+    twitch && sub_or_gift && msg.tags.get("msg-param-sub-plan").map_or(true, |plan| plan != "Prime")
+}
+
+/// A notice's chat event category by its msg-id / msg_type. Shared with the
+/// web renderers' `categoryOf` (src/utils/chatEvents.ts) so a key the settings
+/// page writes hides the same rows on every shell.
+fn event_category(msg_type: &str) -> Option<&'static str> {
+    Some(match msg_type {
+        "sub" | "resub" | "primepaidupgrade" | "giftpaidupgrade" | "anongiftpaidupgrade" | "standardpayforward"
+        | "communitypayforward" | "membership" | "sharedchatnotice" => "subscription",
+        "subgift" | "submysterygift" | "anonsubgift" | "anonsubmysterygift" | "membergift" | "giftedsub"
+        | "tiktok_gift" | "kick_gift" | "kick_gifted" => "gift",
+        "raid" | "unraid" => "raid",
+        "announcement" | "ritual" => "announcement",
+        "viewermilestone" | "watchstreak" | "bitsbadgetier" => "milestone",
+        "charitydonation" | "cheer" | "bits" | "superchat" | "superticker" | "supersticker" => "cheer",
+        "tiktok_follow" | "tiktok_share" | "follow" | "kick_follow" => "follow",
+        _ => return None,
+    })
+}
+
+/// `provider:category` for an event row, or None for an ordinary message. A
+/// Twitch cheer is an ordinary message carrying bits, so it counts as one.
+pub fn event_key(msg: &ChatMessage) -> Option<String> {
+    let provider = if msg.provider.is_empty() { "twitch" } else { msg.provider.as_str() };
+    let msg_type = msg.metadata.msg_type.as_deref().or_else(|| msg.tags.get("msg-id").map(String::as_str));
+    let mut category = msg_type.and_then(event_category);
+    if category.is_none() && provider == "twitch" {
+        // A channel points redemption row names its reward in `sn-reward-title`
+        // (the overlay counts it the same way); a reward redeemed with text is
+        // that viewer's own message, not an event.
+        if msg.tags.get("sn-reward-title").is_some_and(|t| !t.is_empty()) {
+            category = Some("redemption");
+        }
+        let bits = msg
+            .metadata
+            .bits_amount
+            .unwrap_or_else(|| msg.tags.get("bits").and_then(|b| b.parse().ok()).unwrap_or(0));
+        if category.is_none() && bits > 0 {
+            category = Some("cheer");
+        }
+    }
+    category.map(|c| format!("{provider}:{c}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn notice(provider: &str, msg_type: Option<&str>, tags: &[(&str, &str)], bits: Option<u32>) -> ChatMessage {
+        let mut msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "id": "1", "user_id": "7", "username": "a", "display_name": "A", "color": null, "badges": [],
+            "timestamp": "", "content": "", "provider": provider, "tags": {}
+        }))
+        .unwrap();
+        msg.metadata.msg_type = msg_type.map(String::from);
+        msg.metadata.bits_amount = bits;
+        msg.tags = tags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        msg
+    }
+
+    #[test]
+    fn subs_and_gifts_lead_with_twitchs_gift_art_except_prime() {
+        assert!(leads_with_gift_art(&notice("twitch", Some("resub"), &[("msg-param-sub-plan", "1000")], None)));
+        assert!(leads_with_gift_art(&notice("twitch", None, &[("msg-id", "submysterygift")], None)));
+        assert!(leads_with_gift_art(&notice("", Some("subgift"), &[("msg-param-sub-plan", "3000")], None)));
+        // A Prime sub leads with the Prime crown the shell draws.
+        assert!(!leads_with_gift_art(&notice("twitch", Some("sub"), &[("msg-param-sub-plan", "Prime")], None)));
+        // Other events, other platforms and ordinary messages lead with something else.
+        assert!(!leads_with_gift_art(&notice("twitch", Some("raid"), &[], None)));
+        assert!(!leads_with_gift_art(&notice("kick", Some("kick_gift"), &[], None)));
+        assert!(!leads_with_gift_art(&notice("twitch", None, &[], None)));
+    }
+
+    #[test]
+    fn event_keys_match_the_settings_page() {
+        assert_eq!(event_key(&notice("twitch", Some("resub"), &[], None)).as_deref(), Some("twitch:subscription"));
+        assert_eq!(event_key(&notice("twitch", None, &[("msg-id", "submysterygift")], None)).as_deref(), Some("twitch:gift"));
+        assert_eq!(event_key(&notice("twitch", None, &[], Some(100))).as_deref(), Some("twitch:cheer"));
+        assert_eq!(event_key(&notice("twitch", None, &[("bits", "5")], None)).as_deref(), Some("twitch:cheer"));
+        assert_eq!(event_key(&notice("twitch", Some("viewermilestone"), &[], None)).as_deref(), Some("twitch:milestone"));
+        assert_eq!(event_key(&notice("kick", Some("kick_follow"), &[], None)).as_deref(), Some("kick:follow"));
+        assert_eq!(event_key(&notice("kick", Some("raid"), &[], None)).as_deref(), Some("kick:raid"));
+        assert_eq!(event_key(&notice("", Some("raid"), &[], None)).as_deref(), Some("twitch:raid"));
+        // Ordinary messages are not events; a Kick message with bits is not a cheer.
+        assert_eq!(event_key(&notice("twitch", None, &[], None)), None);
+        assert_eq!(event_key(&notice("kick", None, &[], Some(5))), None);
+        assert_eq!(event_key(&notice("twitch", Some("highlighted-message"), &[], None)), None);
+        // A channel points redemption row is one; a reward redeemed with text is not.
+        let redeemed = notice("twitch", None, &[("custom-reward-id", "r1"), ("sn-reward-title", "Hydrate")], None);
+        assert_eq!(event_key(&redeemed).as_deref(), Some("twitch:redemption"));
+        assert_eq!(event_key(&notice("twitch", None, &[("custom-reward-id", "r1")], None)), None);
+        assert_eq!(event_key(&notice("kick", None, &[("sn-reward-title", "Hydrate")], None)), None);
+    }
+
+    #[test]
+    fn the_stamped_view_carries_the_event_key() {
+        let mut msg = notice("twitch", Some("sub"), &[], None);
+        stamp_view(&mut msg);
+        let view = msg.metadata.view.as_ref().unwrap();
+        assert_eq!(view.event.as_deref(), Some("twitch:subscription"));
+        assert_eq!(serde_json::to_value(view).unwrap()["event"], "twitch:subscription");
+
+        let mut plain = notice("twitch", None, &[], None);
+        stamp_view(&mut plain);
+        assert!(serde_json::to_value(plain.metadata.view.as_ref().unwrap()).unwrap().get("event").is_none());
+    }
 
     #[test]
     fn user_overrides_read_from_settings() {
@@ -1478,6 +1602,16 @@ mod tests {
         assert_eq!(twitch_badge_art(Some("42"), "subscriber", "12").unwrap().0, "https://c/sub12/2");
         assert_eq!(twitch_badge_art(Some("42"), "moderator", "1").unwrap().0, "https://g/mod/2");
         assert!(twitch_badge_art(Some("7"), "subscriber", "12").is_none());
+    }
+
+    #[test]
+    fn a_room_counts_as_dressed_only_once_its_own_set_is_noted() {
+        // History reads a room's set itself while this is false: its rows would
+        // otherwise wear Twitch's default subscriber art.
+        assert!(!has_room_badges("5150"));
+        note_twitch_badges(Some("5150"), [("subscriber", "0", "https://c/sub0/2", "Subscriber")]);
+        assert!(has_room_badges("5150"));
+        assert_eq!(twitch_badge_art(Some("5150"), "subscriber", "0").unwrap().0, "https://c/sub0/2");
     }
 
     #[test]

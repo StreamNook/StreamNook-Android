@@ -365,6 +365,12 @@ pub enum MessageSegment {
     Link {
         content: String,
         url: String,
+        /// The card kind this link's shape all but always gets (`expected_card`:
+        /// "youtube", "discord", "generic"...); absent when it may have none. A
+        /// shell holds exactly that card's room while it loads and nothing for
+        /// other links, so none flashes a placeholder and vanishes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        card: Option<String>,
     },
     /// Cheermote segment for animated bits (e.g., Cheer500)
     Cheermote {
@@ -470,6 +476,17 @@ pub struct RowView {
     /// One still being read arrives as a `ROW_PREVIEW` frame.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub previews: Vec<RowPreview>,
+    /// The chat event this row is, as `provider:category` (`twitch:subscription`,
+    /// `kick:follow`), or None for an ordinary message. The shell hides the row
+    /// while that key is in `chat_events.hidden_provider_events`, the same keys
+    /// the settings page writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// The art a subscription or gift notice leads with, as the desktop card
+    /// draws it: Twitch's own gift (the Sub Gifter badge). None for a Prime sub
+    /// (the shell draws Twitch's Prime crown) and for every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_art: Option<String>,
 }
 
 /// One link's card on a row.

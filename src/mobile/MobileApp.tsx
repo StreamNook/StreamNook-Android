@@ -34,12 +34,18 @@ import { SettingsScreen } from './screens/SettingsScreen';
 import { CategoryStreamsScreen } from './screens/CategoryStreamsScreen';
 import { RewardsScreen } from './screens/RewardsScreen';
 import { CosmeticsScreen } from './screens/CosmeticsScreen';
+import { MentionsScreen } from './screens/MentionsScreen';
+import { installMentionInbox } from './mentions/mentionInbox';
+import { WhispersScreen } from './screens/WhispersScreen';
+import { installWhisperInbox } from './whispers/whisperInbox';
 import { MobileClipSheet } from './watch/MobileClipSheet';
+import { MobileChannelSheet } from './watch/MobileChannelSheet';
 import LoadingWidget from '../components/LoadingWidget';
 import DeviceLoginOverlay from '../components/DeviceLoginOverlay';
 import ToastManager from '../components/ToastManager';
 import { usePlatformAccountSync } from '../hooks/usePlatformAccountSync';
 import { useTwitchSignInPrompt } from '../hooks/useTwitchSignInPrompt';
+import { useMentionPing } from '../hooks/useMentionPing';
 
 const TAB_ORDER = ['following', 'browse', 'chats', 'rewards', 'you'] as const;
 
@@ -59,6 +65,9 @@ const MobileApp: React.FC = () => {
   // The chats outside any one screen: the stream tab, the saved chats, and
   // leaving the rooms after a while in the background.
   useChatsLifecycle();
+  // Plays the mention and reply sounds Rust picks (Chat > Mentions & Replies),
+  // as the desktop's main window does.
+  useMentionPing();
 
   const isBooting = useAppStore((s) => s.isBooting);
   const isAuthenticated = useAppStore((s) => s.isAuthenticated);
@@ -130,6 +139,10 @@ const MobileApp: React.FC = () => {
 
   useEffect(() => installBackHandler(), []);
   useEffect(() => installLifecycle(), []);
+  // The mentions unread count (the You row and the chat menu read it).
+  useEffect(() => installMentionInbox(), []);
+  // The whisper list and its unread count, kept current by Rust's events.
+  useEffect(() => installWhisperInbox(), []);
   // Teach the resolver what this screen can show, before any stream resolves.
   useEffect(() => installVideoCap(), []);
   useEffect(() => {
@@ -200,12 +213,18 @@ const MobileApp: React.FC = () => {
           <WatchScreen />
           <CosmeticsScreen />
           <SettingsScreen />
+          {/* Over settings and the watch layer: the chat menu opens it too. */}
+          <MentionsScreen />
+          {/* Over Mentions too: a whisper notification tap opens it from anywhere. */}
+          <WhispersScreen />
           {/* Consumes the same `clipModal` store field the desktop <ClipModal />
               does. Without a mobile consumer, tapping a clip in chat flipped
               that state and rendered nothing. Portals to z-[9000] via
               MobileSheet, so it clears the watch layer regardless of position
               here. */}
           <MobileClipSheet />
+          {/* A channel's videos and clips, from the player's avatar and the offline room. */}
+          <MobileChannelSheet />
         </>
       )}
 

@@ -3,6 +3,7 @@
 interface SNBridge {
   get?(): string;
   setImmersive?(immersive: boolean): void;
+  setPlayerOrientation?(mode: string): void;
   setBarsLightContent?(light: boolean): void;
   setKeepScreenOn?(on: boolean): void;
   setPreferredRefreshRate?(fps: number): void;
@@ -24,6 +25,8 @@ interface SNBridge {
   cancelBackgroundChecks?(): void;
   runNotifyCheckNow?(): void;
   consumePendingChannel?(): string;
+  consumePendingMention?(): string;
+  consumePendingWhisper?(): string;
   mediaSessionStart?(title: string, artist: string, artUrl: string, playing: boolean): void;
   mediaSessionStop?(): void;
   displayShortEdge?(): number;
@@ -35,6 +38,17 @@ interface SNBridge {
 
 function bridge(): SNBridge | undefined {
   return (window as Window & { SNInsets?: SNBridge }).SNInsets;
+}
+
+/** The player's rotate button: hold the screen in `landscape` or `portrait`
+ *  whatever the phone's rotation lock says, or `release` it back to the sensor
+ *  (leaving the player). */
+export function setPlayerOrientation(mode: 'landscape' | 'portrait' | 'release'): void {
+  try {
+    bridge()?.setPlayerOrientation?.(mode);
+  } catch {
+    /* bridge absent */
+  }
 }
 
 export function setImmersive(immersive: boolean): void {
@@ -389,5 +403,33 @@ export function mediaSessionStop(): void {
     bridge()?.mediaSessionStop?.();
   } catch {
     /* bridge absent */
+  }
+}
+
+/**
+ * Message id from a tapped mention notification, or null. Same contract as
+ * consumePendingChannel: reading clears it, drained on mount for the cold
+ * case, while a warm tap arrives through `window.__SN_OPEN_MENTION__`.
+ */
+export function consumePendingMention(): string | null {
+  try {
+    const id = bridge()?.consumePendingMention?.();
+    return id && id.length > 0 ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Conversation key from a tapped whisper notification, or null. Same contract
+ * as consumePendingMention; a warm tap arrives through
+ * `window.__SN_OPEN_WHISPER__`.
+ */
+export function consumePendingWhisper(): string | null {
+  try {
+    const key = bridge()?.consumePendingWhisper?.();
+    return key && key.length > 0 ? key : null;
+  } catch {
+    return null;
   }
 }

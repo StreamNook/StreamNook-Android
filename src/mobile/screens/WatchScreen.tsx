@@ -45,8 +45,11 @@ import {
   useChatTabsVisible,
   useViewingStreamChat,
 } from '../chat/ChatTabStrip';
+import { useMentionsStore } from '../mentions/mentionInbox';
+import { MentionContextCard } from '../mentions/MentionContextCard';
 import { DropProgressBar } from '../watch/DropProgressBar';
 import { PinnedBanner } from '../watch/PinnedBanner';
+import { usePinsOpen } from '../watch/pinsOpen';
 import HypeTrainBanner from '../../components/HypeTrainBanner';
 import PollOverlay from '../../components/PollOverlay';
 import PredictionOverlay from '../../components/PredictionOverlay';
@@ -62,6 +65,7 @@ import {
   setMediaVolume,
   setPipEligible,
   setPipSourceRect,
+  setPlayerOrientation,
   setPreferredRefreshRate,
   setScreenBrightness,
 } from '../nativeBridge';
@@ -81,9 +85,6 @@ const MINI_GUTTER = 16;
 // Clearance so the resting mini player never sits under the floating pill bar
 // (56 px, icons only, riding 14 px above the gesture strip).
 const BOTTOM_GAP = 104;
-// Chats has no tab bar: its composer sits at the bottom edge instead, lower
-// than the bar, so the box rests that much lower to keep the same gap above it.
-const CHATS_COMPOSER_GAP = 0;
 
 // Where the mini player is ALLOWED to be.
 //
@@ -160,7 +161,9 @@ export const WatchScreen: React.FC = () => {
   const [watchLayout, setWatchLayout] = useState<WatchLayout>(readWatchLayout);
   const [chatSplit, setChatSplit] = useState<number | null>(readWatchSplit);
   const [pip, setPip] = useState(false);
-  const [pinsOpen, setPinsOpen] = useState(false);
+  // A pin opens or folds per channel: each channel starts as Chat > Pinned
+  // Messages > Collapsed says, and a tap holds until the chat switches.
+  const pins = usePinsOpen();
   // The poll, prediction and drop cards: one stack in the chat column's flow,
   // laid out by Rust against the column's height. Opened together on a short
   // column (a foldable's side-docked chat) they used to leave no room to read
@@ -189,6 +192,10 @@ export const WatchScreen: React.FC = () => {
   // numeric user_id; a Kick id would name an unrelated Twitch channel.
   const streamScoped = viewingStreamChat && isTwitchStream(currentStream);
   const chatChannelId = useActiveChatChannelId();
+  // An opened mention older than its chat's history, pinned over that chat.
+  const mentionCard = useMentionsStore((s) => s.contextCard);
+  const activeChatRoom = useChatTabsStore((s) => s.activeChannel);
+  const showMentionCard = !!mentionCard && mentionCard.room === activeChatRoom;
   // The viewer picked the audio-only rendition: there is no picture to float.
   const audioOnly = useAppStore((s) => s.activeQuality === 'audio_only');
   // The landscape chat overlay shares its knobs with the desktop overlay:
@@ -349,13 +356,11 @@ export const WatchScreen: React.FC = () => {
   // fullscreen toggle there. Deciding this by WIDTH is what put chat on the
   // right of every landscape phone with no way to dismiss it.
   //
-  // On a phone the landscape chat toggle does not carve a column out of the
-  // picture by default: a phone on its side is ~800px wide, and a 300px chat
-  // column pillarboxes the video to a strip. Chat floats OVER the picture
-  // instead, translucent, at the width and opacity the overlay settings say,
-  // and the player keeps the whole screen. "Beside the video" is still there
-  // as a choice for anyone who prefers the split.
-  const phoneOverlayChat = !shape.largeScreen && (fsChat?.phone_layout ?? 'overlay') === 'overlay';
+  // On a phone the landscape chat toggle takes a column beside the picture by
+  // default: the video gets the rest of the screen to itself, edge to edge.
+  // "Over the video" floats the column over the picture instead, translucent,
+  // at the width and opacity the overlay settings say.
+  const phoneOverlayChat = !shape.largeScreen && (fsChat?.phone_layout ?? 'beside') === 'overlay';
   const twoColumns =
     shape.largeScreen
       ? largeChatHidden
@@ -402,8 +407,10 @@ export const WatchScreen: React.FC = () => {
     if (patch.width != null) setOverlayWidthLive(null);
     if (patch.opacity != null) setOverlayOpacityLive(null);
   }, []);
-  // Never more than half the picture, whatever the desktop slider was set to.
-  const overlayMaxWidth = Math.round(shape.w * 0.5);
+  // The handle's range is the whole screen's (the column's background runs to
+  // the edge through the cutout inset; only its text keeps clear of the cutout),
+  // and the video always keeps at least 240 beside it.
+  const overlayMaxWidth = Math.max(240, Math.round(shape.w - 240));
   const overlayWidth = Math.min(Math.max(240, overlayWidthLive ?? fsChat?.width ?? 340), overlayMaxWidth);
   const overlayOpacity = Math.max(0, Math.min(100, overlayOpacityLive ?? fsChat?.opacity ?? 55));
   // Resizable only where there is genuinely a trade to make. On a phone the
@@ -459,6 +466,10 @@ export const WatchScreen: React.FC = () => {
   // Shown higher over the Chats tab while a chat is open there, so the box
   // never covers its composer; the stored spot is kept for the other tabs.
   const overChatsComposer = useMobileNavStore((s) => s.activeTab === 'chats') && chatTabsOpen;
+  // Chats has no tab bar: the box rests its usual edge gap above the composer
+  // and any streak banner over it, as Chats measures them.
+  const chatsFloor = useMobileNavStore((s) => s.chatsFloor);
+  const miniFloor = overChatsComposer && chatsFloor != null ? chatsFloor + EDGE_GAP : BOTTOM_GAP;
   const miniClamped = useMemo(
     () =>
       clampMini(
@@ -467,9 +478,9 @@ export const WatchScreen: React.FC = () => {
         viewport.w,
         viewport.h,
         readInsets(),
-        overChatsComposer ? BOTTOM_GAP + CHATS_COMPOSER_GAP : BOTTOM_GAP,
+        miniFloor,
       ),
-    [miniPos.x, miniPos.y, viewport.w, viewport.h, overChatsComposer],
+    [miniPos.x, miniPos.y, viewport.w, viewport.h, miniFloor],
   );
 
   // System PiP strip-down flag from MainActivity. Also mirrored onto <html> so
@@ -563,6 +574,13 @@ export const WatchScreen: React.FC = () => {
   // A per-change cleanup sent "show" straight before every "hide", which is a
   // bar flash and an inset re-layout the viewer can see.
   const immersive = show && !mini && !pip && shape.landscape;
+  // The rotate button holds an orientation while the full player is up;
+  // leaving it (the mini box, picture in picture, closing) hands the screen
+  // back to the sensor, so the rest of the app is never stuck on its side.
+  const playerUp = show && !mini && !pip;
+  useEffect(() => {
+    if (!playerUp) setPlayerOrientation('release');
+  }, [playerUp]);
   useEffect(() => {
     setImmersive(immersive);
   }, [immersive]);
@@ -1058,6 +1076,14 @@ export const WatchScreen: React.FC = () => {
               immersive={sideBySide || pip}
               compact={mini || pip}
               onMinimize={mini || pip ? undefined : () => setPlayerMode('mini')}
+              // Turns the screen whatever the rotation lock says; leaving the
+              // player hands it back to the sensor (the effect below).
+              onRotate={
+                mini || pip || shape.largeScreen
+                  ? undefined
+                  : () => setPlayerOrientation(shape.landscape ? 'portrait' : 'landscape')
+              }
+              landscapeNow={shape.landscape}
               onToggleFullscreen={
                 largeToggle && !mini && !pip
                   ? () => setLargeChatHidden((v) => !v)
@@ -1194,7 +1220,7 @@ export const WatchScreen: React.FC = () => {
                 // The floating landscape column is for reading the room, so
                 // the stream's own banners (pins, hype train) stay out of it;
                 // they are all still one rotation away.
-                !chatOverlay && ((streamScoped && currentHypeTrain) || pinned.length > 0)
+                !chatOverlay && ((streamScoped && currentHypeTrain) || pinned.length > 0 || showMentionCard)
                   ? // Pure layout now: no background, no border, no blur, no
                     // shadow. Each child already carries its own container
                     // (PinnedBanner is an sn-popover, the hype train draws its
@@ -1227,9 +1253,12 @@ export const WatchScreen: React.FC = () => {
               <PinnedBanner
                 pins={pinned}
                 channelId={chatChannelId ?? undefined}
-                expanded={pinsOpen}
-                onToggle={() => setPinsOpen((v) => !v)}
+                expanded={pins.open}
+                onToggle={() => pins.setOpen(!pins.open)}
+                collapsedStyle={pins.style}
               />
+              {/* Last in DOM, so first on screen: the mention you just opened. */}
+              {showMentionCard && mentionCard && <MentionContextCard entry={mentionCard} />}
             </div>
 
           <MobileChatPane

@@ -10,9 +10,9 @@ import { useStreamerMode } from '../utils/streamerMode';
 import { useChatUserStore } from '../stores/chatUserStore';
 import type { ProviderId } from '../types/providers';
 import { ScrollbarMarks } from './chat/ScrollbarMarks';
-import { holdChatRow, moderateWithToast, ROW_HOLD_EVENT, useLineConfig, useModSliderSteps } from '../services/moderation';
+import { holdChatRow, moderateWithToast, ROW_HOLD_EVENT, useLineConfig, useModSliderSteps, useSliderConfig, type ModStep } from '../services/moderation';
 import { lineButtons, type LineButton } from './chat/modLine';
-import { bindLineStrips, isOnLineStrip, useLineArt } from './chat/lineArt';
+import { bindLineStrips, bindLineWheel, isOnLineStrip, useLineArt, useLineButtons } from './chat/lineArt';
 import { collectMarks, FALLBACK_MARK_KINDS } from './chat/scrollbarMarkLayout';
 import { IS_MAC, IS_MOBILE } from '../utils/platform';
 
@@ -38,9 +38,12 @@ const PHONE_TOP_FADE: React.CSSProperties = {
  */
 const MOD_HOLD_GRACE_MS = 250;
 
+/** No slider timeouts yet: one array, so the line's hooks see no change. */
+const NO_STEPS: ModStep[] = [];
+
 /** Where a mod action starts, besides the line buttons: a row that offers the
- *  hover dock (ChatMessage marks it), and the slider grip or tile handle. */
-const MOD_TARGET_SELECTOR = '[data-mod-dock], [data-mod-edge]';
+ *  hover dock or the slider (ChatMessage marks both), and the slider grip. */
+const MOD_TARGET_SELECTOR = '[data-mod-dock], [data-mod-row], [data-mod-edge]';
 
 function isOnModTarget(target: EventTarget | null): boolean {
   return target instanceof Element && (isOnLineStrip(target) || target.closest(MOD_TARGET_SELECTOR) !== null);
@@ -204,6 +207,9 @@ const MessageRow = memo(function MessageRow({
 
 interface ChatMessageListProps {
   messages: (string | BackendChatMessage)[];
+  /** A quiet line in the middle while there are no rows ("No recent messages"
+   *  once the join's history answered with none). Gone with the first row. */
+  emptyNote?: string | null;
   /**
    * Bump this whenever the feed changed. It is not read in the body — it exists
    * purely so this component's `memo` has a reliable change signal.
@@ -279,6 +285,7 @@ interface ChatMessageListProps {
  */
 const ChatMessageList = memo(function ChatMessageList({
   messages: liveMessages,
+  emptyNote,
   isPaused,
   onScroll,
   onPauseIntent,
@@ -452,16 +459,35 @@ const ChatMessageList = memo(function ChatMessageList({
   const lineOn = !!isModerator && chatDesign?.mod_line_buttons === true;
   const lineConfig = useLineConfig();
   const lineSteps = useModSliderSteps(homeProvider ?? 'twitch', lineConfig, lineOn);
+  // What the rows get: only that the buttons are on, so a scrolled length
+  // (below) never re-renders a row.
   const modLine = useMemo(
     () => (lineOn && lineSteps && lineSteps.length > 0 ? lineButtons(lineSteps) : null),
     [lineOn, lineSteps],
   );
   const lineActive = modLine !== null;
+  // Hover: only the line under the pointer shows them, pushing its text over.
+  const lineShow = chatDesign?.mod_line_show === 'always' ? 'always' : 'hover';
+  // A scroll over the buttons walks a timeout up or down the slider's
+  // timeouts (its Steps, as Rust applies them on this platform).
+  const sliderConfig = useSliderConfig();
+  const ladderSteps = useModSliderSteps(homeProvider ?? 'twitch', sliderConfig, lineOn);
+  const lineLadder = useMemo(() => ladderSteps?.filter((s) => s.action === 'timeout') ?? NO_STEPS, [ladderSteps]);
+  const { buttons: lineNow, nudge: nudgeLine, reset: resetLine, around: aroundLine } = useLineButtons(lineOn ? lineSteps : null, lineLadder);
+  // Timeouts drawn as wide as any length a scroll can reach.
+  const lineFit = useMemo(
+    () => [...lineLadder, ...(lineSteps ?? []).filter((s) => s.action === 'timeout')].map((s) => s.label),
+    [lineLadder, lineSteps],
+  );
   // The buttons' picture, drawn once for the list; every strip shows it.
-  const lineArt = useLineArt(modLine, chatDesign?.font_size ?? 14);
+  const lineArt = useLineArt(lineNow, chatDesign?.font_size ?? 14, lineFit, modLine);
   const lineArtRef = useRef<{ art: NonNullable<typeof lineArt>; buttons: LineButton[] } | null>(null);
   useLayoutEffect(() => {
-    lineArtRef.current = lineArt && modLine ? { art: lineArt, buttons: modLine } : null;
+    lineArtRef.current = lineArt && lineNow ? { art: lineArt, buttons: lineNow } : null;
+  });
+  const lineWheelRef = useRef({ nudge: nudgeLine, reset: resetLine, around: aroundLine });
+  useLayoutEffect(() => {
+    lineWheelRef.current = { nudge: nudgeLine, reset: resetLine, around: aroundLine };
   });
   // Pointing where a mod action starts freezes the view (mouse and pen; a
   // touch has no hover), so a fast chat cannot pull the target away while you
@@ -528,9 +554,19 @@ const ChatMessageList = memo(function ChatMessageList({
     };
     el.addEventListener('pointerdown', onDown);
     const unbind = bindLineStrips(el, () => lineArtRef.current, (hit) => void moderateWithToast(hit.request));
+    // The wheel over a line's buttons walks its timeout's length; it never
+    // reaches the list's own wheel handling, so chat holds still meanwhile.
+    const unbindWheel = bindLineWheel(
+      el,
+      () => lineArtRef.current,
+      (index, dir) => lineWheelRef.current.nudge(index, dir),
+      () => lineWheelRef.current.reset(),
+      (index) => lineWheelRef.current.around(index),
+    );
     return () => {
       el.removeEventListener('pointerdown', onDown);
       unbind();
+      unbindWheel();
     };
   }, [lineActive]);
 
@@ -868,7 +904,10 @@ const ChatMessageList = memo(function ChatMessageList({
     <div className="relative h-full" style={IS_MOBILE ? PHONE_TOP_FADE : undefined}>
       <div
         ref={containerRef}
-        className="h-full overflow-y-auto overflow-x-hidden scrollbar-thin"
+        // On the phone the bar shows only while the list is paused (sn-chat-live
+        // in styles/mobile.css): pinned to the newest line it moves every message.
+        className={`h-full overflow-y-auto overflow-x-hidden scrollbar-thin${isPaused ? '' : ' sn-chat-live'}`}
+        data-line-show={lineActive ? lineShow : undefined}
         onScroll={handleScroll}
         onWheel={handleWheel}
         onTouchStart={handleTouchStart}
@@ -897,6 +936,9 @@ const ChatMessageList = memo(function ChatMessageList({
           ref={contentRef}
           className={`flex flex-col min-h-full justify-end${chatDesign?.alternating_backgrounds ? ' chat-striped' : ''}`}
           style={headerSpaceReserved ? undefined : { paddingTop: headerInset }}
+          // How much of the list's top the floating header covers; the mod
+          // slider's chip goes under a line that close to it.
+          data-header-inset={headerSpaceReserved ? 0 : headerInset}
           data-entrance={chatDesign?.message_entrance && chatDesign.message_entrance !== 'none' ? chatDesign.message_entrance : undefined}
         >
           {messages.map((message, index) => {
@@ -1005,6 +1047,11 @@ const ChatMessageList = memo(function ChatMessageList({
       </div>
       {marksOn && (
         <ScrollbarMarks scrollerRef={containerRef} contentRef={contentRef} marks={marks} overlay={IS_MAC} />
+      )}
+      {emptyNote && liveMessages.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-6">
+          <p className="text-center text-[13px] text-textMuted">{emptyNote}</p>
+        </div>
       )}
     </div>
   );

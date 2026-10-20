@@ -882,7 +882,7 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   // Moderation
   { tab: 'Moderation', keywords: 'moderation mod ban timeout delete chat actions logs nuke purge mass visibility highlights' },
   { tab: 'Moderation', section: 'Reasons', sectionId: 'settings-section-mod-reasons', label: 'Ban and nuke reasons', keywords: 'reason reasons ban timeout nuke saved preset prefill default text why mod view record note' },
-  { tab: 'Moderation', section: 'Moderation Actions', keywords: 'moderation actions method how you act on a message bucket position where the drop buckets appear pin bucket pin from the drag gesture action style mod drag moderate grab buttons both ban timeout delete whisper profile buckets pin pinned message inline column bar above beside chat layout slider mod slider swipe slide to timeout steps delete ban timeout length message edge line buttons inline mod buttons one click moderation' },
+  { tab: 'Moderation', section: 'Moderation Actions', keywords: 'moderation actions method how you act on a message action style mod drag moderate grab hover buttons ban timeout delete whisper profile pin pinned message slider mod slider swipe slide to timeout steps length slider style preview rail capsule message edge line buttons inline mod buttons one click moderation' },
   { tab: 'Moderation', section: 'Mod Rooms', keywords: 'mod rooms room private encrypted team chat consent connect disconnect connected account moderator backchannel' },
   { tab: 'Moderation', section: 'Mod Logs', keywords: 'mod logs log panel show the mod log beside chat panel recent moderation actions timeouts bans deletions sidebar' },
   { tab: 'Moderation', section: 'Removed Messages', keywords: 'removed messages message visibility action notices announce mod actions inline hide strikethrough removed banned timed out deleted' },
@@ -947,7 +947,8 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   // Notifications
   { tab: 'Notifications', keywords: 'notifications toast dynamic island sound alerts live whisper drops update channel points badge' },
   { tab: 'Notifications', section: 'Display', keywords: 'display notification methods dynamic island show in the dynamic island toasts toast popups position where toasts appear edge distance distance from the edge spacing corner' },
-  { tab: 'Notifications', section: 'Notification Types', keywords: 'notification types followed channels favorite channels whispers app updates claimed drops new drops channel points new badges gift subs earned rewards live going live whisper dm update available drops channel points badge favorite favorites favorite channel watchlist category' },
+  { tab: 'Notifications', section: 'Notify me about', keywords: 'notify me about notification types live channels followed channels favorite channels live mentions and replies whispers app updates drops claimed drops new drops channel points predictions new badges gift subs earned rewards going live whisper dm update available badge favorite favorites watchlist category' },
+  { tab: 'Notifications', section: 'Mentions', keywords: 'mentions counts as a mention name without @ display name highlight words muted chats mute unmute ping replies dynamic island notification history' },
   { tab: 'Notifications', section: 'Sound', keywords: 'sound play a sound tone which sound to play volume test notification send a test notification sound style ping audio' },
 
   // Cache

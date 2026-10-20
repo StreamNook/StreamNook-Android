@@ -9,6 +9,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Check, MagnifyingGlass, Plus } from 'phosphor-react';
+import { ChatsMinimizeButton } from './ChatsMinimizeButton';
 import { useAppStore } from '../../stores/AppStore';
 import { useChatTabsStore } from './chatTabsStore';
 import { Logger } from '../../utils/logger';
@@ -133,12 +134,23 @@ const Label: React.FC<{ text: string; count?: number }> = ({ text, count }) => (
   </div>
 );
 
+const LIST_FADE = {
+  WebkitMaskImage: 'linear-gradient(to bottom, transparent, #000 12px)',
+  maskImage: 'linear-gradient(to bottom, transparent, #000 12px)',
+} as const;
+
 export const ChatPicker: React.FC<{
   /** After a chat opens (the sheet closes itself). */
   onPicked?: () => void;
   /** Extra space under the lists (the inline picker clears the tab bar). */
   bottomClearance?: string;
-}> = ({ onPicked, bottomClearance }) => {
+  /** Scroll the lists here, under a search field that stays put and never
+   *  fades (the Chats screen). In a sheet, the sheet scrolls everything. */
+  scrolls?: boolean;
+  /** Where the picker is the whole Chats screen: a Close beside the search
+   *  leaves Chats. */
+  onClose?: () => void;
+}> = ({ onPicked, bottomClearance, scrolls = false, onClose }) => {
   const tabs = useChatTabsStore((s) => s.tabs);
   const revision = useChatTabsStore((s) => s.revision);
   const addTab = useChatTabsStore((s) => s.addTab);
@@ -223,8 +235,11 @@ export const ChatPicker: React.FC<{
   const mixedFound = new Set(found.map((r) => r.provider)).size > 1;
 
   return (
-    <div className="flex flex-col min-h-0">
-      <div className="flex items-center gap-2 glass-input px-3 mx-1 mb-1 shrink-0">
+    <div className={`flex flex-col min-h-0 ${scrolls ? 'flex-1' : ''}`}>
+      <div className="flex items-center gap-1.5 mx-1 mb-1 shrink-0">
+        {/* Chats' way out, the header's minimize arrow, left of the search on its center line. */}
+        {onClose && <ChatsMinimizeButton onMinimize={onClose} className="-ml-0.5" />}
+      <div className="flex-1 min-w-0 flex items-center gap-2 glass-input px-3">
         <MagnifyingGlass size={16} className="text-textMuted shrink-0" />
         <input
           value={query}
@@ -239,7 +254,13 @@ export const ChatPicker: React.FC<{
           }}
         />
       </div>
-      <div className="flex flex-col" style={{ paddingBottom: bottomClearance }}>
+      </div>
+      <div
+        className={`flex flex-col ${scrolls ? 'flex-1 min-h-0 overflow-y-auto' : ''}`}
+        // Rows scrolling up fade out under the field; at rest the first label
+        // sits below the fade (its own 12 px of top padding), fully drawn.
+        style={{ paddingBottom: bottomClearance, ...(scrolls ? LIST_FADE : null) }}
+      >
         {searchingNow ? (
           searching && found.length === 0 ? (
             <div className="py-6 text-center text-sm text-textMuted">Searching…</div>

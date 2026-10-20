@@ -1,7 +1,7 @@
 // The menu behind the composer's trailing button when there is nothing to send.
 // Send and this share one slot, so the composer never carries a dead button.
 import React, { useState } from 'react';
-import { ArrowsClockwise, BookmarkSimple, CaretRight, ChatsCircle, Heart, HeartBreak, PencilSimpleLine, ShieldCheck, Star, Terminal, X } from 'phosphor-react';
+import { ArrowsClockwise, BookmarkSimple, Tray, CaretRight, ChatsCircle, Heart, HeartBreak, PencilSimpleLine, PushPin, ShieldCheck, Star, Terminal, X } from 'phosphor-react';
 import {
   Fingerprint as ModeUnique,
   Heart as ModeFollowers,
@@ -11,6 +11,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import { MobileSheet } from '../ui/MobileSheet';
+import { fitCount } from '../../utils/fitNumber';
 import { GroupCard, GroupFooter, GroupLabel, GroupRow } from '../ui/GroupedList';
 import { useChannelSocial } from '../../hooks/useChannelSocial';
 import { platformTerms } from '../../utils/platformTerms';
@@ -55,8 +56,16 @@ interface Props {
   /** Opens the stream manager. Absent where there is nothing to manage
    *  (not a Twitch chat you moderate or own). */
   onManageChannel?: () => void;
+  /** The room's moderation sheet (moderators, Twitch). */
+  onModeration?: () => void;
+  /** Opens the room's pin, folded away by Pinned Messages > Style: Hidden.
+   *  Absent while no pin waits there. */
+  onShowPinned?: () => void;
   /** Absent for the stream-following tab, which is not closable. */
   onCloseChat?: () => void;
+  /** The inbox, while a narrow message bar has no room for its tray: its
+   *  row and count live here instead. Absent while the tray is on the bar. */
+  inbox?: { unread: number; open: () => void };
 }
 
 export const ComposerMenuSheet: React.FC<Props> = ({
@@ -74,7 +83,10 @@ export const ComposerMenuSheet: React.FC<Props> = ({
   onReload,
   onBrowseCommands,
   onManageChannel,
+  onModeration,
+  onShowPinned,
   onCloseChat,
+  inbox,
 }) => {
   // The stream's own chat closes with the player unless you keep it; every
   // other open chat is already one of yours.
@@ -214,6 +226,37 @@ export const ComposerMenuSheet: React.FC<Props> = ({
           Add a chat
         </GroupRow>
 
+        {inbox && (
+          <GroupRow
+            onClick={() => {
+              onClose();
+              inbox.open();
+            }}
+            icon={<Tray size={ICON} className="text-textSecondary" />}
+            trailing={
+              inbox.unread > 0 ? (
+                <span className="sn-inbox-badge mr-1 min-w-[18px] h-[18px] px-[5px] rounded-full text-[11px] font-bold leading-[18px] text-center tabular-nums">
+                  {fitCount(inbox.unread)}
+                </span>
+              ) : undefined
+            }
+          >
+            Inbox
+          </GroupRow>
+        )}
+
+        {onShowPinned && (
+          <GroupRow
+            onClick={() => {
+              onClose();
+              onShowPinned();
+            }}
+            icon={<PushPin size={ICON} className="text-textSecondary" />}
+          >
+            Pinned message
+          </GroupRow>
+        )}
+
         <GroupRow
           onClick={() => {
             onReload();
@@ -250,6 +293,19 @@ export const ComposerMenuSheet: React.FC<Props> = ({
             icon={<Terminal size={ICON} className="text-textSecondary" />}
           >
             Chat commands
+          </GroupRow>
+        )}
+
+        {onModeration && (
+          <GroupRow
+            onClick={() => {
+              onClose();
+              onModeration();
+            }}
+            icon={<ShieldCheck size={ICON} className="text-textSecondary" />}
+            trailing={<CaretRight size={16} className="text-textMuted" />}
+          >
+            Moderation
           </GroupRow>
         )}
 

@@ -64,6 +64,9 @@ member-aliases-invalidated
 member-theme-changed
 membership-gift-received
 membership-status-changed
+mention-arrived
+mention-inbox-changed
+mention-notify
 mirrored-notification
 mirrored-notification-activate
 multi-nook://meta
@@ -97,9 +100,12 @@ provider-live-update
 provider-send-unconfirmed
 provider-stream-layout
 provider-stream-offline
+reward-granted
+room-mod-log
 seventv-connected
 seventv-connected-account
 seventv-profile-pictures
+sleep-timer://state
 sn-registry-changed
 stream-manager-state
 streamer-mode-changed
@@ -131,6 +137,7 @@ whisper-archive-changed
 whisper-conversation-updated
 whisper-import-complete
 whisper-import-progress
+whisper-notify
 whisper-received
 window-visibility
 youtube-identity-changed

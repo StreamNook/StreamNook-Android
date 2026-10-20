@@ -33,6 +33,13 @@ interface MobileNavState {
   browseCategory: TwitchCategory | null;
   /** The cosmetics (equip) screen. */
   cosmeticsOpen: boolean;
+  /** The mentions inbox, over everything else (it opens from the chat too). */
+  mentionsOpen: boolean;
+  /** The whispers list, over everything else like Mentions (a notification
+   *  tap and the chat inbox open it from anywhere). */
+  whispersOpen: boolean;
+  /** The conversation open in its bottom sheet, by its inbox key. */
+  whisperKey: string | null;
   /** Watch presentation: full screen, or the draggable in-app mini player
    *  (the tab shell stays live behind it). System PiP is separate: that hands
    *  the whole activity to the OS window. */
@@ -43,6 +50,11 @@ interface MobileNavState {
   /** The tab Chats was opened from: Chats is a full-screen surface with no
    *  tab bar, and leaving it (the grabber, a slide down, back) returns here. */
   chatsReturnTab: MobileTab;
+  /** How far above the bottom edge the Chats composer (and any banner over
+   *  it) starts while a chat shows there, in CSS px; null elsewhere. Chats has
+   *  no tab bar, so the mini player rests above this instead. */
+  chatsFloor: number | null;
+  setChatsFloor: (px: number | null) => void;
   /** Leaves Chats for the tab it was opened from. */
   exitChats: () => void;
   setTab: (tab: MobileTab) => void;
@@ -59,8 +71,18 @@ interface MobileNavState {
   clearSettingsTarget: () => void;
   openBrowseCategory: (category: TwitchCategory | null) => void;
   setCosmeticsOpen: (open: boolean) => void;
+  setMentionsOpen: (open: boolean) => void;
+  /** The whispers list (the entry the inbox and the You tab use). */
+  openWhispers: () => void;
+  /** One conversation, in the bottom sheet the chat menu uses, over whatever
+   *  is on screen (an open inbox goes first). */
+  openWhisper: (key: string) => void;
+  /** Close the conversation's sheet. */
+  closeWhisper: () => void;
+  /** Close the whispers layer entirely. */
+  closeWhispers: () => void;
   setPlayerMode: (mode: 'full' | 'mini') => void;
-  /** Back chain: top sheet -> settings -> cosmetics -> minimize the watch layer
+  /** Back chain: top sheet (a whisper conversation is one) -> whispers -> mentions -> settings -> cosmetics -> minimize the watch layer
    *  -> category drill -> a tab other than the start tab -> not consumed
    *  (native backgrounds the task). */
   handleBack: () => boolean;
@@ -76,9 +98,14 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
   settingsReturn: null,
   browseCategory: null,
   cosmeticsOpen: false,
+  mentionsOpen: false,
+  whispersOpen: false,
+  whisperKey: null,
   playerMode: 'full',
   focusDropCampaignId: null,
   chatsReturnTab: startTab() === 'chats' ? 'following' : startTab(),
+  chatsFloor: null,
+  setChatsFloor: (px) => set((s) => (s.chatsFloor === px ? s : { chatsFloor: px })),
 
   setTab: (tab) =>
     set((s) =>
@@ -119,14 +146,27 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
   clearSettingsTarget: () => set({ settingsTarget: null }),
   openBrowseCategory: (category) => set({ browseCategory: category }),
   setCosmeticsOpen: (open) => set({ cosmeticsOpen: open }),
+  setMentionsOpen: (open) => set({ mentionsOpen: open }),
+  openWhispers: () => set({ whispersOpen: true, whisperKey: null }),
+  openWhisper: (key) => set({ whisperKey: key, mentionsOpen: false }),
+  closeWhisper: () => set({ whisperKey: null }),
+  closeWhispers: () => set({ whispersOpen: false, whisperKey: null }),
   setPlayerMode: (mode) => set({ playerMode: mode }),
 
   handleBack: () => {
-    const { sheetStack, activeTab, settingsView, browseCategory, cosmeticsOpen, playerMode } =
+    const { sheetStack, activeTab, settingsView, browseCategory, cosmeticsOpen, mentionsOpen, playerMode } =
       get();
     if (sheetStack.length > 0) {
       const top = sheetStack[sheetStack.length - 1];
       window.dispatchEvent(new CustomEvent('sn:close-sheet', { detail: top }));
+      return true;
+    }
+    if (get().whispersOpen) {
+      set({ whispersOpen: false });
+      return true;
+    }
+    if (mentionsOpen) {
+      set({ mentionsOpen: false });
       return true;
     }
     if (settingsView) {

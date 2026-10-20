@@ -55,6 +55,9 @@ pub mod version_report;
 pub mod twitch_recap;
 pub mod pronouns;
 pub mod mention_ping;
+pub mod mention_watch;
+pub mod mention_match;
+pub mod mention_inbox;
 pub mod stream_manager;
 pub mod streamer_mode;
 pub mod suspicious_users;
@@ -62,6 +65,8 @@ pub mod user_notes;
 pub mod mod_history;
 pub mod chat_warning;
 pub mod chatter_card;
+pub mod touch_mod_slider;
+pub mod room_mod_log;
 pub mod diagnostic_logger;
 pub mod hls_projection;
 pub mod hls_seq_ids;
@@ -80,6 +85,7 @@ pub mod drop_words;
 pub mod drops_overview;
 pub mod drops_service;
 pub mod game_suggest;
+pub mod wallet_glyph;
 pub mod watched_chest;
 pub mod reward_drops;
 pub mod reward_redeem;
@@ -103,6 +109,7 @@ pub mod http;
 pub mod hype_train_watch;
 pub mod irc_service;
 pub mod ivr;
+pub mod late_third_party;
 pub mod irc_transport;
 pub mod kick_auth_service;
 pub mod layout_service;
@@ -129,7 +136,17 @@ pub mod link_adapt;
 pub mod ll_origin;
 pub mod theme_palette;
 pub mod settings_backups;
+pub mod install_marker;
 pub mod settings_catalog;
+pub mod alert_types;
+// Phones only: go-live push registration. Its rules are tested on desktop.
+#[cfg(any(mobile, test))]
+pub mod push_alerts;
+// Phones only: the background go-live check and its never-twice record. Its
+// rules are tested on desktop.
+#[cfg(any(mobile, test))]
+pub mod live_poll;
+pub mod client_capabilities;
 #[cfg(test)]
 mod ll_soak;
 #[cfg(test)]
@@ -166,6 +183,9 @@ pub mod streamnook_backend;
 pub mod css_fill;
 pub mod cosmetics_registry;
 pub mod member_profile;
+pub mod member_rewards;
+pub mod member_signin;
+pub mod member_stats;
 pub mod member_theme;
 pub mod profile_view;
 pub mod flv_fmp4;
@@ -208,11 +228,14 @@ pub mod collaboration;
 pub mod shared_chat;
 pub mod link_preview_cache;
 pub mod shared_chat_source;
+// The Custom interface font's files on the phones.
+pub mod custom_font;
 pub mod share_link;
 pub mod slash_commands;
 pub mod chat_top_stack;
 pub mod poll_view;
 pub mod predictions;
+pub mod sleep_timer;
 pub mod slash_dispatch;
 pub mod nuke;
 pub mod hls_kind;

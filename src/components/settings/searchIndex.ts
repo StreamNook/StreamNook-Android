@@ -1,3 +1,4 @@
+import { IS_MOBILE } from '../../utils/platform';
 export interface SettingsIndexEntry {
   tab: string;
   section: string;
@@ -198,7 +199,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Streaming',
     sectionId: 'settings-section-streaming',
     title: 'Retry delay',
-    description: 'How long to wait between attempts while a stream is not available yet (0 means a single attempt). Previously "Pause between attempts".'
+    description: 'How long to wait between attempts while a stream has not started yet (0 means a single attempt). Previously "Pause between attempts".'
   },
   {
     tab: 'Player',
@@ -369,7 +370,10 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Font',
     sectionId: 'settings-section-font',
     title: 'Custom font',
-    description: 'Use any font you want for the app. Type a name like Poppins, Bebas Neue, or Rubik and it loads automatically, or type the name of a font already installed on this PC.'
+    // A phone draws only fonts the app downloads; a PC also has its installed ones.
+    description: IS_MOBILE
+      ? 'Use any font you want for the app. Type a name like Poppins, Bebas Neue, or Rubik and it loads automatically.'
+      : 'Use any font you want for the app. Type a name like Poppins, Bebas Neue, or Rubik and it loads automatically, or type the name of a font already installed on this PC.'
   },
   // === Chat ===
   {
@@ -1598,7 +1602,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Moderation Actions',
     title: 'Timeout lengths',
     parent: 'Hover buttons',
-    description: 'The lengths the arrow beside the quick 10m timeout opens on a hovered message, shortest first. Previously "Timeout presets", typed in seconds.'
+    description: 'The lengths the arrow beside the quick 10m timeout opens on a hovered message, shortest first. Pick from the list or type your own (45m, 1h30m, 2d). Previously "Timeout presets", typed in seconds.'
   },
   {
     tab: 'Moderation',
@@ -1631,7 +1635,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Moderation',
     section: 'Moderation Actions',
     title: 'Moderation Actions',
-    description: 'How you ban, time out or delete straight from a message: what sits on its left edge (slider, tiles or line buttons) and the hover buttons in its corner. Also called Action Style or Method.'
+    description: 'How you ban, time out or delete straight from a message: what sits on its left edge (slider or line buttons) and the hover buttons in its corner. Also called Action Style or Method.'
   },
   {
     tab: 'Moderation',
@@ -1642,50 +1646,43 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Moderation',
     section: 'Moderation Actions',
-    title: 'Tile position',
-    parent: 'Message edge',
-    description: 'Beside chat puts a column of bigger tiles to the left of chat, clear of the player controls; Above chat puts a compact cluster right above the message for when space is tight. Previously "Bucket position".'
-  },
-  {
-    tab: 'Moderation',
-    section: 'Moderation Actions',
-    title: 'Pin tile',
-    parent: 'Message edge',
-    description: 'Adds a Pin tile to the drag tiles. Mods always get a Pin button beside Copy on a message. Previously "Pin bucket".'
-  },
-  {
-    tab: 'Moderation',
-    section: 'Moderation Actions',
-    title: 'Timeout length',
-    parent: 'Message edge',
-    description: 'What a drop on the Timeout tile times someone out for. One drop, no second drag; pick other lengths with the slider.'
-  },
-  {
-    tab: 'Moderation',
-    section: 'Moderation Actions',
     title: 'Message edge',
-    description: 'What sits at the left edge of a message you can act on. Slider: drag it right through Delete, timeouts from short to long, then Ban, and let go to apply. Tiles: drag the message by its left-edge handle onto a Delete, Timeout or Ban tile. Line buttons: Delete, timeouts and Ban as small buttons on every line, one click each. Off: nothing. No ban or timeout on your own messages, the owner\'s, or other mods\'. Also called mod slider, swipe to moderate, drag to moderate, grab handle, drag tiles, buckets, inline mod buttons, one-click moderation. Previously "Slider" and "Method: Drag".'
+    description: 'What sits at the left edge of a message you can act on. Slider: drag it right through Delete, timeouts from short to long, then Ban, and let go to apply. Line buttons: Delete, timeouts and Ban as small buttons on every line, one click each. Off: nothing. No ban or timeout on your own messages, the owner\'s, or other mods\'. Also called mod slider, swipe to moderate, drag to moderate, grab handle, inline mod buttons, one-click moderation. Previously "Slider", "Tiles" and "Method: Drag".'
+  },
+  {
+    tab: 'Moderation',
+    section: 'Moderation Actions',
+    title: 'Show',
+    parent: 'Message edge',
+    description: 'When the line buttons show: On hover puts them on the line under your pointer only, pushing its text over; Always keeps them on every line. Scroll over a timeout button to walk its length through your slider Steps. Also called hover line buttons.'
   },
   {
     tab: 'Moderation',
     section: 'Moderation Actions',
     title: 'Buttons',
     parent: 'Message edge',
-    description: 'Which line buttons each message gets: turn Delete and Ban on or off and pick the timeout lengths. They run from mildest to harshest, left to right.'
+    description: 'Which line buttons each message gets: turn Delete and Ban on or off and pick the timeout lengths, or type your own (45m, 1h30m, 2d). They run from mildest to harshest, left to right.'
+  },
+  {
+    tab: 'Moderation',
+    section: 'Moderation Actions',
+    title: 'Style',
+    parent: 'Message edge',
+    description: 'How the slider looks while you drag. Preview: the message stays put, struck through in the color of the step, with a chip naming the step. Rail: every step laid out on a bar over the message. Capsule: the message slides aside for a capsule that names the step. Also called slider look or slider design.'
   },
   {
     tab: 'Moderation',
     section: 'Moderation Actions',
     title: 'Length',
     parent: 'Message edge',
-    description: 'How far you drag to reach each step: Short spreads them over half a message, Medium four fifths, Long the whole width. Also called slider distance or spacing.'
+    description: 'How far you drag for each step, the same at every chat width: Short is closest together, Long is easiest to land on exactly. A narrow chat squeezes them to fit. Also called slider distance or spacing.'
   },
   {
     tab: 'Moderation',
     section: 'Moderation Actions',
     title: 'Steps',
     parent: 'Message edge',
-    description: 'Which steps the slider offers: turn Delete and Ban on or off and pick the timeout lengths. They always run from mildest to harshest.'
+    description: 'Which steps the slider offers: turn Delete and Ban on or off and pick the timeout lengths, or type your own (45m, 1h30m, 2d). They always run from mildest to harshest.'
   },
   {
     tab: 'Moderation',
@@ -2420,17 +2417,14 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     description: 'Block Twitch ads with the ad blocker plugin. Ad-free, TTV LOL, proxy, splice. Plugin integration panels appear here once installed.'
   },
   // === Notifications ===
+  // "Notify me about" rows are drawn from Rust's alert type list
+  // (src-tauri/src/services/alert_types.json, the desktop ones), with its
+  // titles; searchIndex.coverage.test.ts reads that list to check them.
   {
     tab: 'Notifications',
     section: 'Notifications',
     title: 'Notifications',
-    description: 'Control notification system settings.'
-  },
-  {
-    tab: 'Notifications',
-    section: 'Notifications',
-    title: 'All notifications',
-    description: 'Turn this off to silence every notification at once; your choices below stay saved for when you turn it back on. Previously "Show notifications".'
+    description: 'Turn every notification on or off at once; your choices stay saved for when you turn them back on. Master switch, mute all, silence everything. Previously "All notifications".'
   },
   {
     tab: 'Notifications',
@@ -2468,7 +2462,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Notifications',
     section: 'Display',
     title: 'System notifications',
-    description: 'Windows, macOS or desktop notifications while you are in another app, or StreamNook is minimized or in the tray. Native notifications, Action Center, notification popups outside the app.'
+    description: 'Windows, macOS or desktop notifications while you are in another app, or StreamNook is minimized or in the tray. Native notifications, Action Center, notification popups outside the app, macOS permission, allow notifications.'
   },
   {
     tab: 'Notifications',
@@ -2479,104 +2473,116 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Notification Types',
-    description: 'Enable or disable specific types: live streams, whispers, updates, drops, channel points, badges.'
+    section: 'Notify me about',
+    title: 'Notify me about',
+    description: 'Pick which events are worth a notification: live channels, favorites, mentions, whispers, drops, badges, gift subs, rewards, channel points, predictions, app updates. Previously "Notification Types".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Followed channels',
-    description: 'You get a notification the moment someone you follow starts streaming, and clicking it opens the stream. Previously "When a followed channel goes live".'
+    section: 'Notify me about',
+    title: 'Live channels',
+    description: 'When a channel you follow goes live, the moment it starts streaming, and clicking it opens the stream. Going live, followed channels. Previously "Followed channels".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Favorite channels',
-    description: 'Channels you have favorited notify you even if you do not follow them on Twitch. Previously "When a favorite channel goes live".'
+    section: 'Notify me about',
+    title: 'Favorite channels live',
+    description: 'When a channel you favorited goes live, even one you do not follow on Twitch. Favorites. Previously "Favorite channels".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Whispers',
-    description: 'A notification shows each new whisper, and clicking it opens the conversation. Previously "When you get a whisper".'
-  },
-  {
-    tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
     title: 'Mentions and replies',
-    description: 'A notification shows when someone mentions you or replies to you in a Twitch chat while StreamNook is in the background, and clicking it opens that chat.'
+    description: 'When someone mentions or replies to you while that chat is not on screen, and clicking it opens the chat at that message. @ mentions, pings. Previously "Notify me" under Mentions and replies.'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'App updates',
-    description: 'You hear about new StreamNook versions as soon as they are available, and clicking takes you to the Updates page. Previously "When an app update is ready".'
+    section: 'Notify me about',
+    title: 'Whispers',
+    description: 'When someone whispers you, and clicking it opens the conversation. DM, direct message. Previously "When you get a whisper".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Update straight from the toast',
-    description: 'Clicking the update toast starts installing right away instead of opening the Updates page first.'
+    section: 'Notify me about',
+    title: 'Drops',
+    description: 'Campaign progress and claimable rewards: a notification confirms each drop StreamNook claims for you. Previously "Claimed drops".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Claimed drops',
-    description: 'A notification confirms each drop StreamNook claims for you. Previously "When a drop is claimed".'
-  },
-  {
-    tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
     title: 'New drops',
-    parent: 'Claimed drops',
+    parent: 'Drops',
     description: 'At startup, StreamNook checks your favorite categories and tells you when they have new drops to earn. Previously "New drops in favorite categories".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Channel points',
-    description: 'A notification for the points you earn: bonus chests, raids, watch streaks and prediction results, with the channel\'s face and its own name for its points. Points for watching update quietly in Action Center. Previously "When channel points are claimed".'
+    section: 'Notify me about',
+    title: 'New badges',
+    description: 'When a new global badge becomes available to earn. Previously "When new badges appear".'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
+    title: 'Gift subs',
+    description: 'When someone gifts you a sub, even for a channel you were not watching.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
+    title: 'Earned rewards',
+    description: 'When Twitch names a badge or drop reward you earned: which badge, or which drop reward is waiting, by name.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
+    title: 'Channel points',
+    description: 'Bonus chests, raids, watch streaks and prediction results, with the channel\'s face and its own name for its points. Points for watching update quietly in Action Center. Previously "When channel points are claimed".'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
     title: 'Rewards button',
     parent: 'Channel points',
     description: 'A Rewards button on the Windows channel points notification that opens the channel\'s rewards, and a right-click item for these settings.'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
     title: 'Next reward',
     parent: 'Channel points',
     description: 'A progress bar on the Windows channel points notification toward the cheapest reward you cannot afford yet.'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
     title: 'Try one',
     parent: 'Channel points',
     description: 'Shows a sample channel points notification with the extras you turned on. Nothing is spent.'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
     title: 'Predictions',
-    description: 'A notification when a prediction opens on a channel you are watching while StreamNook is in the background, with its choices and how long betting stays open.'
+    description: 'When a prediction opens on a channel you are watching while StreamNook is in the background, with its choices and how long betting stays open.'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
+    section: 'Notify me about',
     title: 'Try one',
     parent: 'Predictions',
     description: 'Shows a sample prediction notification. Nothing is bet.'
   },
   {
     tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'New badges',
-    description: 'You hear about new badges as soon as they become available to earn. Previously "When new badges appear".'
+    section: 'Notify me about',
+    title: 'App updates',
+    description: 'When a new StreamNook version is out, and clicking it opens the changelog to what is new. Previously "When an app update is ready".'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
+    title: 'Update straight from the toast',
+    description: 'Clicking the update toast starts installing right away instead of opening the Updates page first.'
   },
   {
     tab: 'Notifications',
@@ -2600,33 +2606,66 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Notifications',
     section: 'Sound',
+    title: 'Volume',
+    parent: 'Sound',
+    description: 'How loud the notification sound plays. Notification volume, quieter, louder.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Sound',
     title: 'Test notification',
     description: 'Fires a sample notification so you can check the position, sound, and style you picked. Previously "Send a test".'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: 'Mentions',
+    description: 'Everything that mentions or replies to you is kept in the Dynamic Island\'s notification history. @ mentions, replies to you, pings. Previously "Mentions and replies".'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: 'Counts as a mention',
+    description: 'Your @name always counts as a mention. Choose what else does, for notifications and in the Dynamic Island\'s notification history.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: 'Name without @',
+    parent: 'Counts as a mention',
+    description: 'Your login written as a word, without the @ in front, counts as a mention.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: 'Display name',
+    parent: 'Counts as a mention',
+    description: 'Your display name counts as a mention when it differs from your login.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: 'Highlight words',
+    parent: 'Counts as a mention',
+    description: 'Messages that match one of your highlight phrases count as mentions: they can notify you and are kept in the notification history.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: 'Muted chats',
+    description: 'Chats whose mentions never notify you or are kept in the Dynamic Island\'s notification history. Unmute them here. Silence, ignore a channel.'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Mentions',
+    title: "Mentions while you're away",
+    description: "StreamNook's server watches chat in channels you follow for your name and replies, and keeps matches for 7 days. Away, closed app, mentions in other chats, offline mentions."
   },
   {
     tab: 'Notifications',
     section: 'About',
     title: 'About',
     description: 'About notifications and how to use them.'
-  },
-  {
-    tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Gift subs',
-    description: 'A notification when someone gifts you a sub, even for a channel you were not watching. When someone gifts you a sub.'
-  },
-  {
-    tab: 'Notifications',
-    section: 'Notification Types',
-    title: 'Earned rewards',
-    description: 'Hear which badge you earned or which drop reward is waiting, by name. When Twitch names a reward for you.'
-  },
-  {
-    tab: 'Notifications',
-    section: 'Sound',
-    title: 'Volume',
-    parent: 'Sound',
-    description: 'How loud the notification sound plays. Notification volume, quieter, louder.'
   },
   // === Cache ===
   {
@@ -2639,7 +2678,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Cache',
     section: 'Cache',
     title: 'Disk cache',
-    description: 'Stores a copy on this PC after the first download so later channel loads are near instant. Off means every launch fetches them again. Previously "Load emotes and badges from disk".'
+    description: 'Stores a copy on this device after the first download so later channel loads are near instant. Off means every launch fetches them again. Previously "Load emotes and badges from disk".'
   },
   {
     tab: 'Cache',
@@ -2752,7 +2791,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Support',
     section: 'Diagnostics',
     title: 'Detailed log',
-    description: 'Records connection, playback, and chat activity to streamnook.log on this PC so a problem can be traced after the fact. Previously "Keep a detailed log for bug reports".'
+    description: 'Records connection, playback, and chat activity to streamnook.log on this device so a problem can be traced after the fact. Previously "Keep a detailed log for bug reports".'
   },
   {
     tab: 'Support',
@@ -2807,7 +2846,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Backup',
     section: 'Settings File',
     title: 'Location',
-    description: 'The folder on this PC that holds your settings file. Previously "Where your settings file lives".'
+    description: 'The folder on this device that holds your settings file. Previously "Where your settings file lives".'
   },
   {
     tab: 'Chat',

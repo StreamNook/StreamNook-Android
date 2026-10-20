@@ -130,6 +130,7 @@ export const getThemesByCategory = (category: Theme['category']): Theme[] => {
 import { invoke } from '@tauri-apps/api/core';
 import type { CustomTheme, CustomThemeColor, CustomThemePalette } from '../types';
 import { IS_MOBILE } from '../utils/platform';
+import { Logger } from '../utils/logger';
 
 // Resolve a CustomThemeColor to a CSS-compatible string
 const resolveColor = (c: CustomThemeColor): string => {
@@ -701,8 +702,7 @@ export interface FontOption {
     stack: string;
     /**
      * Chat message body weight for this font, written to --chat-body-weight.
-     * Denser faces (Inter) read heavier at a given weight, so they go lighter
-     * here to keep chat looking lean. Defaults to 300 when omitted.
+     * Defaults to 300 when omitted; Twitch's own chat is Inter at 400.
      */
     chatWeight?: number;
 }
@@ -717,11 +717,10 @@ export const FONT_OPTIONS: FontOption[] = [
     {
         id: 'twitch',
         label: 'Twitch',
-        description: 'Inter — the open-source typeface Twitch uses across its UI and chat.',
+        description: 'Inter, the typeface Twitch uses for chat.',
         stack: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-        // Inter is denser than Satoshi, so chat at the normal 300 reads heavy.
-        // Drop to 200 (ExtraLight) so chat stays lean under the Twitch font.
-        chatWeight: 200,
+        // Twitch draws chat in Inter 400 (names 700, buttons 600).
+        chatWeight: 400,
     },
     {
         id: 'geist',
@@ -767,7 +766,7 @@ const FONT_BY_ID: Record<string, FontOption> = Object.fromEntries(
     FONT_OPTIONS.map((o) => [o.id, o]),
 );
 
-// Default chat message body weight (most fonts). Inter overrides lighter.
+// Default chat message body weight (most fonts). The Twitch font sets its own.
 export const DEFAULT_CHAT_BODY_WEIGHT = 300;
 
 // ─── Custom font ────────────────────────────────────────────────────────────
@@ -789,10 +788,10 @@ export const SUGGESTED_FONTS: string[] = [
 export const sanitizeFontFamily = (raw: string): string =>
     (raw || '').replace(/["',;{}()\\]/g, '').trim().slice(0, 64);
 
-// Same fallback tail the bundled options use, so an unresolvable name still
-// lands somewhere readable instead of blanking the UI.
+// A name no font answers to falls back to the house font, then the same tail
+// the bundled options use, so it lands somewhere readable instead of blanking.
 export const customFontStack = (family: string): string =>
-    `"${family}", -apple-system, BlinkMacSystemFont, sans-serif`;
+    `"${family}", "Satoshi", -apple-system, BlinkMacSystemFont, sans-serif`;
 
 // Families that never need a network fetch: CSS generics, and the faces this
 // app already ships as local woff2 (see the @font-face blocks in globals.css).
@@ -843,6 +842,55 @@ const whenFamilyReady = (family: string, done: () => void): void => {
 let webfontTimer: ReturnType<typeof setTimeout> | null = null;
 let loadedFamily = '';
 
+interface CoreFontFace { weight: number; data?: string }
+type CoreFontLookup =
+    | { state: 'ready'; font: { faces: CoreFontFace[] } }
+    | { state: 'not_found' }
+    | { state: 'unreachable' };
+const coreFaces = new Set<string>();
+
+// Where the typed Custom family stands on a phone, for the line under its name
+// field: being read, drawn, not a Google Font, or Google Fonts out of reach.
+export type CustomFontState = 'idle' | 'loading' | 'ready' | 'not_found' | 'unreachable';
+export interface CustomFontStatus { family: string; state: CustomFontState }
+let customFontStatus: CustomFontStatus = { family: '', state: 'idle' };
+const customFontListeners = new Set<() => void>();
+const setCustomFontStatus = (family: string, state: CustomFontState): void => {
+    if (customFontStatus.family === family && customFontStatus.state === state) return;
+    customFontStatus = { family, state };
+    customFontListeners.forEach((listener) => listener());
+};
+export const getCustomFontStatus = (): CustomFontStatus => customFontStatus;
+export const subscribeCustomFontStatus = (listener: () => void): (() => void) => {
+    customFontListeners.add(listener);
+    return () => { customFontListeners.delete(listener); };
+};
+
+// The phone reads a typed family through the core, which fetches its files from
+// Google Fonts once and keeps them on disk (so the font holds offline), and
+// hands them over to load as FontFaces. Resolves false when there is no font to
+// draw; the stack then falls back to the house font.
+const loadCoreFont = async (family: string): Promise<boolean> => {
+    setCustomFontStatus(family, 'loading');
+    const answer = await invoke<CoreFontLookup>('get_custom_font', { family, withData: true });
+    if (answer.state !== 'ready' || !answer.font.faces.length) {
+        Logger.warn(`[CustomFont] ${family}: ${answer.state === 'ready' ? 'no faces' : answer.state}`);
+        setCustomFontStatus(family, answer.state === 'not_found' ? 'not_found' : 'unreachable');
+        return false;
+    }
+    for (const face of answer.font.faces) {
+        const key = `${family.toLowerCase()}|${face.weight}`;
+        if (coreFaces.has(key) || !face.data) continue;
+        const bytes = Uint8Array.from(atob(face.data), (c) => c.charCodeAt(0));
+        const loaded = await new FontFace(family, bytes, { weight: String(face.weight) }).load();
+        document.fonts.add(loaded);
+        coreFaces.add(key);
+    }
+    Logger.warn(`[CustomFont] ${family}: drawing ${answer.font.faces.map((f) => f.weight).join(', ')}`);
+    setCustomFontStatus(family, 'ready');
+    return true;
+};
+
 // Load a typed family, then call back once it is usable. ONE <link> is reused
 // and its href swapped, so switching fonts never leaves dead stylesheets
 // behind, and the fetch is debounced so typing a name does not fire a request
@@ -855,11 +903,27 @@ export const loadWebFont = (family: string, onReady?: () => void): void => {
     if (webfontTimer) { clearTimeout(webfontTimer); webfontTimer = null; }
     const lower = family.toLowerCase();
     if (!family || NO_FETCH_FAMILIES.has(lower) || lower === loadedFamily) {
+        if (family) setCustomFontStatus(family, 'ready');
         onReady?.();
         return;
     }
     webfontTimer = setTimeout(() => {
         webfontTimer = null;
+        if (IS_MOBILE) {
+            // Only a family that drew counts as loaded, so one that failed
+            // (offline, say) is asked again the next time it is typed.
+            void loadCoreFont(family)
+                .catch((e) => {
+                    Logger.warn(`[CustomFont] ${family}: the core call failed`, e);
+                    setCustomFontStatus(family, 'unreachable');
+                    return false;
+                })
+                .then((drawn) => {
+                    if (drawn) loadedFamily = lower;
+                    onReady?.();
+                });
+            return;
+        }
         loadedFamily = lower;
         let link = document.getElementById(WEBFONT_LINK_ID) as HTMLLinkElement | null;
         if (!link) {

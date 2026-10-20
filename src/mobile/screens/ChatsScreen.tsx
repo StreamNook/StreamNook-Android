@@ -9,7 +9,8 @@
 // phone awake, until Rust's idle span passes with no touch, so a phone left on
 // a desk still sleeps.
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ChatsCircle, Play, Plus } from 'phosphor-react';
+import { ChatsCircle, MonitorPlay, Play, Plus } from 'phosphor-react';
+import { ChatsMinimizeButton } from '../chat/ChatsMinimizeButton';
 import { useAppStore } from '../../stores/AppStore';
 import type { TwitchStream } from '../../types';
 import { MobileChatPane } from '../chat/MobileChatPane';
@@ -19,6 +20,7 @@ import { ChatPicker } from '../chat/ChatPicker';
 import { useChatTabsStore, type ChatTab } from '../chat/chatTabsStore';
 import { useRoomPins } from '../chat/useRoomPins';
 import { PinnedBanner } from '../watch/PinnedBanner';
+import { usePinsOpen } from '../watch/pinsOpen';
 import { holdScreenOn } from '../nativeBridge';
 import { useMobileNavStore } from '../navStore';
 import { useChannelState } from '../../stores/channelStateStore';
@@ -46,7 +48,7 @@ function asStream(tab: ChatTab): TwitchStream {
     started_at: '',
     profile_image_url: tab.avatar ?? undefined,
     provider: tab.provider,
-    is_live: true,
+    is_live: tab.live === true,
   } as TwitchStream;
 }
 
@@ -88,7 +90,11 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
   const keepOn = useAppStore((s) => s.settings.chats_keep_screen_on ?? true);
   const startStream = useAppStore((s) => s.startStream);
   const [addOpen, setAddOpen] = useState(false);
-  const [pinsOpen, setPinsOpen] = useState(false);
+  // A pin opens or folds per channel: each channel starts as Chat > Pinned
+  // Messages > Collapsed says, and a tap holds until the chat switches.
+  const chatChannelId = useActiveChatChannelId();
+  const pins = usePinsOpen();
+  const pinsOpen = pins.open;
   // The closed banner's height: the list starts under it. Opened, the banner
   // floats over the rows, so nothing below it moves.
   const pinsRef = useRef<HTMLDivElement | null>(null);
@@ -102,7 +108,8 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
   useReadingAwake(shown && keepOn && tabs.length > 0, idleSecs);
 
   const pinned = useRoomPins(shown && tabs.length > 0);
-  const hasPins = pinned.length > 0;
+  // Folded with Style set to Hidden, a pin draws nothing and holds no room.
+  const hasPins = pinned.length > 0 && (pinsOpen || pins.style !== 'hidden');
   useLayoutEffect(() => {
     const el = pinsRef.current;
     if (!hasPins || !el) {
@@ -117,14 +124,19 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
     observer.observe(el);
     return () => observer.disconnect();
   }, [hasPins, pinsOpen]);
-  const chatChannelId = useActiveChatChannelId();
   const active = tabs.find((t) => t.channel === activeChannel) ?? null;
   // The stream's own tab is already playing; nothing to start.
   const canWatch = !!active && active.live === true && !active.pinnedToStream;
+  // An offline Twitch room's way in: its channel page (latest broadcast, clips),
+  // the same room a search opens. Rust starts the stream if it is live after all.
+  const canOpenRoom = !!active && active.live !== true && active.provider === 'twitch' && !active.pinnedToStream;
 
   const watch = useCallback(() => {
     if (active) void startStream(active.login, asStream(active));
   }, [active, startStream]);
+  const openRoom = useCallback(() => {
+    if (active) void useAppStore.getState().startOfflineChat(active.login, asStream(active));
+  }, [active]);
   const openAdd = useCallback(() => setAddOpen(true), []);
   const closeAdd = useCallback(() => setAddOpen(false), []);
 
@@ -133,6 +145,27 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
   // a drag there is always a scroll.
   const exitChats = useMobileNavStore((s) => s.exitChats);
   const sheetRef = useRef<HTMLDivElement | null>(null);
+  // Where the composer (and any streak banner over it) starts, for the mini
+  // player's rest: it follows the banners in and out and the keyboard.
+  const setChatsFloor = useMobileNavStore((s) => s.setChatsFloor);
+  const hasRooms = tabs.length > 0;
+  useEffect(() => {
+    const el = shown && hasRooms ? sheetRef.current?.querySelector<HTMLElement>('[data-chat-composer]') : null;
+    if (!el) {
+      setChatsFloor(null);
+      return;
+    }
+    const read = () => setChatsFloor(Math.round(window.innerHeight - el.getBoundingClientRect().top));
+    read();
+    const observer = new ResizeObserver(read);
+    observer.observe(el);
+    window.addEventListener('resize', read);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('resize', read);
+      setChatsFloor(null);
+    };
+  }, [shown, hasRooms, activeChannel, setChatsFloor]);
   const drag = useRef<{
     id: number;
     x: number;
@@ -212,15 +245,23 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
     },
   };
 
-  // The handle: a compact grabber at the top center, which also closes on a
-  // tap. The rooms below get the air (CHATS_STRIP_H), not the grabber row.
+  // The handle: the whole band from the top of the screen (through the status
+  // bar's inset) down to the rooms, so it is easy to catch. A tap closes, a
+  // slide down leaves, and the pill lights up while it is held. It takes no
+  // more layout room than its 16 px row: the rooms below get the air
+  // (CHATS_STRIP_H), and the band reaches up into the inset instead.
   const grabber = (
     <button
       onClick={exitChats}
       aria-label="Close chats"
-      className="mx-auto flex h-4 w-16 shrink-0 items-start justify-center pt-1.5"
+      className="group w-full shrink-0 flex items-start justify-center"
+      style={{
+        marginTop: 'calc(-1 * var(--sn-safe-t, 0px))',
+        paddingTop: 'calc(var(--sn-safe-t, 0px) + 6px)',
+        height: 'max(calc(var(--sn-safe-t, 0px) + 16px), 44px)',
+      }}
     >
-      <span className="block h-[5px] w-9 rounded-full bg-textMuted/45" />
+      <span className="block h-[5px] w-10 rounded-full bg-textMuted/60 transition-[width,background-color] duration-150 group-active:w-12 group-active:bg-textSecondary" />
     </button>
   );
 
@@ -270,14 +311,27 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
       {canWatch && (
         <button
           onClick={watch}
-          className="shrink-0 h-11 flex items-center active:opacity-70"
+          // At least the circles' width, so the row keeps its spacing between a
+          // live room and an offline one; a viewer count still widens it.
+          className="shrink-0 h-11 min-w-11 flex items-center justify-center active:opacity-70"
           aria-label={`Watch ${active?.label ?? ''}`}
         >
-          <span className="h-10 flex items-center gap-1.5 px-3 rounded-full chrome-glaze chrome-glaze--flat text-textSecondary">
+          <span className="h-10 min-w-10 flex items-center justify-center gap-1.5 px-3 rounded-full chrome-glaze chrome-glaze--flat text-textSecondary">
             <Play size={12} weight="fill" className="translate-x-[0.5px]" />
             {active?.viewerCount != null && (
               <span className="text-[12px] font-medium tabular-nums">{formatViewerCount(active.viewerCount)}</span>
             )}
+          </span>
+        </button>
+      )}
+      {canOpenRoom && (
+        <button
+          onClick={openRoom}
+          className="shrink-0 w-11 h-11 flex items-center justify-center active:opacity-70"
+          aria-label={`Open ${active?.label ?? ''}'s channel`}
+        >
+          <span className="w-10 h-10 flex items-center justify-center rounded-full chrome-glaze chrome-glaze--flat text-textSecondary">
+            <MonitorPlay size={14} weight="bold" />
           </span>
         </button>
       )}
@@ -299,12 +353,25 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
           moves to it; the room row still scrolls sideways). */}
       <div className="shrink-0 flex flex-col [touch-action:pan-x]" {...headerHandlers}>
         {grabber}
-        {tabs.length > 0 && <ChatTabStrip always trailing={trailing} leading={leading} height={CHATS_STRIP_H} />}
+        {tabs.length > 0 && (
+          <ChatTabStrip
+            always
+            trailing={trailing}
+            leading={leading}
+            edge={<ChatsMinimizeButton onMinimize={exitChats} />}
+            height={CHATS_STRIP_H}
+          />
+        )}
       </div>
       {tabs.length === 0 ? (
-        // No chat open: the tab is the picker itself.
-        <div className="flex-1 min-h-0 overflow-y-auto px-2 pt-1 [scrollbar-width:none] sn-fade-top">
-          <ChatPicker bottomClearance="calc(var(--sn-safe-b, 0px) + 16px)" />
+        // No chat open: the tab is the picker itself, on the glaze the sheets
+        // wear (solid at 0% glassiness). The search field stays put and fully
+        // drawn; only the lists under it scroll and fade.
+        <div className="flex-1 min-h-0 flex flex-col px-2 pt-1" style={{ paddingBottom: 'calc(var(--sn-safe-b, 0px) + 8px)' }}>
+          {/* The glaze is a pill by default; a sheet-sized panel takes the sheets' corner. */}
+          <div className="flex-1 min-h-0 flex flex-col pt-3 px-1 chrome-glaze chrome-glaze--flat" style={{ borderRadius: 28 }}>
+            <ChatPicker scrolls bottomClearance="16px" onClose={exitChats} />
+          </div>
         </div>
       ) : (
         <>
@@ -319,12 +386,13 @@ export const ChatsScreen: React.FC<{ shown?: boolean }> = ({ shown = true }) => 
                   pins={pinned}
                   channelId={chatChannelId ?? undefined}
                   expanded={pinsOpen}
-                  onToggle={() => setPinsOpen((v) => !v)}
+                  onToggle={() => pins.setOpen(!pinsOpen)}
+                  collapsedStyle={pins.style}
                 />
               </div>
             )}
             {hasPins && <div className="shrink-0" style={{ height: pinsBox }} />}
-            <MobileChatPane strip={false} paused={!shown} />
+            <MobileChatPane strip={false} paused={!shown} surface="chats" />
           </div>
         </>
       )}

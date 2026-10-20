@@ -172,6 +172,63 @@ pub fn kick_minutes(seconds: u32) -> u32 {
     seconds.div_ceil(60).clamp(1, KICK_MAX_TIMEOUT_MINUTES)
 }
 
+/// A timeout length typed into Settings: "45m", "1h30m", "1h 30m", "90s",
+/// "2d", "1w", the words ("45 minutes", "2 hours"), or a bare number, read
+/// as minutes. None when it does not read as a length or falls outside what
+/// Twitch allows (1 s to 14 d).
+pub fn parse_timeout_text(text: &str) -> Option<u32> {
+    let t = text.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    if t.chars().all(|c| c.is_ascii_digit()) {
+        let minutes: u64 = t.parse().ok()?;
+        return u32::try_from(minutes.checked_mul(60)?)
+            .ok()
+            .filter(|s| (1..=TWITCH_MAX_TIMEOUT_SECS).contains(s));
+    }
+    let mut total: u64 = 0;
+    let mut chars = t.chars().filter(|c| !c.is_whitespace() && *c != ',').peekable();
+    let mut any = false;
+    while chars.peek().is_some() {
+        let mut digits = String::new();
+        while let Some(c) = chars.peek().filter(|c| c.is_ascii_digit()) {
+            digits.push(*c);
+            chars.next();
+        }
+        let mut unit = String::new();
+        while let Some(c) = chars.peek().filter(|c| c.is_ascii_alphabetic()) {
+            unit.push(*c);
+            chars.next();
+        }
+        if digits.is_empty() || unit.is_empty() {
+            return None;
+        }
+        let size: u64 = match unit.as_str() {
+            "s" | "sec" | "secs" | "second" | "seconds" => 1,
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+            "d" | "day" | "days" => 86_400,
+            "w" | "wk" | "wks" | "week" | "weeks" => 604_800,
+            _ => return None,
+        };
+        total = total.checked_add(digits.parse::<u64>().ok()?.checked_mul(size)?)?;
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    u32::try_from(total).ok().filter(|s| (1..=TWITCH_MAX_TIMEOUT_SECS).contains(s))
+}
+
+/// A typed length as a timeout step (its seconds and Rust's label), or why it
+/// is not one, in the words Settings shows.
+pub fn typed_timeout_step(text: &str) -> Result<ModStep, String> {
+    parse_timeout_text(text)
+        .map(ModStep::timeout)
+        .ok_or_else(|| "Type a length like 45m, 2h or 3d, up to 14 days.".to_string())
+}
+
 /// A short label in the largest unit that fits: one part when it divides
 /// evenly ("10m", "1d", "2w"), otherwise the two largest parts ("1m 30s",
 /// "1h 30m").
@@ -515,6 +572,69 @@ pub async fn moderate(mut req: ModRequest) -> Result<ModOutcome> {
     Ok(outcome_for(platform, &req.action, &name_of(&req)))
 }
 
+/// What the viewer may do to one chat message, by Twitch's own rules. Helix
+/// "Delete Chat Messages" refuses the broadcaster's messages and another
+/// moderator's ("You may not delete the broadcaster's messages", "... another
+/// moderator's messages"), so a moderator may delete their own; "Ban User"
+/// refuses users who "may not be banned" or "put in a timeout": the
+/// broadcaster, yourself, and a moderator unless the broadcaster does it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageReach {
+    /// Delete, the timeouts and ban.
+    All,
+    /// The viewer's own message in a room they moderate (not their own room).
+    DeleteOnly,
+    /// A moderator's message, seen by the broadcaster: the timeouts and ban.
+    NoDelete,
+    /// Nothing: the broadcaster's message (the viewer's own included when it is
+    /// their room), a moderator's seen by another moderator, Twitch staff, or a
+    /// room the viewer does not moderate.
+    Nothing,
+}
+
+impl MessageReach {
+    pub fn can_delete(self) -> bool {
+        matches!(self, Self::All | Self::DeleteOnly)
+    }
+    pub fn can_timeout(self) -> bool {
+        matches!(self, Self::All | Self::NoDelete)
+    }
+}
+
+/// The reach for a message by `target_id` wearing `target_badges` ("moderator"
+/// or "moderator/1"), seen by `viewer_id` with `viewer` standing. Pure, for tests.
+pub fn message_reach(viewer: crate::services::chat_send_limiter::Role, viewer_id: &str, target_id: &str, target_badges: &[String]) -> MessageReach {
+    use crate::services::chat_send_limiter::Role;
+    let broadcaster = viewer == Role::Broadcaster;
+    if !(broadcaster || viewer == Role::Moderator) || target_id.is_empty() {
+        return MessageReach::Nothing;
+    }
+    let has = |name: &str| target_badges.iter().any(|b| b == name || b.starts_with(&format!("{name}/")));
+    let own = !viewer_id.is_empty() && target_id == viewer_id;
+    if has("broadcaster") || (own && broadcaster) || has("staff") || has("admin") || has("global_mod") {
+        return MessageReach::Nothing;
+    }
+    if own {
+        return MessageReach::DeleteOnly;
+    }
+    if has("moderator") || has("lead_moderator") {
+        return if broadcaster { MessageReach::NoDelete } else { MessageReach::Nothing };
+    }
+    MessageReach::All
+}
+
+/// The slider's steps a message allows.
+pub fn steps_within(steps: Vec<ModStep>, reach: MessageReach) -> Vec<ModStep> {
+    steps
+        .into_iter()
+        .filter(|s| match s.action {
+            StepAction::Delete => reach.can_delete(),
+            StepAction::Timeout | StepAction::Ban => reach.can_timeout(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -542,6 +662,27 @@ mod tests {
         };
         assert!(moderate(req("twitch", Some("  "))).await.unwrap_err().to_string().contains("needs a reason"));
         assert!(moderate(req("kick", Some("spam"))).await.unwrap_err().to_string().contains("Twitch feature"));
+    }
+
+    #[test]
+    fn typed_timeout_lengths() {
+        assert_eq!(parse_timeout_text("45m"), Some(2_700));
+        assert_eq!(parse_timeout_text(" 1h30m "), Some(5_400));
+        assert_eq!(parse_timeout_text("1h 30m"), Some(5_400));
+        assert_eq!(parse_timeout_text("90s"), Some(90));
+        assert_eq!(parse_timeout_text("2d"), Some(172_800));
+        assert_eq!(parse_timeout_text("1W"), Some(604_800));
+        assert_eq!(parse_timeout_text("2 hours"), Some(7_200));
+        assert_eq!(parse_timeout_text("45 minutes"), Some(2_700));
+        assert_eq!(parse_timeout_text("15"), Some(900), "a bare number is minutes");
+        assert_eq!(parse_timeout_text("14d"), Some(TWITCH_MAX_TIMEOUT_SECS));
+        assert_eq!(parse_timeout_text("15d"), None, "past what Twitch allows");
+        assert_eq!(parse_timeout_text("0m"), None);
+        assert_eq!(parse_timeout_text(""), None);
+        assert_eq!(parse_timeout_text("soon"), None);
+        assert_eq!(parse_timeout_text("5x"), None);
+        assert_eq!(parse_timeout_text("m5"), None);
+        assert_eq!(parse_timeout_text("99999999999999999999d"), None);
     }
 
     fn labels(steps: &[ModStep]) -> Vec<&str> {
@@ -678,5 +819,38 @@ mod tests {
         assert!(matches!(req.action, ModAction::Timeout { seconds: 7200 }));
         assert_eq!(req.reason.as_deref(), Some("being rude"));
         assert!(req.typed.is_none());
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::*;
+    use crate::services::chat_send_limiter::Role;
+
+    fn b(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_moderator_may_delete_their_own_message_and_nothing_more() {
+        assert_eq!(message_reach(Role::Moderator, "7", "7", &b(&["moderator/1"])), MessageReach::DeleteOnly);
+        let steps = steps_within(slider_steps(Platform::Twitch, &SliderConfig { delete: true, timeouts: vec![60], ban: true }), MessageReach::DeleteOnly);
+        assert_eq!(steps.iter().map(|s| s.action).collect::<Vec<_>>(), vec![StepAction::Delete]);
+    }
+
+    #[test]
+    fn nobody_acts_on_the_broadcasters_messages_not_even_the_broadcaster() {
+        assert_eq!(message_reach(Role::Broadcaster, "1", "1", &b(&["broadcaster/1"])), MessageReach::Nothing);
+        assert_eq!(message_reach(Role::Broadcaster, "1", "1", &[]), MessageReach::Nothing, "own room, own message, badge not seen yet");
+        assert_eq!(message_reach(Role::Moderator, "7", "1", &b(&["broadcaster/1"])), MessageReach::Nothing);
+    }
+
+    #[test]
+    fn moderators_and_each_other() {
+        assert_eq!(message_reach(Role::Moderator, "7", "8", &b(&["moderator/1"])), MessageReach::Nothing);
+        assert_eq!(message_reach(Role::Broadcaster, "1", "8", &b(&["moderator/1"])), MessageReach::NoDelete);
+        assert_eq!(message_reach(Role::Moderator, "7", "9", &b(&["subscriber/12"])), MessageReach::All);
+        assert_eq!(message_reach(Role::Viewer, "7", "9", &[]), MessageReach::Nothing);
+        assert_eq!(message_reach(Role::Moderator, "7", "9", &b(&["staff/1"])), MessageReach::Nothing);
     }
 }

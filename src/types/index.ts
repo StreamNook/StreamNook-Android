@@ -370,25 +370,10 @@ export interface ChatDesignSettings {
   link_color?: string;
   // Underline links. Default true.
   link_underline?: boolean;
-  // Two switches in one field: the hover buttons (delete/timeout/ban in the
-  // corner of the hovered message) and drag to tiles (the left-edge handle
-  // lifts the chatter onto action tiles, only while the slider and the line
-  // buttons are off). 'buttons' = hover only, 'drag' = tiles only, 'both',
-  // 'none'. Settings shows them as Message edge and Hover buttons.
-  mod_action_style?: 'buttons' | 'drag' | 'both' | 'none';
-  // Where the grab cursor shows while drag is on: 'row' = anywhere on the
-  // message, 'edge' = only the accent strip at its left edge. A press anywhere
-  // lifts the chatter either way. Default 'row'.
-  mod_drag_cursor?: 'row' | 'edge';
-  // Style of the drag-to-moderate controls: 'column' = vertical bucket column
-  // docked beside chat; 'bar' = horizontal bucket row above the chat. Default
-  // 'column'. (A legacy 'slider' value may persist from older builds; it is
-  // treated as 'column'.)
-  mod_drag_layout?: 'column' | 'bar';
-  // Where the moderator Pin action appears: 'inline' = a quick button next to
-  // Copy on the message, 'drag' = a drop target in the drag-to-moderate gesture,
-  // 'both' = both places. Mod-only either way. Default 'both'.
-  mod_pin_style?: 'inline' | 'drag' | 'both';
+  // The hover buttons (delete/timeout/ban in the corner of the hovered
+  // message): 'buttons' or 'none'. Default 'buttons'. Rust moves the values
+  // left from drag to tiles ('both', 'drag') on load.
+  mod_action_style?: 'buttons' | 'none';
   // The slider on a message's left edge: drag right through the timeout steps
   // to Ban, release to apply. Moderators only. Default true.
   mod_slider?: boolean;
@@ -398,9 +383,16 @@ export interface ChatDesignSettings {
   mod_slider_delete?: boolean;
   mod_slider_timeouts?: number[];
   mod_slider_ban?: boolean;
-  // How much of the message width the slider's steps spread over: half,
-  // four fifths (default) or all of it. Steps stay evenly spaced.
+  // The phones' press-and-hold menu offers Delete, Timeout and Ban (moderators).
+  mod_hold_buttons?: boolean;
+  // How far the slider's steps sit apart: 18, 22 (default) or 28 px each, the
+  // same at every chat width (a narrow chat squeezes them to fit).
   mod_slider_length?: 'short' | 'medium' | 'long';
+  // How the slider draws a pull: 'preview' (default; the message stays put,
+  // struck through in the step's color, a chip names the step), 'rail' (every
+  // step laid out on a rail over the message) or 'capsule' (the message
+  // slides aside for a capsule that names the step).
+  mod_slider_style?: 'preview' | 'rail' | 'capsule';
   // Line buttons: one-click action buttons at the start of every line a
   // moderator can act on. They take the left edge, so the slider grip is not
   // drawn while they are on. Default false.
@@ -410,11 +402,9 @@ export interface ChatDesignSettings {
   mod_line_delete?: boolean;
   mod_line_timeouts?: number[];
   mod_line_ban?: boolean;
-  // Seconds a drop on the drag-to-moderate Timeout tile times out for.
-  // Default 600.
-  mod_bucket_timeout?: number;
-  // Deprecated: superseded by mod_action_style ('buttons' when this was false).
-  drag_moderation_enabled?: boolean;
+  // When the line buttons show: 'hover' (default; only on the line under the
+  // pointer, pushing its text over) or 'always' (on every line).
+  mod_line_show?: 'hover' | 'always';
 }
 
 export interface HighlightPhrase {
@@ -649,6 +639,101 @@ export interface ChatBurstSettings {
   vary_repeats?: boolean;
 }
 
+// What counts as a mention of you, and which chats keep them quiet.
+// Mirrored in models/settings.rs (MentionSettings).
+export interface MentionSettings {
+  // Your login as a whole word, without the @. Default true.
+  match_bare_login?: boolean;
+  // Your display name, when it differs from your login. Default true.
+  match_display_name?: boolean;
+  // Highlight phrases count as mentions (inbox and notifications). Default true.
+  highlight_words?: boolean;
+  // Room keys (bare Twitch login, provider:slug otherwise) that never notify
+  // or reach the inbox.
+  muted_channels?: string[];
+  // Mentions while you're away: StreamNook's server watches chat in followed
+  // channels for your name and replies (services/mention_watch.rs). Default false.
+  away_alerts?: boolean;
+}
+
+// One entry in the mentions inbox (services/mention_inbox.rs `MentionEntry`).
+// Rust files, reads and removes them; the pages only draw them.
+export type MentionKind = 'mention' | 'reply' | 'word';
+
+export interface MentionEntry {
+  /** The platform's message id. */
+  id: string;
+  platform: string;
+  /** Chat key: bare Twitch login, `provider:slug` otherwise (lowercased). */
+  room: string;
+  /** What opens this chat (`startStream`): like `room` but keeping the
+   *  channel's own case (a YouTube id is case-sensitive). Older entries lack it. */
+  open_key?: string;
+  /** The channel's own page on its platform (live page or video), for a shell
+   *  that cannot show this platform's chat. Older entries lack it. */
+  watch_url?: string;
+  /** A Twitch login (lowercased), else the slug or id with its own case. */
+  channel_login: string;
+  channel_id?: string | null;
+  sender_id: string;
+  sender_login: string;
+  sender_name: string;
+  sender_color?: string | null;
+  text: string;
+  kind: MentionKind;
+  reply_parent_id?: string | null;
+  at_ms: number;
+  read: boolean;
+  /** A moderator deleted the message after it was filed. */
+  removed: boolean;
+  /** The message as the chat drew it, words and emotes in order. Absent on
+   *  older entries and on a message with no emote: show `text`. */
+  parts?: MentionPart[];
+}
+
+/** One piece of a filed message (mention_inbox.rs `MentionPart`). */
+export type MentionPart = { type: 'text'; text: string } | { type: 'emote'; name: string; url: string };
+
+/** The phones' inbox chips (mention_inbox.rs `InboxFilter`; `whispers` once
+ *  the whisper store joins the view). */
+export type InboxFilterId = 'all' | 'mentions' | 'highlights' | 'whispers';
+
+/** One row of `get_inbox_view`: the newest of a run of identical messages. */
+export interface InboxRowView {
+  entry: MentionEntry;
+  /** The older identical messages, newest first. */
+  folded: { id: string; at_ms: number; read: boolean }[];
+  /** Any message in the row is unread. */
+  unread: boolean;
+  /** The sender's picture, once Rust has it. */
+  avatar: string | null;
+}
+
+/** `get_inbox_view` (commands/mention_inbox.rs `InboxView`). */
+export interface InboxView {
+  rows: InboxRowView[];
+  has_more: boolean;
+  /** The `beforeMs` that asks for the next page. */
+  before_ms: number | null;
+  unread_total: number;
+  chips: { id: InboxFilterId; unread: number }[];
+}
+
+/** `mention-arrived`: a live entry just filed unread, for the card over the
+ *  message bar. */
+export interface MentionArrival {
+  entry: MentionEntry;
+  avatar: string | null;
+}
+
+/** `get_mention_inbox` (commands/mention_inbox.rs `MentionPage`). */
+export interface MentionPage {
+  /** Newest first. */
+  entries: MentionEntry[];
+  has_more: boolean;
+  unread_total: number;
+}
+
 // Render / perf controls. All optional with defaults preserving prior behavior.
 export interface ChatRenderSettings {
   // Animate the scroll when the user clicks the "Resume" button at the
@@ -719,6 +804,10 @@ export interface ChatInputSettings {
   // in the message box while they are on. Typed in Rust
   // (models/settings.rs ChatInputSettings), which owns the default: on.
   show_room_modes?: boolean;
+  // Which end of the phones' message bar the inbox button takes: left (the
+  // default, the chat menu on the right) or right (the pair mirrored). Typed
+  // in Rust (models/settings.rs ChatInputSettings), which owns the default.
+  inbox_button_side?: 'left' | 'right';
   // How the modes show: named in place of "Send a message" only while one
   // holds you back (the default), or one chip at the box's edge whenever a
   // mode is on. Typed in Rust beside show_room_modes.
@@ -1246,6 +1335,7 @@ export interface Settings {
   snippets?: SnippetSettings;
   cosmetics?: CosmeticsSettings;
   chat_burst?: ChatBurstSettings;
+  mentions?: MentionSettings;
   /** The phones' Chats screen keeps the screen on while in front, until 30 min pass with no touch. Default on. */
   chats_keep_screen_on?: boolean;
   live_notifications?: LiveNotificationSettings;
@@ -2648,6 +2738,28 @@ export interface WhisperUpdate {
     unread_count: number;
   };
   message: Whisper | null;
+}
+
+/** One row of Rust's `whisper_list`: the conversation's meta, flattened, with
+ *  its newest line. */
+export interface WhisperListRow {
+  key: string;
+  user_id: string;
+  user_login: string;
+  user_name: string;
+  profile_image_url: string | null;
+  last_message_timestamp: number;
+  unread_count: number;
+  last_text: string;
+  last_is_sent: boolean;
+}
+
+/** Rust's `whisper_list`: the signed-in account's conversations, newest
+ *  first. `owner_id` is empty when nobody is signed in; the writes take it. */
+export interface WhisperList {
+  owner_id: string;
+  conversations: WhisperListRow[];
+  unread_total: number;
 }
 
 // Hype Train Types
