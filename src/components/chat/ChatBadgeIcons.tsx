@@ -6,6 +6,7 @@ import { getBadgeImageUrl, getBadgeFallbackUrls } from '../../services/seventvSe
 import { openBadgeInfo } from '../../stores/badgeSpotlightStore';
 import { sevenTvBadgeRef, thirdPartyBadgeRef, twitchRowBadgeRef } from '../../utils/badgeSpotlight';
 import { IS_MOBILE } from '../../utils/platform';
+import { useLowPower } from '../../utils/lowPower';
 import { CHANNEL_SPECIFIC_TWITCH_BADGES } from '../../utils/badgeOrder';
 import { queueBadgeForCaching, getCachedBadgeUrl } from '../../services/badgeImageCacheService';
 import type { ThirdPartyBadge } from '../../services/badgeService';
@@ -39,6 +40,9 @@ export type SevenTvBadgeLike = Parameters<typeof getBadgeImageUrl>[0];
 
 const isTwitchBadgeCdn = (url: string | undefined): boolean =>
   !url || url.startsWith('https://static-cdn.jtvnw.net/');
+
+// A badge that fails fails on every row that shows it; one line per source.
+const reportedBadgeFailures = new Set<string>();
 
 /**
  * Get the best URL for a Twitch badge, with reactive caching.
@@ -118,6 +122,8 @@ export function ChatBadgeIcons({
   interactive = true,
   keyPrefix = 'badge',
 }: ChatBadgeIconsProps) {
+  // Battery Saver: the 7TV badge's published still (utils/lowPower).
+  const stillBadges = useLowPower();
   // Touch has no hover and no spotlight host on the phone shell.
   const clickable = interactive && !IS_MOBILE;
   return (
@@ -133,8 +139,20 @@ export function ChatBadgeIcons({
             alt={info.title}
             className="sn-chat-badge block"
             onError={(e) => {
-              Logger.warn('[Badge] Failed to load badge:', badge.key, info.image_url_1x);
-              e.currentTarget.style.display = 'none';
+              // A disk copy that went missing: show Twitch's own image instead.
+              const remote = info.image_url_4x || info.image_url_1x;
+              const el = e.currentTarget;
+              if (remote && src !== remote && !el.dataset.remote) {
+                el.dataset.remote = '1';
+                el.src = remote;
+                return;
+              }
+              const failed = el.dataset.remote ? remote : src;
+              if (failed && !reportedBadgeFailures.has(failed)) {
+                reportedBadgeFailures.add(failed);
+                Logger.warn('[Badge] Failed to load badge:', badge.key, failed);
+              }
+              el.style.display = 'none';
             }}
           />
         );
@@ -164,7 +182,7 @@ export function ChatBadgeIcons({
         const ref = sevenTvBadgeRef(seventvBadge);
         const img = (
           <FallbackImage
-            src={getBadgeImageUrl(seventvBadge)}
+            src={getBadgeImageUrl(seventvBadge, stillBadges)}
             fallbackUrls={getBadgeFallbackUrls(seventvBadge.id).slice(1)}
             alt={ref.title}
             className="sn-chat-badge block"

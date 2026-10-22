@@ -144,9 +144,22 @@ body:has(.sn-mobile) .glass-input:focus {
   opacity: 0.6;
   animation: sn-atm-breathe-2 12s ease-in-out infinite;
 }
+/* The watch layer's chat fading in when it gets its box back: after the player
+   lands from the mini box, so the spring never lays chat out. No fill mode on
+   purpose: a held opacity animation keeps a stacking context, which would put
+   the pinned and hype cards under the player's cast for good. */
+.sn-mobile .sn-chat-reveal {
+  animation: sn-chat-reveal 160ms ease-out;
+}
+@keyframes sn-chat-reveal {
+  from {
+    opacity: 0;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .sn-atm-breathe-1,
-  .sn-atm-breathe-2 {
+  .sn-atm-breathe-2,
+  .sn-mobile .sn-chat-reveal {
     animation: none;
   }
 }
@@ -224,9 +237,16 @@ body:has(.sn-mobile) .glass-input:focus {
    thousands of nodes would add style-recalc cost of its own and trade one
    compositor bill for another. */
 [data-sn-covered='true'] .animate-ping,
+[data-sn-covered='true'] .card-chip-shine > span,
 [data-sn-covered='true'] .hype-train-badge-glass::after,
 [data-sn-covered='true'] .hype-train-badge-glass-golden::after {
   animation: none !important;
+}
+
+/* A stream row's live-dot ping scrolled out of view (MobileStreamCard,
+   utils/offscreenPause): no halo nobody can see. */
+.sn-mobile [data-sn-off] > .animate-ping {
+  animation: none;
 }
 
 /* The in-band loading mark. Width first as a plain fallback for a WebView
@@ -277,6 +297,24 @@ body:has(.sn-mobile) .glass-input:focus {
 [data-sn-covered='true'] .glass-panel {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
+}
+
+/* System Battery Saver (html[data-sn-low-power], src/mobile/lowPower.ts).
+   Motion already drops to Reduced there; these are the decorative loops
+   Reduced does not name. Each rests on its un-animated style, except the chip
+   shine whose resting place is a visible band, so it leaves the tree. */
+html[data-sn-low-power] .sn-aurora-1,
+html[data-sn-low-power] .sn-aurora-2,
+html[data-sn-low-power] .sn-atm-breathe-1,
+html[data-sn-low-power] .sn-atm-breathe-2,
+html[data-sn-low-power] .cologne-wash,
+html[data-sn-low-power] .hype-train-fill-wave,
+html[data-sn-low-power] .hype-train-progress-rainbow::before,
+html[data-sn-low-power] .hype-train-progress-golden::before {
+  animation: none !important;
+}
+html[data-sn-low-power] .card-chip-shine > span {
+  display: none;
 }
 
 /* A popover with no blur behind it (the drop bar, the pinned banner, the You

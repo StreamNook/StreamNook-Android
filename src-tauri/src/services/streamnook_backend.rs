@@ -91,7 +91,17 @@ pub async fn rpc(name: &str, args: Value) -> Result<Value, String> {
         let body = res.text().await.unwrap_or_default();
         return Err(format!("{name}: {status} {}", body.chars().take(200).collect::<String>()));
     }
-    res.json::<Value>().await.map_err(|e| format!("{name}: {e}"))
+    // A function that returns nothing answers 200 or 204 with an empty body;
+    // that is a success, not a body to decode.
+    let body = res.text().await.map_err(|e| format!("{name}: {e}"))?;
+    rpc_body(&body).map_err(|e| format!("{name}: {e}"))
+}
+
+fn rpc_body(body: &str) -> Result<Value, serde_json::Error> {
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(body)
 }
 
 /// The legacy direct write: an upsert under the anon key. Used only while the
@@ -205,6 +215,12 @@ pub fn start_realtime() {
         let mut joined_before = false;
         let mut pause = Duration::from_secs(2);
         loop {
+            // A phone in the background holds no socket; the rejoin on return
+            // re-reads the registries (Change::Rejoined).
+            if crate::services::window_visibility::phone_idle() {
+                crate::services::window_visibility::until_shown().await;
+                pause = Duration::from_secs(2);
+            }
             match run_socket(&ws, key, &mut joined_before).await {
                 Ok(()) => pause = Duration::from_secs(2),
                 Err(e) => log::debug!("[StreamNookBackend] realtime: {e}"),
@@ -223,6 +239,9 @@ async fn run_socket(ws: &str, key: &str, joined_before: &mut bool) -> Result<(),
     loop {
         tokio::select! {
             _ = beat.tick() => {
+                if crate::services::window_visibility::phone_idle() {
+                    return Ok(());
+                }
                 let msg = json!({ "topic": "phoenix", "event": "heartbeat", "payload": {}, "ref": next_ref() }).to_string();
                 socket.send(Message::Text(msg.into())).await.map_err(|e| e.to_string())?;
             }
@@ -249,6 +268,14 @@ async fn run_socket(ws: &str, key: &str, joined_before: &mut bool) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_function_that_returns_nothing_is_a_success() {
+        assert_eq!(rpc_body("").unwrap(), Value::Null);
+        assert_eq!(rpc_body("  \n").unwrap(), Value::Null);
+        assert_eq!(rpc_body("5").unwrap(), json!(5));
+        assert!(rpc_body("{not json").is_err());
+    }
 
     #[test]
     fn a_postgres_change_carries_its_table_kind_and_row() {

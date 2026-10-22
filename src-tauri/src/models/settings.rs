@@ -222,6 +222,12 @@ fn default_background_mode() -> String {
     "pip".to_string()
 }
 
+/// A fresh install keeps the audio going on lock or Home when the video cannot
+/// float (Background play on). An older file without the key stays on "pip".
+fn first_run_background_mode() -> String {
+    "audio".to_string()
+}
+
 fn default_wheel_volume_step() -> f32 {
     0.05
 }
@@ -244,7 +250,7 @@ impl Default for VideoPlayerSettings {
             ll_target_latency: None,
             ad_bypass_enabled: true,
             ad_bypass_proxies: String::new(),
-            background_mode: default_background_mode(),
+            background_mode: first_run_background_mode(),
             scroll_volume: true,
             scroll_about_reveal: true,
             middle_click_mute: true,
@@ -1317,6 +1323,9 @@ pub struct ChatInputSettings {
     /// (the default, the chat menu on the right) or `right` (the pair
     /// mirrored, for a right thumb).
     pub inbox_button_side: String,
+    /// Image uploads: the emote menu's Images section, paste upload, and the
+    /// host both send to (`services::image_upload`).
+    pub image_uploader: ImageUploaderSettings,
     /// The composer keys this struct does not name (placeholder, buttons,
     /// spellcheck, tab completion, ...), kept verbatim.
     #[serde(flatten)]
@@ -1330,6 +1339,52 @@ impl Default for ChatInputSettings {
             room_modes_style: "prompt".into(),
             room_modes_prompt_adopted: true,
             inbox_button_side: "left".into(),
+            image_uploader: ImageUploaderSettings::default(),
+            extra: HashMap::new(),
+        }
+    }
+}
+
+/// Where chat images go. Mirrors the frontend `ImageUploaderSettings`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct ImageUploaderSettings {
+    /// Paste upload (desktop): an image pasted into the message box uploads.
+    pub enabled: bool,
+    /// The emote menu's Images section.
+    pub show_in_menu: bool,
+    /// A preset id (`services::image_upload::PRESETS`) or "custom".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub form_field: Option<String>,
+    /// Extra text form fields, url-encoded "k=v&k2=v2".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_fields: Option<String>,
+    /// Where the link is in the reply: empty = the body is the link, a dotted
+    /// JSON path, or a `{field}` template (`services::image_upload::link_from_reply`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_path: Option<String>,
+    /// How the Images tab shows uploads: "grid" (pictures) or "list" (details).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub view: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Default for ImageUploaderSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            show_in_menu: true,
+            preset: None,
+            url: None,
+            form_field: None,
+            extra_fields: None,
+            response_path: None,
+            view: None,
             extra: HashMap::new(),
         }
     }
@@ -1599,10 +1654,17 @@ fn default_theme() -> String {
     "winters-glass".to_string()
 }
 
+/// The quality a fresh install starts on. The desktop starts on Auto, as
+/// twitch.tv does; the phones' "best" has always been their Auto. A saved file
+/// always names its quality, so this never reaches an existing install.
+fn first_run_quality() -> String {
+    if cfg!(mobile) { "best" } else { "auto" }.to_string()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            quality: "best".to_string(),
+            quality: first_run_quality(),
             chat_placement: "right".to_string(),
             accounts: vec![],
             current_account: "".to_string(),
@@ -2334,6 +2396,12 @@ mod backup_persistence_tests {
     /// The first-run chat look reaches only a fresh install. A file that
     /// predates a field (or the whole block) keeps the look it always had.
     #[test]
+    fn a_fresh_install_keeps_audio_and_old_files_keep_pip() {
+        assert_eq!(Settings::default().video_player.background_mode, "audio");
+        assert_eq!(default_background_mode(), "pip");
+    }
+
+    #[test]
     fn first_run_chat_look_reaches_only_a_fresh_install() {
         let fresh = Settings::default().chat_design;
         assert_eq!(fresh.message_entrance, "slide");
@@ -2359,6 +2427,24 @@ mod backup_persistence_tests {
         let parsed: Settings = serde_json::from_value(value).expect("parses");
         assert_eq!(parsed.chat_design.message_entrance, "none");
         assert_eq!(parsed.chat_design.deleted_message_style, "strikethrough");
+    }
+
+    /// A fresh desktop install starts on Auto; the phones keep "best", their
+    /// Auto. A saved file keeps whatever quality it names, "best" included.
+    #[test]
+    fn a_fresh_install_starts_on_auto_and_a_saved_best_stays_best() {
+        let fresh = Settings::default();
+        assert_eq!(fresh.quality, if cfg!(mobile) { "best" } else { "auto" });
+
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value["quality"] = serde_json::json!("best");
+        let parsed: Settings = serde_json::from_value(value).expect("parses");
+        assert_eq!(parsed.quality, "best");
+
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value["quality"] = serde_json::json!("720p60");
+        let parsed: Settings = serde_json::from_value(value).expect("parses");
+        assert_eq!(parsed.quality, "720p60");
     }
 
     /// Frontend-managed preference groups the struct doesn't model (highlight
@@ -2416,6 +2502,20 @@ mod backup_persistence_tests {
         let fresh = Settings::default();
         assert_eq!(fresh.chat_input.room_modes_style, "prompt");
         assert!(fresh.chat_input.room_modes_prompt_adopted);
+    }
+
+    #[test]
+    fn image_uploader_reads_old_files_and_defaults_the_menu_on() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["chat_input"]["image_uploader"] = serde_json::json!({ "enabled": true, "preset": "catbox", "later_key": 2 });
+        let s: Settings = serde_json::from_value(value).unwrap();
+        assert!(s.chat_input.image_uploader.enabled);
+        assert!(s.chat_input.image_uploader.show_in_menu, "the Images section is on unless turned off");
+        assert_eq!(s.chat_input.image_uploader.preset.as_deref(), Some("catbox"));
+        let back = serde_json::to_value(&s).unwrap();
+        assert_eq!(back["chat_input"]["image_uploader"]["preset"], "catbox");
+        assert_eq!(back["chat_input"]["image_uploader"]["later_key"], 2);
+        assert!(!Settings::default().chat_input.image_uploader.enabled, "paste upload starts off");
     }
 
     #[test]

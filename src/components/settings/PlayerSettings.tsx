@@ -449,11 +449,11 @@ const PlayerSettings = () => {
         {IS_MOBILE && (
           <SettingsRow
             title="Background play"
-            onReset={resetFor(['video_player.background_mode', 'pip'])}
+            onReset={resetFor(['video_player.background_mode', 'audio'])}
             description={
               (videoPlayer?.background_mode ?? 'pip') === 'audio'
-                ? 'Leaving the app floats the video in picture-in-picture. Close the window and the audio keeps going behind a media notification.'
-                : 'Leaving the app floats the video in picture-in-picture. Closing the window ends the stream.'
+                ? 'Leaving the app floats the video in picture-in-picture. Close the window or lock the phone and the audio keeps going behind a media notification.'
+                : 'Leaving the app floats the video in picture-in-picture. Closing the window ends the stream; locking the phone pauses it.'
             }
             control={
               <Toggle
@@ -479,7 +479,7 @@ const PlayerSettings = () => {
         <SettingsRow
           title="Start quality"
           onReset={resetFor('quality')}
-          description="Every stream opens at this quality, and you can change it anytime from the player controls."
+          description="Every stream opens at this quality, and you can change it anytime from the player controls. Auto steps down when your connection struggles, so the stream keeps playing, and back up when it recovers."
         >
           <Dropdown
             value={settings.quality}
@@ -487,7 +487,14 @@ const PlayerSettings = () => {
             className="w-full"
             ariaLabel="Default stream quality"
             options={[
-              { value: 'best', label: 'Auto (Source)' },
+              // The desktop offers Auto beside the fixed source; on the phones
+              // "best" has always been their Auto.
+              ...(IS_MOBILE
+                ? [{ value: 'best', label: 'Auto' }]
+                : [
+                    { value: 'auto', label: 'Auto' },
+                    { value: 'best', label: 'Source' },
+                  ]),
               { value: '1440p60', label: '1440p60' },
               { value: '1080p60', label: '1080p60' },
               { value: '720p60', label: '720p60' },

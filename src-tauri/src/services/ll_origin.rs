@@ -377,6 +377,14 @@ pub struct LlOrigin {
     /// PART-TARGET of the Apple playlist, fixed by the first one served for
     /// this stream (see `APPLE_PART_TARGET_HEADROOM`).
     apple_part_target: Mutex<Option<f64>>,
+    /// The stream `link_adapt` knows this origin by (`solo` or a tile id): its
+    /// lost tails and its own segment downloads are reported under it.
+    adapt_id: Mutex<String>,
+    /// The upstream playlist the reader follows, so a parked origin can restart it.
+    upstream: Mutex<Option<String>>,
+    /// The player paused past earning_gate::PARK_AFTER: the reader is stopped and
+    /// the edge held until the player plays or asks for it again (`unpark`).
+    parked: AtomicBool,
 }
 
 /// Hard kill switch: when true, no origin activates and the relays fall back to the
@@ -954,14 +962,14 @@ pub fn set_target_gap(gap: Option<f32>) {
 
 /// Seconds to add to (or take off) the default hold-back so AVPlayer rides the
 /// viewer's target gap, or at Auto the same gap as the desktop and Android: never
-/// under the spec's two part targets.
+/// under three part targets (LL-HLS: PART-HOLD-BACK SHOULD be at least 3x).
 fn apple_gap_adjust(target: f64, hold_parts: u64) -> f64 {
     gap_adjust(TARGET_GAP_MS.load(Ordering::Relaxed), target, hold_parts)
 }
 
 fn gap_adjust(ms: u64, target: f64, hold_parts: u64) -> f64 {
     let gap = if ms == 0 { AUTO_LL_GAP_SECS } else { ms as f64 / 1000.0 };
-    let wanted = (gap - LL_EDGE_DELAY_SECS - APPLE_BEHIND_OVER_HOLD).max(target * 2.0);
+    let wanted = (gap - LL_EDGE_DELAY_SECS - APPLE_BEHIND_OVER_HOLD).max(target * 3.0);
     wanted - target * hold_parts as f64
 }
 
@@ -978,7 +986,19 @@ impl LlOrigin {
             cmaf_video: Mutex::new(None),
             retired: Mutex::new(VecDeque::new()),
             apple_part_target: Mutex::new(None),
+            adapt_id: Mutex::new(String::new()),
+            upstream: Mutex::new(None),
+            parked: AtomicBool::new(false),
         })
+    }
+
+    /// Name the stream this origin serves, for `link_adapt`.
+    pub(crate) fn set_adapt_id(&self, id: &str) {
+        *self.adapt_id.lock().unwrap() = id.to_string();
+    }
+
+    fn adapt_id(&self) -> String {
+        self.adapt_id.lock().unwrap().clone()
     }
 
     fn window(&self) -> usize {
@@ -1055,7 +1075,78 @@ impl LlOrigin {
         *self.cmaf_video.lock().unwrap() = None;
         self.retired.lock().unwrap().clear();
         *self.apple_part_target.lock().unwrap() = None;
+        self.parked.store(false, Ordering::SeqCst);
+        *self.upstream.lock().unwrap() = None;
         self.wake_serves();
+    }
+
+    /// The player paused past earning_gate::PARK_AFTER: stop downloading. The reader
+    /// ends and the half-read in-progress segment is closed the way an abandoned
+    /// tail is (stream_response): what arrived stays, the transmuxer drops its
+    /// partial input and bridges the loss, and the segment is finished at the sum
+    /// of its parts. So the playlist never shrinks under a client that read it, a
+    /// paused player's blocking reloads get it back (serve_playlist_apple), and a
+    /// reader restarted soon after (`unpark`, a gap too small to rebuild) carries on
+    /// from a complete segment instead of an unfinishable one. A long park rebuilds
+    /// at the live edge (plan_catch_up).
+    pub fn park(&self) -> bool {
+        if !self.is_active() || self.parked.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(h) = self.reader_task.lock().unwrap().take() {
+            h.abort();
+        }
+        if let Some(t) = self.transmux.lock().unwrap().as_mut() {
+            t.drop_partial_input();
+        }
+        self.close_tail();
+        self.wake_serves();
+        info!("[LLOrigin] parked (player paused)");
+        true
+    }
+
+    /// Restart a parked reader. The held edge keeps serving until the reader's first
+    /// catch-up replaces it, so the player never sees the origin go inactive.
+    pub fn unpark(self: &Arc<Self>) -> bool {
+        let mut task = self.reader_task.lock().unwrap();
+        if !self.parked.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.parked.store(false, Ordering::SeqCst);
+        let Some(url) = self.upstream.lock().unwrap().clone().filter(|_| self.is_active()) else {
+            return false;
+        };
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        *task = Some(tokio::spawn(run_reader(self.clone(), url, http_client(), gen)));
+        info!("[LLOrigin] unparked; reader back at the live edge");
+        true
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.parked.load(Ordering::SeqCst)
+    }
+
+    /// The in-progress tail at a park: finished at what it holds, or dropped when
+    /// it is still a bare shell (listed only as the preload hint, so no listed
+    /// segment disappears).
+    fn close_tail(&self) {
+        let tail = {
+            let mut g = self.live_edge.lock().unwrap();
+            let Some(edge) = g.as_mut() else { return };
+            let (pop, finish) = match edge.segments.back() {
+                Some(s) if !s.complete && s.parts.is_empty() => (edge.segments.len() > 1, None),
+                Some(s) if !s.complete => (false, Some(s.sn)),
+                _ => (false, None),
+            };
+            if pop {
+                edge.segments.pop_back();
+            }
+            finish
+        };
+        if let Some(sn) = tail {
+            self.finish_segment(sn);
+        }
     }
 
     /// Probe the upstream and, if it's a low-latency broadcast we can serve, build the
@@ -1185,7 +1276,17 @@ impl LlOrigin {
         for (sn, pdt, url) in backfill {
             match client.get(&url).timeout(FETCH_TIMEOUT).send().await.ok() {
                 Some(resp) => {
+                    // Timed from the response, so the connection's setup (and
+                    // the first one's handshake) is left out.
+                    let t0 = std::time::Instant::now();
                     let bytes = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+                    // A whole published segment at the link's full rate: the
+                    // parts path's best measure of it, and the start pick's.
+                    crate::services::link_adapt::note_throughput(
+                        &self.adapt_id(),
+                        bytes.len() as u64,
+                        t0.elapsed().as_secs_f64(),
+                    );
                     let parts = self.convert_parts(split_complete(&bytes, container));
                     if !parts.is_empty() {
                         segments.push_back(make_segment(sn, pdt, true, parts));
@@ -1235,6 +1336,7 @@ impl LlOrigin {
             upstream_playlist_url.split('?').next().unwrap_or("")
         );
 
+        *self.upstream.lock().unwrap() = Some(upstream_playlist_url.clone());
         let handle = tokio::spawn(run_reader(self.clone(), upstream_playlist_url, client, gen));
         *self.reader_task.lock().unwrap() = Some(handle);
         StartOutcome {
@@ -1737,6 +1839,7 @@ async fn fetch_published(
     url: &str,
     origin: &LlOrigin,
 ) -> Option<Segment> {
+    let t0 = std::time::Instant::now();
     let resp = match client.get(url).timeout(FETCH_TIMEOUT).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -1751,6 +1854,7 @@ async fn fetch_published(
             return None;
         }
     };
+    crate::services::link_adapt::note_throughput(&origin.adapt_id(), bytes.len() as u64, t0.elapsed().as_secs_f64());
     let parts = origin.convert_parts(split_complete(&bytes, origin.container()));
     if parts.is_empty() {
         warn!("[LLOrigin] catch-up segment sn {sn} produced no parts");
@@ -1799,7 +1903,8 @@ async fn stream_response(
     // On a phone that has been stalling, the player keeps more distance from
     // the edge (`link_adapt`), so a late tail can still arrive in time: the
     // deadline and the silence limit widen with that cushion. Zero otherwise.
-    let cushion = crate::services::link_adapt::extra_cushion();
+    let adapt_id = origin.adapt_id();
+    let cushion = crate::services::link_adapt::extra_cushion(&adapt_id);
     let deadline_secs = origin.expected_segment_secs() + SEGMENT_DEADLINE_GRACE + cushion;
     let midstream_timeout = MIDSTREAM_CHUNK_TIMEOUT + Duration::from_secs_f64(cushion / 2.0);
     let mut received: u64 = 0;
@@ -1823,7 +1928,7 @@ async fn stream_response(
                 let remaining = (deadline_secs - t0.elapsed().as_secs_f64()).max(0.0);
                 if remaining <= 0.0 {
                     warn!("[LLOrigin] sn {sn} exceeded its delivery deadline; abandoning the tail");
-                    crate::services::link_adapt::note_tail_loss();
+                    crate::services::link_adapt::note_tail_loss(&adapt_id);
                     break;
                 }
                 midstream_timeout.min(Duration::from_secs_f64(remaining))
@@ -1928,7 +2033,7 @@ async fn stream_response(
                 // may take longer than 1.5 s to arrive, so it gets whatever is
                 // left of the delivery deadline.
                 let budget = match first_chunk_at {
-                    Some(t0) if crate::services::link_adapt::enabled() => {
+                    Some(t0) if crate::services::link_adapt::phone_rules() => {
                         (deadline_secs - t0.elapsed().as_secs_f64()).max(1.5)
                     }
                     _ => 1.5,
@@ -1947,7 +2052,7 @@ async fn stream_response(
         warn!(
             "[LLOrigin] in-progress {why} for sn {sn} after {received} bytes / {parts} parts; abandoning the tail"
         );
-        crate::services::link_adapt::note_tail_loss();
+        crate::services::link_adapt::note_tail_loss(&adapt_id);
         crate::services::ll_diagnostics::event(&format!(
             "\"ev\":\"o_abandon\",\"sn\":{sn},\"why\":\"{}\",\"received\":{received},\"parts\":{parts},\"pending\":{}",
             why.replace('"', "'"),
@@ -2656,7 +2761,11 @@ impl LlOrigin {
                     }
                 })
                 .await;
-            if !held {
+            // A hold that runs out answers with the held playlist (wait_for is
+            // true at its deadline), parked or not, so a paused player costs one
+            // loopback request per hold and never reaches the upstream relay.
+            // Only an edge that went away falls through.
+            if !held && !self.is_parked() {
                 return None;
             }
         }
@@ -2683,7 +2792,7 @@ impl LlOrigin {
             base,
             target,
             hold_parts,
-            crate::services::link_adapt::extra_cushion() + apple_gap_adjust(target, hold_parts),
+            crate::services::link_adapt::extra_cushion(&self.adapt_id()) + apple_gap_adjust(target, hold_parts),
         ))
     }
 
@@ -2775,7 +2884,11 @@ impl LlOrigin {
 /// The solo player's shared instance (one solo stream at a time). MultiNook tiles
 /// each construct their own origin via `LlOrigin::new`; these functions keep the
 /// solo relay's call sites on a single global origin.
-static SOLO: Lazy<Arc<LlOrigin>> = Lazy::new(|| LlOrigin::new(MAX_SEGMENTS));
+static SOLO: Lazy<Arc<LlOrigin>> = Lazy::new(|| {
+    let origin = LlOrigin::new(MAX_SEGMENTS);
+    origin.set_adapt_id(crate::services::link_adapt::SOLO);
+    origin
+});
 
 /// Whether the upstream playlist probed at the last `start()` carried
 /// `#EXT-X-TWITCH-PREFETCH` hints: a low-latency broadcast, whether or not
@@ -2810,6 +2923,19 @@ pub fn engine_disabled() -> bool {
 
 pub fn stop() {
     SOLO.stop()
+}
+
+/// The main player paused past earning_gate::PARK_AFTER (see `LlOrigin::park`).
+pub fn park() -> bool {
+    SOLO.park()
+}
+
+pub fn unpark() -> bool {
+    SOLO.unpark()
+}
+
+pub fn is_parked() -> bool {
+    SOLO.is_parked()
 }
 
 pub async fn start(upstream_playlist_url: String) -> StartOutcome {
@@ -3669,6 +3795,84 @@ mod tests {
         assert!(origin.edge_version.load(Ordering::SeqCst) > before);
     }
 
+    fn held_sns(origin: &LlOrigin) -> Vec<u64> {
+        origin.live_edge.lock().unwrap().as_ref().unwrap().segments.iter().map(|s| s.sn).collect()
+    }
+
+    #[test]
+    fn park_finishes_a_half_read_tail_at_its_parts() {
+        let origin = LlOrigin::new(6);
+        let mut edge = ts_edge_with_one_segment();
+        edge.segments.push_back(make_segment(2, None, false, even_parts(vec![vec![1], vec![2]])));
+        *origin.live_edge.lock().unwrap() = Some(edge);
+        assert!(origin.park());
+        let g = origin.live_edge.lock().unwrap();
+        let tail = g.as_ref().unwrap().segments.back().unwrap();
+        assert_eq!(tail.sn, 2);
+        assert!(tail.complete, "a restarted reader must find a finished segment");
+        let sum: f64 = tail.parts.iter().map(|p| p.duration).sum();
+        assert!((tail.duration - sum).abs() < 1e-9);
+    }
+
+    #[test]
+    fn park_drops_a_bare_shell() {
+        let origin = LlOrigin::new(6);
+        let mut edge = ts_edge_with_one_segment();
+        edge.segments.push_back(make_segment(2, None, false, Vec::new()));
+        *origin.live_edge.lock().unwrap() = Some(edge);
+        assert!(origin.park());
+        assert_eq!(held_sns(&origin), vec![1]);
+    }
+
+    #[test]
+    fn park_holds_the_edge_as_served() {
+        let origin = LlOrigin::new(6);
+        *origin.live_edge.lock().unwrap() = Some(ts_edge_with_one_segment());
+        let before = held_sns(&origin);
+        let generation = origin.generation.load(Ordering::SeqCst);
+        assert!(origin.park());
+        assert!(origin.is_active());
+        assert!(origin.is_parked());
+        assert!(origin.generation.load(Ordering::SeqCst) > generation);
+        assert_eq!(held_sns(&origin), before);
+        assert!(!origin.park(), "a second park is a no-op");
+    }
+
+    #[test]
+    fn unpark_without_an_upstream_clears_the_park_and_starts_nothing() {
+        let origin = LlOrigin::new(6);
+        *origin.live_edge.lock().unwrap() = Some(ts_edge_with_one_segment());
+        assert!(origin.park());
+        assert!(!origin.unpark());
+        assert!(!origin.is_parked());
+        assert!(origin.reader_task.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn stop_clears_a_park() {
+        let origin = LlOrigin::new(6);
+        *origin.live_edge.lock().unwrap() = Some(ts_edge_with_one_segment());
+        assert!(origin.park());
+        origin.stop();
+        assert!(!origin.is_parked());
+        assert!(!origin.is_active());
+    }
+
+    #[test]
+    fn a_parked_origin_answers_a_timed_out_apple_reload() {
+        // A paused AVPlayer keeps making blocking reloads. One the edge never
+        // satisfies runs out its hold and gets the held playlist back, parked or
+        // not, so the relay never goes upstream for it.
+        let origin = LlOrigin::new(6);
+        *origin.live_edge.lock().unwrap() = Some(ts_edge_with_one_segment());
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let unparked = rt.block_on(origin.serve_playlist_apple(Some(1_000), None, "http://x/", 2));
+        assert!(unparked.is_some());
+        assert!(origin.park());
+        let parked = rt.block_on(origin.serve_playlist_apple(Some(1_000), None, "http://x/", 2));
+        assert!(parked.is_some());
+    }
+
     #[test]
     fn init_url_update_only_fires_on_a_cmaf_change() {
         // CMAF passthrough: a changed upstream MAP URI is adopted (forces hls.js
@@ -3817,11 +4021,11 @@ http://127.0.0.1:9/seg/50.ts\n\
 
     #[test]
     fn the_target_gap_moves_the_apple_hold_back() {
-        // Auto rides the desktop's 1.5 s behind live: a 0.65 s hold-back.
-        assert!((gap_adjust(0, 0.312, 3) - (0.65 - 0.936)).abs() < 1e-9);
+        // Auto: three part targets, the default hold-back.
+        assert!(gap_adjust(0, 0.312, 3).abs() < 1e-9);
         assert!((gap_adjust(3000, 0.312, 3) - (2.15 - 0.936)).abs() < 1e-9);
-        // Never under two part targets, however low the gap.
-        assert!((gap_adjust(500, 0.312, 3) + 0.312).abs() < 1e-9);
+        // Never under three part targets, however low the gap.
+        assert!(gap_adjust(500, 0.312, 3).abs() < 1e-9);
     }
 
     #[test]

@@ -23,8 +23,10 @@
 //!   fetched right behind every list's viewer counts (followed, recommended,
 //!   the next recommended page, a Home's category and search results) and
 //!   sent AHEAD of that list, so a card paints with its group instead of
-//!   gaining it a poll later. Skipped while no window is on screen; a Home
-//!   mount catches up. See `services::collaboration`.
+//!   gaining it a poll later (a slow answer follows the list instead).
+//!   Skipped while no window is on screen; coming back on screen
+//!   (`note_ui_on_screen`, which also covers a boot's hidden first paint) and a
+//!   Home mount catch up. See `services::collaboration`.
 //! - shared chats (Shared Chat outside a Stream Together group): started by
 //!   every collaborations pass, as a background pass of their own so the
 //!   per-channel Helix lookups never hold a list back; channels already in a
@@ -505,7 +507,12 @@ pub fn start(app: AppHandle, notifications: Arc<LiveNotificationService>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
         loop {
-            refresh_followed(&followed).await;
+            // A phone in the background rests: its live alerts come from the push
+            // server and the phones' own background checks, not this poll, and the
+            // resume refresh (note_app_resumed) catches Home up.
+            if !crate::services::window_visibility::phone_idle() {
+                refresh_followed(&followed).await;
+            }
             tokio::time::sleep(FOLLOWED_PERIOD).await;
         }
     });
@@ -524,7 +531,7 @@ pub fn start(app: AppHandle, notifications: Arc<LiveNotificationService>) {
                 let s = offline.snap.read().await;
                 (s.followed_live_at.is_some(), is_stale(s.offline_at, OFFLINE_PERIOD))
             };
-            if signed && stale {
+            if signed && stale && !crate::services::window_visibility::phone_idle() {
                 refresh_offline(&offline).await;
             }
             tokio::time::sleep(if signed { OFFLINE_PERIOD } else { Duration::from_secs(15) }).await;
@@ -536,7 +543,7 @@ pub fn start(app: AppHandle, notifications: Arc<LiveNotificationService>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(10)).await;
         loop {
-            if recommended.home_mounted() {
+            if recommended.home_mounted() && !crate::services::window_visibility::phone_idle() {
                 refresh_recommended(&recommended).await;
             }
             tokio::time::sleep(RECOMMENDED_PERIOD).await;
@@ -680,7 +687,7 @@ pub async fn load_more_recommended() -> Result<(), String> {
         s.recommended_at = Some(at);
         (s.recommended.clone(), next)
     };
-    collaborations_before_list(inner).await;
+    collaborations_before_list().await;
     emit(&inner.app, HomeUpdate::Recommended { streams: merged, cursor: next, at });
     // The next page ranks into the unified list too.
     rebuild_discover(inner).await;
@@ -731,6 +738,18 @@ pub fn note_main_window_focused() {
     });
 }
 
+/// Something is back on screen after nothing was: the reveal after a boot's
+/// first paint, or a restore from the tray or a minimize. The collaborations
+/// pass behind each list skips its turn while nothing is, and a boot's first
+/// lists often land before the window shows, so the cards' groups are read now
+/// instead of with the next followed poll, up to a minute away. This runs off
+/// the visibility pass itself, not the window's focus, because focus can
+/// arrive before that pass has seen the window and the read would skip again.
+pub fn note_ui_on_screen() {
+    let Some(inner) = SERVICE.get().cloned() else { return };
+    tauri::async_runtime::spawn(async move { refresh_collaborations(&inner).await });
+}
+
 /// Something the Following lists read, or the Discover lists leave out,
 /// changed outside this module: a platform's live follows, the live
 /// favourites, the favourite list or the follow list. The Following lists are
@@ -759,9 +778,10 @@ pub fn note_discover_inputs_changed() {
 /// tray nor minimized, with its Home still mounted and nobody looking at it.
 /// A destroyed main window is not up either.
 fn main_window_shown(app: &AppHandle) -> bool {
-    app.get_webview_window("main").is_some_and(|window| {
-        window.is_visible().unwrap_or(true) && !window.is_minimized().unwrap_or(false)
-    })
+    !crate::services::window_visibility::phone_idle()
+        && app.get_webview_window("main").is_some_and(|window| {
+            window.is_visible().unwrap_or(true) && !window.is_minimized().unwrap_or(false)
+        })
 }
 
 /// `Settings.favorite_streamers`, copied out from under the lock.
@@ -1561,7 +1581,7 @@ async fn refresh_followed(inner: &Inner) {
                 s.followed_live_at = Some(at);
                 changed
             };
-            collaborations_before_list(inner).await;
+            collaborations_before_list().await;
             if changed {
                 emit(
                     &inner.app,
@@ -1718,7 +1738,7 @@ async fn refresh_recommended_with(
         s.recommended_at = Some(at);
         changed
     };
-    collaborations_before_list(inner).await;
+    collaborations_before_list().await;
     if changed {
         emit(&inner.app, HomeUpdate::Recommended { streams, cursor, at });
         rebuild_discover(inner).await;
@@ -1743,21 +1763,30 @@ async fn card_channel_ids(inner: &Inner) -> Vec<String> {
 /// Collaborations for the cards, right behind a list's viewer counts and ahead
 /// of the list itself, so the windows hold a card's group before they draw the
 /// card. Bounded by `COLLAB_WAIT`: a slow answer must never hold back the list
-/// (or the live notifications behind the followed one); it is dropped and the
-/// next pass fills in.
-async fn collaborations_before_list(inner: &Inner) {
-    if tokio::time::timeout(COLLAB_WAIT, refresh_collaborations(inner)).await.is_err() {
-        debug!("[HomeSnapshot] collaborations: no answer in {COLLAB_WAIT:?}, sending the list without");
+/// (or the live notifications behind the followed one), so the list goes out
+/// first and the groups follow when the answer lands. Dropping the request
+/// instead left the cards bare until the next list, a minute away.
+async fn collaborations_before_list() {
+    let Some(inner) = SERVICE.get().cloned() else { return };
+    let pass = tauri::async_runtime::spawn(async move { refresh_collaborations(&inner).await });
+    if tokio::time::timeout(COLLAB_WAIT, pass).await.is_err() {
+        debug!("[HomeSnapshot] collaborations: no answer in {COLLAB_WAIT:?}, sending the list first");
     }
 }
 
+/// One collaborations pass at a time. A pass the list stopped waiting for
+/// still lands, and a later one finishing first would then be overwritten by
+/// that older answer.
+static COLLAB_PASS: Mutex<()> = Mutex::const_new(());
+
 /// Shared Viewership for every card on screen. Skipped while no window is on
-/// screen; a Home mount catches up. A channel whose batch failed keeps the
-/// group it had.
+/// screen; `note_ui_on_screen` catches up when one returns, a Home mount when
+/// it mounts. A channel whose batch failed keeps the group it had.
 async fn refresh_collaborations(inner: &Inner) {
     if !crate::services::window_visibility::ui_exists(&inner.app) || crate::services::window_visibility::all_hidden() {
         return;
     }
+    let _pass = COLLAB_PASS.lock().await;
     spawn_shared_chats();
     let ids = card_channel_ids(inner).await;
     let found = collaboration::fetch(&ids).await;

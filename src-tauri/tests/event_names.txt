@@ -7,6 +7,7 @@
 account-roster-changed
 ad-pivot
 app-foregrounded
+app-presence
 asset-cache://cached
 asset-cache://cleared
 badge-available
@@ -122,6 +123,7 @@ twitch-overlay-close
 twitch-overlay-open
 twitch-overlay-url
 twitch-reward-received
+unban-requests
 update://status
 user-history-message
 watch-session://offline
