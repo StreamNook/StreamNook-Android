@@ -53,6 +53,10 @@ const ALLOWED_PATHS: &[&str] = &[
     // reporter. The server keys it on (member, minute), so a repeat or a
     // second device in the same minute counts once.
     "/api/v1/watch/minute",
+    // The watch-minute reporter's batch: up to twenty minutes in one body. The
+    // server keys each minute on (member, minute), so a minute sent here and
+    // again through the single path still counts once.
+    "/api/v1/watch/minutes",
     // The memberships this member was gifted, read by the Rust gift poll
     // (services::membership_gifts). The member comes from the token.
     "/api/v1/membership/gifts",
@@ -124,9 +128,7 @@ pub async fn streamnook_api_request(
         "POST" => client.post(&url).json(&body.unwrap_or(serde_json::Value::Null)),
         other => return Err(format!("method_not_allowed: {}", other)),
     };
-    let resp = req
-        .bearer_auth(&token)
-        .send()
+    let resp = crate::services::sn_transport::send(req.bearer_auth(&token))
         .await
         .map_err(|e| format!("network: {}", e))?;
     let status = resp.status();
@@ -173,12 +175,14 @@ pub(crate) async fn post_json(
             .map_err(|e| format!("no_token: {}", e))?,
     };
 
-    let client = crate::services::http::client();
-    let resp = client
+    // Through the StreamNook transport, so a network that drops the site's
+    // addresses still delivers watch minutes, the version report and every
+    // other write here by the relay.
+    let request = crate::services::http::client()
         .post(format!("{}{}", API_BASE, path))
         .bearer_auth(&token)
-        .json(body)
-        .send()
+        .json(body);
+    let resp = crate::services::sn_transport::send(request)
         .await
         .map_err(|e| format!("network: {}", e))?;
 
@@ -224,6 +228,12 @@ mod tests {
             assert!(!p.contains("://"), "{p} must not carry a scheme");
             assert!(!p.contains('*'), "{p} must be exact, not a pattern");
         }
+    }
+
+    #[test]
+    fn the_single_and_batch_watch_minute_paths_are_both_allowed() {
+        assert!(ALLOWED_PATHS.contains(&"/api/v1/watch/minute"));
+        assert!(ALLOWED_PATHS.contains(&"/api/v1/watch/minutes"));
     }
 
     #[test]

@@ -47,15 +47,16 @@ import { applySlashOutcome, handleSlashCommand, runSlashCommand, type SlashOutco
 import { StreakBanners, type ArmedShare } from './StreakBanners';
 import type { ChatWarningView, RoomModeKind, RoomModeView, SendChannelOutcome } from '../../stores/chatConnectionStore';
 import { WarningBox } from './WarningBox';
-import { RoomModeIndicator } from '../../components/chat/RoomModeIndicator';
 import type { ProviderId } from '../../types/providers';
 import { isTwitchStream } from '../../utils/streamProvider';
 import { formatShortCount } from '../../utils/streamStats';
+import { bitsOn } from '../../utils/wallet';
 import { usePlatformAccountStore } from '../../stores/platformAccountStore';
 import { ManageChannelSheet } from './ManageChannelSheet';
 import { ModerationSheet } from './ModerationSheet';
 import { useHiddenPinWaiting, usePinsOpen } from '../watch/pinsOpen';
 import { useOutsidePress } from '../../hooks/useOutsidePress';
+import { measureText, pickFittingText } from './placeholderFit';
 
 // The emote menu takes the keyboard's place, at the keyboard's last height,
 // the platform's own emoji-keyboard pattern: the emote button swaps one for
@@ -115,13 +116,18 @@ interface Props {
   channelId: string | null;
   channelLabel: string | null;
   gating: ChatGating;
-  /** The room's chat modes in Rust's words, or null while hidden or none. */
+  /** The room's chat modes in Rust's words, or null while hidden or none: a mode that holds you
+   *  back names itself in place of "Send a message". */
   roomModes?: RoomModeView | null;
-  /** Name the modes in place of "Send a message" instead of the chip. */
-  roomModesAsPrompt?: boolean;
   emotes: EmoteSet | null;
   replyTo?: { messageId: string; username: string } | null;
   onCancelReply?: () => void;
+  /** A send finished, with the reply it went out with: the pane clears the draft only if it is
+   *  still that one. */
+  onReplySent?: (sentWith: string | null) => void;
+  /** Set to this box's reply focus while it is mounted: the keyboard, or the emote panel in an
+   *  emote-only room. The pane calls it inside the touch that started the reply. */
+  focusRef?: React.MutableRefObject<(() => void) | null>;
   isModerator: boolean;
   modToolsOn: boolean;
   onToggleModTools: () => void;
@@ -145,10 +151,11 @@ const MobileChatInputImpl: React.FC<Props> = ({
   channelLabel,
   gating,
   roomModes = null,
-  roomModesAsPrompt = false,
   emotes,
   replyTo,
   onCancelReply,
+  onReplySent,
+  focusRef,
   isModerator,
   modToolsOn,
   onToggleModTools,
@@ -225,10 +232,27 @@ const MobileChatInputImpl: React.FC<Props> = ({
   // behaves the same; the gap between the two thresholds keeps it from
   // flickering at the edge.
   const [trayFolded, setTrayFolded] = useState(false);
+  // The field's text width and font, so its prompt can be the wording that
+  // fits on its one line (placeholderFit.ts).
+  const [fieldBox, setFieldBox] = useState<{ width: number; font: string }>({ width: 0, font: '' });
   const inboxUnread = useMentionsStore((s) => s.unreadTotal);
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [sending, setSending] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // The pane starts a reply from inside a touch handler and calls this there, so the keyboard
+  // rises with it. In an emote-only room the emote panel is how one types, so it opens instead.
+  const emoteOnly = gating.blocked === 'emote_only';
+  useEffect(() => {
+    if (!focusRef) return;
+    const focus = () => {
+      if (emoteOnly) setEmotesOpen(true);
+      else inputRef.current?.focus();
+    };
+    focusRef.current = focus;
+    return () => {
+      if (focusRef.current === focus) focusRef.current = null;
+    };
+  }, [focusRef, emoteOnly]);
   // A streak share the banner armed: the next send goes to it instead of to
   // chat, with whatever is typed (nothing typed is fine).
   const armedShare = useRef<ArmedShare | null>(null);
@@ -345,11 +369,31 @@ const MobileChatInputImpl: React.FC<Props> = ({
       setFailureFor(key, null);
     };
     const failed = (why: string) => setFailureFor(key, { text: message, why });
+    // The reply this send goes out with: a reply started while it is on its way is kept.
+    const sentWith = replyTo?.messageId ?? null;
     if (!isTwitch) {
-      // Slash commands are Twitch calls; typed here they would post as text.
+      // Commands that need no Twitch API (text tools, /song, /songs, your own
+      // commands) run in Rust for any platform's chat, the desktop's rule; Rust
+      // answers "not mine" for the rest, which would post as text here.
+      let body = message;
       if (message.startsWith('/')) {
-        useAppStore.getState().addToast('Commands only work in Twitch chats', 'info');
-        return;
+        const answer = await runSlashCommand(message, '', key).catch((err: unknown) => {
+          Logger.warn('[MobileChatInput] run_slash_command failed:', err);
+          return null;
+        });
+        if (!answer?.handled) {
+          useAppStore.getState().addToast('Commands only work in Twitch chats', 'info');
+          return;
+        }
+        const reply: { text?: string } = {};
+        await applySlashOutcome(answer, key, '', (msg) => {
+          reply.text = msg;
+        });
+        if (reply.text === undefined) {
+          sent();
+          return;
+        }
+        body = reply.text;
       }
       setSending(true);
       try {
@@ -360,7 +404,7 @@ const MobileChatInputImpl: React.FC<Props> = ({
           {
             provider,
             channel: channel.toLowerCase(),
-            text: message,
+            text: body,
             replyTo: replyTo?.messageId ?? null,
           },
         );
@@ -370,7 +414,8 @@ const MobileChatInputImpl: React.FC<Props> = ({
         }
         sent();
         startSlowWait(key, channel);
-        onCancelReply?.();
+        if (onReplySent) onReplySent(sentWith);
+        else onCancelReply?.();
       } catch (err) {
         Logger.warn('[MobileChatInput] send failed:', err);
         failed(failureWords(err));
@@ -465,7 +510,8 @@ const MobileChatInputImpl: React.FC<Props> = ({
       }
       sent();
       startSlowWait(key, channel);
-      onCancelReply?.();
+      if (onReplySent) onReplySent(sentWith);
+      else onCancelReply?.();
     } catch (err) {
       Logger.error('[MobileChatInput] send failed:', err);
       failed(failureWords(err));
@@ -522,18 +568,22 @@ const MobileChatInputImpl: React.FC<Props> = ({
   // slow-mode wait, else "Send a message" (nothing when Settings hides it). A
   // mode that only may hold you back is said once, by its icon at the field's
   // end; the chat menu names it in full.
-  const placeholder = gating.warning
-    ? gating.warning.prompt
+  // Longest wording first; the field shows the first that fits on its line.
+  const placeholderWordings: string[] = gating.warning
+    ? [gating.warning.prompt]
     : shareArmed
     ? // The armed share rides the next send: the field says what it is for.
-      `Add a message to your ${shareArmed === 'watch' ? 'watch streak' : 'resub'}`
+      [`Add a message to your ${shareArmed === 'watch' ? 'watch streak' : 'resub'}`]
     : gating.blocked
-    ? (gating.reason ?? 'Chat restricted')
+    ? [gating.reason ?? 'Chat restricted']
     : slowWait > 0
-      ? `Slow mode: you can send again in ${slowWait}s`
+      ? [`Slow mode: you can send again in ${slowWait}s`, `Send again in ${slowWait}s`]
       : hidePlaceholder
-        ? ''
-        : ((roomModesAsPrompt ? roomModes?.prompt : null) ?? 'Send a message');
+        ? []
+        : roomModes?.prompt
+          ? [roomModes.prompt, roomModes.prompt_short ?? roomModes.prompt]
+          : ['Send a message'];
+  const placeholder = pickFittingText(placeholderWordings, fieldBox.width - 2, (t) => measureText(t, fieldBox.font));
   // Characters as Twitch counts them (code points, so an emoji is one).
   const charCount = text.length >= COUNTER_FROM ? Array.from(text).length : text.length;
 
@@ -551,14 +601,19 @@ const MobileChatInputImpl: React.FC<Props> = ({
   // and wallet panels), so the card waits while one is up and shows once it
   // clears, after the send. A taller draft lifts the card with the bar.
   useEffect(() => {
-    setComposerBusy(showSuggestions || emotesOpen || pointsOpen);
-  }, [showSuggestions, emotesOpen, pointsOpen]);
-  useEffect(() => () => setComposerBusy(false), []);
+    setComposerBusy(inboxSurface, showSuggestions || emotesOpen || pointsOpen);
+  }, [inboxSurface, showSuggestions, emotesOpen, pointsOpen]);
+  useEffect(() => () => setComposerBusy(inboxSurface, false), [inboxSurface]);
 
   useEffect(() => {
     const el = inputRef.current;
     if (!el) return;
     const read = () => {
+      const style = getComputedStyle(el);
+      const textWidth = el.clientWidth - parseFloat(style.paddingLeft || '0') - parseFloat(style.paddingRight || '0');
+      setFieldBox((prev) =>
+        prev.width === textWidth && prev.font === style.font ? prev : { width: textWidth, font: style.font },
+      );
       // Typing hides the tray anyway, so the bar's resting width is not on
       // screen to judge by; the call waits for the keyboard to go.
       if (document.activeElement === el) return;
@@ -779,7 +834,10 @@ const MobileChatInputImpl: React.FC<Props> = ({
               onChange={(e) => setText(e.target.value)}
               // Its own hide-keyboard button takes the menu's slot while typing.
               data-keyboard-hide="own"
-              onFocus={() => {
+              onFocus={(e) => {
+                // A surface out of sight refuses focus before this runs (refuseFocusIn): a field
+                // that is no longer focused is not being typed in.
+                if (document.activeElement !== e.currentTarget) return;
                 setTyping(true);
                 setEmotesOpen(false);
                 // The bar is for writing now: an open inbox goes first.
@@ -805,11 +863,9 @@ const MobileChatInputImpl: React.FC<Props> = ({
               enterKeyHint="send"
             />
           )}
-          {/* Near Twitch's limit, the count takes the mode icon's place: quiet,
-              orange in the last 20, red past it. Otherwise the room's chat
-              modes, staying while you type; a tap opens the chat menu, which
-              lists them in full. Hidden while a mode blocks you, since the
-              placeholder already says that one. */}
+          {/* Near Twitch's limit, the count: quiet, orange in the last 20, red
+              past it. The room's chat modes have no icon here: the chat menu
+              lists them, and the placeholder names one that stops you. */}
           {!needsKickSignIn &&
             (charCount >= COUNTER_FROM ? (
               <span
@@ -824,18 +880,7 @@ const MobileChatInputImpl: React.FC<Props> = ({
               >
                 {charCount}/{MESSAGE_LIMIT}
               </span>
-            ) : (
-              roomModes &&
-              !roomModesAsPrompt &&
-              !gating.blocked && <RoomModeIndicator
-                  view={roomModes}
-                  inline
-                  onActivate={() => {
-                    setEmotesOpen(false);
-                    setMenuOpen(true);
-                  }}
-                />
-            ))}
+            ) : null)}
           {/* The command list one tap from the field instead of two menus deep.
               Commands are Twitch calls (any other room would post the "/" as
               text), so only a Twitch room shows it. */}
@@ -1130,9 +1175,16 @@ const MobileChatInputImpl: React.FC<Props> = ({
       {/* The rewards, as a sheet: the phone's own surface for a menu like this.
           Its first open does not wait on Twitch: the read below fills Rust's
           list as soon as there is a points button, and the menu paints that
-          list at once while it reads a fresh one. */}
+          list at once while it reads a fresh one. With both tabs it opens at
+          full height, so a tab switch or the Bits tab's late answer never
+          resizes it under the finger. */}
       {hasWallet && channel && channelId && (
-        <MobileSheet open={pointsOpen} onClose={() => setPointsOpen(false)} maxHeightFraction={0.78}>
+        <MobileSheet
+          open={pointsOpen}
+          onClose={() => setPointsOpen(false)}
+          maxHeightFraction={0.78}
+          fill={points.balance !== null && bitsOn(walletBits) !== null}
+        >
           <WalletSheet
             channelLogin={channel}
             channelId={channelId}

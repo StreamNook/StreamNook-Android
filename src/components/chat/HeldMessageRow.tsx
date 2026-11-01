@@ -48,7 +48,11 @@ function HeldMessageRow({ row }: HeldMessageRowProps) {
       <p className="text-[14.5px] leading-snug text-textPrimary [overflow-wrap:anywhere]">
         <span className="font-bold text-accent">{name}</span>: {held.text}
       </p>
-      <div className="mt-2 flex gap-2">
+      {/* data-mod-act: Allow and Deny are one-press mod buttons, so they act
+          only once the rows under the pointer have held still, and rest
+          dimmed while they move (ChatMessageList), as the other mod buttons
+          do. */}
+      <div data-mod-act="true" className="mt-2 flex gap-2">
         <button
           type="button"
           disabled={busy != null}

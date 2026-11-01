@@ -51,7 +51,7 @@ use commands::{
     badges::*, bits::*, cache::*, channel_links::*, channel_panels::*, channel_state::*, chat::*, chat_identity::*, components::*,
     cosmetics_cache::*, diagnostic_logging::*, drops::*, emoji::*, emote_prefetch::*,
     emotes::*, eventsub::*, ffz::*, gifs::*, helix::*, home_snapshot::*, shared_chat::*, fonts::*, hype_train::*, identity::*, justlog::*, layout::*,
-    link_preview::*, logs::*, media_glow::*, mod_log_storage::*, modroom::*, overlay_file::*, plugins::*,
+    link_preview::*, live_alerts::*, logs::*, media_glow::*, mod_log_storage::*, modroom::*, overlay_file::*, plugins::*,
     profile_cache::*, provider_browse::*,
     resub::*, session::*, settings::*, settings_fields::*, settings_lists::*, settings_extras::*, seventv::*, seventv_cosmetics::*,
     seventv_cosmetics_fetch::*, sn_cosmetics::*, song_id::*, spellcheck::*, streamnook_api::*, streaming::*, subscriptions::*,
@@ -216,7 +216,7 @@ fn main_window_chrome(
 /// and the "Show StreamNook" menu item. Restores from minimized if needed and
 /// re-shows if the window was hidden to the tray on close.
 #[cfg(desktop)]
-fn show_main_window(app: &crate::rt::AppHandle) {
+pub(crate) fn show_main_window(app: &crate::rt::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -382,6 +382,23 @@ mod services;
 mod twitch_login_plugin;
 mod utils;
 
+/// What the saved settings feed at launch: the chat rule engine (highlights,
+/// ignores, saved filters, the composer's emote matching and chatter names),
+/// streamer mode, the mention and whisper inboxes, mentions while you're away
+/// and hidden channels. Runs on the file read at the top of `run()`, and again
+/// on a phone once its data folder resolves, since that first read falls back
+/// to the defaults there.
+fn apply_loaded_settings(settings: &Settings) {
+    services::chat_rules::ChatRules::refresh(settings);
+    services::streamer_mode::StreamerMode::refresh(settings);
+    services::mention_ping::refresh(settings);
+    services::mention_inbox::refresh(settings);
+    // Mentions while you're away: told once at launch when on, then pulled.
+    services::mention_watch::client::seed(settings);
+    services::whisper_inbox::refresh_settings(settings);
+    services::hidden_channels::refresh(settings);
+}
+
 /// Load settings from the custom location in the same directory as cache
 fn load_settings_from_file() -> Result<Settings, Box<dyn std::error::Error>> {
     let app_dir = cache_service::get_app_data_dir()?;
@@ -411,6 +428,8 @@ fn load_settings_from_file() -> Result<Settings, Box<dyn std::error::Error>> {
     settings.lift_custom_theme_muted();
     settings.map_legacy_event_keys();
     settings.retire_oled_v2();
+    settings.adopt_multi_nook_start_volume_once();
+    services::favorite_channels::repair(&mut settings);
     Ok(settings)
 }
 
@@ -647,6 +666,15 @@ mod webview_args_tests {
             "--disable-features=A,B,C --force-color-profile=srgb --disable-direct-composition-video-overlays"
         );
     }
+
+    #[test]
+    fn media_keys_off_joins_the_one_disable_features_switch() {
+        let launch = merge_webview_args("A,B", Some("--force-color-profile=srgb"));
+        assert_eq!(
+            merge_webview_args("HardwareMediaKeyHandling", Some(&launch)),
+            "--disable-features=HardwareMediaKeyHandling,A,B --force-color-profile=srgb"
+        );
+    }
 }
 
 /// Flush every debounced store before the process dies; each is a no-op when
@@ -662,6 +690,7 @@ pub(crate) fn flush_debounced_stores() {
     #[cfg(desktop)]
     let _ = commands::popout_window::flush_now();
     let _ = services::activity_history_service::flush_now();
+    let _ = services::song_id::history::flush_now();
     let _ = services::chat_logger_service::ChatLoggerService::flush_all();
 }
 
@@ -793,62 +822,6 @@ pub fn run() {
     // Streamlink-bundled build (native resolution no longer needs it).
     cleanup_legacy_streamlink_bundle();
 
-    // Migrate emote cache if app version changed (handles format changes like webp → avif)
-    // This clears stale emote files that may have the old format
-    let current_version = env!("CARGO_PKG_VERSION");
-    match services::universal_cache_service::migrate_emote_cache_on_version_change(current_version)
-    {
-        Ok(migrated) => {
-            if migrated {
-                debug!("[Main] Emote cache migrated for new version");
-            }
-        }
-        Err(e) => {
-            error!("[Main] Failed to migrate emote cache: {}", e);
-        }
-    }
-
-    // One-time, FFZ-only purge so previously cached static FFZ frames re-download
-    // as their animated variants. Targeted by source URL, so other providers'
-    // emote caches are left intact.
-    match services::universal_cache_service::migrate_ffz_animated_cache() {
-        Ok(purged) => {
-            if purged {
-                debug!("[Main] FFZ emote cache purged for animated re-fetch");
-            }
-        }
-        Err(e) => {
-            error!("[Main] Failed to purge FFZ emote cache: {}", e);
-        }
-    }
-
-    // One-time purge of cached 7TV paint images that hold a still frame, so
-    // animated paints re-download as animations.
-    match services::universal_cache_service::migrate_paint_animated_cache() {
-        Ok(purged) => {
-            if purged {
-                debug!("[Main] 7TV paint cache purged for animated re-fetch");
-            }
-        }
-        Err(e) => {
-            error!("[Main] Failed to purge 7TV paint cache: {}", e);
-        }
-    }
-
-    // One-time purge of OLD non-7TV emote files (bare-id keys + URL-derived
-    // `.0`/`.bin` extensions) so they re-cache under provider-namespaced keys with
-    // content-typed extensions. 7TV files (already correct) are kept.
-    match services::universal_cache_service::migrate_emote_namespace_cache() {
-        Ok(purged) => {
-            if purged {
-                debug!("[Main] Non-7TV emote cache purged for namespaced re-fetch");
-            }
-        }
-        Err(e) => {
-            error!("[Main] Failed to purge non-7TV emote cache: {}", e);
-        }
-    }
-
     // Forced-logout switch. Bumping FORCE_REAUTH_TOKEN in account_store signs every
     // user out on their next launch so they re-login into the current auth-storage
     // layout. It runs HERE, before the Tauri builder creates any window, so the
@@ -880,17 +853,33 @@ pub fn run() {
     services::token_vault::warm_up();
 
     // Load settings from our custom location in the same directory as cache
-    let settings = load_settings_from_file().unwrap_or_else(|_| Settings::default());
+    let loaded_settings = load_settings_from_file();
+    // Sound files that settings from before imports existed point at stay
+    // playable: they are chosen once, from the settings as the file read them.
+    // A failed read says nothing about them (nothing is chosen and the next
+    // launch tries again). A phone's read here is not its real one; it chooses
+    // inside setup, once its data folder resolves.
+    #[cfg(desktop)]
+    if let Ok(read) = &loaded_settings {
+        commands::sounds::freeze_legacy_sounds(read);
+    }
+    let settings = loaded_settings.unwrap_or_else(|_| Settings::default());
+    // Media keys off: Chromium's media key handling is what puts the webview in
+    // Windows' media controls, where it takes play/pause from the viewer's music
+    // player. It is a browser switch, so it joins the arguments here, after the
+    // settings read and before the first webview starts.
+    #[cfg(windows)]
+    if !settings.video_player.media_keys {
+        let current = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok();
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            merge_webview_args("HardwareMediaKeyHandling", current.as_deref()),
+        );
+        info!("[WebView2] Media keys off: the player stays out of the system media controls");
+    }
     // Compile the chat rule engine (highlights, ignores, saved filters) from
     // the loaded settings before any chat connects.
-    services::chat_rules::ChatRules::refresh(&settings);
-    services::streamer_mode::StreamerMode::refresh(&settings);
-    services::mention_ping::refresh(&settings);
-    services::mention_inbox::refresh(&settings);
-    // Mentions while you're away: told once at launch when on, then pulled.
-    services::mention_watch::client::seed(&settings);
-    services::whisper_inbox::refresh_settings(&settings);
-    services::hidden_channels::refresh(&settings);
+    apply_loaded_settings(&settings);
 
     // Apply persisted diagnostic logging setting immediately after loading settings
     services::diagnostic_logger::apply_setting(settings.error_reporting_enabled);
@@ -938,6 +927,11 @@ pub fn run() {
     ));
     let eventsub_service_state = commands::eventsub::EventSubServiceState(eventsub_service.clone());
 
+    // Closed here, before any window can ask the cache for a list or write a
+    // file, on every platform. The setup closure owns it and moves it into the
+    // migrations' task, which opens it when they end however they end; if setup
+    // never runs, dropping the app drops the closure and opens it.
+    let startup_gate = services::universal_cache_service::StartupGateGuard::close();
     let builder = Builder::new();
     // Single-instance is desktop-only and must be registered first: it forwards a
     // streamnook:// deep link opened while the app is already running to the
@@ -1018,6 +1012,10 @@ pub fn run() {
     // endpoint live in tauri.windows.conf.json, the only config that has them.
     #[cfg(windows)]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    // A page whose WebKit content process died: recorded, then reloaded (the
+    // WebView2 renderer failure handling, on macOS).
+    #[cfg(target_os = "macos")]
+    let builder = builder.on_web_content_process_terminate(services::webkit_failures::content_process_terminated);
     #[cfg(not(target_os = "ios"))]
     let builder = builder
         .plugin(tauri_plugin_dialog::init())
@@ -1035,11 +1033,37 @@ pub fn run() {
         .manage(emote_service_state)
         .manage(emote_prefetch_state)
         .manage(eventsub_service_state)
+        // A reload of the main page destroys the players that were using the
+        // relay sessions, and nothing in the new page knows their ids, so the
+        // sessions are released as it starts loading. The first load finds none.
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main" && payload.event() == tauri::webview::PageLoadEvent::Started {
+                // What the old page declared to Discord presence goes with it.
+                #[cfg(desktop)]
+                services::discord_presence::page_ended();
+                tauri::async_runtime::spawn(async {
+                    services::tiktok_relay::stop_all_except("");
+                    services::youtube_dash::stop_all_except("").await;
+                    let _ = services::multi_nook_server::MultiNookServer::stop_all().await;
+                });
+            }
+        })
         .setup(move |app| {
             // Only the primary instance reaches setup (a deep-link secondary
             // exits inside the single-instance plugin), so this is the proof
             // that unlocks the file log and its "==== started ====" banner.
             services::file_log::arm();
+            // What the macOS update helper did last time, now that the log
+            // can take it.
+            commands::components::report_last_update_swap();
+            commands::components::log_install_context();
+            // The page and every other webview of the app may load the app's
+            // own picture and sound folders and nothing else. The config names
+            // the same folders for the first requests; this adds them as they
+            // resolve here, plus the frozen legacy sounds. A phone does the same
+            // below, once its data folder is known.
+            #[cfg(desktop)]
+            services::asset_scope::allow_app_assets(app.handle());
             // Linux builds the main window here instead of from the config
             // (tauri.linux.conf.json sets `create: false`), after every plugin
             // has registered its init script, and always opaque: the CEF
@@ -1108,6 +1132,10 @@ pub fn run() {
                     });
                 }
             }
+            // The data folder resolves above, so the asset scope can name the
+            // app's own folders as this code resolves them.
+            #[cfg(target_os = "android")]
+            services::asset_scope::allow_app_assets(app.handle());
             #[cfg(mobile)]
             services::token_vault::warm_up();
             // Before anything can start a stream: a Cast session the SDK
@@ -1130,13 +1158,26 @@ pub fn run() {
                         if let Err(e) = commands::settings::write_settings_to_disk_sync(&loaded) {
                             log::warn!("[Setup] could not save the install's setup state: {e}");
                         }
+                        // A restored install's push state is the old phone's
+                        // (its device, a device left to delete): start over.
+                        if !loaded.setup_complete {
+                            services::push_alerts::server::forget_restored_state();
+                        }
                     }
                 }
+                // The settings as the real file read them (the read at the top of
+                // run() fell back to defaults): the one time the legacy sound files
+                // are chosen. Then the page may play them.
+                commands::sounds::freeze_legacy_sounds(&loaded);
+                #[cfg(target_os = "android")]
+                services::asset_scope::allow_legacy_sounds(app.handle());
                 services::diagnostic_logger::apply_setting(loaded.error_reporting_enabled);
                 services::ll_origin::set_disabled(!loaded.video_player.experimental_low_latency);
                 services::ll_origin::set_target_gap(loaded.video_player.ll_target_latency);
                 // What the go-live push registration compares each save against.
                 services::push_alerts::server::seed(&loaded);
+                // Everything else launch fed from the defaults above.
+                apply_loaded_settings(&loaded);
                 let drops_settings = loaded.drops.clone();
                 if let Ok(mut s) = settings_arc.lock() {
                     *s = loaded;
@@ -1155,10 +1196,85 @@ pub fn run() {
             if let Ok(s) = settings_arc.lock() {
                 services::twitch_resolver::refresh_device_codecs(&s);
             }
+            // The cache migrations, then the temp files a crashed run left in the
+            // cache folders, on the blocking pool. The migrations run in order,
+            // each once per install, and edit the manifest in memory before the
+            // sweep reads which files it names. The sweep runs once per process
+            // and only while no other instance holds the cache's writers lock; a
+            // cache write that starts first waits for it. The cache lists the
+            // windows ask for, and the file writes they start, wait on the start-up
+            // gate, which the guard moved in below holds closed until the
+            // migrations end, however they end.
+            tauri::async_runtime::spawn_blocking(move || {
+                // Migrate emote cache if app version changed (handles format changes like webp → avif)
+                // This clears stale emote files that may have the old format
+                let current_version = env!("CARGO_PKG_VERSION");
+                match services::universal_cache_service::migrate_emote_cache_on_version_change(current_version)
+                {
+                    Ok(migrated) => {
+                        if migrated {
+                            debug!("[Main] Emote cache migrated for new version");
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Main] Failed to migrate emote cache: {}", e);
+                    }
+                }
+
+                // One-time, FFZ-only purge so previously cached static FFZ frames re-download
+                // as their animated variants. Targeted by source URL, so other providers'
+                // emote caches are left intact.
+                match services::universal_cache_service::migrate_ffz_animated_cache() {
+                    Ok(purged) => {
+                        if purged {
+                            debug!("[Main] FFZ emote cache purged for animated re-fetch");
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Main] Failed to purge FFZ emote cache: {}", e);
+                    }
+                }
+
+                // One-time purge of cached 7TV paint images that hold a still frame, so
+                // animated paints re-download as animations.
+                match services::universal_cache_service::migrate_paint_animated_cache() {
+                    Ok(purged) => {
+                        if purged {
+                            debug!("[Main] 7TV paint cache purged for animated re-fetch");
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Main] Failed to purge 7TV paint cache: {}", e);
+                    }
+                }
+
+                // One-time purge of OLD non-7TV emote files (bare-id keys + URL-derived
+                // `.0`/`.bin` extensions) so they re-cache under provider-namespaced keys with
+                // content-typed extensions. 7TV files (already correct) are kept.
+                match services::universal_cache_service::migrate_emote_namespace_cache() {
+                    Ok(purged) => {
+                        if purged {
+                            debug!("[Main] Non-7TV emote cache purged for namespaced re-fetch");
+                        }
+                    }
+                    Err(e) => {
+                        error!("[Main] Failed to purge non-7TV emote cache: {}", e);
+                    }
+                }
+
+                // The lists are final now; the sweep below changes no entry.
+                drop(startup_gate);
+
+                if let Ok(cache_root) = services::universal_cache_service::get_universal_cache_dir() {
+                    services::universal_cache_service::sweep_temp_files_once(&cache_root);
+                }
+            });
             // Runtime stall detector: measures backend freezes (tokio-blocked vs
             // whole-process) and records them to the capture file. Started here,
             // inside the tokio runtime Tauri set up.
             services::runtime_watchdog::start();
+            // A main-window page that stops answering ([PageHang]).
+            services::page_watchdog::start(app.handle().clone());
             // Process-tree memory logging: one [Resource] line a minute in the
             // file log (rust, WebView2 browser/GPU/renderers/utilities, plugin
             // children), so a "StreamNook is at 800 MB" report can be read off
@@ -1222,6 +1338,8 @@ pub fn run() {
             // its `ad-pivot` reload event to the player.
             services::stream_server::set_app_handle(app_handle.clone());
             services::providers::set_app_handle(app_handle.clone());
+            // Cached art over loopback, off the UI thread (Windows and Android).
+            services::cache_file_server::start();
 
             // Start the shared 7TV EventAPI WebSocket client (live emote set
             // updates, and later cosmetics). It idle-connects and subscribes
@@ -1406,6 +1524,10 @@ pub fn run() {
             // Manage AppState directly, not wrapped in Arc
             app.manage(app_state);
 
+            // Discord Rich Presence reads the switch and the style from AppState.
+            #[cfg(desktop)]
+            services::discord_presence::init(&app_handle);
+
             // Who's-live polling for followed channels on non-Twitch platforms.
             // Separate from the Twitch live-notification service: it reads the
             // app-local follow list and each platform's own adapter, but emits
@@ -1554,7 +1676,11 @@ pub fn run() {
                             // multi-account registry. Cheap once recorded; self-heals if
                             // the user later signs in as a different account. Best-effort.
                             if let Some(uid) = status.user_id.as_deref() {
-                                services::account_store::AccountStore::reconcile_primary(uid).await;
+                                services::account_store::AccountStore::reconcile_primary(
+                                    uid,
+                                    status.login.as_deref(),
+                                )
+                                .await;
                             }
                         } else {
                             debug!(
@@ -1703,8 +1829,6 @@ pub fn run() {
             #[cfg(target_os = "android")]
             twitch_login_plugin::get_mobile_login_cookies,
             #[cfg(target_os = "android")]
-            twitch_login_plugin::finish_mobile_drops_login,
-            #[cfg(target_os = "android")]
             twitch_login_plugin::clear_mobile_login_cookies,
             #[cfg(mobile)]
             export_logs,
@@ -1721,7 +1845,7 @@ pub fn run() {
             #[cfg(mobile)]
             services::push_alerts::server::push_register,
             #[cfg(mobile)]
-            services::push_alerts::server::push_unregister,
+            services::push_alerts::server::push_flush,
             #[cfg(target_os = "ios")]
             services::push_alerts::server::push_set_apns_device,
             #[cfg(target_os = "ios")]
@@ -1846,8 +1970,6 @@ pub fn run() {
             // webview windows); mobile logs in via the device-code flow.
             #[cfg(desktop)]
             open_twitch_login_window,
-            #[cfg(desktop)]
-            open_drops_login_window,
             // Two bodies: a desktop panel, and the phone's login overlay or sheet.
             open_subscribe_window,
             #[cfg(any(desktop, target_os = "android"))]
@@ -1901,11 +2023,11 @@ pub fn run() {
             follow_channel,
             unfollow_channel,
             channel_relationship,
+            channel_sub_badge,
             check_following_status,
             get_all_followed_channels,
             get_offline_last_broadcasts,
             get_streams_by_user_ids,
-            get_users_by_ids,
             verify_token_health,
             force_refresh_token,
             get_twitch_token,
@@ -1915,6 +2037,7 @@ pub fn run() {
             get_streams_by_game_name,
             get_streams_by_game_id,
             get_streams_by_game_with_tags,
+            category_tag_suggestions,
             get_clips_by_game,
             get_clips_by_broadcaster,
             get_clip_reactions,
@@ -1935,6 +2058,7 @@ pub fn run() {
             get_stream_low_latency,
             get_stream_prefetch_present,
             get_relay_live_distance,
+            relay_rebuild_live_edge,
             set_experimental_low_latency,
             set_codec_preference,
             report_solo_codec_failure,
@@ -1956,8 +2080,15 @@ pub fn run() {
             report_vod_position,
             get_vod_progress,
             clear_vod_progress,
-            // Song recognition
+            // Song recognition and Your songs
             identify_song,
+            get_song_history,
+            get_song,
+            remove_song,
+            restore_song,
+            clear_song_history,
+            song_app_links,
+            open_song_link,
             // Multi-stream commands (desktop-only — not part of the phone app)
             #[cfg(desktop)]
             start_multi_nook,
@@ -2058,6 +2189,8 @@ pub fn run() {
             youtube_user_profile,
             provider_membership,
             log_frontend_diag,
+            page_heartbeat,
+            note_playback_reload,
             kick_account_is_synced,
             report_kick_follows,
             report_kick_resolve_diag,
@@ -2150,17 +2283,15 @@ pub fn run() {
             stream_manager_act,
             get_reward_queue,
             search_raid_targets,
-            // Discord commands (desktop-only — Discord Rich Presence)
+            // Discord Rich Presence (desktop only)
             #[cfg(desktop)]
-            connect_discord,
+            discord_presence_preview,
             #[cfg(desktop)]
-            disconnect_discord,
+            discord_presence_page,
             #[cfg(desktop)]
-            set_idle_discord_presence,
+            discord_presence_set_grid,
             #[cfg(desktop)]
-            update_discord_presence,
-            #[cfg(desktop)]
-            clear_discord_presence,
+            discord_presence_set_media,
             // Settings commands
             load_settings,
             patch_settings,
@@ -2169,6 +2300,7 @@ pub fn run() {
             complete_setup,
             set_chat_user_hidden,
             set_favorite_category,
+            set_favorite_channel,
             set_channel_hidden,
             set_hidden_channel_blocked,
             set_hidden_channel_realms,
@@ -2179,6 +2311,10 @@ pub fn run() {
             edit_settings_list,
             get_community_invite,
             get_followed_channels_for_alerts,
+            live_alert_state,
+            set_live_alert,
+            copy_twitch_live_mutes,
+            undo_live_mutes,
             add_custom_sound,
             delete_custom_sound,
             get_theme_catalog,
@@ -2271,6 +2407,7 @@ pub fn run() {
             assign_badge_positions,
             export_manifest,
             asset_cache_enqueue,
+            cache_file_server,
             asset_cache_set_burst,
             get_cached_file,
             get_cached_files,
@@ -2321,7 +2458,7 @@ pub fn run() {
             report_player_state,
             // Automation commands
             // Drops Authentication commands
-            start_drops_login,
+            connect_twitch_approval,
             start_drops_device_flow,
             poll_drops_token,
             drops_logout,
@@ -2364,6 +2501,7 @@ pub fn run() {
             // Session resume
             save_resume_snapshot,
             take_resume_snapshot,
+            restart_app,
             // Announcements
             fetch_announcements,
             fetch_user_chat_logs,
@@ -2404,6 +2542,7 @@ pub fn run() {
             set_visible_mention_rooms,
             mention_watch_pull,
             mention_push_arrived,
+            services::mention_ping::mention_ping_claim,
             // IVR account facts
             get_ivr_user_summary,
             get_ivr_subage_summary,
@@ -2450,7 +2589,6 @@ pub fn run() {
             watch_session_start,
             watch_session_stop,
             watch_session_resolve_offline,
-            watch_session_refresh_presence,
             open_offline_room,
             hype_train_watch,
             hype_train_unwatch,
@@ -2554,6 +2692,8 @@ pub fn run() {
             get_streamnook_identities,
             get_streamnook_identity_resolved,
             set_streamnook_identity,
+            // A member's profile card, computed by streamnook.app (first paint).
+            get_profile_snapshot,
             // Authenticated writes to StreamNook's own API. One command, path-allowlisted.
             streamnook_api_post,
             // The member's own membership status line (paid or gifted).
@@ -2771,6 +2911,9 @@ pub fn run() {
                 // the main window emits when it boots.
                 if label == "main" {
                     use tauri::Emitter;
+                    // What the main page declared to Discord presence goes with it.
+                    #[cfg(desktop)]
+                    services::discord_presence::page_ended();
                     // Its player is gone without a `stop_stream`: file where
                     // the viewer left the live stream it was showing. On the
                     // runtime, so the progress store's flush task can start.
@@ -2945,6 +3088,10 @@ pub fn run() {
                 // Started here so it runs alongside the plugin shutdown below;
                 // waited on after it, bounded.
                 let vod_sync_done = services::vod_sync::start_exit_sync();
+                // Unsent stat counts and watch minutes go out the same way:
+                // started now so they run alongside the plugin shutdown.
+                let stats_done = services::member_stats::flush_on_exit();
+                let minutes_done = services::watch_minutes::flush_on_exit();
                 // Ask running plugin processes to shut down before the app
                 // process dies, waiting briefly so well-behaved plugins exit
                 // gracefully (stragglers are killed with the supervisor).
@@ -2975,11 +3122,23 @@ pub fn run() {
                         warn!("[Main] plugin shutdown did not finish within 3 s; exiting anyway");
                     }
                 }
+                // Usually finished already, having run during the plugin
+                // wait. One deadline covers all three, so together they add
+                // never more than 2 s past it.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                 if let Some(done) = vod_sync_done {
-                    // Usually finished already, having run during the plugin
-                    // wait. Never more than 2 s past it.
-                    if done.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+                    if done.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_err() {
                         warn!("[Main] VOD position sync did not finish within 2 s; exiting anyway");
+                    }
+                }
+                if let Some(done) = stats_done {
+                    if done.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_err() {
+                        warn!("[Main] stat counts did not finish sending within 2 s; exiting anyway");
+                    }
+                }
+                if let Some(done) = minutes_done {
+                    if done.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).is_err() {
+                        warn!("[Main] watch minutes did not finish sending within 2 s; exiting anyway");
                     }
                 }
                 services::app_exit::on_shutdown_complete(shutdown_started.elapsed().as_millis());

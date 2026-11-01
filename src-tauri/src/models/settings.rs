@@ -169,6 +169,13 @@ pub struct VideoPlayerSettings {
     /// volume and this moves to Shift + scroll down, so both can coexist.
     #[serde(default = "default_true")]
     pub scroll_about_reveal: bool,
+    /// A click on the video pauses and plays it (the main player and a
+    /// maximized MultiNook tile). Off by default, as a click was before 8.8.16:
+    /// it only moves focus out of a text box so the player keys work. Pausing
+    /// stops the download whichever way it happens, so this changes only what
+    /// a click does.
+    #[serde(default)]
+    pub click_to_pause: bool,
     /// Middle-clicking the player toggles mute. On by default.
     #[serde(default = "default_true")]
     pub middle_click_mute: bool,
@@ -176,6 +183,12 @@ pub struct VideoPlayerSettings {
     /// by default.
     #[serde(default = "default_true")]
     pub middle_click_multinook: bool,
+    /// The keyboard's media keys (play/pause, next, previous) reach the player.
+    /// On by default. Off keeps StreamNook out of the system media controls so
+    /// the keys go to the viewer's music player instead. Read once at launch
+    /// (Windows): it is a browser switch, so a change applies on the next start.
+    #[serde(default = "default_true")]
+    pub media_keys: bool,
     /// How much one wheel notch moves the volume (0.01-0.25). Default 5%.
     #[serde(default = "default_wheel_volume_step")]
     pub wheel_volume_step: f32,
@@ -189,6 +202,12 @@ pub struct VideoPlayerSettings {
     /// `resume_vod_playback` is on.
     #[serde(default = "default_true")]
     pub sync_vod_progress: bool,
+    /// Home's Continue Watching row also shows the live broadcasts the viewer
+    /// left partway through (the `live_bookmark` entries), opening each one's
+    /// recording at that spot. Off by default: a stream you quit stays off the
+    /// row unless you ask for it. Only applies while `resume_vod_playback` is on.
+    #[serde(default)]
+    pub continue_watching_live: bool,
     /// Ad-free live playback (Android). Routes the playlist through a public
     /// relay and strips ad segments out of what the player is served. On by
     /// default, matching the behavior the phone app shipped with through 7.8.6.
@@ -216,6 +235,11 @@ pub struct VideoPlayerSettings {
     /// nothing to render, so it survives.
     #[serde(default = "default_background_mode")]
     pub background_mode: String,
+    /// Phones only. On its side the stream fills a long screen by trimming its
+    /// top and bottom (never its sides, at most 1.5x). A pinch on the video or
+    /// the Player settings switch sets it. The desktop player ignores it.
+    #[serde(default)]
+    pub zoom_to_fill: bool,
 }
 
 fn default_background_mode() -> String {
@@ -253,11 +277,15 @@ impl Default for VideoPlayerSettings {
             background_mode: first_run_background_mode(),
             scroll_volume: true,
             scroll_about_reveal: true,
+            click_to_pause: false,
             middle_click_mute: true,
             middle_click_multinook: true,
+            media_keys: true,
             wheel_volume_step: 0.05,
             resume_vod_playback: true,
             sync_vod_progress: true,
+            continue_watching_live: false,
+            zoom_to_fill: false,
         }
     }
 }
@@ -320,6 +348,10 @@ pub struct ChatDesignSettings {
     /// "12h" (default) | "24h". Read by irc_service's timestamp formatter.
     #[serde(default = "default_timestamp_format")]
     pub timestamp_format: String,
+    /// "inline" (default): the time leads the name line. "own_line": the time
+    /// sits on its own line above the message.
+    #[serde(default = "default_timestamp_position")]
+    pub timestamp_position: String,
     // The fields below were added to the TS type over time but were missing here,
     // so they silently failed to persist (serde drops unknown fields on save).
     // Each carries a serde default matching the frontend default so old
@@ -455,6 +487,10 @@ pub struct ChatDesignSettings {
     pub show_third_party_badges: bool,
     #[serde(default)]
     pub hidden_badge_providers: Vec<String>,
+    /// StreamNook atmospheres (and the Cologne event look) behind members' chat
+    /// rows. Profiles show them either way.
+    #[serde(default = "default_true")]
+    pub show_chat_atmospheres: bool,
     #[serde(default = "default_message_entrance")]
     pub message_entrance: String, // none | fade | slide | rise
     #[serde(default = "default_emoji_style")]
@@ -649,6 +685,7 @@ impl Default for ChatDesignSettings {
             show_timestamps: false,
             show_timestamp_seconds: false,
             timestamp_format: default_timestamp_format(),
+            timestamp_position: default_timestamp_position(),
             emote_scale: 1.0,
             animate_emotes: default_animate_emotes(),
             show_chat_gifs: true,
@@ -677,6 +714,7 @@ impl Default for ChatDesignSettings {
             ffz_custom_role_badges: true,
             show_third_party_badges: true,
             hidden_badge_providers: Vec::new(),
+            show_chat_atmospheres: true,
             message_entrance: default_message_entrance(),
             emoji_style: default_emoji_style(),
             show_personal_emotes: true,
@@ -1066,6 +1104,9 @@ pub struct Settings {
     pub current_account: String,
     pub hide_search_bar_on_startup: bool,
     pub discord_rpc_enabled: bool,
+    /// How the Discord status looks (Settings > Integrations > Customize).
+    #[serde(default)]
+    pub discord_presence: DiscordPresenceSettings,
     pub video_player: VideoPlayerSettings,
     pub cache: CacheSettings,
     #[serde(default)]
@@ -1143,6 +1184,11 @@ pub struct Settings {
     pub multi_nook_slots: Vec<MultiNookSlot>,
     #[serde(default)]
     pub multi_nook_chat_hidden: bool,
+    /// Set once saved grid tiles at the old fixed 50% have moved to the
+    /// player's Start volume. Absent on older files (false), so the move runs
+    /// once there; `Default` is true, so a fresh install never runs it.
+    #[serde(default)]
+    pub multi_nook_start_volume_adopted: bool,
     /// How the MultiNook tiles are arranged (grid, or one main tile with the
     /// rest small).
     #[serde(default)]
@@ -1301,6 +1347,76 @@ pub struct CustomSnippet {
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keywords: Option<String>,
+}
+
+/// How the Discord status looks. Mirrors the frontend `DiscordPresenceSettings`.
+/// Every choice is a plain string, so a value a newer build adds reads here as
+/// the default (`services::discord_presence` treats unknown values that way)
+/// instead of failing the whole settings file; keys this build does not know
+/// ride `extra` and survive its saves.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct DiscordPresenceSettings {
+    /// "category" | "streamer" | "streamnook"
+    pub large_image: String,
+    /// "platform" | "streamer" | "category" | "none"
+    pub small_image: String,
+    /// "watching" | "playing" | "listening"
+    pub activity_type: String,
+    /// What the member list shows: "app" | "top" | "bottom"
+    pub status_display: String,
+    /// "watching" | "uptime" | "off"
+    pub timer: String,
+    /// The top line (and a streamer picture) link to the channel.
+    pub link_text: bool,
+    pub watching_top: String,
+    pub watching_bottom: String,
+    pub replay_top: String,
+    pub replay_bottom: String,
+    pub grid_top: String,
+    pub grid_bottom: String,
+    pub offline_top: String,
+    pub offline_bottom: String,
+    pub watch_button: bool,
+    pub watch_button_label: String,
+    /// Off hides the StreamNook button: subscribers only (others always send it).
+    pub promo_button: bool,
+    /// The name after the verb: "streamnook" | "platform" ("Watching Twitch",
+    /// with Discord's own platform mark). Subscribers only.
+    pub app_name: String,
+    /// While browsing: "phrases" | "custom" | "hidden"
+    pub idle_mode: String,
+    pub idle_text: String,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl Default for DiscordPresenceSettings {
+    fn default() -> Self {
+        Self {
+            large_image: "category".into(),
+            small_image: "platform".into(),
+            activity_type: "watching".into(),
+            status_display: "app".into(),
+            timer: "watching".into(),
+            link_text: false,
+            watching_top: "Watching {streamer}".into(),
+            watching_bottom: "{title}".into(),
+            replay_top: "Watching {streamer}".into(),
+            replay_bottom: "{kind}: {title}".into(),
+            grid_top: "Watching {count} Streams".into(),
+            grid_bottom: "{streamers}".into(),
+            offline_top: "In {streamer}'s chat".into(),
+            offline_bottom: "Offline".into(),
+            watch_button: true,
+            watch_button_label: "Watch {kind}".into(),
+            promo_button: true,
+            app_name: "streamnook".into(),
+            idle_mode: "phrases".into(),
+            idle_text: "Browsing streams".into(),
+            extra: HashMap::new(),
+        }
+    }
 }
 
 /// The message box. Mirrors the frontend `ChatInputSettings`.
@@ -1670,6 +1786,7 @@ impl Default for Settings {
             current_account: "".to_string(),
             hide_search_bar_on_startup: true,
             discord_rpc_enabled: true,
+            discord_presence: DiscordPresenceSettings::default(),
             video_player: VideoPlayerSettings::default(),
             cache: CacheSettings::default(),
             streamlink: StreamlinkSettings::default(),
@@ -1705,6 +1822,7 @@ impl Default for Settings {
             error_reporting_enabled: true, // Diagnostics enabled by default
             multi_nook_slots: Vec::new(),
             multi_nook_chat_hidden: false,
+            multi_nook_start_volume_adopted: true,
             multi_nook_layout: MultiNookLayout::default(),
             show_mod_logs: false,
             keybindings: HashMap::new(),
@@ -1844,6 +1962,10 @@ impl Settings {
         self.channel_links = authoritative.channel_links.clone();
         self.first_run_look_adopted = authoritative.first_run_look_adopted;
         self.install_marked = authoritative.install_marked;
+        // Favorites change only through `set_favorite_channel` and the
+        // identity fill; a window's copy of them is never written back.
+        self.favorite_streamers = authoritative.favorite_streamers.clone();
+        self.favorite_channels = authoritative.favorite_channels.clone();
     }
 
     /// One-time move of an existing install onto the first-run chat look,
@@ -1902,6 +2024,23 @@ impl Settings {
             self.video_player.experimental_low_latency = true;
             self.video_player.low_latency_engine_defaulted = true;
         }
+    }
+
+    /// One-time move of saved MultiNook tiles from the old fixed 50% to the
+    /// player's Start volume. Every tile opened before Start volume applied
+    /// to the grid was saved at exactly 0.5, a value nobody chose.
+    pub fn adopt_multi_nook_start_volume_once(&mut self) {
+        if self.multi_nook_start_volume_adopted {
+            return;
+        }
+        let start = self.video_player.volume;
+        let start = if start.is_finite() { start.clamp(0.0, 1.0) } else { 1.0 };
+        for slot in &mut self.multi_nook_slots {
+            if slot.volume == 0.5 {
+                slot.volume = start;
+            }
+        }
+        self.multi_nook_start_volume_adopted = true;
     }
 
     /// One-time reset of the global combined-chat platform switches, for
@@ -2094,6 +2233,51 @@ mod backup_persistence_tests {
     }
 
     #[test]
+    fn saved_tiles_at_the_old_half_volume_adopt_start_volume_once() {
+        assert!(Settings::default().multi_nook_start_volume_adopted);
+
+        // A file from before the flag: two tiles, one at the old fixed 50%.
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        let obj = value.as_object_mut().expect("settings is an object");
+        obj.remove("multi_nook_start_volume_adopted");
+        obj.insert(
+            "multi_nook_slots".into(),
+            serde_json::json!([
+                { "id": "cell-1", "channelLogin": "a", "volume": 0.5, "muted": false, "isFocused": true },
+                { "id": "cell-2", "channelLogin": "b", "volume": 0.4, "muted": true, "isFocused": false }
+            ]),
+        );
+        let mut old: Settings = serde_json::from_value(value).expect("parse");
+        assert!(!old.multi_nook_start_volume_adopted);
+        old.video_player.volume = 0.09;
+        old.adopt_multi_nook_start_volume_once();
+        assert_eq!(old.multi_nook_slots[0].volume, 0.09);
+        assert_eq!(old.multi_nook_slots[1].volume, 0.4);
+        assert!(old.multi_nook_start_volume_adopted);
+
+        // A tile set to 50% afterwards stays at 50% on the next load.
+        old.multi_nook_slots[1].volume = 0.5;
+        old.video_player.volume = 0.3;
+        old.adopt_multi_nook_start_volume_once();
+        assert_eq!(old.multi_nook_slots[0].volume, 0.09);
+        assert_eq!(old.multi_nook_slots[1].volume, 0.5);
+
+        // An unusable Start volume never lands on a tile as-is.
+        let mut bad = old.clone();
+        bad.multi_nook_start_volume_adopted = false;
+        bad.multi_nook_slots[0].volume = 0.5;
+        bad.video_player.volume = f32::NAN;
+        bad.adopt_multi_nook_start_volume_once();
+        assert_eq!(bad.multi_nook_slots[0].volume, 1.0);
+        let mut loud = old.clone();
+        loud.multi_nook_start_volume_adopted = false;
+        loud.multi_nook_slots[0].volume = 0.5;
+        loud.video_player.volume = 1.7;
+        loud.adopt_multi_nook_start_volume_once();
+        assert_eq!(loud.multi_nook_slots[0].volume, 1.0);
+    }
+
+    #[test]
     fn hide_title_bar_while_watching_persists_and_defaults_off() {
         assert!(!Settings::default().video_player.hide_title_bar_while_watching);
 
@@ -2270,6 +2454,25 @@ mod backup_persistence_tests {
         assert_eq!(incoming.provider_follows.len(), 1, "the follow survived too");
     }
 
+    #[test]
+    fn a_save_cannot_write_the_favorite_lists() {
+        let mut authoritative = Settings::default();
+        authoritative.favorite_streamers = vec!["1".into()];
+        authoritative.favorite_channels = vec![FavoriteChannel {
+            id: "1".into(),
+            provider: "twitch".into(),
+            channel: "one".into(),
+            display_name: None,
+            avatar: None,
+            added_at: String::new(),
+        }];
+        let mut incoming = Settings::default();
+        incoming.favorite_streamers = vec!["2".into()];
+        incoming.adopt_backend_owned(&authoritative);
+        assert_eq!(incoming.favorite_streamers, vec!["1"]);
+        assert_eq!(incoming.favorite_channels.len(), 1);
+    }
+
     /// YouTube channel ids are case-SENSITIVE, and the link member is handed
     /// straight to acquireChannel rather than rebuilt from a (lowercased) slice
     /// key. A settings round trip that folded the case would point chat at a
@@ -2399,6 +2602,17 @@ mod backup_persistence_tests {
     fn a_fresh_install_keeps_audio_and_old_files_keep_pip() {
         assert_eq!(Settings::default().video_player.background_mode, "audio");
         assert_eq!(default_background_mode(), "pip");
+    }
+
+    #[test]
+    fn zoom_to_fill_defaults_off_and_round_trips() {
+        assert!(!Settings::default().video_player.zoom_to_fill);
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value["video_player"]["zoom_to_fill"] = serde_json::Value::Bool(true);
+        let parsed: Settings = serde_json::from_value(value).expect("parse");
+        assert!(parsed.video_player.zoom_to_fill);
+        let saved = serde_json::to_value(&parsed).expect("serialize");
+        assert_eq!(saved["video_player"]["zoom_to_fill"], serde_json::Value::Bool(true));
     }
 
     #[test]
@@ -2916,6 +3130,10 @@ mod backup_persistence_tests {
 
 fn default_timestamp_format() -> String {
     "12h".to_string()
+}
+
+fn default_timestamp_position() -> String {
+    "inline".to_string()
 }
 
 fn default_animate_emotes() -> String {

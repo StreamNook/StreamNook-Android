@@ -114,6 +114,19 @@ const defaultLoadout = (userId: string): IdentityLoadout => ({
   updated_at: null,
 });
 
+// The defaults a FAILED read stands in with (and caches for the TTL). They look
+// like a member who chose nothing, so a caller that must tell "answered: none"
+// from "the read failed" asks `isIdentityFallback`. The same object is cached,
+// so the mark survives cache hits.
+const failedReads = new WeakSet<object>();
+
+/** True when this loadout or resolved bundle is the stand-in for a failed read. */
+export const isIdentityFallback = (value: unknown): boolean =>
+  typeof value === 'object' && value !== null && failedReads.has(value);
+// A failed read keeps the full TTL on purpose: chat asks for every chatter, so a
+// shorter retry would multiply the requests to a server that is already down.
+// The profile card does not need it sooner; it marks the part unanswered.
+
 /** Synchronous cache peek — null if not loaded yet. */
 export function getIdentityFromMemoryCache(userId: string): IdentityLoadout | null {
   const hit = cache.get(userId);
@@ -141,6 +154,7 @@ export async function getIdentityWithCache(userId: string): Promise<IdentityLoad
     } catch (e) {
       Logger.warn('[identityService] get failed, defaulting to show-all:', e);
       const fallback = defaultLoadout(userId);
+      failedReads.add(fallback);
       boundedSet(cache, userId, { data: fallback, ts: Date.now() }, IDENTITY_CACHE_MAX);
       return fallback;
     } finally {
@@ -240,6 +254,7 @@ export async function getResolvedIdentity(userId: string): Promise<ResolvedIdent
     } catch (e) {
       Logger.warn('[identityService] resolved get failed:', e);
       const fb = defaultResolved(userId);
+      failedReads.add(fb);
       boundedSet(resolvedCache, userId, { data: fb, ts: Date.now() }, IDENTITY_CACHE_MAX);
       return fb;
     } finally {

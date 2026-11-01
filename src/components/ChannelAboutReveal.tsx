@@ -8,6 +8,7 @@ import { useAppStore } from '../stores/AppStore';
 import { aboutRevealNeedsShift, scrollAboutRevealOn } from '../utils/playerMouseControls';
 import { playerOverlayButtonOn } from '../utils/playerOverlayButtons';
 import { useChannelSocial } from '../hooks/useChannelSocial';
+import { LiveAlertBell } from './LiveAlertBell';
 import StreamerAboutPanel from './StreamerAboutPanel';
 
 interface ChannelAboutRevealProps {
@@ -105,6 +106,7 @@ export default function ChannelAboutReveal({ enabled, channelLogin, children }: 
     isSubscribed,
     hasSubHistory,
     subscriberBadgeUrl,
+    subscriberBadgePending,
     handleSubscribeClick,
     offersMembership,
   } = useChannelSocial({
@@ -200,6 +202,22 @@ export default function ChannelAboutReveal({ enabled, channelLogin, children }: 
               {/* Channel actions, mirrored from the player overlay so you can act
                   without leaving the About — including its visibility setting. */}
               <div className="ml-auto flex items-center gap-2">
+                {/* Live alerts, left of Follow so its arrival never moves Follow.
+                    py-[7px] around the 14 px icon makes it the 28 px of the text
+                    buttons beside it. */}
+                {playerOverlayButtonOn(playerOverlayButtons, 'follow') && currentStream && (
+                  <LiveAlertBell
+                    provider={streamProvider(currentStream)}
+                    userId={currentStream.user_id}
+                    userLogin={currentStream.user_login}
+                    userName={currentStream.user_name}
+                    isFollowing={isFollowing}
+                    buttonClassName="flex items-center justify-center px-2.5 py-[7px] glass-button rounded-lg"
+                    iconClassName="h-3.5 w-3.5"
+                    tooltipSide="top"
+                    iconSet="lucide"
+                  />
+                )}
                 {playerOverlayButtonOn(playerOverlayButtons, 'follow') && (
                 <button
                   type="button"
@@ -227,6 +245,8 @@ export default function ChannelAboutReveal({ enabled, channelLogin, children }: 
                 >
                   {subscriberBadgeUrl ? (
                     <img src={subscriberBadgeUrl} alt="" className="h-4 w-4 object-contain" referrerPolicy="no-referrer" />
+                  ) : subscriberBadgePending ? (
+                    <span aria-hidden className="h-4 w-4" />
                   ) : (
                     <Star className="h-3.5 w-3.5 text-accent" />
                   )}

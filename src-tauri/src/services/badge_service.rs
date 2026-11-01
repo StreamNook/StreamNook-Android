@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 const BADGE_LOOKUP_QUERY: &str = r#"
 query StreamNookBadgeLookup($id: ID!, $login: String!, $channelID: ID!, $channelLogin: String!) {
     user(id: $id) {
+        login
         displayBadges(channelID: $channelID) { setID version }
     }
     channelViewer(userLogin: $login, channelLogin: $channelLogin) {
@@ -84,6 +85,9 @@ struct GQLData {
 // Option<Vec>: `#[serde(default)]` alone only covers a MISSING field.
 #[derive(Debug, Deserialize)]
 struct TargetUser {
+    /// The account's login today; read by id, so it follows a rename.
+    #[serde(default)]
+    login: Option<String>,
     #[serde(rename = "displayBadges", default)]
     display_badges: Option<Vec<GQLBadge>>,
 }
@@ -99,6 +103,22 @@ struct GQLBadge {
     #[serde(rename = "setID")]
     set_id: String,
     version: String,
+}
+
+/// One badge lookup, each field's absence kept (`None` = Twitch did not
+/// answer it), as "set_id/version" strings.
+struct BadgeLookup {
+    display: Option<Vec<String>>,
+    earned: Option<Vec<String>>,
+    /// The login the looked-up id has now.
+    current_login: Option<String>,
+}
+
+/// The login to ask again with when Twitch knows the id by a different login
+/// than the one asked: the account was renamed. `None` when it is the same
+/// login (Twitch lowercases logins, so case alone is no rename) or unknown.
+fn renamed_login<'a>(current: Option<&'a str>, asked: &str) -> Option<&'a str> {
+    current.filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case(asked))
 }
 
 /// `id.twitch.tv/oauth2/validate` body: the subset we need to learn which
@@ -722,6 +742,13 @@ impl ChattyBadge {
         self.id == "ffz" && self.version.as_deref() == Some(FFZ_BOT_BADGE_NAME)
     }
 
+    /// One of FFZ's own badges re-hosted by Chatty (Supporter, Subwoofer, ...).
+    /// FFZ's feed is the authority on these: Chatty's copy can lag it (a member
+    /// who moved from Subwoofer to Supporter is listed under both).
+    fn is_ffz_rehost(&self) -> bool {
+        self.id == "ffz"
+    }
+
     /// The largest image and the colour to paint behind it, when this badge
     /// needs one drawn for it. FFZ's own CDN draws its badges finished (see
     /// `ffz_colored_badge_url`); the rest of the feed (FFZ:AP) is a white
@@ -1002,6 +1029,11 @@ impl ThirdPartyCache {
             entry.insert(at, (Arc::clone(badge), rank));
         }
 
+        // Everyone FFZ's own feed lists. Chatty's re-hosts of FFZ badges are
+        // skipped for them below; with no FFZ feed (a failed fetch) it is
+        // empty and the re-hosts stand in, as before.
+        let mut ffz_holders: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         // FFZ. `users` is keyed by badge_id (as a string) -> [numeric user_id],
         // so the holder key is each numeric id rendered back to a String.
         if let Some(ffz) = &self.ffz {
@@ -1029,6 +1061,7 @@ impl ThirdPartyCache {
                 let title_lower = arc.badge_info.title.to_lowercase();
                 if let Some(holders) = ffz.users.get(&badge.id.to_string()) {
                     for uid in holders {
+                        ffz_holders.insert(uid.to_string());
                         push(&mut by_user, uid.to_string(), &arc, &title_lower, rank);
                     }
                 }
@@ -1221,7 +1254,11 @@ impl ThirdPartyCache {
                     provider: BadgeProvider::Chatty,
                 });
                 let title_lower = arc.badge_info.title.to_lowercase();
+                let rehost = badge.is_ffz_rehost();
                 for uid in &badge.userids {
+                    if rehost && ffz_holders.contains(uid) {
+                        continue; // FFZ's own feed says which FFZ badge they hold
+                    }
                     push(&mut by_user, uid.clone(), &arc, &title_lower, rank);
                 }
             }
@@ -2298,10 +2335,13 @@ impl BadgeService {
         channel_id: &str,
         channel_name: &str,
     ) -> Result<(Vec<String>, Vec<String>), String> {
-        let (display, earned) = self
+        let found = self
             .lookup_badges(user_id, username, channel_id, channel_name)
             .await?;
-        Ok((display.unwrap_or_default(), earned.unwrap_or_default()))
+        Ok((
+            found.display.unwrap_or_default(),
+            found.earned.unwrap_or_default(),
+        ))
     }
 
     /// A user's earned badges, read anonymously, as "set_id/version" strings.
@@ -2311,13 +2351,33 @@ impl BadgeService {
     /// is asked in, so no sign-in of any kind is needed to know what a user owns.
     /// Asked in the user's own channel. Errs, rather than answering empty, when
     /// Twitch did not return the field: an empty list must mean "owns nothing".
+    ///
+    /// `channelViewer` is asked by login, and a login kept from before a rename
+    /// names nobody, so Twitch answers no collection at all. The same reply
+    /// carries the login the id has now; when it differs, ask again with it.
     pub async fn earned_badge_collection(
         &self,
         user_id: &str,
         login: &str,
     ) -> Result<Vec<String>, String> {
-        let (_, earned) = self.lookup_badges(user_id, login, user_id, login).await?;
-        earned.ok_or_else(|| "Twitch returned no earnedBadges for this user".to_string())
+        let found = self.lookup_badges(user_id, login, user_id, login).await?;
+        if let Some(earned) = found.earned {
+            return Ok(earned);
+        }
+        match renamed_login(found.current_login.as_deref(), login) {
+            Some(current) => {
+                log::info!(
+                    "[BadgeService] @{} is @{} on Twitch now; reading the collection under the new login",
+                    login,
+                    current
+                );
+                self.lookup_badges(user_id, current, user_id, current)
+                    .await?
+                    .earned
+                    .ok_or_else(|| "Twitch returned no earnedBadges for this user".to_string())
+            }
+            None => Err("Twitch returned no earnedBadges for this user".to_string()),
+        }
     }
 
     /// The global badge `user_id` selected on Twitch: the one chat shows for
@@ -2377,7 +2437,7 @@ impl BadgeService {
         username: &str,
         channel_id: &str,
         channel_name: &str,
-    ) -> Result<(Option<Vec<String>>, Option<Vec<String>>), String> {
+    ) -> Result<BadgeLookup, String> {
         let request = BadgeLookupRequest {
             query: BADGE_LOOKUP_QUERY,
             variables: BadgeLookupVariables {
@@ -2447,10 +2507,17 @@ impl BadgeService {
             })
         };
 
-        let display_badges = to_ids(gql_data.user.and_then(|u| u.display_badges));
-        let earned_badges = to_ids(gql_data.channel_viewer.and_then(|cv| cv.earned_badges));
+        let (current_login, display) = match gql_data.user {
+            Some(u) => (u.login, to_ids(u.display_badges)),
+            None => (None, None),
+        };
+        let earned = to_ids(gql_data.channel_viewer.and_then(|cv| cv.earned_badges));
 
-        Ok((display_badges, earned_badges))
+        Ok(BadgeLookup {
+            display,
+            earned,
+            current_login,
+        })
     }
 
     /// Resolve which Twitch user the current Drops token belongs to, cached per
@@ -3055,6 +3122,23 @@ mod earned_order_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renamed_account_is_asked_again_under_its_new_login() {
+        assert_eq!(renamed_login(Some("1shaiza"), "shaiza__"), Some("1shaiza"));
+        assert_eq!(renamed_login(Some("br_winters"), "BR_Winters"), None);
+        assert_eq!(renamed_login(Some(""), "shaiza__"), None);
+        assert_eq!(renamed_login(None, "shaiza__"), None);
+    }
+
+    #[test]
+    fn the_lookup_reads_the_login_the_id_has_now() {
+        let body =
+            r#"{"data":{"user":{"login":"1shaiza","displayBadges":[]},"channelViewer":null}}"#;
+        let parsed: GQLResponse = serde_json::from_str(body).expect("parses");
+        let user = parsed.data.and_then(|d| d.user).expect("user");
+        assert_eq!(user.login.as_deref(), Some("1shaiza"));
+    }
 
     #[test]
     fn by_user_index_resolves_ffz_holder() {
@@ -3725,6 +3809,46 @@ mod tests {
         assert_eq!(titles(&worn), ["FFZ Supporter", "FFZ:AP Supporter", "DankChat Supporter"]);
         let providers: Vec<_> = worn.iter().map(|b| b.provider.as_key()).collect();
         assert_eq!(providers, ["ffz", "chatty", "dankchat"]);
+    }
+
+    /// Chatty's copy of FFZ's list can lag FFZ itself: a member FFZ lists as a
+    /// Supporter was still in Chatty's Subwoofer list, and chat drew two FFZ
+    /// clouds (SN-5). FFZ's own feed wins for anyone it lists; someone only
+    /// Chatty lists keeps Chatty's copy.
+    #[test]
+    fn chatty_ffz_rehosts_give_way_to_ffzs_own_feed() {
+        let mut cache = empty_cache();
+        cache.chatty = Some(
+            serde_json::from_str(
+                r#"[{"id":"ffz","version":"subwoofer","meta_title":"FFZ Subwoofer","image_url":"https://cdn.frankerfacez.com/badge/4/1","userids":["206872719","95700001"]},
+                    {"id":"ffzap","version":"206872719","meta_title":"FFZ:AP Supporter","image_url":"https://api.ffzap.com/v1/user/badge/206872719/1","userids":["206872719"]}]"#,
+            )
+            .unwrap(),
+        );
+        let mut ffz_users = HashMap::new();
+        ffz_users.insert("3".to_string(), vec![206872719u32]);
+        cache.ffz = Some(FFZBadgesResponse {
+            badges: vec![FFZBadge {
+                id: 3,
+                title: Some("FFZ Supporter".to_string()),
+                name: Some("supporter".to_string()),
+                urls: HashMap::new(),
+                slot: Some(5),
+            }],
+            users: ffz_users,
+        });
+        let index = cache.build_by_user_index();
+
+        // FFZ lists them: its Supporter only, no stale Subwoofer; FFZ:AP is not
+        // an FFZ re-host, so it stays.
+        assert_eq!(titles(&owned(&index, "206872719")), ["FFZ Supporter", "FFZ:AP Supporter"]);
+        // Only Chatty lists them: Chatty's copy still stands in.
+        assert_eq!(titles(&owned(&index, "95700001")), ["FFZ Subwoofer"]);
+
+        // No FFZ feed at all (a failed fetch): every re-host stands in.
+        cache.ffz = None;
+        let index = cache.build_by_user_index();
+        assert_eq!(titles(&owned(&index, "206872719")), ["FFZ Subwoofer", "FFZ:AP Supporter"]);
     }
 
     /// The badge services setting hides a Homies custom badge by the key

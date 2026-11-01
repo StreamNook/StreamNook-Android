@@ -1,9 +1,10 @@
 import React, { useMemo, useState, useEffect, memo, useSyncExternalStore, type JSX } from 'react';
 import { Gift } from 'lucide-react';
 import { parseBadges } from '../services/twitchBadges';
-import { Tooltip } from './ui/Tooltip';
+import { Tooltip, type TooltipChildProps } from './ui/Tooltip';
 import { parseMessage, type LinkCardShape, type MessageSegment } from '../services/twitchChat';
-import { queueEmoteForDisplayCaching, getCachedEmoteUrl, getEmoteLookup, inlineEmoteTier, sevenTvTierUrl, EmoteSet } from '../services/emoteService';
+import { queueEmoteForDisplayCaching, getCachedEmoteUrl, getEmoteLookup, inlineEmoteTier, rememberRowEmoteFile, sevenTvTierUrl, EmoteSet } from '../services/emoteService';
+import { isDiskCopyUrl } from '../utils/cacheFileUrl';
 import { getCachedEmojiUrl, parseEmojisSync } from '../services/emojiService';
 import { calculateHalfPadding } from '../utils/chatLayoutUtils';
 import { mentionHoldBackground } from './chat/mentionHold';
@@ -36,7 +37,8 @@ import { isStreamNookUser, getStreamNookUserNumber, subscribeStreamNookRegistryV
 import { MemberReveal, MEMBER_REVEAL_CARD_CLASS } from './StreamNookBadge';
 import { EmoteCreditLine } from './chat/EmoteCreditLine';
 import { canCredit } from '../services/emoteCredit';
-import { openEmoteCard, useEmoteCardStore } from '../stores/emoteCardStore';
+import { openEmoteCard, useEmoteCardStore, type EmoteCardTarget } from '../stores/emoteCardStore';
+import { emoteClickRoute, emoteRef, stackTargets } from '../utils/emoteClick';
 import { chatBodyWeight } from '../utils/chatBodyWeight';
 import { AtmosphereBackground } from './AtmosphereBackground';
 import { MajorCologneChrome } from './MajorCologneChrome';
@@ -45,7 +47,8 @@ import { features } from '../features';
 import { MAJOR_COLOGNE_THEME_ID } from '../services/cologneEvent';
 import type { HighlightMatch } from '../utils/chatHighlightMatcher';
 import { useStreamerMode } from '../utils/streamerMode';
-import { sevenTvSrcSet, staticEmoteUrl, static7tvSrcSet } from '../utils/staticEmoteUrl';
+import { hasNoStillFrame, markNoStillFrame, sevenTvSrcSet, staticEmoteUrl, static7tvSrcSet } from '../utils/staticEmoteUrl';
+import { emoteImageRetry } from '../utils/emoteImageRetry';
 import { flashTitle } from '../utils/titleFlasher';
 import { useLowPower } from '../utils/lowPower';
 import { playSoundThrottled } from '../utils/notificationSound';
@@ -276,6 +279,106 @@ const WideEmoteImg = (
   );
 };
 
+// A 7TV emote's image once the cache and CDN fallbacks have all failed (a
+// just-uploaded emote has no file on the CDN yet). The emote shows as its name
+// in a muted style while the shared retry looks for any file that exists, then
+// swaps to that image. Every other emote renders its plain image.
+//
+// The emote's Tooltip clones this element to add its hover and focus handlers
+// (TooltipChildProps); they are passed on to whatever is drawn, or the hover
+// preview never opens.
+const RetryingEmoteImg = ({
+  imgProps,
+  kind,
+  baseHeight,
+  retryId,
+  name,
+  tier,
+  wantStatic,
+  quiet,
+  placeholderStyle,
+  ...tooltipProps
+}: {
+  imgProps: React.ImgHTMLAttributes<HTMLImageElement>;
+  kind: 'plain' | 'growX' | 'wide';
+  baseHeight: string;
+  /** Set for 7TV emotes only; the id the shared retry looks up. */
+  retryId?: string;
+  name: string;
+  tier: string;
+  wantStatic: boolean;
+  /** An overlay emote draws nothing while it waits, so it cannot cover its base. */
+  quiet: boolean;
+  placeholderStyle: React.CSSProperties;
+} & TooltipChildProps) => {
+  const [phase, setPhase] = useState<'image' | 'pending' | 'found' | 'dead'>('image');
+  const [found, setFound] = useState<string | null>(null);
+  const [slotId, setSlotId] = useState(retryId);
+  if (slotId !== retryId) {
+    setSlotId(retryId);
+    setPhase('image');
+    setFound(null);
+  }
+
+  useEffect(() => {
+    if (phase !== 'pending' || !retryId) return;
+    return emoteImageRetry.subscribe(retryId, {
+      preferredTier: tier,
+      onResolved: (url) => {
+        setFound(url);
+        setPhase('found');
+      },
+    });
+  }, [phase, retryId, tier]);
+
+  if (phase === 'pending' || phase === 'dead') {
+    if (quiet) return null;
+    return (
+      <span
+        {...tooltipProps}
+        data-emote-pending={phase === 'pending' ? '' : undefined}
+        className="text-textSecondary opacity-60"
+        style={placeholderStyle}
+      >
+        {name}
+      </span>
+    );
+  }
+
+  const base: React.ImgHTMLAttributes<HTMLImageElement> = { ...imgProps, ...tooltipProps };
+  let props = base;
+  if (phase === 'image') {
+    props = {
+      ...base,
+      onError: (e) => {
+        imgProps.onError?.(e);
+        if (retryId && e.currentTarget.dataset.ladderDone) setPhase('pending');
+      },
+    };
+  } else if (found) {
+    const url = wantStatic ? staticEmoteUrl(found) : found;
+    props = {
+      ...base,
+      src: url,
+      srcSet: undefined,
+      onError: (e) => {
+        const t = e.currentTarget;
+        // The still frame may not exist in this format; the animated file does.
+        if (url !== found && !t.dataset.stillFallback) {
+          t.dataset.stillFallback = '1';
+          t.src = found;
+          return;
+        }
+        setPhase('dead');
+      },
+    };
+  }
+
+  if (kind === 'wide') return <WideEmoteImg {...props} baseHeight={baseHeight} />;
+  if (kind === 'growX') return <GrowXEmoteImg {...props} baseHeight={baseHeight} />;
+  return <img {...props} />;
+};
+
 // Parse plain text into emote/emoji/text segments by name lookup against the
 // loaded emote sets. Serves the local-echo fallback (no Rust segments yet) and
 // the reply preview, which only ever has the parent message as raw text.
@@ -285,6 +388,9 @@ const WideEmoteImg = (
 const fromRustSegments = (segments: MessageSegment[], isProvider: boolean): EmoteSegment[] => {
   return segments.flatMap((seg): EmoteSegment[] => {
     if (seg.type === 'emote') {
+      // A history row carries its 7TV emote's disk file: seed the disk map
+      // before this row's emotes resolve, so the first paint is the disk copy.
+      if (seg.local_path && seg.emote_id) rememberRowEmoteFile(seg.emote_id, seg.local_path);
       return [{
         type: 'emote' as const,
         content: seg.content,
@@ -437,6 +543,7 @@ import { ModSlider } from './chat/ModSlider';
 import { HoverModButtons } from './chat/HoverModButtons';
 import { ModLineButtons } from './chat/ModLineButtons';
 import type { LineButton } from './chat/modLine';
+import { INLINE_TIME_STYLE, OWN_LINE_TIME_STYLE, timestampOnOwnLine } from './chat/chatTimestamp';
 import { WatchStreakFlame } from './icons/WatchStreakFlame';
 
 interface ChatMessageProps {
@@ -457,6 +564,9 @@ interface ChatMessageProps {
   isHighlighted?: boolean;
   moderationContext?: { type: 'timeout' | 'ban' | 'deleted'; duration?: number; by?: string; reason?: string } | null; // Moderation context from CLEARMSG/CLEARCHAT, named by EventSub for moderators
   onEmoteRightClick?: (emoteName: string) => void;
+  /** The phone's emote sheet: a tap on any image of an emote (or of a stack) hands it the
+   *  stack's creditable emotes, the one to show first. Desktop passes none and keeps its card. */
+  onEmoteOpen?: (shown: EmoteCardTarget, stack: EmoteCardTarget[]) => void;
   onMessageCopy?: (content: string) => void;
   onUsernameRightClick?: (messageId: string, username: string) => void;
   onBadgeClick?: (badgeKey: string, badgeInfo: { url?: string; image_url_4x?: string }) => void;
@@ -472,7 +582,7 @@ interface ChatMessageProps {
   homeProvider?: ProviderId;
   /** Blended feed: the row's platform logo, drawn at the start of the name
    *  line on every row type, so it sits beside the name whatever is above it
-   *  (a reply, a redemption header, a timestamp). */
+   *  (a reply, a redemption header). */
   sourceMark?: ProviderId;
   /** Line buttons, resolved once by the list when the viewer moderates this
    *  channel and has them on; null otherwise. One shared array for every
@@ -807,7 +917,7 @@ function UsernameWithCosmetics({
   );
 }
 
-const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, onReplyClick, isHighlighted = false, moderationContext = null, onEmoteRightClick, onMessageCopy, onUsernameRightClick, onBadgeClick, emotes, isModerator = false, broadcasterId, homeProvider = 'twitch', sourceMark, modLine = null }: ChatMessageProps) {
+const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, onReplyClick, isHighlighted = false, moderationContext = null, onEmoteRightClick, onEmoteOpen, onMessageCopy, onUsernameRightClick, onBadgeClick, emotes, isModerator = false, broadcasterId, homeProvider = 'twitch', sourceMark, modLine = null }: ChatMessageProps) {
   // Field selectors, NOT a whole-store subscription. This component is mounted
   // once per chat row, so subscribing to the entire store made every row
   // re-render on every unrelated store tick (hours-watched, viewer count, etc.).
@@ -891,6 +1001,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
 
   // PHASE 3.1 - THE ENDGAME: Use pre-formatted timestamps from Rust
   // Zero Date parsing on main thread!
+  const timestampOwnLine = timestampOnOwnLine(chatDesign?.timestamp_position);
   const formattedTimestamp = (() => {
     if (!chatDesign?.show_timestamps) return null;
 
@@ -1145,6 +1256,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // evaluations per store write across every mounted row; one tuple selector
   // has identical reactivity (shallow compare on the five fields matches the
   // per-field Object.is checks) at a fifth of the cost.
+  // The viewer can keep every member's atmosphere off their chat (profiles
+  // still show them).
+  const atmospheresInChat = chatDesign?.show_chat_atmospheres !== false;
   const {
     paint: seventvPaintRaw,
     seventvBadge: seventvBadgeRaw,
@@ -1155,7 +1269,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     useShallow((s) => {
       const u = cosmeticsKey ? s.users.get(cosmeticsKey) : undefined;
       // A member can keep their theme on their profile but off their chat rows.
-      const themeInChat = !u?.themeHiddenInChat;
+      const themeInChat = atmospheresInChat && !u?.themeHiddenInChat;
       return {
         paint: u?.paint,
         seventvBadge: u?.seventvBadge,
@@ -1214,7 +1328,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const cologneAtm = cologne ? getAtmosphere(MAJOR_COLOGNE_THEME_ID) : null;
   const [broadcasterType] = useState<string | null>(null);
   // Hover-action DOM (copy/pin cluster + mod menu) mounts on the row's FIRST
-  // hover and stays mounted, so the CSS group-hover fade still runs on every
+  // real hover (a move over it, or a touch) and stays mounted, so the CSS
+  // group-hover fade still runs on every
   // later hover. Before this, every row carried ~30-60 hidden nodes (mods:
   // the full punitive toolbar with tooltips) whether or not it was ever
   // hovered. Keyboard and drag moderation don't need this DOM (verified:
@@ -1329,7 +1444,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     // Cache 7TV Badge - use id directly (BadgeV4 interface)
     if (seventvBadge?.id && !seventvBadge.localUrl) {
       const badgeUrl = getBadgeImageUrl(seventvBadge);
-      if (badgeUrl && !badgeUrl.startsWith('asset') && !badgeUrl.includes('localhost')) {
+      if (badgeUrl && !isDiskCopyUrl(badgeUrl)) {
         queueCosmeticForCaching(seventvBadge.id, badgeUrl);
       }
     }
@@ -1385,8 +1500,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const showPlatformMark =
     rowSourceProvider !== homeProvider && chatBlend?.show_platform_badge !== false;
   // Blended feed: every row leads its name line with its platform's logo. It
-  // is drawn inside that line, so a reply quote, a redemption header or a
-  // timestamp above the name never pulls it off the name. Centred on the text
+  // is drawn inside that line, so a reply quote or a redemption header
+  // above the name never pulls it off the name. Centred on the text
   // the way the badge strip is (see .sn-badge-strip): an image-only
   // inline-flex box sits on its bottom edge, lifted until its middle meets
   // the text's.
@@ -1425,6 +1540,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     // Gigantified render: 4x-size art and 8em sizing for the plucked emote
     // (and its whole group, so overlays keep covering their base).
     giant: boolean = false,
+    // The images of the stack this one belongs to (the hidden modifiers left out): on a phone a
+    // tap on any of them opens the stack, since a finger cannot aim between them.
+    stack?: EmoteSegment[],
   ) => {
     const gridStyle = inGrid ? { gridArea: '1/1' } : {};
     const marginClass = inGrid ? '' : 'mx-0.5';
@@ -1440,32 +1558,17 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       // Provider detection up front (reused for tiered caching, disk-first
       // render, srcSet, and the hover preview below). BTTV IDs are ALSO 24 hex
       // characters, so the other CDNs are excluded explicitly.
-      const is7TVEmote = !!segment.emoteId && (
-        emoteUrl.includes('7tv') ||
-        ((segment.emoteId.length === 24 || segment.emoteId.length === 26) &&
-          !emoteUrl.includes('jtvnw.net') &&
-          !emoteUrl.includes('frankerfacez') &&
-          !emoteUrl.includes('betterttv'))
-      );
+      // One rule with Rust's native rows (utils/emoteClick.ts `emoteRef`).
+      const source = emoteRef(emoteUrl, segment.emoteId);
+      const is7TVEmote = source === '7tv';
       const emoteTier = giant ? ('4x' as const) : inlineEmoteTier();
 
       // Resolve the real provider so the cache key matches the provider-
       // namespaced key the picker + prefetch write (otherwise disk-first
       // silently misses). 7TV stays per-tier; others key by `{provider}-{id}`.
-      const emoteProvider = is7TVEmote
-        ? '7tv'
-        : emoteUrl.includes('jtvnw.net')
-          ? 'twitch'
-          : emoteUrl.includes('betterttv')
-            ? 'bttv'
-            : emoteUrl.includes('frankerfacez')
-              ? 'ffz'
-              : // Kick's own emotes: the same `kick-<id>` file the emote picker
-                // and Rust's prefetch keep. Without a provider they were cached
-                // again under the bare id, two files for one image.
-                emoteUrl.includes('files.kick.com')
-                ? 'kick'
-                : undefined;
+      // Kick's own emotes included: the same `kick-<id>` file the emote picker
+      // and Rust's prefetch keep.
+      const emoteProvider = source ?? undefined;
 
       // Giant art URL. Only 7TV cache keys are per-tier; the other providers
       // key by bare id, so caching 4x bytes there would overwrite the
@@ -1482,11 +1585,20 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       // Static mode: the CDN's first-frame file, bypassing the animated disk
       // cache (a static URL under the animated key would corrupt it).
       // Battery Saver stills the gigantified emote too, the costliest one.
-      const wantStatic = stillEmotes || (!giant && (animateEmotes === 'never' || (animateEmotes === 'hover' && !rowHovering)));
+      // 7TV and BTTV publish a first frame only for emotes that animate, so an
+      // emote known to be still (the channel set says so, or its first frame
+      // already answered 404) draws its normal file, disk copy included.
+      const setEmote = emotes && segment.emoteId ? getEmoteLookup(emotes).byName.get(segment.content) : undefined;
+      const knownStill =
+        (setEmote?.id === segment.emoteId && setEmote?.animated === false) ||
+        hasNoStillFrame(emoteProvider, segment.emoteId);
+      const wantStatic =
+        !knownStill &&
+        (stillEmotes || (!giant && (animateEmotes === 'never' || (animateEmotes === 'hover' && !rowHovering))));
       const cachedEmoteUrl = !wantStatic && segment.emoteId && (!giant || emoteProvider === '7tv')
         ? getCachedEmoteUrl(segment.emoteId, emoteProvider, emoteTier)
         : undefined;
-      if (!wantStatic && !cachedEmoteUrl && displayUrl && !displayUrl.startsWith('asset://') && !displayUrl.includes('asset.localhost') && segment.emoteId && (!giant || emoteProvider === '7tv')) {
+      if (!wantStatic && !cachedEmoteUrl && displayUrl && !isDiskCopyUrl(displayUrl) && segment.emoteId && (!giant || emoteProvider === '7tv')) {
         queueEmoteForDisplayCaching(segment.emoteId, emoteProvider, displayUrl, emoteTier);
       }
 
@@ -1526,19 +1638,26 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         },
         referrerPolicy: 'no-referrer',
         onClick: () => {
+          // The phone's sheet: any image of a stack opens the stack (its base, or its first
+          // member the core can credit).
+          if (onEmoteOpen) {
+            const targets = stackTargets(stack ?? [segment], creditRoom);
+            if (targets.length > 0) onEmoteOpen(targets[0], targets);
+            return;
+          }
           if (!segment.emoteId) return;
           // A 7TV emote opens the 7TV spotlight where this window has it (main:
           // add to any channel you edit, creator chip). Everything creditable
           // elsewhere, and every Twitch / BTTV / FFZ emote, opens the emote
           // card with its creators. Kick and YouTube emotes have none to show.
-          if (is7TVEmote && useEmoteCardStore.getState().seventvSpotlight) {
+          const route = emoteClickRoute(source, useEmoteCardStore.getState().seventvSpotlight);
+          if (route === 'spotlight') {
             useAppStore.getState().openEmoteSpotlight(segment.emoteId, segment.content);
             return;
           }
-          const provider = is7TVEmote ? '7tv' : emoteProvider;
-          if (provider && canCredit(provider)) {
+          if (route === 'card' && source) {
             openEmoteCard({
-              provider,
+              provider: source,
               id: segment.emoteId,
               name: segment.content ?? '',
               url: emoteUrl,
@@ -1553,6 +1672,16 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         },
         onError: (e) => {
           const t = e.currentTarget;
+          // No first frame: the emote does not animate. It draws its normal
+          // file now, and every later row skips the still for it.
+          if (wantStatic && !t.dataset.stillFallback) {
+            t.dataset.stillFallback = '1';
+            markNoStillFrame(emoteProvider, segment.emoteId);
+            if (is7TVEmote && segment.emoteId && !giant) t.srcset = sevenTvSrcSet(segment.emoteId, 'avif');
+            else t.removeAttribute('srcset');
+            t.src = displayUrl;
+            return;
+          }
           // Giant 4x URL failed: retry once with the inline-size URL upscaled
           // (FFZ-equivalent degradation) before the cache/CDN ladder below.
           if (giant && displayUrl !== emoteUrl && !t.dataset.giantFallback) {
@@ -1577,9 +1706,16 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           // Android phones) cannot decode AVIF at all.
           if (is7TVEmote && segment.emoteId && !t.dataset.webpFallback) {
             t.dataset.webpFallback = '1';
-            const still = wantStatic ? '_static' : '';
-            t.srcset = sevenTvSrcSet(segment.emoteId, 'webp', wantStatic);
+            const drawStill = wantStatic && !t.dataset.stillFallback;
+            const still = drawStill ? '_static' : '';
+            t.srcset = sevenTvSrcSet(segment.emoteId, 'webp', drawStill);
             t.src = `https://cdn.7tv.app/emote/${segment.emoteId}/${emoteTier}${still}.webp`;
+            return;
+          }
+          // Every file a 7TV emote has failed: the image slot hands the emote
+          // to the shared retry, which keeps looking while a row shows it.
+          if (is7TVEmote && segment.emoteId) {
+            t.dataset.ladderDone = '1';
             return;
           }
           // A phone waking its radio fails a good image once. One late retry
@@ -1603,18 +1739,18 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       };
       // BetterTTV's absolute stretch wins over FFZ's relative one when a
       // message stacks w! and ffzW on the same target.
-      const imgElement = mods?.wideX ? (
-        <WideEmoteImg
-          {...imgProps}
+      const imgElement = (
+        <RetryingEmoteImg
+          imgProps={imgProps}
+          kind={mods?.wideX ? 'wide' : mods?.growX ? 'growX' : 'plain'}
           baseHeight={giant ? GIANT_EMOTE_HEIGHT : INLINE_EMOTE_HEIGHT}
+          retryId={is7TVEmote ? segment.emoteId : undefined}
+          name={segment.content}
+          tier={emoteTier}
+          wantStatic={wantStatic}
+          quiet={isOverlay}
+          placeholderStyle={{ ...gridStyle, ...(inGrid ? {} : EMOTE_SIDE_MARGINS) }}
         />
-      ) : mods?.growX ? (
-        <GrowXEmoteImg
-          {...imgProps}
-          baseHeight={giant ? GIANT_EMOTE_HEIGHT : INLINE_EMOTE_HEIGHT}
-        />
-      ) : (
-        <img {...imgProps} />
       );
 
       // Big-preview tooltip mirroring the emote-picker's hover card. Compact
@@ -1748,6 +1884,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             alt={segment.content}
             className={`inline h-5 w-5 ${inGrid ? '' : 'align-middle'} ${marginClass}`}
             style={gridStyle}
+            loading="lazy"
+            decoding="async"
             onError={(e) => {
               const t = e.currentTarget;
               // emoji-datasource-apple names some older text-default symbols
@@ -1781,6 +1919,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               src={segment.cheermoteUrl}
               alt={segment.content}
               className="inline-block h-7 w-auto align-middle"
+              loading="lazy"
+              decoding="async"
               referrerPolicy="no-referrer"
               onError={(e) => {
                 e.currentTarget.style.display = 'none';
@@ -2017,6 +2157,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         .filter((s) => s.modifierFlags != null && memberContributes(s))
         .map((s) => s.content);
 
+      // The images a tap on any of them opens on a phone (hidden modifiers draw nothing).
+      const stackMembers = group.filter(
+        (seg, i) => !(i > 0 && memberContributes(seg) && ((seg.modifierFlags ?? 0) & MOD_HIDDEN) !== 0),
+      );
       const gridSpan = (
         <span
           key={effectBits ? undefined : `group-${index}`}
@@ -2043,6 +2187,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   }
                 : undefined,
               giant,
+              stackMembers,
             );
           })}
         </span>
@@ -2270,7 +2415,11 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const isFirstMessage =
     parsed.tags.get('first-msg') === '1' || parsed.metadata?.is_first_message === true;
   const isReturningChatter = parsed.tags.get('returning-chatter') === '1';
-  const isOwnMessage = !!currentUser?.user_id && parsed.tags.get('user-id') === currentUser.user_id;
+  // Rust stamps every evaluated row (any platform); an optimistic local row
+  // is not evaluated yet and still has the Twitch user-id tag.
+  const isOwnMessage =
+    parsed.metadata?.is_own === true ||
+    (!!currentUser?.user_id && parsed.tags.get('user-id') === currentUser.user_id);
   const isRaidNotice = parsed.tags.get('msg-id') === 'raid';
 
   // Resolve which built-in event (if any) should drive the row's tint. Order
@@ -3362,16 +3511,20 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           ? { paddingLeft: 18, paddingRight: 18, paddingTop: 7, paddingBottom: 7, minHeight: 36 }
           : {}),
       }}
-      data-mod-dock={dockOffered ? 'true' : undefined}
-      // A row whose edge offers the slider or the line buttons: the list holds
-      // still from the moment the pointer reaches it, hover buttons or not, so
-      // a fast chat cannot slide another row under the edge on the way there.
-      data-mod-row={showModSlider || showModLine ? 'true' : undefined}
       onContextMenu={handleRowContextMenu}
-      onPointerEnter={(e) => {
-        if (!hoverArmed) setHoverArmed(true);
-        if (animateEmotes === 'hover' && e.pointerType !== 'touch') setRowHovering(true);
-      }}
+      onPointerEnter={
+        animateEmotes === 'hover'
+          ? (e) => {
+              if (e.pointerType !== 'touch') setRowHovering(true);
+            }
+          : undefined
+      }
+      // The hover dock and the slider mount on a real move over the row or a
+      // touch on it. A row that slides under a still pointer gets a
+      // pointerenter with neither, and mounted them for good on every row
+      // that passed under a resting mouse.
+      onPointerMove={hoverArmed ? undefined : () => setHoverArmed(true)}
+      onPointerDown={hoverArmed ? undefined : () => setHoverArmed(true)}
       onPointerLeave={
         animateEmotes === 'hover' || timeoutLengthsOpen
           ? () => {
@@ -3441,13 +3594,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       {parsed.replyInfo && replyStyle === 'full' && (
         <Tooltip content="Click to view parent message" side="top">
           <div
-            className="mb-1.5 pl-2 border-l-2 border-textSecondary/40 cursor-pointer hover:border-textSecondary/60 transition-colors"
-            // This line owns its own tap. Without the marker, a tap on mobile
-            // ALSO reaches MobileChatPane's tap-to-reply handler on the list, so
-            // jumping to the parent would simultaneously start a reply to the
-            // child. `data-no-drag` is the existing repo convention for exactly
-            // this (see the mod-drag handles below and StyledChatName), and it
-            // is inert on desktop, which has no competing parent click handler.
+            className="mb-1 pl-2 border-l-2 border-textSecondary/40 cursor-pointer hover:border-textSecondary/60 transition-colors"
+            // This line owns its own tap: `data-no-drag` marks it as a control the
+            // phone's row gestures leave alone (the repo's convention, see the
+            // mod-drag handles below and StyledChatName); inert on desktop.
             data-no-drag="true"
             onClick={() => onReplyClick?.(parsed.replyInfo!.parentMsgId)}
           >
@@ -3484,33 +3634,32 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       )}
 
       <div>
-        {/* Timestamp - own line above the badges/name/message when enabled */}
-        {formattedTimestamp && (
-          <div
-            className={`text-[10px] leading-tight mb-0.5 text-textSecondary ${
-              atmosphereFrost
-                ? `block w-fit rounded-sm px-1 opacity-80 ${frostClass}`
-                : 'opacity-50'
-            }`}
-          >
-            {formattedTimestamp}
-          </div>
-        )}
         {/* Badges and Message content - inline flow so wrapped text starts at left edge.
             When the atmosphere asks for frost (chatFrost) this is one frosted
-            block hugging the badges + name + message (the timestamp gets its
-            own separate frost above), so the text/badges stay readable over a
-            busy wash. */}
+            block hugging the timestamp + badges + name + message, so the
+            text/badges stay readable over a busy wash. */}
         {/* The row carries the chat font size so badges, name and text are all
             measured against the same line: the badge group centres on it and the
             text sits on its baseline, so a tall emote grows the line without
             moving the name away from the badges. */}
         <div
-          className={atmosphereFrost ? `inline-block max-w-full rounded-md px-1.5 py-0.5 ${frostClass}` : 'min-w-0'}
+          className={atmosphereFrost ? `inline-block max-w-full -ml-1.5 -my-0.5 rounded-md px-1.5 py-0.5 ${frostClass}` : 'min-w-0'}
           style={{ fontSize: `${chatDesign?.font_size ?? 14}px`, lineHeight: 1.625 }}
         >
+          {/* The time leads the row's inline flow, on the text's baseline, so
+              wrapped text still starts at the left edge; "own_line" gives it a
+              line of its own above the message. Left selectable so a copied
+              line keeps its time. */}
+          {formattedTimestamp && (
+            <span
+              className={`text-textMuted tabular-nums whitespace-nowrap${timestampOwnLine ? ' block' : ''}`}
+              style={timestampOwnLine ? OWN_LINE_TIME_STYLE : INLINE_TIME_STYLE}
+            >
+              {formattedTimestamp}
+            </span>
+          )}
           {/* Where this row came from, when it is not the platform being watched.
-              FIRST, ahead of the avatar and every badge, because it answers
+              Right after the time, ahead of the avatar and every badge, because it answers
               "which community is this" before anything about who they are in
               it — and because a mark that has to be hunted for between badges
               is not doing its one job. Small on purpose: it is a marker, not a
@@ -3763,8 +3912,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           was; for a mod the quick timeout (its length printed) comes next,
           then Delete, and Ban farthest from Copy. Inside the row every button
           belongs to the line under the pointer (a menu above the row covered
-          the line before it), and the list holds still while a mod points at
-          the row (ChatMessageList), so nothing slides away mid-aim. The other
+          the line before it), and a mod's buttons act only once the rows under
+          the pointer have held still (ChatMessageList), so nothing slides in
+          mid-aim. The other
           lengths open on a click, in place, and their close button lands on
           the chevron's own spot, so a double click only toggles. data-no-drag
           so nothing here starts a mod drag. */}
@@ -3800,7 +3950,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           )}
           {dockOffered && (onMessageCopy || showInlinePin) && <div className="mx-0.5 h-4 w-px bg-white/10" />}
           {showInlinePin && broadcasterId && thisMessageId && parsed.provider === 'twitch' && (
-            <Tooltip content={isThisPinned ? 'Unpin message' : 'Pin message'} side="top">
+            <Tooltip content={isThisPinned ? 'Unpin message' : 'Pin message'} side="top" requirePointerMove>
               <button
                 onClick={async (e) => {
                   e.preventDefault();
@@ -3827,7 +3977,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             </Tooltip>
           )}
           {onMessageCopy && (
-            <Tooltip content="Copy message" side="top">
+            <Tooltip content="Copy message" side="top" requirePointerMove>
               <button
                 aria-label="Copy message"
                 onClick={(e) => { e.preventDefault(); onMessageCopy(parsed.content); }}

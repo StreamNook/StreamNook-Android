@@ -24,13 +24,16 @@ import { useAppStore, clipSourceOf, type SettingsTab } from '../stores/AppStore'
 import { sectionIdFromLabel } from '../components/settings/sectionId';
 import { useChatUserStore } from '../stores/chatUserStore';
 import { useFollowsStore } from '../stores/followsStore';
-import { favoriteIdOf, favoriteMetaOf } from './favorites';
+import { favoriteRefOf, isFavoriteNow, setFavoriteChannel } from './favoriteDoor';
 import { currentCategoryTarget } from './streamCategory';
 import { sevenTvIdForStream } from '../services/sevenTvPictures';
 import { useSnippetStore } from '../stores/snippetStore';
+import { AUDIO_GRAPH_SUPPORTED } from './audioBoost';
+import { openSongs } from './songHistory';
 import { WATCHABLE_PROVIDERS, providerLabel, type ProviderId } from '../types/providers';
 import { usePluginUiRegistry } from '../plugins-ui/registry';
 import { Logger } from './logger';
+import { isApprovalClosed } from './twitchApproval';
 import { requestChangelog } from './changelogEvents';
 import { getBuiltInSnippets, type Snippet } from './commandPaletteCopypastas';
 import type { TwitchStream, TwitchVideo, TwitchClip } from '../types';
@@ -207,6 +210,17 @@ function buildPlatformItems(): PaletteItem[] {
   });
 }
 
+// Offered where song identification runs (not macOS, whose video engine
+// keeps stream audio from the app).
+const YOUR_SONGS_ITEM: PaletteItem = {
+  id: 'qa.openSongs',
+  section: 'Quick Actions',
+  title: 'Open Your songs',
+  subtitle: 'Every song you identified, with its links',
+  keywords: 'songs your songs song history identified music shazam what song track name remember',
+  run: () => openSongs(),
+};
+
 function buildQuickActions(): PaletteItem[] {
   const items: PaletteItem[] = [];
 
@@ -260,6 +274,7 @@ function buildQuickActions(): PaletteItem[] {
       keywords: 'whispers dms messages inbox',
       run: () => useAppStore.getState().setShowWhispersOverlay(true),
     },
+    ...(AUDIO_GRAPH_SUPPORTED ? [YOUR_SONGS_ITEM] : []),
     {
       id: 'qa.openProfile',
       section: 'Quick Actions',
@@ -437,10 +452,8 @@ function buildQuickActions(): PaletteItem[] {
       run: async () => {
         const stream = requireStream();
         if (!stream) return;
-        // `favoriteIdOf`, not `user_id`: platform ids collide across services.
-        const id = favoriteIdOf(stream);
-        if (!id) return;
-        await useAppStore.getState().toggleFavoriteStreamer(id, favoriteMetaOf(stream, id));
+        const ref = favoriteRefOf(stream);
+        await setFavoriteChannel(ref, !isFavoriteNow(ref));
       },
     },
     {
@@ -456,8 +469,10 @@ function buildQuickActions(): PaletteItem[] {
           await invoke('follow_channel', { targetUserId: stream.user_id });
           useAppStore.getState().addToast(`Following ${stream.user_name}`, 'success');
         } catch (e) {
+          // Closing Twitch's approval sheet leaves things as they were, quietly.
+          if (isApprovalClosed(e)) return;
           Logger.warn('[CommandPalette] follow_channel failed:', e);
-          useAppStore.getState().addToast('Follow failed', 'error');
+          useAppStore.getState().addToast(`Couldn't follow ${stream.user_name}. Try again.`, 'error');
         }
       },
     },
@@ -474,8 +489,9 @@ function buildQuickActions(): PaletteItem[] {
           await invoke('unfollow_channel', { targetUserId: stream.user_id });
           useAppStore.getState().addToast(`Unfollowed ${stream.user_name}`, 'success');
         } catch (e) {
+          if (isApprovalClosed(e)) return;
           Logger.warn('[CommandPalette] unfollow_channel failed:', e);
-          useAppStore.getState().addToast('Unfollow failed', 'error');
+          useAppStore.getState().addToast(`Couldn't unfollow ${stream.user_name}. Try again.`, 'error');
         }
       },
     },
@@ -820,7 +836,7 @@ interface SettingsEntry {
 const SETTINGS_CATALOG: SettingsEntry[] = [
   // Player
   { tab: 'Player', keywords: 'player video stream playback latency buffering picture overlay buttons auto switch streaming codecs audio boost song id' },
-  { tab: 'Player', section: 'Player Buttons', keywords: 'player buttons overlay buttons follow subscribe clip identify song clips vods multinook refresh close hide show customize which buttons top right' },
+  { tab: 'Player', section: 'Player Buttons', keywords: 'player buttons overlay buttons follow subscribe clip identify song songs your songs share clips vods multinook refresh close hide show customize which buttons top right' },
   { tab: 'Player', section: 'Mouse Controls', sectionId: 'settings-section-mouse-controls', keywords: 'mouse controls scroll volume step scroll for about middle-click mute wheel scroll volume louder quieter middle click mute unmute middle-click opens multinook middle click open in multinook multi view stream card sidebar one handed scroll wheel button volume step notch channel about reveal shift scroll down' },
   { tab: 'Player', section: 'Auto-Switch', sectionId: 'settings-section-auto-switch', keywords: 'auto switch stream switching destination notice follow raids stay in chat move to another stream when this one ends where to go next tell me when it switches fallback offline next stream raid redirect followed category notification stay offline chat' },
   { tab: 'Player', section: 'Streaming', sectionId: 'settings-section-streaming', keywords: 'streaming start timeout retry delay keep trying pause between attempts codecs h265 hevc av1 h264 connection timeout auto retry delay resolve' },
@@ -828,7 +844,7 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   { tab: 'Player', section: 'Latency & Buffering', sectionId: 'settings-section-latency', keywords: 'latency buffering target latency how close to live live edge gap delay low latency buffer ahead stutter' },
   { tab: 'Player', section: 'Picture', keywords: 'picture 16:9 window aspect ratio lock keep the window cinema mode letterbox bars black color match theme floating pillarbox ambient glow glow with the stream backdrop hide title bar while watching auto-hide top bar hover toolbar edge to edge distraction free' },
   { tab: 'Player', section: 'Audio Boost', sectionId: 'settings-section-audio-boost', keywords: 'audio boost leveling turn on audio boost compressor makeup gain louder volume normalize even out loud quiet clipping threshold ratio knee attack release' },
-  { tab: 'Player', section: 'Song Identification', sectionId: 'settings-section-song-id', keywords: 'song identification identify music what song is this shazam recognize now playing track name spotify apple music song.link listen time retries retries when nothing matches capture detection' },
+  { tab: 'Player', section: 'Song Identification', sectionId: 'settings-section-song-id', keywords: 'song identification identify music what song is this shazam recognize now playing track name spotify apple music youtube music deezer tidal beatport song links listen time retries retries when nothing matches capture detection your songs song history list of identified songs' },
 
   // Theme
   { tab: 'Theme', keywords: 'theme color accent skin dark light palette glassiness font' },
@@ -946,6 +962,7 @@ const SETTINGS_CATALOG: SettingsEntry[] = [
   // Integrations
   { tab: 'Integrations', keywords: 'integrations discord rpc rich presence ttv lol ad block ad-free connected apps services' },
   { tab: 'Integrations', section: 'Discord Rich Presence', keywords: 'discord rpc rich presence activity status what watching' },
+  { tab: 'Integrations', section: 'Discord Rich Presence', label: 'Discord Status', sectionId: 'discord-status-editor', keywords: 'discord status customize rich presence profile picture pfp avatar streamer picture big picture badge watch button timer uptime member list text' },
   { tab: 'Integrations', section: 'Ad Blocking', keywords: 'ad block ad-free ads ttv lol proxy splice block twitch ads plugin' },
 
   // Notifications

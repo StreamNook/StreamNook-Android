@@ -48,6 +48,7 @@ import DropProgressController from './components/plugins/DropProgressController'
 import EmoteSpotlight from './components/EmoteSpotlight';
 import BadgeSpotlightHost from './components/BadgeSpotlightHost';
 import WhispersWidget from './components/WhispersWidget';
+import { SongsPanelHost } from './components/songs/SongsPanelHost';
 import PluginRuntimeBridge from './components/plugins/PluginRuntimeBridge';
 import Sidebar from './components/Sidebar';
 import TwitchOverlay from './components/TwitchOverlay';
@@ -69,6 +70,12 @@ import { getAppVersion, primeClientIdentity } from './utils/appVersion';
 import { OPEN_CHANGELOG_EVENT, requestChangelog, type OpenChangelogDetail } from './utils/changelogEvents';
 
 import { Logger } from './utils/logger';
+import { startPageHeartbeat } from './utils/pageHeartbeat';
+import { startChatLatencyReporter } from './utils/chatLatency';
+import { startGpuRecoveryWatch } from './utils/gpuRecovery';
+import { features } from './features';
+import { installDiscordPresenceFeed } from './stores/discordPresenceFeed';
+import { ensureCacheFileServer } from './utils/cacheFileUrl';
 
 // Heavy overlays load on first open instead of riding the boot bundle. Each
 // always-mounted one is gated behind an "ever opened" latch in the component
@@ -982,6 +989,17 @@ function App() {
       unlistenSettingsSync = unlisten;
     });
     cleanupFunctions.push(() => unlistenSettingsSync?.());
+
+    // Discord presence: this window's MultiNook grid and player, as raw facts
+    // for Rust. Main window only (the feed checks), desktop only.
+    if (features.discordRpc) {
+      void installDiscordPresenceFeed()
+        .then((stop) => {
+          if (isMounted) cleanupFunctions.push(stop);
+          else stop();
+        })
+        .catch((e) => Logger.warn('[Discord] presence feed did not start:', e));
+    }
 
     // Stagger helper scoped to this effect: schedules a task in a boot tier and
     // wires its cancel into this effect's cleanup (mirroring the isMounted
@@ -1941,6 +1959,15 @@ function App() {
     };
   }, []);
 
+  // Page main-thread lateness in the log once a minute, the drawing mode and
+  // the restart offer after a GPU fallback, and the cached-art server's address.
+  useEffect(() => {
+    void ensureCacheFileServer();
+    startPageHeartbeat();
+    startChatLatencyReporter();
+    return startGpuRecoveryWatch();
+  }, []);
+
   // Warm the lazy VideoPlayer chunk once boot has settled, so the first stream
   // start doesn't pay the chunk-load latency on top of stream resolution.
   useEffect(() => afterBoot(5000, () => {
@@ -2519,6 +2546,7 @@ function App() {
         isOpen={showWhispersOverlay}
         onClose={() => setShowWhispersOverlay(false)}
       />
+      <SongsPanelHost />
       <PluginRuntimeBridge />
       <PluginUiHost />
       <PluginUpdatesChecker />

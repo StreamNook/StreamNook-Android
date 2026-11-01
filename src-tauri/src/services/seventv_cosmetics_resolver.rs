@@ -1173,6 +1173,29 @@ pub fn invalidate(id: &str) {
     }
 }
 
+/// Whether a live 7TV entitlement for a paint or badge (`kind` "PAINT" or
+/// "BADGE", `ref_id` the cosmetic it names) disagrees with what the cache says
+/// this chatter wears: a new one put on, or the worn one taken off. The burst
+/// 7TV replays on every subscribe names what people already wear, so it says
+/// no; so does a chatter nobody has looked up yet, whose first lookup asks 7TV
+/// anyway. Reads the cache without touching its order or age.
+pub fn entitlement_is_change(id: &str, kind: &str, action: &str, ref_id: Option<&str>) -> bool {
+    let Some(ref_id) = ref_id else { return false };
+    let Ok(guard) = USERS.lock() else { return false };
+    let Some(entry) = guard.as_ref().and_then(|lru| lru.peek(id)) else { return false };
+    let list = match kind {
+        "BADGE" => &entry.data.badges,
+        "PAINT" => &entry.data.paints,
+        _ => return false,
+    };
+    let worn = list.first().and_then(|v| v.get("id")).and_then(Value::as_str);
+    if action == "delete" {
+        worn == Some(ref_id)
+    } else {
+        worn != Some(ref_id)
+    }
+}
+
 pub fn clear() {
     if let Ok(mut guard) = USERS.lock() {
         *guard = None;
@@ -1205,7 +1228,18 @@ async fn fetch_inventory(id: String) -> Option<Inventory> {
         "{{ id style {{ activePaint {{ id }} activeBadge {{ id description }} activeProfilePicture {{ id images {{ url mime scale frameCount }} }} }} inventory {{ paints {{ to {{ paint {PAINT_FIELDS} }} }} badges {{ to {{ badge {BADGE_FIELDS} }} }} }} }}"
     );
     let data = request_gql(&user_query(std::slice::from_ref(&id), &selection)).await?;
-    let user = data.get(alias_of(&id))?.get("userByConnection").filter(|u| !u.is_null())?;
+    inventory_from_answer(&data, &id)
+}
+
+/// One account's inventory from 7TV's answer. 7TV answered and knows no such
+/// account: owning nothing is the answer (an empty inventory with no
+/// `seventv_user_id`). `None` stays for an answer that does not cover the
+/// account, as for a request that failed, so a caller can tell the two apart.
+fn inventory_from_answer(data: &Value, id: &str) -> Option<Inventory> {
+    let entry = data.get(alias_of(id))?;
+    let Some(user) = entry.get("userByConnection").filter(|u| !u.is_null()) else {
+        return Some(Inventory::default());
+    };
     let cosmetics = owned_cosmetics(user);
     // The card's lookup already carries the images; the chat path reuses them.
     if let Some(picture) = &cosmetics.profile_picture {
@@ -1337,6 +1371,21 @@ mod tests {
         note_own_pick("pick-test", Some(None), None);
         let off = with_pick("pick-test", UserCosmetics { paints, ..Default::default() }, false);
         assert!(off.paints.is_empty());
+    }
+
+    #[test]
+    fn an_account_7tv_does_not_know_owns_nothing_and_a_missing_answer_is_none() {
+        let unknown = json!({ alias_of("424242"): { "userByConnection": null } });
+        let inv = inventory_from_answer(&unknown, "424242").expect("an answer");
+        assert!(inv.cosmetics.seventv_user_id.is_none());
+        assert!(inv.cosmetics.paints.is_empty() && inv.cosmetics.badges.is_empty());
+
+        assert!(inventory_from_answer(&json!({}), "424242").is_none());
+
+        let known = json!({ alias_of("424242"): { "userByConnection": {
+            "id": "01SEVENTV", "style": {}, "inventory": { "paints": [], "badges": [] } } } });
+        let inv = inventory_from_answer(&known, "424242").expect("an answer");
+        assert_eq!(inv.cosmetics.seventv_user_id.as_deref(), Some("01SEVENTV"));
     }
 
     #[test]
@@ -1594,6 +1643,35 @@ mod tests {
 
     fn wearing(picture_id: &str) -> UserCosmetics {
         UserCosmetics { picture_id: Some(picture_id.into()), ..Default::default() }
+    }
+
+    fn worn(badge: Option<&str>, paint: Option<&str>) -> UserCosmetics {
+        UserCosmetics {
+            badges: badge.map(|b| vec![json!({ "id": b, "selected": true })]).unwrap_or_default(),
+            paints: paint.map(|p| vec![json!({ "id": p, "selected": true })]).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_entitlement_is_a_change_only_when_it_disagrees_with_the_worn_cosmetic() {
+        put_cached("90000201", worn(Some("b-old"), Some("p-old")), Duration::from_secs(1), true);
+        // The subscribe replay names what is already worn: no change.
+        assert!(!entitlement_is_change("90000201", "BADGE", "create", Some("b-old")));
+        assert!(!entitlement_is_change("90000201", "PAINT", "create", Some("p-old")));
+        // A different badge or paint put on, or the worn one taken off: a change.
+        assert!(entitlement_is_change("90000201", "BADGE", "create", Some("b-new")));
+        assert!(entitlement_is_change("90000201", "PAINT", "update", Some("p-new")));
+        assert!(entitlement_is_change("90000201", "BADGE", "delete", Some("b-old")));
+        // Taking off something they were not wearing changes nothing.
+        assert!(!entitlement_is_change("90000201", "BADGE", "delete", Some("b-other")));
+        // Putting one on when nothing was worn is a change.
+        put_cached("90000202", worn(None, None), Duration::from_secs(1), true);
+        assert!(entitlement_is_change("90000202", "BADGE", "create", Some("b-first")));
+        // Nobody looked them up yet, an emote set, or no cosmetic named: not ours to recheck.
+        assert!(!entitlement_is_change("90000299", "BADGE", "create", Some("b-new")));
+        assert!(!entitlement_is_change("90000201", "EMOTE_SET", "create", Some("set")));
+        assert!(!entitlement_is_change("90000201", "BADGE", "create", None));
     }
 
     #[test]

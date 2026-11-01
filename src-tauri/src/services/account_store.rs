@@ -65,6 +65,12 @@ pub struct StoredAccount {
 
 pub struct AccountStore;
 
+/// Whether Twitch reports a different login than the one on file. Logins are
+/// lowercase on Twitch, so a case difference alone is not a rename.
+fn login_changed(stored: &str, validated: &str) -> bool {
+    !validated.is_empty() && !stored.eq_ignore_ascii_case(validated)
+}
+
 impl AccountStore {
     // ----- registry (metadata) persistence -------------------------------
 
@@ -235,13 +241,13 @@ impl AccountStore {
 
     /// Record the current login as the main account in the registry, and keep a
     /// backup copy of its token so it can be demoted losslessly later. Called on
-    /// startup with the user id Twitch's validate endpoint already returned.
+    /// startup with the user id and login Twitch's validate endpoint returned.
     ///
     /// Non-destructive: when a DIFFERENT account is found occupying the primary
     /// slot (a re-login as someone else), the previous main is demoted to a
     /// linked account rather than deleted. Always best-effort: any failure is
     /// logged and swallowed so login is never broken.
-    pub async fn reconcile_primary(validated_user_id: &str) {
+    pub async fn reconcile_primary(validated_user_id: &str, validated_login: Option<&str>) {
         let accounts = Self::list();
         let current_primary = accounts.iter().find(|a| a.is_primary).cloned();
 
@@ -251,6 +257,9 @@ impl AccountStore {
         // to a usable linked account without losing its token.
         if let Some(p) = &current_primary {
             if p.user_id == validated_user_id {
+                if let Some(login) = validated_login.filter(|l| login_changed(&p.login, l)) {
+                    Self::record_rename(accounts, validated_user_id, login).await;
+                }
                 if let Ok(token) = TwitchService::load_primary_token().await {
                     let _ = Self::store_secondary_token(validated_user_id, &token);
                 }
@@ -304,6 +313,40 @@ impl AccountStore {
         }
     }
 
+    /// The main account was renamed on Twitch: its id stayed, its login did not.
+    /// Everything that reads the login from here (the badge collection, `/me`,
+    /// the send limiter's own-login check) would keep asking for a name that is
+    /// gone. Takes the display name and avatar from Twitch too when it answers;
+    /// otherwise the validated login alone is recorded.
+    async fn record_rename(mut accounts: Vec<StoredAccount>, user_id: &str, login: &str) {
+        let info = TwitchService::get_user_info()
+            .await
+            .ok()
+            .filter(|i| i.id == user_id);
+        let Some(account) = accounts.iter_mut().find(|a| a.user_id == user_id) else {
+            return;
+        };
+        let previous = std::mem::replace(&mut account.login, login.to_string());
+        match info {
+            Some(i) => {
+                account.login = i.login;
+                account.display_name = i.display_name;
+                account.avatar_url = i.profile_image_url;
+            }
+            None => account.display_name = login.to_string(),
+        }
+        match Self::save(&accounts) {
+            Ok(_) => debug!(
+                "[accounts] main account renamed on Twitch: @{} is now @{}",
+                previous, login
+            ),
+            Err(e) => warn!(
+                "[accounts] failed to record the main account's new login: {}",
+                e
+            ),
+        }
+    }
+
     /// Promote a linked account to the active (main) account: the one you watch
     /// and stream as. Lossless and non-destructive:
     ///   1. capture the outgoing main's token from the primary slot and file it
@@ -335,17 +378,24 @@ impl AccountStore {
             )
         })?;
 
-        // Preserve the outgoing main losslessly: copy its slot token into its own
-        // store so it becomes a normal linked account.
-        if let Some(old) = accounts.iter().find(|a| a.is_primary) {
-            if let Ok(old_token) = TwitchService::load_primary_token().await {
-                let _ = Self::store_secondary_token(&old.user_id, &old_token);
+        // Hold the primary slot from reading the outgoing main to writing the
+        // new one, so a token refresh can never land in between and be filed
+        // under the wrong account.
+        {
+            let slot = TwitchService::primary_slot().await;
+            // Preserve the outgoing main losslessly: copy its slot token into its
+            // own store so it becomes a normal linked account.
+            if let Some(old) = accounts.iter().find(|a| a.is_primary) {
+                if let Ok(old_token) = TwitchService::load_primary_token().await {
+                    let _ = Self::store_secondary_token(&old.user_id, &old_token);
+                }
             }
-        }
 
-        // Move the target's token into the primary slot, then drop its secondary
-        // copy so the token has exactly one home.
-        TwitchService::persist_primary_token(&target_token).await?;
+            // Move the target's token into the primary slot.
+            TwitchService::persist_primary_token(&slot, &target_token).await?;
+            TwitchService::bump_account_generation();
+        }
+        // Then drop its secondary copy so the token has exactly one home.
         let _ = Self::delete_secondary_token(user_id);
 
         let mut next = accounts;
@@ -353,6 +403,9 @@ impl AccountStore {
             a.is_primary = a.user_id == user_id;
         }
         Self::save(&next)?;
+        // A phone's go-live pushes move to the account now in front.
+        #[cfg(mobile)]
+        crate::services::push_alerts::server::schedule();
         debug!("[accounts] switched main account to @{}", target.login);
         Self::get(user_id).ok_or_else(|| anyhow::anyhow!("Account vanished after switch"))
     }
@@ -395,7 +448,11 @@ impl AccountStore {
 
         if let Some((next, next_token)) = promote {
             // Promote the chosen account into the now-empty primary slot.
-            TwitchService::persist_primary_token(&next_token).await?;
+            {
+                let slot = TwitchService::primary_slot().await;
+                TwitchService::persist_primary_token(&slot, &next_token).await?;
+                TwitchService::bump_account_generation();
+            }
             let _ = Self::delete_secondary_token(&next.user_id);
 
             let mut rebuilt: Vec<StoredAccount> = Self::list()
@@ -406,6 +463,10 @@ impl AccountStore {
                 a.is_primary = a.user_id == next.user_id;
             }
             Self::save(&rebuilt)?;
+            // `logout` above took this device off the server; it registers again
+            // under the promoted account.
+            #[cfg(mobile)]
+            crate::services::push_alerts::server::schedule();
             debug!("[accounts] signed out main; promoted @{}", next.login);
             return Ok(Some(next));
         }
@@ -556,5 +617,17 @@ fn wipe_default_webview_store() {
                 warn!("[accounts] force-reauth: could not remove {path:?}: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::login_changed;
+
+    #[test]
+    fn a_new_login_for_the_same_id_is_a_rename() {
+        assert!(login_changed("shaiza__", "1shaiza"));
+        assert!(!login_changed("BR_Winters", "br_winters"));
+        assert!(!login_changed("shaiza__", ""));
     }
 }

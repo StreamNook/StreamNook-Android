@@ -3,6 +3,7 @@
 // safe-area frame). Boot orchestration is deliberately replicated, not shared;
 // see boot/useMobileBoot.ts for the contract with App.tsx.
 import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
+import { createRevealRise } from './ui/revealRise';
 import { AnimatePresence, motion } from 'framer-motion';
 import './mobile.css';
 import { useAppStore } from '../stores/AppStore';
@@ -17,6 +18,7 @@ import { installVideoCap } from './videoCap';
 import { installLowPower } from './lowPower';
 import { installAppPresence } from './appPresence';
 import { usePageState } from './ui/usePageState';
+import { focusUnder, refuseFocusIn, watchLayerUp } from './ui/coveredSurface';
 import { MobileTabBar } from './MobileTabBar';
 import { MobileOnboarding } from './MobileOnboarding';
 // The real wizard, not a phone-shaped rewrite of it. SetupWizard is already
@@ -40,9 +42,11 @@ import { CosmeticsScreen } from './screens/CosmeticsScreen';
 import { MentionsScreen } from './screens/MentionsScreen';
 import { installMentionInbox } from './mentions/mentionInbox';
 import { WhispersScreen } from './screens/WhispersScreen';
+import { SongsScreen } from './screens/SongsScreen';
 import { installWhisperInbox } from './whispers/whisperInbox';
 import { MobileClipSheet } from './watch/MobileClipSheet';
 import { MobileChannelSheet } from './watch/MobileChannelSheet';
+import { ChannelHoldSheet } from './ui/ChannelHold';
 import LoadingWidget from '../components/LoadingWidget';
 import DeviceLoginOverlay from '../components/DeviceLoginOverlay';
 import ToastManager from '../components/ToastManager';
@@ -97,6 +101,26 @@ const MobileApp: React.FC = () => {
   // tab bar does not re-enter around a PiP round trip.
   const page = usePageState();
   const shellHidden = shellCovered || page.pip;
+  // The watch layer is up at full size over the shell: a stream, one still loading, or an offline
+  // room (WatchScreen shows on `streamUrl || isLoading`), from the layer's first frame. Input
+  // follows this one: the keyboard and the menus left open under the layer. The rests
+  // (`data-sn-covered`: glass off, animations paused) keep `shellHidden`, which only turns on
+  // once a stream is known, after the layer's fade-in, so nothing visible changes mid-fade.
+  const isLoading = useAppStore((s) => s.isLoading);
+  const shellOutOfSight = watchLayerUp(playerMode, streamUrl, isLoading) || page.pip;
+  // When the layer covers the shell, a field typed in under it gives up the keyboard: a mention,
+  // an alert or a link opens the player without the tap rule that would have put it away. Focus
+  // that arrives while it is covered is refused too (a sheet above it picking a command focuses
+  // the composer under the player).
+  // State, not a ref: the shell only renders signed in, and a remounted shell must get the
+  // listener again.
+  const [shellEl, setShellEl] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!shellOutOfSight || !shellEl) return;
+    const field = focusUnder<Element>(shellEl, document.activeElement);
+    if (field instanceof HTMLElement) field.blur();
+    return refuseFocusIn(shellEl);
+  }, [shellOutOfSight, shellEl]);
 
   // Same backstop the desktop gate uses, and it matters MORE here: the wizard's
   // own comment records that `setup_complete` has been seen reverting to false
@@ -132,8 +156,12 @@ const MobileApp: React.FC = () => {
   if (activeTab === 'chats' && !chatsKept) setChatsKept(true);
   const chatsShown = activeTab === 'chats';
   const chatsRef = useRef<HTMLDivElement | null>(null);
+  // Chats shown while the full player covered the shell (Close video lands
+  // there) is already in place when the player fades: it does not rise as well
+  // (revealRise.ts reads "covered" from the render before).
+  const [chatsRise] = useState(() => createRevealRise(chatsShown, shellHidden));
   useEffect(() => {
-    if (!chatsShown || !chatsRef.current) return;
+    if (!chatsRise(chatsShown, shellHidden) || !chatsRef.current) return;
     // A surface over the tabs (no tab bar there), so it rises into place.
     chatsRef.current.animate(
       [
@@ -142,7 +170,7 @@ const MobileApp: React.FC = () => {
       ],
       { duration: 200, easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)' },
     );
-  }, [chatsShown]);
+  });
 
   useEffect(() => installBackHandler(), []);
   useEffect(() => installLifecycle(), []);
@@ -192,8 +220,10 @@ const MobileApp: React.FC = () => {
       ) : (
         <>
           <div
+            ref={setShellEl}
             className="flex-1 min-h-0 flex flex-col relative overflow-hidden"
             data-sn-covered={shellHidden ? 'true' : undefined}
+            data-sn-out-of-sight={shellOutOfSight ? 'true' : undefined}
             style={{ paddingTop: 'var(--sn-safe-t, 0px)' }}
           >
             <AnimatePresence mode="popLayout" initial={false} custom={direction}>
@@ -228,6 +258,8 @@ const MobileApp: React.FC = () => {
           <MentionsScreen />
           {/* Over Mentions too: a whisper notification tap opens it from anywhere. */}
           <WhispersScreen />
+          {/* Over Whispers: a song card in any chat opens it too. */}
+          <SongsScreen />
           {/* Consumes the same `clipModal` store field the desktop <ClipModal />
               does. Without a mobile consumer, tapping a clip in chat flipped
               that state and rendered nothing. Portals to z-[9000] via
@@ -236,6 +268,9 @@ const MobileApp: React.FC = () => {
           <MobileClipSheet />
           {/* A channel's videos and clips, from the player's avatar and the offline room. */}
           <MobileChannelSheet />
+          {/* A held card's sheet: one for every card, so a card that moves or
+              goes away after a press never takes the sheet with it. */}
+          <ChannelHoldSheet />
         </>
       )}
 

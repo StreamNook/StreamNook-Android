@@ -2,6 +2,7 @@ pub mod default_name_color;
 pub mod account_roster;
 pub mod watch_minutes;
 pub mod link_detect;
+pub mod web_link;
 pub mod background_service;
 pub mod badge_feed;
 pub mod badge_polling_service;
@@ -22,6 +23,7 @@ pub mod activity_history_service;
 pub mod ad_bypass;
 pub mod ad_detect;
 pub mod app_paths;
+pub mod asset_scope;
 #[cfg(target_os = "ios")]
 pub mod ios_sheet;
 pub mod auth_proxy;
@@ -29,6 +31,7 @@ pub mod cache_service;
 pub mod cast_pick;
 #[cfg(target_os = "android")]
 pub mod cast_session;
+pub mod category_tags;
 pub mod changelog;
 pub mod channel_media;
 pub mod channel_avatars;
@@ -77,9 +80,17 @@ pub mod hls_projection;
 pub mod hls_seq_ids;
 #[cfg(windows)]
 pub mod webview2_failures;
+// macOS twin: a WebKit web content process that died (recorded, page reloaded).
+pub mod webkit_failures;
 // Desktop-only: Discord Rich Presence (IPC to a running Discord client).
 #[cfg(desktop)]
 pub mod discord_service;
+// Desktop-only: what the Discord status says, and the pump that sends it.
+#[cfg(desktop)]
+pub mod discord_presence;
+// Desktop-only: the viewer's own Discord look for the Discord Status preview.
+#[cfg(desktop)]
+pub mod discord_look;
 // macOS supplies its own socket discovery; see the file header for why the
 // crate's Unix finder cannot locate Discord there.
 #[cfg(target_os = "macos")]
@@ -116,6 +127,7 @@ pub mod ffz_room_badges;
 pub mod file_log;
 pub mod app_exit;
 pub mod http;
+pub mod sn_transport;
 pub mod hype_train_watch;
 pub mod irc_service;
 pub mod ivr;
@@ -131,10 +143,14 @@ pub mod youtube_auth_service;
 pub mod favorite_categories;
 pub mod hidden_channels;
 pub mod favorite_live_service;
+// Every change to the favorite lists, and their repairs.
+pub mod favorite_channels;
 // The live line for the desktop chat dock and the phone chats.
 pub mod chat_dock_live;
 pub mod live_announce;
 pub mod live_bookmark;
+// Per-channel go-live mutes and Copy from Twitch.
+pub mod live_mute;
 pub mod live_notification_service;
 pub mod offline_room;
 pub mod onsite_notifications;
@@ -144,6 +160,8 @@ pub mod provider_categories;
 pub mod provider_live_service;
 pub mod link_adapt;
 pub mod ll_origin;
+pub mod page_watchdog;
+pub mod playback_reload;
 pub mod theme_palette;
 pub mod settings_backups;
 pub mod install_marker;
@@ -152,6 +170,9 @@ pub mod alert_types;
 // Phones only: go-live push registration. Its rules are tested on desktop.
 #[cfg(any(mobile, test))]
 pub mod push_alerts;
+// The registration's state machine, pure, so its rules are tested on desktop.
+#[cfg(any(mobile, test))]
+pub mod push_plan;
 // Phones only: the background go-live check and its never-twice record. Its
 // rules are tested on desktop.
 #[cfg(any(mobile, test))]
@@ -173,6 +194,29 @@ pub mod moderation;
 // Desktop-only: MultiNook multi-stream tiling is not part of the phone app.
 #[cfg(desktop)]
 pub mod multi_nook_server;
+/// Phones have no MultiNook grid, so the tile notices the shared relays
+/// (TikTok, YouTube) send go nowhere there.
+#[cfg(not(desktop))]
+pub mod multi_nook_server {
+    pub(crate) use crate::services::tile_end::{provider_tile_ended, ProviderEndState, TileFetch};
+
+    pub(crate) fn note_tile_playlist_request(_stream_id: &str) {}
+
+    pub(crate) fn report_tile_ended(_stream_id: &str) {}
+
+    pub fn rebuild_tile_at_edge(_stream_id: &str) -> bool {
+        false
+    }
+
+    pub struct MultiNookServer;
+
+    impl MultiNookServer {
+        pub async fn stop_all() -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+}
+pub mod tile_end;
 pub mod multi_nook_meta;
 #[cfg(desktop)]
 pub mod multi_nook_raids;
@@ -187,7 +231,9 @@ pub mod seventv_cosmetics_resolver;
 pub mod seventv_eventapi;
 pub mod song_id;
 pub mod stream_server;
+pub mod cache_file_server;
 pub mod sub_standing;
+pub mod sub_badge;
 pub mod follow_lookup;
 pub mod streamnook_backend;
 pub mod css_fill;
@@ -198,6 +244,7 @@ pub mod member_signin;
 pub mod member_stats;
 pub mod member_theme;
 pub mod profile_view;
+pub mod profile_snapshot;
 pub mod flv_fmp4;
 pub mod tiktok_relay;
 pub mod ts_fmp4;
@@ -217,6 +264,7 @@ pub mod token_vault;
 pub mod tv_screen;
 pub mod twitch_chat_history;
 pub mod twitch_service;
+pub mod twitch_approval;
 pub mod twitch_signin;
 pub mod twitch_profile_edit;
 pub mod universal_cache_service;

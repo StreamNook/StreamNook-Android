@@ -81,6 +81,12 @@ static APP_HANDLE: OnceLock<crate::rt::AppHandle> = OnceLock::new();
 
 pub fn set_app_handle(handle: crate::rt::AppHandle) {
     let _ = APP_HANDLE.set(handle);
+    // Who you are on each platform is known before any window asks, so a
+    // Kick-only account's replies count from the first message. Follow
+    // only: the roster event and its Twitch-side effects wait for `notify`.
+    tauri::async_runtime::spawn(async {
+        let _ = crate::services::account_roster::build_followed().await;
+    });
 }
 
 pub fn app_handle() -> Option<crate::rt::AppHandle> {
@@ -288,7 +294,7 @@ pub async fn publish_chat_message(msg: &ChatMessage) {
         let frame = crate::services::chat_bridge_route::BridgeFrame::row(
             &msg.channel,
             json,
-            msg.metadata.is_mentioned || msg.metadata.is_reply_to_me,
+            crate::services::mention_inbox::pinged(&verdict),
         );
         match IrcService::broadcaster().await {
             Some(tx) => {

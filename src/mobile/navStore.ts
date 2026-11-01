@@ -40,6 +40,11 @@ interface MobileNavState {
   whispersOpen: boolean;
   /** The conversation open in its bottom sheet, by its inbox key. */
   whisperKey: string | null;
+  /** Your songs, over everything else like Mentions (a song card in any chat
+   *  opens it too). */
+  songsOpen: boolean;
+  /** The song open in its detail, by its history key; null shows the list. */
+  songsFocus: string | null;
   /** Watch presentation: full screen, or the draggable in-app mini player
    *  (the tab shell stays live behind it). System PiP is separate: that hands
    *  the whole activity to the OS window. */
@@ -81,11 +86,30 @@ interface MobileNavState {
   closeWhisper: () => void;
   /** Close the whispers layer entirely. */
   closeWhispers: () => void;
+  /** Your songs, on one song's detail when `focus` is given. */
+  openSongs: (focus?: string | null) => void;
+  closeSongs: () => void;
+  setSongsFocus: (key: string | null) => void;
   setPlayerMode: (mode: 'full' | 'mini') => void;
-  /** Back chain: top sheet (a whisper conversation is one) -> whispers -> mentions -> settings -> cosmetics -> minimize the watch layer
+  /** Back chain: top sheet (a whisper conversation is one) -> a song's detail -> songs -> whispers -> mentions -> settings -> cosmetics -> minimize the watch layer
    *  -> category drill -> a tab other than the start tab -> not consumed
    *  (native backgrounds the task). */
   handleBack: () => boolean;
+}
+
+/** What takes Back before the full player shrinks, in handleBack's order: an
+ *  open sheet, Songs, Whispers, Mentions, Settings, Cosmetics. The watch
+ *  layer's claim on chat's screen edge reads it too (SN-30), so a new Back
+ *  consumer ahead of the player belongs here as well as in handleBack. */
+export function backTakenBeforePlayer(s: {
+  sheetStack: string[];
+  songsOpen: boolean;
+  whispersOpen: boolean;
+  mentionsOpen: boolean;
+  settingsView: string | null;
+  cosmeticsOpen: boolean;
+}): boolean {
+  return s.sheetStack.length > 0 || s.songsOpen || s.whispersOpen || s.mentionsOpen || !!s.settingsView || s.cosmeticsOpen;
 }
 
 export const useMobileNavStore = create<MobileNavState>((set, get) => ({
@@ -101,6 +125,8 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
   mentionsOpen: false,
   whispersOpen: false,
   whisperKey: null,
+  songsOpen: false,
+  songsFocus: null,
   playerMode: 'full',
   focusDropCampaignId: null,
   chatsReturnTab: startTab() === 'chats' ? 'following' : startTab(),
@@ -151,30 +177,44 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
   openWhisper: (key) => set({ whisperKey: key, mentionsOpen: false }),
   closeWhisper: () => set({ whisperKey: null }),
   closeWhispers: () => set({ whispersOpen: false, whisperKey: null }),
+  openSongs: (focus = null) => set({ songsOpen: true, songsFocus: focus }),
+  closeSongs: () => set({ songsOpen: false, songsFocus: null }),
+  setSongsFocus: (key) => set({ songsFocus: key }),
   setPlayerMode: (mode) => set({ playerMode: mode }),
 
   handleBack: () => {
     const { sheetStack, activeTab, settingsView, browseCategory, cosmeticsOpen, mentionsOpen, playerMode } =
       get();
-    if (sheetStack.length > 0) {
-      const top = sheetStack[sheetStack.length - 1];
-      window.dispatchEvent(new CustomEvent('sn:close-sheet', { detail: top }));
-      return true;
-    }
-    if (get().whispersOpen) {
-      set({ whispersOpen: false });
-      return true;
-    }
-    if (mentionsOpen) {
-      set({ mentionsOpen: false });
-      return true;
-    }
-    if (settingsView) {
-      get().closeSettings();
-      return true;
-    }
-    if (cosmeticsOpen) {
-      set({ cosmeticsOpen: false });
+    // Only what backTakenBeforePlayer lists may take Back before the player: a
+    // consumer added here without it never runs, so the watch layer's claim on
+    // chat's edge cannot drift from this list.
+    if (backTakenBeforePlayer(get())) {
+      if (sheetStack.length > 0) {
+        const top = sheetStack[sheetStack.length - 1];
+        window.dispatchEvent(new CustomEvent('sn:close-sheet', { detail: top }));
+        return true;
+      }
+      if (get().songsOpen) {
+        if (get().songsFocus) set({ songsFocus: null });
+        else get().closeSongs();
+        return true;
+      }
+      if (get().whispersOpen) {
+        set({ whispersOpen: false });
+        return true;
+      }
+      if (mentionsOpen) {
+        set({ mentionsOpen: false });
+        return true;
+      }
+      if (settingsView) {
+        get().closeSettings();
+        return true;
+      }
+      if (cosmeticsOpen) {
+        set({ cosmeticsOpen: false });
+        return true;
+      }
       return true;
     }
     // Back from the full watch view shrinks into the in-app mini player, so
@@ -184,13 +224,14 @@ export const useMobileNavStore = create<MobileNavState>((set, get) => ({
       set({ playerMode: 'mini' });
       return true;
     }
-    if (browseCategory) {
-      set({ browseCategory: null });
-      return true;
-    }
-    // Chats is a surface over the tabs: back leaves it for the tab it came from.
+    // Chats is a surface over the tabs (and over a category page left open on
+    // Browse): back leaves it for the tab it came from, category and all.
     if (activeTab === 'chats') {
       get().exitChats();
+      return true;
+    }
+    if (browseCategory) {
+      set({ browseCategory: null });
       return true;
     }
     // Back unwinds to the tab the app OPENS on, not to Following: someone who

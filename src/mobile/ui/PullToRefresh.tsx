@@ -9,6 +9,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { ArrowDown } from 'phosphor-react';
 import PenroseMarch from '../../components/PenroseMarch';
+import { pullDecision } from './pullGesture';
 
 const ARM_THRESHOLD_PX = 72;
 const MAX_PULL_PX = 120;
@@ -17,7 +18,10 @@ export const PullToRefresh: React.FC<{
   onRefresh: () => Promise<unknown>;
   className?: string;
   children: React.ReactNode;
-}> = ({ onRefresh, className, children }) => {
+  /** Gets the list's scroller, for a screen that scrolls it itself (to the top
+   *  on a new tag filter). */
+  scrollerRef?: React.MutableRefObject<HTMLDivElement | null>;
+}> = ({ onRefresh, className, children, scrollerRef }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [pull, setPull] = useState(0);
   const [dragging, setDragging] = useState(false);
@@ -30,11 +34,23 @@ export const PullToRefresh: React.FC<{
     onRefreshRef.current = onRefresh;
   });
 
+  // Hands the scroller to a screen that asked for it. Copied out, never passed
+  // as the element's `ref`: this component's own touch listeners hang off
+  // `scrollRef`.
+  useEffect(() => {
+    if (!scrollerRef) return;
+    scrollerRef.current = scrollRef.current;
+    return () => {
+      scrollerRef.current = null;
+    };
+  }, [scrollerRef]);
+
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
 
     let startY: number | null = null;
+    let startX = 0;
     let pulling = false;
     let lastPull = 0;
 
@@ -49,6 +65,7 @@ export const PullToRefresh: React.FC<{
       if (refreshingRef.current) return;
       if (el.scrollTop > 0) return;
       startY = e.touches[0].clientY;
+      startX = e.touches[0].clientX;
       pulling = false;
     };
 
@@ -57,8 +74,14 @@ export const PullToRefresh: React.FC<{
       const dy = e.touches[0].clientY - startY;
       if (!pulling) {
         // Only claim the gesture when the list is at its top and the finger
-        // moves down; otherwise hand it back to native scrolling.
-        if (dy <= 0 || el.scrollTop > 0) {
+        // moves more down than sideways; otherwise hand it back to native
+        // scrolling, so a sideways scroller in the list (a card's tag line)
+        // keeps its swipe.
+        // Decided only once the finger is past the slop (inside it, neither
+        // claimed nor handed back), see pullDecision.
+        const decision = pullDecision(e.touches[0].clientX - startX, dy, el.scrollTop, e.cancelable);
+        if (decision === 'wait') return;
+        if (decision === 'release') {
           startY = null;
           return;
         }

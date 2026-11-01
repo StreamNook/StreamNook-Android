@@ -1,8 +1,9 @@
+import { useState } from 'react';
 import { Dropdown } from '../ui/Dropdown';
 import { useAppStore } from '../../stores/AppStore';
 // Shared panel: both shells render it, so a platform branch here is legitimate.
 // Hides rows whose backing feature does not exist on Android.
-import { IS_MOBILE } from '../../utils/platform';
+import { IS_LINUX, IS_MAC, IS_MOBILE } from '../../utils/platform';
 import { SettingsSection, SettingsRow, SegmentedSelect } from './_primitives';
 import { InlineSlider, SubControl, SubControls } from '../plugins/settingsPageKit';
 import { DEFAULT_AUDIO_BOOST, DEFAULT_SONG_ID } from '../../types';
@@ -14,8 +15,12 @@ import {
   AUDIO_GRAPH_REFUSAL,
 } from '../../utils/audioBoost';
 import { reportCodecPreference } from '../../utils/codecPreference';
+import { openSongs } from '../../utils/songHistory';
+import { GLAZE_PILL } from '../ui/glazeButtons';
 import { invoke } from '@tauri-apps/api/core';
 import { thenRun, useSettingReset } from './settingReset';
+import { fillScale } from '../../mobile/player/videoFill';
+import { useZoomToFill, writeZoomToFill } from '../../mobile/player/zoomToFill';
 import { AUTO_GAP } from '../../utils/latency';
 import { TitleBarTuckPreview } from './TitleBarTuckPreview';
 import { GlassMultiSelect } from '../ui/GlassMultiSelect';
@@ -40,11 +45,19 @@ const Toggle = ({ enabled, onChange }: { enabled: boolean; onChange: () => void 
 
 // The action buttons that can appear in the player's top-right overlay. Ids
 // match the gating in VideoPlayer. Undefined `player_overlay_buttons` = all on.
-const OVERLAY_BUTTONS: { id: string; label: string }[] = [
-  { id: 'follow', label: 'Follow / Unfollow' },
+const OVERLAY_BUTTONS: { id: string; label: string; description?: string }[] = [
+  {
+    id: 'follow',
+    label: 'Follow / Unfollow',
+    description: 'The bell beside it turns live alerts on or off for that channel.',
+  },
   { id: 'subscribe', label: 'Subscribe / Gift' },
   { id: 'clip', label: 'Create Clip' },
-  { id: 'song', label: 'Identify Song' },
+  {
+    id: 'song',
+    label: 'Songs',
+    description: 'The music note identifies the song playing, and the arrow beside it opens your songs.',
+  },
   { id: 'share', label: 'Share' },
   { id: 'clipsvods', label: 'Clips & VODs' },
   { id: 'multinook', label: 'Add to MultiNook' },
@@ -60,9 +73,44 @@ const refreshContinueWatching = () => {
   void invoke('refresh_home_section', { section: 'continue_watching' }).catch(() => {});
 };
 
+/** What Zoom to fill does on this phone: its own screen on its side, with a
+ *  16:9 picture fitted (bars at the sides) or filled (top and bottom trimmed).
+ *  A screen no wider than 16:9 shows a 4:3 picture, so the change shows. Uses
+ *  the player's own fillScale. */
+const FillPreview = ({ on }: { on: boolean }) => {
+  const [aspect] = useState(() => {
+    const long = Math.max(window.screen.width, window.screen.height);
+    const short = Math.min(window.screen.width, window.screen.height);
+    return short > 0 ? long / short : 19.5 / 9;
+  });
+  const picture: [number, number] = aspect > 16 / 9 + 0.01 ? [16, 9] : [4, 3];
+  const width = 168;
+  const height = Math.round(width / aspect);
+  const pictureWidth = (height * picture[0]) / picture[1];
+  const scale = on ? fillScale(aspect * 90, 90, picture[0], picture[1]) : 1;
+  return (
+    <div
+      aria-hidden
+      className="relative mx-auto mt-1 overflow-hidden rounded-[10px] bg-black ring-1 ring-borderSubtle"
+      style={{ width, height }}
+    >
+      <div
+        className="absolute top-0 bottom-0 left-1/2 transition-transform duration-200 ease-[cubic-bezier(0.2,0.8,0.2,1)]"
+        style={{
+          width: pictureWidth,
+          marginLeft: -pictureWidth / 2,
+          transform: `scale(${scale})`,
+          background: 'linear-gradient(135deg, var(--color-accent), color-mix(in srgb, var(--color-accent) 35%, #000))',
+        }}
+      />
+    </div>
+  );
+};
+
 const PlayerSettings = () => {
   const { settings, updateSettings } = useAppStore();
   const resetFor = useSettingReset();
+  const zoomToFill = useZoomToFill();
 
   // Fallback only used if settings.streamlink is somehow absent.
   const streamlinkDefaults = {
@@ -87,10 +135,13 @@ const PlayerSettings = () => {
 
   const scrollVolume = videoPlayer?.scroll_volume ?? true;
   const scrollAboutReveal = videoPlayer?.scroll_about_reveal ?? true;
+  const clickToPause = videoPlayer?.click_to_pause ?? false;
   const middleClickMute = videoPlayer?.middle_click_mute ?? true;
   const middleClickMultiNook = videoPlayer?.middle_click_multinook ?? true;
+  const mediaKeys = videoPlayer?.media_keys ?? true;
   const resumeVodPlayback = videoPlayer?.resume_vod_playback ?? true;
   const syncVodProgress = videoPlayer?.sync_vod_progress ?? true;
+  const continueWatchingLive = videoPlayer?.continue_watching_live ?? false;
   const targetLatencyLabel =
     videoPlayer?.ll_target_latency == null ? 'Auto' : `${videoPlayer.ll_target_latency.toFixed(1)}s`;
   const wheelVolumeStep = videoPlayer?.wheel_volume_step ?? 0.05;
@@ -166,6 +217,7 @@ const PlayerSettings = () => {
           <SettingsRow
             key={b.id}
             title={b.label}
+            description={b.description}
             onReset={isOverlayButtonOn(b.id) ? undefined : () => toggleOverlayButton(b.id)}
             control={
               <Toggle enabled={isOverlayButtonOn(b.id)} onChange={() => toggleOverlayButton(b.id)} />
@@ -343,6 +395,19 @@ const PlayerSettings = () => {
         description="Drive the player one-handed with the mouse. The player controls apply to the main player and to each MultiNook tile."
       >
         <SettingsRow
+          title="Click to pause"
+          onReset={resetFor(['video_player.click_to_pause', false])}
+          description="Click the video to pause or play it. Off, a click only leaves the chat box, so Space, M and the other player keys work."
+          help="Double-click still goes full screen. A paused stream stops downloading however you pause it."
+          control={
+            <Toggle
+              enabled={clickToPause}
+              onChange={() => setVideoPlayer({ click_to_pause: !clickToPause })}
+            />
+          }
+        />
+
+        <SettingsRow
           title="Scroll volume"
           onReset={resetFor(['video_player.scroll_volume', true])}
           description="Scroll the wheel over the player to turn the stream up and down."
@@ -444,6 +509,24 @@ const PlayerSettings = () => {
           }
         />
 
+        {/* Windows only: Rust reads it at launch and turns off the webview's
+            media key handling, which is what puts the player in Windows' media
+            controls. */}
+        {!IS_MOBILE && !IS_MAC && !IS_LINUX && (
+          <SettingsRow
+            title="Media keys"
+            onReset={resetFor(['video_player.media_keys', true])}
+            description="Your keyboard's play/pause key pauses and plays the stream. Turn it off to keep the media keys for your music player."
+            help="Off, StreamNook also leaves the Windows media panel. The change applies the next time StreamNook starts."
+            control={
+              <Toggle
+                enabled={mediaKeys}
+                onChange={() => setVideoPlayer({ media_keys: !mediaKeys })}
+              />
+            }
+          />
+        )}
+
         {/* Phone-only: a desktop has nothing to leave the app INTO, and no
             picture-in-picture window to choose against. */}
         {IS_MOBILE && (
@@ -474,6 +557,19 @@ const PlayerSettings = () => {
               />
             }
           />
+        )}
+
+        {/* Phone-only: the landscape picture fills a long screen. A pinch on the
+            video sets the same thing (zoomToFill.ts is its one writer). */}
+        {IS_MOBILE && (
+          <SettingsRow
+            title="Zoom to fill"
+            onReset={zoomToFill ? () => void writeZoomToFill(false) : undefined}
+            description="On its side, the stream fills a long screen by trimming a little off the top and bottom. A pinch on the video switches it too."
+            control={<Toggle enabled={zoomToFill} onChange={() => void writeZoomToFill(!zoomToFill)} />}
+          >
+            <FillPreview on={zoomToFill} />
+          </SettingsRow>
         )}
 
         <SettingsRow
@@ -556,7 +652,7 @@ const PlayerSettings = () => {
           help={
             IS_MOBILE
               ? "Off starts every VOD from the beginning. Only past broadcasts you open yourself are remembered, never a live stream you were watching. Device sync keeps your place in each VOD the same on every StreamNook you sign in to, and saves it to your Twitch account for Twitch's own apps."
-              : "Off starts every VOD from the beginning and hides the Continue Watching row; positions are still remembered for the video cards. Only VODs you open yourself are remembered, never a live stream you were watching. Device sync keeps your Continue Watching row and your place in each VOD the same on every StreamNook you sign in to, and saves your place to your Twitch account for Twitch's own apps."
+              : "Off starts every VOD from the beginning and hides the Continue Watching row; positions are still remembered for the video cards. Live streams adds the streams you left partway through to the row, each opening its recording where you left; a stream you watched to the end or only flipped past for a couple of minutes stays off. Device sync keeps your Continue Watching row and your place in each VOD the same on every StreamNook you sign in to, and saves your place to your Twitch account for Twitch's own apps."
           }
           control={
             <Toggle
@@ -588,6 +684,26 @@ const PlayerSettings = () => {
                   />
                 }
               />
+              {/* Desktop only: the phones draw no Continue Watching row. */}
+              {!IS_MOBILE && (
+                <SubControl
+                  title="Live streams"
+                  onReset={
+                    continueWatchingLive
+                      ? thenRun(resetFor(['video_player.continue_watching_live', false]), refreshContinueWatching)
+                      : undefined
+                  }
+                  control={
+                    <Toggle
+                      enabled={continueWatchingLive}
+                      onChange={() => {
+                        setVideoPlayer({ continue_watching_live: !continueWatchingLive });
+                        refreshContinueWatching();
+                      }}
+                    />
+                  }
+                />
+              )}
             </SubControls>
           )}
         </SettingsRow>
@@ -871,6 +987,17 @@ const PlayerSettings = () => {
         {/* Recognition listens through the same tap Audio Boost uses, so it is
             closed on exactly the same shells. */}
         <div className={AUDIO_GRAPH_SUPPORTED ? '' : 'opacity-50 pointer-events-none'}>
+        {AUDIO_GRAPH_SUPPORTED && (
+          <SettingsRow
+            title="Your songs"
+            description="Every song you identified, newest first, with its links and where you heard it."
+            control={
+              <button type="button" onClick={() => openSongs()} className={`${GLAZE_PILL} h-8 px-3.5 text-[12.5px]`}>
+                Open
+              </button>
+            }
+          />
+        )}
         <SettingsRow
           title={`Listen time: ${songId.capture_seconds}s`}
           onReset={resetFor(['video_player.song_id.capture_seconds', DEFAULT_SONG_ID.capture_seconds])}

@@ -68,7 +68,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Player',
     section: 'Player Buttons',
     title: 'Player Buttons',
-    description: 'Choose which action buttons (follow, subscribe, create clip, identify song, clips & vods, add to multinook, refresh, close) appear in the top-right of the video player. Previously "Player Overlay Buttons".'
+    description: 'Choose which action buttons (follow, subscribe, create clip, songs, share, clips & vods, add to multinook, refresh, close) appear in the top-right of the video player. Songs identifies the song playing and opens your songs. Previously "Player Overlay Buttons".'
   },
   {
     tab: 'Player',
@@ -83,6 +83,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     sectionId: 'settings-section-mouse-controls',
     title: 'Scroll for About',
     description: "Scroll down over the player (with Shift when the wheel is set to volume) to slide the channel's About panel up over the stream. Previously \"Scroll to open Channel About\"."
+  },
+  {
+    tab: 'Player',
+    section: 'Mouse Controls',
+    sectionId: 'settings-section-mouse-controls',
+    title: 'Click to pause',
+    description: 'Click the video to pause or play the stream. Turn it off and a click only leaves the chat box, so Space, M and the other player keys work without pausing.'
   },
   {
     tab: 'Player',
@@ -120,6 +127,14 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     title: 'Device sync',
     parent: 'Resume VODs',
     description: 'Keep Continue Watching and your place in each VOD the same on every StreamNook you sign in to, and in Twitch apps.'
+  },
+  {
+    tab: 'Player',
+    section: 'Playback',
+    sectionId: 'settings-section-video-player',
+    title: 'Live streams',
+    parent: 'Resume VODs',
+    description: 'Continue Watching also shows live streams you left partway through, each opening its recording where you left. Resume a livestream, pick up a stream where I left off, live resume.'
   },
   {
     tab: 'Player',
@@ -217,6 +232,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Player',
+    section: 'Playback',
+    sectionId: 'settings-section-video-player',
+    title: 'Media keys',
+    description: 'The keyboard play/pause key controls the stream. Turn it off so the media keys go to your music player instead; applies after a restart. Ignore media keys, hardware keys, Windows media controls.'
+  },
+  {
+    tab: 'Player',
     section: 'Latency & Buffering',
     sectionId: 'settings-section-latency',
     title: 'Target latency',
@@ -310,7 +332,14 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Song Identification',
     sectionId: 'settings-section-song-id',
     title: 'Song Identification',
-    description: 'Identify the music playing in a stream (what song is this). Powers the /song chat command and the player music button; names the track and links it on Spotify, Apple Music, and song.link. Shazam, recognize, now playing.'
+    description: 'Identify the music playing in a stream (what song is this). Powers the /song chat command and the player music button; names the track and links it on Spotify, Apple Music, YouTube Music, Deezer, Tidal and more. Shazam, recognize, now playing.'
+  },
+  {
+    tab: 'Player',
+    section: 'Song Identification',
+    sectionId: 'settings-section-song-id',
+    title: 'Your songs',
+    description: 'Every song you identified, newest first, with its links and where you heard it. Song history, a list of identified songs, remember song names.'
   },
   {
     tab: 'Player',
@@ -625,6 +654,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Chat',
     section: 'Message Layout',
+    title: 'Position',
+    parent: 'Timestamps',
+    description: 'Beside the name, or on its own line above the message.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Message Layout',
     title: 'Seconds',
     parent: 'Timestamps',
     description: 'Shows seconds too, so 7:42 PM reads 7:42:30 PM. Previously "Include seconds".'
@@ -819,7 +855,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Tab Completion',
     sectionId: 'settings-section-emote-tab-completion',
     title: 'Colon list',
-    description: 'Type a colon and two letters to see every emote you can use and where it comes from. Previously "Show the emote list when you type :".'
+    description: 'Type a colon and a letter to see every emote you can use and where it comes from. Previously "Show the emote list when you type :".'
   },
   {
     tab: 'Chat',
@@ -1007,6 +1043,12 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Names & Badges',
     title: 'Paint shadows',
     description: 'Some paints stack several drop shadows for readability; keep them all, just one, or none if names look too noisy. Previously "Paint drop shadows". Visual controls for 7TV-rendered usernames (paints), including drop shadows.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Names & Badges',
+    title: 'Atmospheres',
+    description: "A StreamNook member's atmosphere behind their messages. Off keeps every message plain; their profile still shows it. Hide atmospheres in chat, message backgrounds, Cologne look, member wash."
   },
   {
     tab: 'Chat',
@@ -2495,6 +2537,21 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     title: 'Discord Rich Presence',
     description: "Show what you're watching on your Discord profile. Discord RPC, activity, status."
   },
+  { tab: 'Integrations', section: 'Presets', sectionId: 'discord-status-editor', title: 'Presets', description: 'Discord status looks: Classic, Spotlight, Low-key. Customize your Discord Rich Presence.' },
+  { tab: 'Integrations', section: 'Pictures', sectionId: 'discord-status-editor', title: 'Big picture', description: "The large image on your Discord status: category art, the streamer's profile picture (pfp, avatar) or StreamNook." },
+  { tab: 'Integrations', section: 'Pictures', sectionId: 'discord-status-editor', title: 'Small badge', description: 'The small circle on your Discord status picture: platform logo, streamer picture, category or none.' },
+  { tab: 'Integrations', section: 'Text', sectionId: 'discord-status-editor', title: 'Top line', description: 'Your Discord status text, first line. Tokens like {streamer}, {title}, {category}.' },
+  { tab: 'Integrations', section: 'Text', sectionId: 'discord-status-editor', title: 'Bottom line', description: 'Your Discord status text, second line.' },
+  { tab: 'Integrations', section: 'Text', sectionId: 'discord-status-editor', title: 'Show', description: 'Your Discord status while browsing: fun phrases, your own text, or nothing.' },
+  { tab: 'Integrations', section: 'Text', sectionId: 'discord-status-editor', parent: 'Show', title: 'Text', description: 'Your own Discord status text while browsing.' },
+  { tab: 'Integrations', section: 'Status', sectionId: 'discord-status-editor', title: 'Activity', description: 'Watching, Playing or Listening on your Discord status.' },
+  { tab: 'Integrations', section: 'Status', sectionId: 'discord-status-editor', title: 'Member list', description: "What a server's member list shows under your name." },
+  { tab: 'Integrations', section: 'Status', sectionId: 'discord-status-editor', title: 'Timer', description: 'Your Discord status timer: time watching, stream uptime, or off.' },
+  { tab: 'Integrations', section: 'Buttons', sectionId: 'discord-status-editor', title: 'Watch button', description: 'A button friends click to open the stream, VOD or clip.' },
+  { tab: 'Integrations', section: 'Buttons', sectionId: 'discord-status-editor', parent: 'Watch button', title: 'Label', description: 'The Watch button text.' },
+  { tab: 'Integrations', section: 'Buttons', sectionId: 'discord-status-editor', title: 'StreamNook button', description: 'The streamnook.app button on your Discord status. Subscribers can turn it off.' },
+  { tab: 'Integrations', section: 'Status', sectionId: 'discord-status-editor', title: 'Shown as', description: 'Watching Twitch instead of Watching StreamNook on your Discord status, with the platform mark. Subscribers only.' },
+  { tab: 'Integrations', section: 'Links', sectionId: 'discord-status-editor', title: 'Clickable text', description: 'Your Discord status text links to the channel.' },
   {
     tab: 'Integrations',
     section: 'Ad Blocking',
@@ -2567,6 +2624,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Notify me about',
     title: 'Live channels',
     description: 'When a channel you follow goes live, the moment it starts streaming, and clicking it opens the stream. Going live, followed channels. Previously "Followed channels".'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
+    title: 'Which channels',
+    parent: 'Live channels',
+    description: 'Turn live alerts off for single channels you follow or favorited, or copy every channel whose notification bell is off on Twitch. Mute alerts, mute a channel, silence a streamer, bell.'
   },
   {
     tab: 'Notifications',

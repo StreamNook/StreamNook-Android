@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, emit } from '@tauri-apps/api/event';
-import type { Settings, TwitchUser, TwitchStream, UserInfo, TwitchCategory, HypeTrainData, ModLogEvent, DropProgressStatus, FavoriteChannel, VodStartInfo, LiveRewindInfo, HomeSnapshot, HomeSnapshotUpdate, HypeTrainBulkStatus, ContinueWatchingItem, FollowingLists, Collaboration, SharedChat, OfflineRoom } from '../types';
+import type { Settings, TwitchUser, TwitchStream, UserInfo, TwitchCategory, HypeTrainData, ModLogEvent, DropProgressStatus, VodStartInfo, LiveRewindInfo, HomeSnapshot, HomeSnapshotUpdate, HypeTrainBulkStatus, ContinueWatchingItem, FollowingLists, Collaboration, SharedChat, OfflineRoom } from '../types';
 import { trackActivity } from '../services/logService';
 import { Logger, setDiagnosticsEnabled } from '../utils/logger';
 import { getAppVersion } from '../utils/appVersion';
@@ -14,7 +14,8 @@ import { updatePresence } from '../services/supabaseService';
 import { patchSettings, settingsDiff } from '../utils/settingsBroadcast';
 import { IS_MOBILE } from '../utils/platform';
 import { makeKey, parseKey } from '../utils/providerKey';
-import { isStrayYouTubeFavoriteId } from '../utils/favorites';
+import { clearPauseIntent, forgetOwnChannel, holdOwnChannel } from '../utils/pausePark';
+import { favoritesDiffer, RUST_ONLY_KEYS, settlePending, type FavoritePending } from '../utils/favoriteLabel';
 import { buildProviderUrl, streamProvider } from '../utils/streamProvider';
 import { categoryNavigation, type StreamCategoryTarget } from '../utils/streamCategory';
 import { signInRequiredFrom } from '../utils/signInRequired';
@@ -57,6 +58,9 @@ export type StreamStartResult = {
   /** Clips only: where this clip sits inside its source broadcast, so chat replay can
    *  address the right comments. Playback never uses it. */
   clip_source?: ClipSource;
+  /** Clips and VODs: the Twitch category they were recorded under. Absent for live
+   *  (the stream row carries it) and for a video filed under none. */
+  category?: { id: string; name: string };
   /** How the player should ingest `url`. Absent (every Twitch path) means HLS. */
   kind?: 'hls' | 'flv' | 'mp4';
   /** VOD starts only: status, length, where to begin, and whether this VOD is
@@ -100,6 +104,8 @@ function logQualityFallback(requested: string, actual: string) {
 
 export interface Toast {
   id: number;
+  /** A short heading drawn above the message. */
+  title?: string;
   message: string | React.ReactNode;
   type: 'info' | 'success' | 'warning' | 'error' | 'live' | 'channel_points';
   action?: {
@@ -219,7 +225,7 @@ export interface WhisperImportState {
   error: string | null;
 }
 
-interface AppState {
+export interface AppState {
   settings: Settings;
   followedStreams: TwitchStream[];
   offlineFollowedChannels: TwitchStream[];
@@ -256,6 +262,17 @@ interface AppState {
    *  snapshot section): live favourites, the other live follows and the
    *  offline roster. Home and the Sidebar only filter to their platform. */
   following: FollowingLists;
+  /** The revision of the `following` lists held, -1 before any arrived. */
+  followingRev: number;
+  /** Rust's lists have arrived in this window (a snapshot or a push). */
+  followingApplied: boolean;
+  /** Favorite presses on their way, by tagged key (utils/favoriteLabel). */
+  favoritePending: Record<string, FavoritePending>;
+  /** A row's key to the `id:` key Rust stored it under, when they differ. */
+  favoriteAlias: Record<string, string>;
+  /** Moves on every change a favorite label can read: lists rendering
+   *  hearts select it. */
+  favoriteVersion: number;
   /** The unified Categories tab's "On other platforms" row, built in Rust. */
   otherCategories: ProviderCategory[];
   /** The Categories tab's favorites row, built in Rust with live counts. */
@@ -418,6 +435,10 @@ interface AppState {
   // a cross-channel "add to a set" picker. Set by clicking an emote in chat.
   emoteSpotlight: { id: string; name: string } | null;
   showWhispersOverlay: boolean;
+  /** Your songs (components/songs/SongsPanelHost): open, with the song shown
+   *  in detail by its history key, or null for the list. Presentation only;
+   *  the songs are Rust's. */
+  songsPanel: { focus: string | null } | null;
   showDashboardOverlay: boolean;
   whisperTargetUser: { id: string; login: string; display_name: string; profile_image_url?: string } | null;
   // Whisper import state (persistent across wizard open/close)
@@ -508,6 +529,11 @@ interface AppState {
    */
   searchReturnTab: HomeTab;
   homeCategoryTab: 'live' | 'clips' | 'videos';
+  /** The category page's picked tags: one category's (its name trimmed and
+   *  lowercased, as `categoryKey` makes it) while you are in it. Kept here so
+   *  they survive Home unmounting under the player; Home clears them on leaving
+   *  the category. */
+  homeCategoryTags: { key: string; tags: string[] };
   
   // Media sorting and filtering state
   clipsPeriod: string;
@@ -541,7 +567,7 @@ interface AppState {
   patchCurrentStream: (partial: Partial<TwitchStream>) => void;
   /** `sticky` keeps the toast on screen until it is dismissed or removed by
    *  id; pass `id` to be able to remove it. */
-  addToast: (message: string | React.ReactNode, type: 'info' | 'success' | 'warning' | 'error' | 'live' | 'channel_points', action?: { label: string; onClick: () => void }, options?: { skipIsland?: boolean; alwaysShow?: boolean; avatarUrl?: string; avatarSevenTvId?: string; source?: 'plugin'; sticky?: boolean; id?: number }) => void;
+  addToast: (message: string | React.ReactNode, type: 'info' | 'success' | 'warning' | 'error' | 'live' | 'channel_points', action?: { label: string; onClick: () => void }, options?: { skipIsland?: boolean; alwaysShow?: boolean; avatarUrl?: string; avatarSevenTvId?: string; source?: 'plugin'; sticky?: boolean; id?: number; title?: string; songKey?: string }) => void;
   removeToast: (id: number) => void;
   loadSettings: () => Promise<void>;
   updateSettings: (newSettings: Settings) => Promise<void>;
@@ -588,8 +614,13 @@ interface AppState {
   playMedia: (type: 'clip' | 'video', url: string, info: MediaInfo) => Promise<void>;
   stopStream: (options?: { preserveBackend?: boolean }) => Promise<void>;
   /** Restart the current stream (stops and starts again). `quiet` skips the
-   *  confirmation toast, for a reload the viewer did not ask for. */
-  restartStream: (options?: { quiet?: boolean }) => Promise<void>;
+   *  confirmation toast, for a reload the viewer did not ask for. `ifUrl` makes
+   *  the restart a no-op when the stream's URL is no longer that one (a swap
+   *  replaced the stream the caller saw). A call made while a restart is
+   *  running returns that restart. `reason` names an AUTOMATIC reload (the
+   *  player recovering on its own); Rust counts those per channel and logs
+   *  them. Absent = the viewer asked. */
+  restartStream: (options?: { quiet?: boolean; ifUrl?: string; reason?: AutoReloadReason }) => Promise<void>;
   isRestartingStream: boolean;  // True from restart begin until the new stream URL lands; the player freezes its loader on this so it doesn't poll a dead backend
   /** Phone only: why a provider stream has no picture while its chat keeps
    *  running (it ended, is offline, or failed to start). Keyed by the stream's
@@ -637,6 +668,9 @@ interface AppState {
   openEmoteSpotlight: (emoteId: string, name: string) => void;
   setEmoteSpotlight: (e: { id: string; name: string } | null) => void;
   setShowWhispersOverlay: (show: boolean) => void;
+  openSongs: (focus?: string | null) => void;
+  closeSongs: () => void;
+  setSongsFocus: (key: string | null) => void;
   setShowDashboardOverlay: (show: boolean) => void;
   openWhisperWithUser: (user: { id: string; login: string; display_name: string; profile_image_url?: string }) => void;
   clearWhisperTargetUser: () => void;
@@ -653,15 +687,6 @@ interface AppState {
   /** Internal: refresh watched identity + follows + accounts + chat after the primary slot changes. */
   reestablishIdentityAfterSwitch: () => Promise<void>;
   checkAuthStatus: () => Promise<void>;
-  /** Add or remove a favorite. `id` comes from `favoriteIdOf` (utils/favorites),
-   *  never from a raw `user_id`: platform ids collide across services. `meta` is
-   *  the identity sidecar, captured from the row so the channel can still be
-   *  drawn once it is offline. */
-  toggleFavoriteStreamer: (id: string, meta?: FavoriteChannel) => Promise<void>;
-  isFavoriteStreamer: (id: string) => boolean;
-  /** Fill in identity for favorites saved as bare ids, before the sidecar
-   *  existed. Resolves nothing and writes nothing when they all already have it. */
-  backfillFavoriteIdentities: () => Promise<void>;
   toggleHome: () => void;
   exitStream: (options?: { preserveBackend?: boolean }) => Promise<void>;
   // Navigation actions for deep linking
@@ -681,6 +706,7 @@ interface AppState {
   openStreamCategory: (target: StreamCategoryTarget) => void;
   setSearchReturnTab: (tab: HomeTab) => void;
   setHomeCategoryTab: (tab: 'live' | 'clips' | 'videos') => void;
+  setHomeCategoryTags: (key: string, tags: string[]) => void;
   
   // Category cache actions
   setCachedTopGames: (games: TwitchCategory[], cursor: string | null, hasMore: boolean) => void;
@@ -713,8 +739,17 @@ interface AppState {
 /** Newest-first, in-memory ceiling across channels. */
 const MOD_LOG_CAP = 300;
 
+/** Seconds to wait before each retry of a mod-log history load Rust rejected;
+ *  the last wait repeats until the load succeeds or the channel closes. */
+const MOD_LOG_RETRY_SECONDS = [1, 2, 4, 8, 16, 30];
+
+/** The history load that owns each channel. A load keeps retrying only while it
+ *  still owns its channel, so a channel is never retried by two loads at once. */
+const modLogLoadOwner = new Map<string, number>();
+let modLogLoadCount = 0;
+
 /** Replace the entry with the same id in place, or put it on top. */
-const upsertModLog = (logs: ModLogEvent[], entry: ModLogEvent): ModLogEvent[] => {
+const upsertModLog =(logs: ModLogEvent[], entry: ModLogEvent): ModLogEvent[] => {
   const index = logs.findIndex((l) => l.id === entry.id);
   if (index === -1) return [entry, ...logs].slice(0, MOD_LOG_CAP);
   const next = logs.slice();
@@ -765,6 +800,9 @@ function whenBootSettled(task: () => void): void {
 // store tells it what is playing and acts on what it decides; the player and
 // the chat panes stay here.
 
+/** Why the player reloaded a live stream by itself (see `note_playback_reload`). */
+export type AutoReloadReason = 'stall' | 'no-buffer' | 'gave-up';
+
 type StoreSet = (partial: Partial<AppState>) => void;
 type StoreGet = () => AppState;
 
@@ -775,7 +813,7 @@ interface OfflineNotice {
 
 /** What Rust decided about a stream that looked offline. */
 type OfflineDecision =
-  | { action: 'nothing'; why: string }
+  | { action: 'nothing'; why: string; ended?: boolean }
   | { action: 'still_live' }
   | { action: 'resume' }
   | { action: 'offline_chat' }
@@ -784,6 +822,12 @@ type OfflineDecision =
   | { action: 'switch_to'; stream: TwitchStream; notice: OfflineNotice | null };
 
 let watchSessionListening = false;
+
+/** A raid redirect follows only a stream still open in the layer: one being
+ *  closed (its URL already dropped, its row not yet) stays closed. */
+export function raidFollowAllowed(s: Pick<AppState, 'currentStream' | 'streamUrl' | 'isLoading'>): boolean {
+  return !!s.currentStream && (!!s.streamUrl || s.isLoading);
+}
 
 /** Subscribe once to the session's events, in the window that plays streams. */
 function ensureWatchSessionListeners(set: StoreSet, get: StoreGet): void {
@@ -796,12 +840,12 @@ function ensureWatchSessionListeners(set: StoreSet, get: StoreGet): void {
     const { target } = event.payload;
     // Phone: a raid follows a stream that is open. One closed before the
     // notice (or during it) stays closed; the raid must not reopen the layer.
-    if (IS_MOBILE && !get().currentStream) return;
+    if (IS_MOBILE && !raidFollowAllowed(get())) return;
     Logger.debug(`[WatchSession] Raid detected, joining ${target.user_login}`);
     get().addToast(`Raid starting! Joining ${target.user_login}...`, 'info');
     // Long enough to read the notice before the stream changes under it.
     await new Promise((resolve) => setTimeout(resolve, 1500));
-    if (IS_MOBILE && !get().currentStream) {
+    if (IS_MOBILE && !raidFollowAllowed(get())) {
       Logger.debug('[WatchSession] Stream closed during the raid notice; not following');
       return;
     }
@@ -924,6 +968,13 @@ async function applyOfflineDecision(
   switch (decision.action) {
     case 'nothing':
       Logger.debug('[AutoSwitch] Nothing to do:', decision.why);
+      // A confirmed end leaves nothing else to do, but the stream's pause and
+      // the own-channel memory end with it. Other answers (a newer stream, a
+      // confirmation already running) say nothing about the stream's end.
+      if (decision.ended) {
+        clearPauseIntent('main');
+        forgetOwnChannel();
+      }
       return;
     case 'still_live':
       Logger.debug('[AutoSwitch] Helix kept reporting the stream online; treating as a blip');
@@ -932,14 +983,20 @@ async function applyOfflineDecision(
       // Live, and the player was stuck on a manifest the streamer reconnected
       // out of. The confirmation is over, so the restart is not refused as
       // mid-switch even if the resolving event has not landed yet.
-      Logger.info(`[WatchSession] ${ended.user_login} is live; reloading the stream in place`);
+      Logger.warn(`[WatchSession] ${ended.user_login} is live; reloading the stream in place`);
       set({ isAutoSwitching: false });
-      await get().restartStream({ quiet: true });
+      await get().restartStream({ quiet: true, reason: 'gave-up' });
       return;
     case 'notify':
+      // The stream is confirmed over: its pause and the own-channel memory end with it.
+      clearPauseIntent('main');
+      forgetOwnChannel();
       say(decision.notice);
       return;
     case 'offline_chat':
+      // The stream ended: its pause and the own-channel memory end with it.
+      clearPauseIntent('main');
+      forgetOwnChannel();
       // Stop the video but not the chat, then settle into offline chat.
       await invoke('stop_stream').catch((e) => Logger.warn('[AutoSwitch] Error stopping stream video:', e));
       setTimeout(() => {
@@ -968,6 +1025,8 @@ async function applyOfflineDecision(
         // The relay, the watch session, drops and channel points (services/watch_start.rs).
         await invoke('watch_stop', { preserveBackend: false }).catch((e) => Logger.warn('[AutoSwitch] Error stopping stream:', e));
         await invoke('stop_chat').catch((e) => Logger.warn('[AutoSwitch] Error stopping chat:', e));
+        clearPauseIntent('main');
+        forgetOwnChannel();
         set({ streamUrl: null, activeQuality: null, availableQualities: [], adSource: null, currentStream: null, currentMediaType: null });
         say(decision.notice);
         if (decision.action === 'stop') return;
@@ -1016,6 +1075,9 @@ let transientSwapInFlight: Promise<void> | null = null;
 // winning over the restore issued after it, and every one of them a full relay
 // restart and player rebuild.
 let transientSwapSeq = 0;
+// The restart that is running. A second restart asked for meanwhile is that
+// one, so two relay cycles never overlap.
+let restartInFlight: Promise<void> | null = null;
 async function settleTransientSwap(): Promise<void> {
   if (transientSwapInFlight) await transientSwapInFlight.catch(() => {});
 }
@@ -1338,10 +1400,6 @@ async function teardownProviderSession(): Promise<void> {
 // share one promise) plus a short TTL (back-to-back callers skip) collapse it.
 let followedInFlight: Promise<void> | null = null;
 let followedFetchedAt = 0;
-/** Serializes every write to the favorites lists. See `toggleFavoriteStreamer`:
- *  settings are persisted before the in-memory copy is updated, so concurrent
- *  writers would read stale state and drop each other's changes. */
-let favoriteWriteChain: Promise<void> = Promise.resolve();
 let recommendedInFlight: Promise<void> | null = null;
 let recommendedFetchedAt = 0;
 const STREAMS_GUARD_TTL_MS = 10_000;
@@ -1411,9 +1469,11 @@ function ensureHomeSnapshotListener(): Promise<unknown> {
 /** Register the `home-snapshot` listener once per window and hydrate the
  *  store from the current snapshot. Idempotent; safe from any window. */
 export function ensureHomeSnapshotSync(): Promise<void> {
-  void ensureHomeSnapshotListener();
   if (!homeSnapshotHydration) {
-    homeSnapshotHydration = invoke<HomeSnapshot>('get_home_snapshot')
+    // Listening first: a push sent between the read and the listener would be
+    // lost, and the revision guard could not tell.
+    homeSnapshotHydration = ensureHomeSnapshotListener()
+      .then(() => invoke<HomeSnapshot>('get_home_snapshot'))
       .then((snapshot) => useAppStore.getState().applyHomeSnapshot(snapshot))
       .catch((e) => {
         homeSnapshotHydration = null;
@@ -1421,6 +1481,31 @@ export function ensureHomeSnapshotSync(): Promise<void> {
       });
   }
   return homeSnapshotHydration;
+}
+
+/** The store fields one applied Following list set changes: the lists, their
+ *  revision, and the favorite labels when the favorites moved. */
+function followingFields(
+  s: Pick<AppState, 'following' | 'favoritePending' | 'favoriteVersion'>,
+  next: FollowingLists,
+  rev: number,
+): Partial<AppState> {
+  const ids = next.favorite_ids ?? [];
+  const list = next.favorites_list ?? [];
+  const moved = favoritesDiffer(
+    { ids: s.following.favorite_ids ?? [], list: s.following.favorites_list ?? [] },
+    { ids, list },
+  );
+  // Every applied list settles the presses its revision holds.
+  const settled = settlePending(s.favoritePending, rev);
+  return {
+    following: { ...next, favorite_ids: ids, favorites_list: list },
+    followingRev: rev,
+    followingApplied: true,
+    ...(moved || settled !== s.favoritePending
+      ? { favoritePending: settled, favoriteVersion: s.favoriteVersion + 1 }
+      : {}),
+  };
 }
 
 /** Publish hype-train statuses only when the content changed (see the
@@ -1468,7 +1553,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   isLoadingMore: false,
   unifiedDiscover: [],
   sidebarDiscover: null,
-  following: { favorites: [], live: [], offline: [], followed_live: [], platforms: [] },
+  following: { favorites: [], live: [], offline: [], followed_live: [], platforms: [], favorite_ids: [], favorites_list: [] },
+  followingRev: -1,
+  followingApplied: false,
+  favoritePending: {},
+  favoriteAlias: {},
+  favoriteVersion: 0,
   otherCategories: [],
   favoriteCategories: [],
   streamUrl: null,
@@ -1522,6 +1612,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   emoteSetsOverlayInitialTab: null,
   emoteSpotlight: null,
   showWhispersOverlay: false,
+  songsPanel: null,
   showDashboardOverlay: false,
   whisperTargetUser: null,
   isHomeActive: true,
@@ -1562,6 +1653,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   homeLastExitedProviderCategory: null,
   searchReturnTab: 'following' as HomeTab,
   homeCategoryTab: 'live' as 'live' | 'clips' | 'videos',
+  homeCategoryTags: { key: '', tags: [] },
 
   // Media sorting and filtering state
   clipsPeriod: 'all',
@@ -1602,20 +1694,38 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (get().loadedModLogChannels.has(key)) return;
     // Mark loaded up-front so a re-render doesn't kick off a duplicate load.
     set((state) => ({ loadedModLogChannels: new Set(state.loadedModLogChannels).add(key) }));
+    const load = ++modLogLoadCount;
+    modLogLoadOwner.set(key, load);
+    // This load still owns the channel and the channel is still open (closing
+    // it drops the key from loadedModLogChannels).
+    const isCurrent = () => modLogLoadOwner.get(key) === load && get().loadedModLogChannels.has(key);
     try {
-      const entries = await invoke<ModLogEvent[]>('load_mod_logs', { channel: key });
-      if (!entries || entries.length === 0) return;
-      set((state) => {
-        const seen = new Set(state.modLogs.map((l) => l.id));
-        const fresh = entries.filter((e) => e && e.id && !seen.has(e.id));
-        if (fresh.length === 0) return { modLogs: state.modLogs };
-        const merged = [...state.modLogs, ...fresh]
-          .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-          .slice(0, MOD_LOG_CAP);
-        return { modLogs: merged };
-      });
-    } catch (e) {
-      Logger.warn(`[ModLogs] Failed to load history for ${key}:`, e);
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const entries = await invoke<ModLogEvent[]>('load_mod_logs', { channel: key });
+          if (!isCurrent() || !entries || entries.length === 0) return;
+          set((state) => {
+            const seen = new Set(state.modLogs.map((l) => l.id));
+            const fresh = entries.filter((e) => e && e.id && !seen.has(e.id));
+            if (fresh.length === 0) return { modLogs: state.modLogs };
+            const merged = [...state.modLogs, ...fresh]
+              .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+              .slice(0, MOD_LOG_CAP);
+            return { modLogs: merged };
+          });
+          return;
+        } catch (e) {
+          Logger.warn(`[ModLogs] Failed to load history for ${key}:`, e);
+          // The history never arrived: ask again after a growing wait, until it
+          // does or the channel closes.
+          if (!isCurrent()) return;
+          const seconds = MOD_LOG_RETRY_SECONDS[Math.min(attempt, MOD_LOG_RETRY_SECONDS.length - 1)];
+          await new Promise<void>((resolve) => setTimeout(resolve, seconds * 1000));
+          if (!isCurrent()) return;
+        }
+      }
+    } finally {
+      if (modLogLoadOwner.get(key) === load) modLogLoadOwner.delete(key);
     }
   },
   pruneModLogsToChannels: (activeChannels) => set((state) => {
@@ -1682,7 +1792,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
     if (snapshot.unified_discover_at !== null) set({ unifiedDiscover: snapshot.unified_discover });
     // `!= null`: a snapshot from a build without these sections leaves them undefined.
-    if (snapshot.following_at != null && snapshot.following) set({ following: snapshot.following });
+    // At least as new as every push at or below its revision (Rust builds it
+    // under the same lock), so it applies at an equal revision; an older one
+    // would roll the labels back. A build without revisions always applies.
+    if (snapshot.following_at != null && snapshot.following) {
+      const held = get().followingRev;
+      const rev = snapshot.following_rev ?? held;
+      if (snapshot.following_rev == null || rev >= held) set(followingFields(get(), snapshot.following, rev));
+    }
     if (snapshot.other_categories_at != null && snapshot.other_categories) {
       set({ otherCategories: snapshot.other_categories });
     }
@@ -1733,17 +1850,28 @@ export const useAppStore = create<AppState>((set, get) => ({
       case 'sidebar_discover':
         set({ sidebarDiscover: { scope: update.scope, streams: update.streams } });
         break;
-      case 'following':
-        set({
-          following: {
-            favorites: update.favorites,
-            live: update.live,
-            offline: update.offline,
-            followed_live: update.followed_live ?? [],
-            platforms: update.platforms ?? [],
-          },
-        });
+      case 'following': {
+        // Newer than held only: a push at or below the held revision is older
+        // than what a snapshot already gave this window.
+        const held = get().followingRev;
+        if (update.rev != null && update.rev <= held) break;
+        set(
+          followingFields(
+            get(),
+            {
+              favorites: update.favorites,
+              live: update.live,
+              offline: update.offline,
+              followed_live: update.followed_live ?? [],
+              platforms: update.platforms ?? [],
+              favorite_ids: update.favorite_ids ?? [],
+              favorites_list: update.favorites_list ?? [],
+            },
+            update.rev ?? held,
+          ),
+        );
         break;
+      }
       case 'other_categories':
         set({ otherCategories: update.categories });
         break;
@@ -1820,12 +1948,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     // notifications use. The passive callers (live/whisper/drop/badge...) pass
     // { skipIsland: true } because they already register their own island entry,
     // and the rich JSX toasts can't ride the (string-only) event bus anyway, so
-    // this only fires for the ~80 string action toasts.
-    if (!options?.skipIsland && typeof message === 'string') {
+    // this only fires for the ~80 string action toasts. A toast whose id is
+    // already showing is the same notification updated in place, so it adds no
+    // second entry.
+    const alreadyShowing = options?.id !== undefined && get().toasts.some(t => t.id === options.id);
+    if (!options?.skipIsland && !alreadyShowing && typeof message === 'string') {
       const islandOn = !ln || (ln.enabled !== false && ln.use_dynamic_island !== false);
       if (islandOn) {
         emit('action-notification', {
-          text: message,
+          text: options?.title ? `${options.title}. ${message}` : message,
           level: type,
           // Only the callers that are about a PERSON pass this; everything else
           // keeps the level glyph.
@@ -1833,6 +1964,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           // That person's cosmetics id, so the entry draws their 7TV picture.
           avatarSevenTvId: options?.avatarSevenTvId,
           source: options?.source,
+          // A song you identified: its island row opens it in Your songs.
+          songKey: options?.songKey,
         }).catch(() => {});
       }
     }
@@ -1863,18 +1996,25 @@ export const useAppStore = create<AppState>((set, get) => ({
     // A live toast, or one carrying an action (Undo), leaves its timer to the
     // surface that draws it, so hovering holds it: an Undo must never vanish
     // under the pointer. Other toasts use the simple auto-dismiss.
+    // A toast added with an id that is already showing replaces it in place:
+    // same position and same createdAt, with the old auto-dismiss timer cleared
+    // so it cannot remove the replacement.
+    const showing = get().toasts.find(t => t.id === id);
+    if (showing?.timeoutId) clearTimeout(showing.timeoutId);
+    const place = (toast: Toast) => set(state => ({
+      toasts: state.toasts.some(t => t.id === id)
+        ? state.toasts.map(t => (t.id === id ? { ...toast, createdAt: t.createdAt } : t))
+        : [...state.toasts, toast],
+    }));
+
     if (type === 'live' || options?.sticky || action) {
-      set(state => ({
-        toasts: [...state.toasts, { id, message, type, action, duration, createdAt }]
-      }));
+      place({ id, title: options?.title, message, type, action, duration, createdAt });
     } else {
       const timeoutId = setTimeout(() => {
         set(state => ({ toasts: state.toasts.filter(t => t.id !== id) }));
       }, duration);
 
-      set(state => ({
-        toasts: [...state.toasts, { id, message, type, action, timeoutId, duration, createdAt }]
-      }));
+      place({ id, title: options?.title, message, type, action, timeoutId, duration, createdAt });
     }
   },
   removeToast: (id) => {
@@ -1897,33 +2037,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (!settings.cache) {
       settings.cache = { enabled: true, expiry_days: 7 };
     }
-    // Ensure favorite_streamers has a default if not present
-    if (!settings.favorite_streamers) {
-      settings.favorite_streamers = [];
-    }
-    if (!settings.favorite_channels) {
-      settings.favorite_channels = [];
-    }
-    // Repair favorites the OLD sidebar wrote as a raw `stream.user_id`.
-    //
-    // On a YouTube row that id is the channel's `UC…`, stored with no provider
-    // prefix, so `parseKey` reads it back as a TWITCH login: the heart never
-    // fills again, the channel appears in no list, and the backend sweep hands
-    // the UC id to Helix as a Twitch user id. Found in real settings data, not
-    // theorised. A 24-character `UC` id is YouTube's own shape (the same test
-    // `first_channel_id` uses in youtube_media.rs), so this can't catch a
-    // Twitch id, which is always numeric.
-    const strayYouTubeIds = (settings.favorite_streamers || []).filter(isStrayYouTubeFavoriteId);
-    if (strayYouTubeIds.length > 0) {
-      const stray = new Set(strayYouTubeIds);
-      settings.favorite_streamers = (settings.favorite_streamers || []).map((id) =>
-        stray.has(id) ? makeKey('youtube', id) : id,
-      );
-      settings.favorite_channels = (settings.favorite_channels || []).map((f) =>
-        stray.has(f.id) ? { ...f, id: makeKey('youtube', f.id), provider: 'youtube' as const } : f,
-      );
-      Logger.info(`[favorites] re-keyed ${strayYouTubeIds.length} YouTube favorite(s) written without a provider prefix`);
-    }
+    // The favorite lists come from Rust, repaired there on every load
+    // (services/favorite_channels.rs), and always serialized.
     // Restore the platform the app was last scoped to, ignoring a platform whose
     // watch support isn't in this build (so removing one can't strand the user
     // in an empty context).
@@ -1946,17 +2061,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     // of reading the file again (utils/settingsOnceLoaded.ts).
     settleFirstSettings(settings);
 
-    // The favorites re-key above has to reach DISK, not just this store: the
-    // backend's who's-live sweep reads `favorite_streamers` from its own copy of
-    // settings, so an in-memory-only repair would leave it handing a YouTube UC
-    // id to Helix as a Twitch user id forever. The patch writes through to that
-    // copy. One-time and idempotent: it stops matching once repaired.
-    if (strayYouTubeIds.length > 0) {
-      patchSettings({ favorite_streamers: settings.favorite_streamers }).catch((e) => {
-        Logger.warn('[favorites] could not persist the YouTube favorite re-key:', e);
-      });
-    }
-
     // This window's own logger. Rust applies the saved setting to its logging
     // itself (at boot and when a save changes it), so a second window loading
     // its settings never turns the app's logging up or down.
@@ -1972,68 +2076,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     // this. Must run before chat renders, or the first frame picks the default.
     setInlineEmoteScale(settings.chat_design?.emote_scale ?? 1);
 
-    // Connect to Discord if enabled. Fire-and-forget: boot waits on
-    // loadSettings, and a Discord whose pipe never answers must not hold the
-    // boot overlay up.
-    if (settings.discord_rpc_enabled) {
-      invoke('connect_discord').catch((e) => {
-        Logger.warn('Could not connect to Discord:', e);
-      });
-    }
-
   },
   updateSettings: async (newSettings) => {
     const oldSettings = get().settings;
 
     // Write only the keys this change touched; Rust announces the write to the
-    // other windows. Nothing changed means nothing to write.
-    const patch = settingsDiff(oldSettings, newSettings);
+    // other windows. Nothing changed means nothing to write. The favorite
+    // lists are Rust's alone: a caller's copy of them (often an older spread)
+    // is never sent, and the store keeps the copy it holds.
+    const patch = settingsDiff(oldSettings, newSettings) as Record<string, unknown>;
+    for (const key of RUST_ONLY_KEYS) delete patch[key];
     if (Object.keys(patch).length === 0) {
       return;
     }
 
-    await patchSettings(patch);
+    await patchSettings(patch as Parameters<typeof patchSettings>[0]);
 
     const state = get();
+    const kept: Record<string, unknown> = {};
+    for (const key of RUST_ONLY_KEYS) kept[key] = (state.settings as unknown as Record<string, unknown>)[key];
+    const next = { ...newSettings, ...kept } as Settings;
     if (state.isTheaterMode) {
       // Don't un-hide the chat if we're in compact/theater mode, just quietly update the original placement
-      set({ settings: newSettings, originalChatPlacement: newSettings.chat_placement });
+      set({ settings: next, originalChatPlacement: next.chat_placement });
     } else {
-      set({ settings: newSettings, chatPlacement: newSettings.chat_placement });
+      set({ settings: next, chatPlacement: next.chat_placement });
     }
 
     // This window's own logger; the save above already reached Rust's.
     if (newSettings.error_reporting_enabled !== oldSettings.error_reporting_enabled) {
       setDiagnosticsEnabled(newSettings.error_reporting_enabled !== false);
-    }
-
-    // Handle Discord enable/disable toggle. Not awaited: the settings write is
-    // done, and a slow Discord must not hold up whoever awaits this save.
-    if (newSettings.discord_rpc_enabled !== oldSettings.discord_rpc_enabled) {
-      if (newSettings.discord_rpc_enabled) {
-        void (async () => {
-          try {
-            await invoke('connect_discord');
-
-            let multiNookModule;
-            try { multiNookModule = await import('./multiNookStore'); } catch { /* ignore */ }
-            const multiNookState = multiNookModule ? multiNookModule.usemultiNookStore.getState() : null;
-
-            if (multiNookState && multiNookState.isMultiNookActive && multiNookState.slots.length > 0) {
-              multiNookModule?.broadcastMultiNookPresence(multiNookState.slots);
-            } else {
-              // The watch session knows what is playing (or that nothing is).
-              invoke('watch_session_refresh_presence').catch(() => {});
-            }
-          } catch (e) {
-            Logger.warn('Could not connect to Discord:', e);
-          }
-        })();
-      } else {
-        invoke('disconnect_discord').catch((e) => {
-          Logger.warn('Could not disconnect from Discord:', e);
-        });
-      }
     }
   },
   loadFollowedStreams: async () => {
@@ -2213,7 +2285,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         user_login: vodOwnerLogin,
         title: info.title || `Twitch ${type}`,
         viewer_count: info.view_count || 0,
-        game_name: type === 'clip' ? 'Twitch Clip' : 'Twitch Video',
+        // The category Rust read off the clip or VOD; none leaves the slot empty.
+        game_id: result.category?.id || undefined,
+        game_name: result.category?.name ?? '',
         thumbnail_url: info.thumbnail_url || '',
         // Filled in by the lookup below. Neither TwitchVideo nor TwitchClip carries the
         // broadcaster's avatar, and leaving it blank is why a VOD or clip showed no
@@ -2397,6 +2471,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   stopStream: async (options) => {
     const preserveBackend = options?.preserveBackend ?? false;
     trackActivity('Stopped stream');
+    // Stopping the stream drops the viewer's pause and the own-channel memory.
+    clearPauseIntent('main');
+    forgetOwnChannel();
     // Starts wait for this close to finish (settleStop).
     let finishStop: () => void = () => {};
     const stopping = new Promise<void>((resolve) => {
@@ -2451,7 +2528,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         // the viewer keeps a chat open beside the stream (a phone's Chats
         // room, a docked chat, another window), and those rooms are still on
         // screen.
-        const stopped = await invoke<boolean>('stop_chat');
+        // A failed stop reads as "still up": the shared chatter store stays,
+        // and the clear below still runs.
+        const stopped = await invoke<boolean>('stop_chat').catch(() => false);
 
         // Drop the per-chatter store (mention list + each talker's paint/badge
         // data). It is otherwise only cleared on a channel SWITCH, so a plain
@@ -2469,18 +2548,19 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
       }
 
-      set({ streamUrl: null, activeQuality: null, availableQualities: [], adSource: null, playbackKind: null, currentStream: null, currentMediaType: null, currentHypeTrain: null, streamOriginCategory: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false });
-
-
     } catch (e) {
       Logger.error('Failed to stop stream:', e);
     } finally {
+      // Whatever failed above: a half-closed stream (no URL, its row still set)
+      // would keep its chat tab pinned for good.
+      set({ streamUrl: null, activeQuality: null, availableQualities: [], adSource: null, playbackKind: null, currentStream: null, currentMediaType: null, currentHypeTrain: null, streamOriginCategory: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false });
       finishStop();
       if (stopInFlight === stopping) stopInFlight = null;
     }
   },
 
   restartStream: async (options) => {
+    if (restartInFlight) return restartInFlight;
     const quiet = options?.quiet ?? false;
     const { currentStream, settings, currentMediaType, isAutoSwitching } = get();
     if (!currentStream) {
@@ -2502,6 +2582,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     Logger.info(`[Stream] Restarting stream for ${currentStream.user_login}...`);
     trackActivity('Restarted stream');
+    if (options?.reason) {
+      // Counted and logged in Rust; repeated reloads turn low latency off
+      // for a while, which the start below then honors.
+      await invoke<boolean>('note_playback_reload', {
+        login: currentStream.user_login,
+        reason: options.reason,
+      }).catch(() => false);
+    }
 
     // Save current stream info
     const channel = currentStream.user_login;
@@ -2509,9 +2597,24 @@ export const useAppStore = create<AppState>((set, get) => ({
     const quality = settings.quality;
     const provider = streamProvider(currentStream);
 
+    // From here this call is the restart that is running, until it ends or
+    // hands a dead channel to the offline decision (which may restart again).
+    let release = () => {};
+    const running = new Promise<void>((resolve) => {
+      release = () => {
+        if (restartInFlight === running) restartInFlight = null;
+        resolve();
+      };
+    });
+    restartInFlight = running;
+
     // Provider streams re-resolve through their own adapter. Same shape as the
     // Twitch path below, minus the Helix repair/liveness steps it can't use.
     if (provider !== 'twitch') {
+      if (options?.ifUrl && get().streamUrl !== options.ifUrl) {
+        release();
+        return;
+      }
       try {
         set({ isRestartingStream: true });
         await invoke('stop_stream');
@@ -2535,7 +2638,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ isRestartingStream: false });
         // A failed re-resolve on these platforms usually means the stream
         // ended, so check rather than retrying into a loop.
+        release();
         await get().handleStreamOffline();
+      } finally {
+        release();
       }
       return;
     }
@@ -2563,9 +2669,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     }
     
+    // A swap still resolving must land before the relay is cycled under it.
+    await settleTransientSwap();
+    // The stream the caller saw has been replaced (by that swap or another):
+    // there is nothing left to recover.
+    if (options?.ifUrl && get().streamUrl !== options.ifUrl) {
+      release();
+      return;
+    }
+
     try {
-      // A swap still resolving must land before the relay is cycled under it.
-      await settleTransientSwap();
       // Freeze the running player's loader BEFORE the backend goes down: the relay
       // and its LL origin stop here, but the old hls.js instance lives until the
       // new streamUrl lands (~1-2s of resolve), and polling a dead origin in that
@@ -2603,6 +2716,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         if (!live) {
           Logger.info(`[Stream] ${channel} is offline; routing to auto-switch instead of restarting`);
           set({ isRestartingStream: false });
+          release();
           await get().handleStreamOffline();
           return;
         }
@@ -2622,6 +2736,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Always release the freeze; on the recovery path startStream set a fresh
       // streamUrl and the remounted player must be allowed to load.
       if (get().isRestartingStream) set({ isRestartingStream: false });
+      release();
     }
   },
 
@@ -2944,6 +3059,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!preResolved) logQualityFallback(requestedQuality, result.quality);
       // The row is Rust's; only the unified lists' provider marks ride along.
       const info: TwitchStream = { ...started.row, provider: seed?.provider, watch_url: seed?.watch_url };
+      // The signed-in broadcaster opening their own live channel: it opens
+      // paused, chat only (no second video pipeline on the machine that is
+      // streaming, and no echo into the stream). Once per opening; any other
+      // channel resets that.
+      const me = get().currentUser?.user_id;
+      if (me && info.user_id === me) {
+        if (holdOwnChannel(makeKey('twitch', info.user_login))) {
+          Logger.warn('[Stream] your own channel opens paused (chat only)');
+        }
+      } else {
+        forgetOwnChannel();
+      }
 
       set({ streamUrl: result.url, activeQuality: result.quality, adSource: adSourceFrom(result), availableQualities: result.available ?? [], playbackKind: 'hls', currentStream: info, currentMediaType: 'live', originalMediaUrl: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false, isHomeActive: false });
 
@@ -3022,6 +3149,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         return;
       }
 
+      // An offline room plays nothing: no pause to keep, and the next time
+      // the broadcaster's own channel goes live it opens paused again.
+      clearPauseIntent('main');
+      forgetOwnChannel();
       const info: TwitchStream = { ...(opened.row as TwitchStream), user_login: login, is_live: false };
       set({
         streamUrl: 'offline',
@@ -3247,6 +3378,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Clear target user when closing
     if (!show) set({ whisperTargetUser: null });
   },
+  openSongs: (focus = null) => {
+    trackActivity('Opened Your songs');
+    set({ songsPanel: { focus } });
+  },
+  closeSongs: () => set({ songsPanel: null }),
+  setSongsFocus: (key) => set((s) => (s.songsPanel ? { songsPanel: { focus: key } } : s)),
   setShowDashboardOverlay: (show: boolean) => {
     if (show) trackActivity('Opened Dashboard');
     set({ showDashboardOverlay: show });
@@ -3371,15 +3508,33 @@ export const useAppStore = create<AppState>((set, get) => ({
       const unlisten = await listen('twitch-login-complete', async () => {
         Logger.debug('Login complete event received');
 
+        // Follow, channel points and drops run on Twitch's separate Drops
+        // approval, so it is asked for now, while the session sign-in just
+        // made answers it (usually with no consent screen). Rust drives it
+        // (connect_twitch_approval). On the phone it takes over this same
+        // sheet, so the sheet is not closed first; closing it with its X is
+        // the approval's own cancel now, not the sign-in's.
+        const needsApproval = !(await invoke<boolean>('is_drops_authenticated').catch(() => true));
+        if (needsApproval) removeCancelListener?.();
+
         // Dismiss the in-app login overlay
         try {
           if (isMobile) {
-            await invoke('close_mobile_login');
+            if (!needsApproval) await invoke('close_mobile_login');
           } else {
             await invoke('close_login_overlay', { label: 'twitch-login' });
           }
         } catch (e) {
           Logger.warn('[TwitchLogin] Failed to close login overlay:', e);
+        }
+
+        if (needsApproval) {
+          void invoke<boolean>('connect_twitch_approval')
+            .catch((e) => Logger.warn('[TwitchLogin] Drops approval failed:', e))
+            // Rust closes the sheet itself; this covers a failure before it opened.
+            .finally(() => {
+              if (isMobile) void invoke('close_mobile_login').catch(() => {});
+            });
         }
 
         // After successful login, check auth status FIRST
@@ -3679,101 +3834,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  toggleFavoriteStreamer: (id: string, meta?: FavoriteChannel) => {
-    // SERIALIZED, and that is the whole point of the chain. `updateSettings`
-    // awaits `patch_settings` BEFORE it calls `set`, so two toggles in flight
-    // both read the pre-write settings and the second one silently drops the
-    // first. That was survivable when the heart lived on one tab; now that it
-    // is on every card, favoriting several in a row is the expected use.
-    // Each link re-reads `get().settings` only once the previous write landed.
-    favoriteWriteChain = favoriteWriteChain.then(async () => {
-      const currentSettings = get().settings;
-      const favorites = currentSettings.favorite_streamers || [];
-      const identities = currentSettings.favorite_channels || [];
-      const isFavorite = favorites.includes(id);
-
-      const newSettings = {
-        ...currentSettings,
-        favorite_streamers: isFavorite
-          ? favorites.filter(f => f !== id)
-          : [...favorites, id],
-        // Membership and identity move together, in ONE write. Two writes would
-        // reopen the same lost-update race this chain exists to close.
-        favorite_channels: isFavorite
-          ? identities.filter(f => f.id !== id)
-          : meta
-            ? [...identities.filter(f => f.id !== id), meta]
-            : identities,
-      };
-
-      await get().updateSettings(newSettings);
-
-      // Check this one channel now rather than at the next cadence tick, so a
-      // channel that is live right now appears in the sidebar immediately. Fire
-      // and forget: failing to refresh early costs a minute, never correctness.
-      if (!isFavorite) {
-        invoke('refresh_favorites', { key: id }).catch(() => {});
-      }
-    }).catch(err => {
-      // One failed write must not poison every later toggle: an unhandled
-      // rejection here would leave the chain permanently rejected.
-      Logger.error('Failed to update favorites:', err);
-    });
-
-    return favoriteWriteChain;
-  },
-
-  isFavoriteStreamer: (id: string) => {
-    const favorites = get().settings.favorite_streamers || [];
-    return favorites.includes(id);
-  },
-
-  backfillFavoriteIdentities: async () => {
-    const settings = get().settings;
-    const favorites = settings.favorite_streamers || [];
-    const identities = settings.favorite_channels || [];
-    const known = new Set(identities.map(f => f.id));
-    // Only bare Twitch ids: a composite key already carries its channel, and a
-    // provider identity would need that platform's own lookup.
-    const missing = favorites.filter(id => !known.has(id) && !id.includes(':'));
-    if (missing.length === 0) return;
-
-    let resolved: Record<string, [string, string, string | null]>;
-    try {
-      resolved = await invoke('get_users_by_ids', { userIds: missing });
-    } catch (e) {
-      Logger.warn('[favorites] identity backfill failed:', e);
-      return;
-    }
-
-    const rows: FavoriteChannel[] = Object.entries(resolved).map(([id, [login, displayName, avatar]]) => ({
-      id,
-      provider: 'twitch' as const,
-      channel: login,
-      display_name: displayName || login,
-      avatar: avatar || undefined,
-      added_at: '',
-    }));
-    if (rows.length === 0) return;
-
-    // Through the same chain as a toggle, so a backfill landing mid-click can't
-    // clobber the favorite the user just added.
-    favoriteWriteChain = favoriteWriteChain.then(async () => {
-      const current = get().settings;
-      const existing = current.favorite_channels || [];
-      const have = new Set(existing.map(f => f.id));
-      const added = rows.filter(r => !have.has(r.id));
-      if (added.length === 0) return;
-      await get().updateSettings({
-        ...current,
-        favorite_channels: [...existing, ...added],
-      });
-      Logger.info(`[favorites] filled in identity for ${added.length} channel(s)`);
-    }).catch(err => Logger.error('[favorites] identity backfill write failed:', err));
-
-    return favoriteWriteChain;
-  },
-
   toggleHome: () => {
     const state = get();
     const newHomeActive = !state.isHomeActive;
@@ -3908,6 +3968,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setHomeCategoryTab: (tab: 'live' | 'clips' | 'videos') => {
     set({ homeCategoryTab: tab });
+  },
+
+  setHomeCategoryTags: (key: string, tags: string[]) => {
+    set({ homeCategoryTags: tags.length > 0 ? { key, tags } : { key: '', tags: [] } });
   },
 
   setCachedTopGames: (games: TwitchCategory[], cursor: string | null, hasMore: boolean) => {
@@ -4086,3 +4150,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 }));
+
+/** The chat room the main view holds for the playing stream (a chat slice
+ *  key): the provider room it acquired, or the Twitch channel's login. Null
+ *  when it holds none. */
+export function mainChatRoom(): string | null {
+  if (mainProviderChatKey) return mainProviderChatKey;
+  const stream = useAppStore.getState().currentStream;
+  return stream?.user_login && streamProvider(stream) === 'twitch' ? stream.user_login.toLowerCase() : null;
+}

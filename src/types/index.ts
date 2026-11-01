@@ -73,16 +73,29 @@ export interface VideoPlayerSettings {
    *           media notification that taps back into the app.
    */
   background_mode?: 'pip' | 'audio';
+  /** Phones only: on its side the stream fills a long screen by trimming its
+   *  top and bottom (never its sides, at most 1.5x). Set by a pinch on the
+   *  video or the Player switch. Default false. Typed in Rust. */
+  zoom_to_fill?: boolean;
   /** Scroll over the player to adjust volume. Default true. */
   scroll_volume?: boolean;
   /** Scroll down over the player to open the channel About drawer. Default
    *  true. Moves to Shift + scroll down while `scroll_volume` is also on. */
   scroll_about_reveal?: boolean;
+  /** A click on the video pauses and plays it (the main player and a
+   *  maximized MultiNook tile). Default false: a click only moves focus out of
+   *  a text box so the player keys work. Typed in Rust. */
+  click_to_pause?: boolean;
   /** Middle-click the player to toggle mute. Default true. */
   middle_click_mute?: boolean;
   /** Middle-click a stream card or sidebar row to open it in MultiNook.
    *  Default true. */
   middle_click_multinook?: boolean;
+  /** The keyboard's media keys reach the player. Default true. Off keeps the
+   *  app out of the system media controls so the keys go to your music player;
+   *  read at launch on Windows, so a change applies on the next start. Typed
+   *  in Rust. */
+  media_keys?: boolean;
   /** Volume moved per wheel notch, 0.01-0.25. Default 0.05. */
   wheel_volume_step?: number;
   /** Reopen a VOD where you left off. Default true. Typed in Rust. */
@@ -91,6 +104,10 @@ export interface VideoPlayerSettings {
    *  StreamNook installs (and your place in Twitch's apps). Only applies while
    *  resume_vod_playback is on. Default true. */
   sync_vod_progress?: boolean;
+  /** Home's Continue Watching row also shows live streams you left partway
+   *  through, opening each recording where you left. Only applies while
+   *  resume_vod_playback is on. Default false. Typed in Rust. */
+  continue_watching_live?: boolean;
 }
 
 export interface CacheSettings {
@@ -219,6 +236,9 @@ export interface ChatDesignSettings {
   show_timestamps?: boolean; // Show timestamp next to each message
   show_timestamp_seconds?: boolean; // Include seconds in timestamps
   timestamp_format?: '12h' | '24h'; // Formatted in Rust; default 12h
+  // Where the time sits: leading the name line (default) or on its own line
+  // above the message. Typed in Rust too (ChatDesignSettings).
+  timestamp_position?: 'inline' | 'own_line';
   emote_scale?: number; // Emote size multiplier (0.5x to 3x). Default 1.
   // Animated emotes: play always (default), only while the row is hovered,
   // or never (first frame). Typed in Rust too; the CDNs serve static files.
@@ -348,6 +368,9 @@ export interface ChatDesignSettings {
   // 'ffz', 'bttv', 'chatterino', 'homies', 'moltorino', 'chatsen', 'chatty',
   // 'dankchat'). Default none.
   hidden_badge_providers?: string[];
+  // StreamNook atmospheres (and the Cologne event look) behind members' chat
+  // rows. Off keeps every row plain; profiles still show them. Default true.
+  show_chat_atmospheres?: boolean;
   // How a new message arrives: none (default), fade, slide, rise. History
   // rows loaded on join never animate.
   message_entrance?: 'none' | 'fade' | 'slide' | 'rise';
@@ -683,6 +706,8 @@ export interface MentionEntry {
   text: string;
   kind: MentionKind;
   reply_parent_id?: string | null;
+  /** The message a reply answers (yours), on one line. Replies only. */
+  reply_parent_text?: string | null;
   at_ms: number;
   read: boolean;
   /** A moderator deleted the message after it was filed. */
@@ -850,10 +875,14 @@ export interface ChatInputSettings {
   emote_tab_complete_enabled?: boolean;
   emote_tab_complete_match_mode?: 'starts_with' | 'includes';
   emote_tab_complete_include_chatters?: boolean;
+  // Phones: suggestions only for a word that starts with ":" (emotes) or "@"
+  // (chatters); a plain word gets none. Rust decides (emote_match.rs
+  // fill_gate). Defaults to off.
+  emote_suggest_colon_only?: boolean;
   // What Tab opens: the inline carousel (complete in place, Tab again cycles;
   // the default) or the emote list (narrows as you type). Never both.
   emote_tab_style?: 'carousel' | 'list';
-  // Typing ":" plus two letters opens the emote list. Defaults to on.
+  // Typing ":" plus a letter opens the emote list. Defaults to on.
   emote_colon_search_enabled?: boolean;
   // Underline misspelled words in the composer and offer corrections on
   // right-click. Replaces the webview's own spell check, which flags every
@@ -1352,6 +1381,37 @@ export interface FullscreenChatSettings {
   // (sharing opacity, width and side with the desktop overlay) or gives it a
   // column beside the picture. Default 'overlay'.
   phone_layout?: 'overlay' | 'beside';
+  // Phone only. Whether a stream's landscape opens with chat shown (in the
+  // phone_layout), as the person last left it. Default true: chat beside the
+  // stream until they choose otherwise.
+  landscape_open?: boolean;
+}
+
+/** How the Discord status looks. Mirrors Rust `DiscordPresenceSettings`
+ *  (models/settings.rs); Rust treats a value it does not know as the default. */
+export interface DiscordPresenceSettings {
+  large_image: 'category' | 'streamer' | 'streamnook';
+  small_image: 'platform' | 'streamer' | 'category' | 'none';
+  activity_type: 'watching' | 'playing' | 'listening';
+  status_display: 'app' | 'top' | 'bottom';
+  timer: 'watching' | 'uptime' | 'off';
+  link_text: boolean;
+  watching_top: string;
+  watching_bottom: string;
+  replay_top: string;
+  replay_bottom: string;
+  grid_top: string;
+  grid_bottom: string;
+  offline_top: string;
+  offline_bottom: string;
+  watch_button: boolean;
+  watch_button_label: string;
+  /** Off hides the StreamNook button: subscribers only. */
+  promo_button: boolean;
+  /** The name after the verb ("Watching Twitch"): subscribers only. */
+  app_name: 'streamnook' | 'platform';
+  idle_mode: 'phrases' | 'custom' | 'hidden';
+  idle_text: string;
 }
 
 export interface Settings {
@@ -1374,6 +1434,7 @@ export interface Settings {
   current_account: string;
   hide_search_bar_on_startup: boolean;
   discord_rpc_enabled: boolean;
+  discord_presence: DiscordPresenceSettings;
   video_player: VideoPlayerSettings;
   cache: CacheSettings;
   streamlink?: StreamlinkSettings;
@@ -1429,6 +1490,7 @@ export interface Settings {
   oled_accent?: string; // Accent hex (#rrggbb) for the OLED theme, which lets you pick any accent. Default DEFAULT_OLED_ACCENT.
   multi_nook_slots?: MultiNookSlot[]; // Persisted multi-nook grid configurations
   multi_nook_chat_hidden?: boolean; // Whether the chat panel is globally hidden in MultiNook
+  multi_nook_start_volume_adopted?: boolean; // Set once saved tiles at the old fixed 50% moved to Start volume
   /** How the MultiNook tiles are arranged. Rust reads it leniently and fills the default. */
   multi_nook_layout?: MultiNookLayout;
   multi_nook_presets?: MultiNookPreset[]; // Saved, named channel sets openable into the grid in one click
@@ -1735,6 +1797,8 @@ export interface AndroidRelease {
   version: string;
   published_at: string | null;
   changes: { title: string; body: string; topic: AndroidChangeTopic }[];
+  /** The APK's size in bytes, when the manifest names it. */
+  size: number | null;
 }
 
 /** A rise in one of the viewer's balances on a channel (Rust `WalletGain`),
@@ -1909,6 +1973,8 @@ export interface HomeSnapshot {
    *  platform whose rows they show. */
   following: FollowingLists;
   following_at: number | null;
+  /** The Following revision this snapshot's lists carry (see `followingRev`). */
+  following_rev?: number;
   /** The unified Categories tab's "On other platforms" row, built in Rust from
    *  each platform's cached categories. */
   other_categories: ProviderCategory[];
@@ -1954,6 +2020,19 @@ export interface FollowingLists {
   followed_live?: TwitchStream[];
   /** The platforms you follow at least one channel on, in platform order. */
   platforms?: string[];
+  /** Every favorite id, as Rust holds them: what every favorite label reads. */
+  favorite_ids?: string[];
+  /** Each favorite with its kept channel, so a row known only by login (a
+   *  Twitch room before its id arrives) can still be labeled. */
+  favorites_list?: FavoriteListEntry[];
+}
+
+/** One favorite as Rust pushes it with the Following lists. */
+export interface FavoriteListEntry {
+  id: string;
+  provider: string;
+  /** Login, slug, handle or UC id; empty when only a bare id is known. */
+  channel: string;
 }
 
 /** One card in Home's Continue Watching row. Rust builds these from the local
@@ -2001,6 +2080,10 @@ export type HomeSnapshotUpdate =
       offline: TwitchStream[];
       followed_live?: TwitchStream[];
       platforms?: string[];
+      favorite_ids?: string[];
+      favorites_list?: FavoriteListEntry[];
+      /** Process-wide and only rising; a push applies when newer than held. */
+      rev?: number;
       at: number;
     }
   | { section: 'other_categories'; categories: ProviderCategory[]; at: number }
@@ -2686,6 +2769,16 @@ export interface LiveNotificationData {
   /** The streamer's 7TV cosmetics id from Rust (a bare Twitch id, `kick:<id>`
    *  or `youtube:UC...`), for their 7TV picture. Absent on older entries. */
   seventv_id?: string;
+  /** Each platform's channel this entry stands for, as Rust names it, so the
+   *  row's "Turn off alerts" mutes every one. Absent on older entries. */
+  channels?: AlertChannel[];
+}
+
+/** One platform's channel in a go-live, as Rust's `AlertChannel`. */
+export interface AlertChannel {
+  provider: string;
+  user_id: string;
+  user_login: string;
 }
 
 export interface WhisperNotificationData {
@@ -2711,6 +2804,9 @@ export interface SystemNotificationData {
   avatar_url?: string;
   /** The cosmetics id of whoever `avatar_url` shows, for their 7TV picture. */
   avatar_seventv_id?: string;
+  /** A song you identified (its key in Your songs): the row draws
+   *  `avatar_url` as the song's cover, square, and opens the song there. */
+  song_key?: string;
   title: string;
   message: string;
   icon?: string;

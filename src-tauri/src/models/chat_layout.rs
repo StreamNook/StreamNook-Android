@@ -258,6 +258,10 @@ pub struct MessageMetadata {
     /// The message replies to one of ours.
     #[serde(default)]
     pub is_reply_to_me: bool,
+    /// The signed-in account sent it, on whichever platform the row is from
+    /// (stamped by the rule engine). Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_own: bool,
     /// First matching user highlight rule (phrase, user, or badge), if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlight: Option<HighlightStamp>,
@@ -357,6 +361,12 @@ pub enum MessageSegment {
         /// emote came from the channel's own sets.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_personal: Option<bool>,
+        /// The emote's file in the disk cache at the size the page draws, when
+        /// Rust knew it as the row was handed over (`load_channel_history`
+        /// stamps history rows' 7TV emotes). The page draws that file on the
+        /// row's first paint. Absent otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_path: Option<String>,
     },
     Emoji {
         content: String,
@@ -445,6 +455,11 @@ pub struct ChatMessage {
     /// All message analysis done in Rust, frontend just renders
     #[serde(default)]
     pub metadata: MessageMetadata,
+    /// Wall-clock milliseconds at which the IRC line this row came from was
+    /// read, set on live PRIVMSG and USERNOTICE rows only (never history), so
+    /// the page can time each hop a row took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at_ms: Option<i64>,
 }
 
 /// A chat row as a native renderer draws it, built once in Rust so the shell
@@ -591,6 +606,13 @@ pub struct ViewEmote {
     /// A modifier that draws nothing itself and only lends its effect.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// The emote's id on its service. Set together with `credit`, only when the core can say who
+    /// made it: a native shell's tap on the emote asks `emote_credit` with both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The service `emote_credit` takes for it: "twitch", "7tv", "bttv" or "ffz".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credit: Option<String>,
 }
 
 /// A 7TV paint reduced to what a renderer fills a name with.

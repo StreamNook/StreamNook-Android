@@ -1,0 +1,91 @@
+/* The listening pill over a chat's last messages and the player's note while
+   a song is identified (ListeningStrip.tsx). Everything here moves by
+   `transform` or `opacity` only, so it runs on the compositor and repaints
+   nothing over a playing stream. The bars' heights are written every frame by
+   one shared renderer (listeningBars.ts), never through React state. How far
+   the listening has come is a ring around Cancel (ListeningStrip.tsx). */
+
+/* Whole pixels throughout (4 px bars, 3 px gaps), and a pixel of room on
+   each side: a bar's anti-aliased edge stays inside its group's box. The
+   heights change every frame, so each bar is its own compositor layer and is
+   only scaled, never repainted. Repainted bars left a sliver: as the first bar
+   shrank, the soft edge it had drawn just outside the group's box (where it
+   had been taller) was never cleared. */
+.sn-listen-bars {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  height: 24px;
+  padding: 0 1px;
+}
+
+.sn-listen-bars > i {
+  display: block;
+  flex: none;
+  width: 4px;
+  height: 100%;
+  border-radius: 9999px;
+  background: currentColor;
+  transform: scaleY(0.25);
+  transform-origin: center;
+  will-change: transform;
+}
+
+/* The pill's bars, in the theme's accent, lighter at their tips. */
+.sn-listen-bars--accent > i {
+  background: linear-gradient(to top, var(--color-accent), color-mix(in srgb, var(--color-accent) 50%, white));
+}
+
+/* The player's note: the same five bars in its 16 px icon box (2 px bars,
+   1 px gaps, a pixel each side). */
+.sn-listen-bars--small {
+  gap: 1px;
+  height: 14px;
+}
+.sn-listen-bars--small > i {
+  width: 2px;
+}
+
+/* The dots after a phrase that is still going ("Tuning in..."): they come and
+   go, by opacity. Still under the Reduced and Off Motion settings. */
+.sn-listen-dots > i {
+  font-style: normal;
+  opacity: 0.25;
+  animation: sn-listen-dot 1.4s ease-in-out infinite;
+}
+.sn-listen-dots > i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.sn-listen-dots > i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+html[data-motion="reduced"] .sn-listen-dots > i,
+html[data-motion="off"] .sn-listen-dots > i {
+  animation: none;
+  opacity: 1;
+}
+
+@keyframes sn-listen-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+/* While the pill shows at the foot of a chat's messages (60 px tall, 8 px
+   above the foot), Chat Paused rises by its height and an 8 px gap, so the
+   two stack instead of fighting for the same place. By transform only;
+   Tailwind's `transform` class on Chat Paused reads this translate. The Off
+   Motion setting makes the move instant (globals.css). */
+.sn-chat-paused {
+  transition: transform 0.2s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.sn-chat-panel:has([data-listening-shape]) .sn-chat-paused {
+  --tw-translate-y: -68px;
+}
+

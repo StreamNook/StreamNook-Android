@@ -36,6 +36,8 @@ chat-mention-ping
 chat-overlay-click-through
 chat-rebuilt
 chat-tabs
+discord-presence://changed
+discord-presence://page
 drop-claimed
 drop-ready
 drops-login-complete
@@ -72,6 +74,7 @@ mirrored-notification
 mirrored-notification-activate
 multi-nook://meta
 multi-nook://raid
+multi-nook://tile-ended
 multichat-popout-closed
 my-clips://changed
 new-favorite-drops
@@ -108,6 +111,7 @@ seventv-connected-account
 seventv-profile-pictures
 sleep-timer://state
 sn-registry-changed
+song-history-changed
 stream-manager-state
 streamer-mode-changed
 streamer-went-live
@@ -135,6 +139,7 @@ watch-session://stream-update
 watch-session://waiting
 watch-session://went-live
 watched-chest-claimed
+webview-gpu-failed
 whisper-archive-changed
 whisper-conversation-updated
 whisper-import-complete

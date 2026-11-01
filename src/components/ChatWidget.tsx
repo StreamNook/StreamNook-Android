@@ -16,7 +16,6 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { IS_MOBILE } from '../utils/platform';
 import { registerChatSearchController } from '../keybindings/chatSearchController';
 import { Dropdown, type DropdownOption } from './ui/Dropdown';
-import { BANNER_STYLE, GLAZE_BANNER } from './ui/glazeButtons';
 
 import { useTwitchChat, type ModerationContext } from '../hooks/useTwitchChat';
 import { useChannelEmotes, ensureChannelEmotes, getChannelEmotes, emoteCacheKey, refreshChannelEmotes, useChannelChat, useChannelChatMeta, useChatConnectionStore, setChannelPaused, sliceLookupKey, injectSystemMessage, systemSourceFor, ensureChannelHistory } from '../stores/chatConnectionStore';
@@ -55,11 +54,11 @@ import { useAppStore } from '../stores/AppStore';
 import { useChannelState, watchChannel, unwatchChannel, refreshChannelState } from '../stores/channelStateStore';
 import { useProviderEmoteStore } from '../stores/providerEmoteStore';
 import { usePlatformAccountStore } from '../stores/platformAccountStore';
-import { trackEmoteUsage } from '../utils/trackEmoteUsage';
 import { EmoteText, useTextEmotes } from '../utils/emoteText';
 import { isImeComposing } from '../utils/imeComposing';
 import { syncComposerPlaceholder, trackComposerWidth } from '../utils/composerNarrow';
 import { LinkPreviewCard } from './chat/LinkPreviewCard';
+import { usePausedNewCount } from '../hooks/usePausedNewCount';
 import { PinnedChatter } from './chat/PinnedChatter';
 import { SevenTvAvatar } from './SevenTvAvatar';
 import { previewUrlsFromLinks, type RowLink } from '../services/linkPreviewService';
@@ -115,12 +114,10 @@ import {
 import {
   matchEmoteFill,
   matchEmotes,
-  matchMentions,
   rowsToTabCandidates,
   createRequestSeq,
   type EmoteMatchChannel,
   type EmoteMatchRow,
-  type MentionSuggestion,
 } from '../services/emoteMatch';
 import {
   COMMAND_DEFINITIONS,
@@ -164,6 +161,7 @@ import { lastLiveLabel } from '../utils/lastLive';
 import { moderateChatter, moderateWithToast, type ModAction, type ModRequest } from '../services/moderation';
 import { openBadgeInfo } from '../stores/badgeSpotlightStore';
 import { twitchRowBadgeRef, type TwitchRowBadgeInfo } from '../utils/badgeSpotlight';
+import { ListeningStrip } from './chat/ListeningStrip';
 
 /** Lets ChatWidget render against a caller-supplied channel instead of the
  *  AppStore's currentStream — same pattern as the MultiNook synthesis branch
@@ -273,7 +271,10 @@ interface ChatMessagesPanelProps {
   /** Replay-mode snapshot; null in live mode. */
   override: ChatMessagesPanelSource | null;
   isPaused: boolean;
-  onPauseIntent: () => void;
+  onPauseIntent: (opts?: { deliberate?: boolean }) => void;
+  /** Resume to live, as the Chat Paused button does (ChatMessageList calls it
+   *  when a reason picker that paused chat closes). */
+  onResumeIntent: () => void;
   onScroll: (distanceToBottom: number, isUserScroll: boolean) => void;
   onUsernameClick: React.ComponentProps<typeof ChatMessageList>['onUsernameClick'];
   onReplyClick: (parentMsgId: string) => void;
@@ -299,6 +300,13 @@ interface ChatMessagesPanelProps {
   pinnedIds?: ReadonlySet<string>;
   /** Filled with the list's own glide to the live bottom (ChatMessageList). */
   scrollToBottomRef?: React.RefObject<(() => void) | null>;
+  /** Chat Paused, drawn over this panel's own bottom edge: clear of the strips
+   *  and the composer below. */
+  pausedPill?: React.ReactNode;
+  /** The listening pill (and the answer after it), floating over the last
+   *  messages at this panel's foot: never over the strips or the composer
+   *  below. Chat Paused rises above it while it shows (listeningStrip.css). */
+  listeningPill?: React.ReactNode;
 }
 
 /** How many consecutive untagged messages end the shared-chat indicator. */
@@ -322,6 +330,7 @@ const ChatMessagesPanel = ({
   override,
   isPaused,
   onPauseIntent,
+  onResumeIntent,
   onScroll,
   onUsernameClick,
   onReplyClick,
@@ -342,6 +351,8 @@ const ChatMessagesPanel = ({
   headerInset,
   pinnedIds,
   scrollToBottomRef,
+  pausedPill,
+  listeningPill,
 }: ChatMessagesPanelProps) => {
   const live = useChannelChat(override ? null : channelKey);
   const src: ChatMessagesPanelSource = override ?? live;
@@ -594,7 +605,7 @@ const ChatMessagesPanel = ({
 
   return (
     <div
-      className="flex-1 overflow-hidden animate-panel-slide-down"
+      className="sn-chat-panel relative flex-1 overflow-hidden animate-panel-slide-down"
       onMouseEnter={() => { hoveringRef.current = true; }}
       onMouseLeave={() => { hoveringRef.current = false; }}
     >
@@ -613,6 +624,7 @@ const ChatMessagesPanel = ({
             renderToken={src.renderToken}
             isPaused={isPaused}
             onPauseIntent={onPauseIntent}
+            onResumeIntent={onResumeIntent}
             onScroll={onScroll}
             onUsernameClick={onUsernameClick}
             onReplyClick={onReplyClick}
@@ -637,39 +649,19 @@ const ChatMessagesPanel = ({
           />
         </ErrorBoundary>
       )}
+      {listeningPill}
+      {pausedPill}
     </div>
   );
 };
 
-// "N new since paused": anchored to the channel's MONOTONIC live-message
-// counter at the instant pause begins (accurate under buffer trimming, unlike
-// a messages.length diff). Isolated here so its per-flush subscription
-// re-renders only this span, never the widget.
-// Takes the slice keys it should count rather than one channel: a merged feed's
-// "N new" is the total across every source, and reading only the watched channel
-// would under-count it by however much the companions said while you were away.
-// Joined into a string so the identity is stable without the caller memoizing.
+// "N new since paused". Isolated here so its per-flush subscription re-renders
+// only this span, never the widget. Takes the slice keys it should count rather
+// than one channel: a merged feed's "N new" is the total across every source,
+// and reading only the watched channel would under-count it by however much the
+// companions said while you were away.
 const PausedNewCount = ({ sliceKeys, isPaused }: { sliceKeys: string; isPaused: boolean }) => {
-  const keys = sliceKeys ? sliceKeys.split('|') : [];
-  const sumLive = () => {
-    const st = useChatConnectionStore.getState();
-    return keys.reduce((n, k) => n + (st.channels.get(k)?.liveMessageCount ?? 0), 0);
-  };
-  useChatConnectionStore((state) =>
-    isPaused ? keys.reduce((n, k) => n + (state.revisionByChannel[k] ?? 0), 0) : 0,
-  );
-  // Anchor captured once per pause via effect (never a render-time ref write).
-  const [anchor, setAnchor] = useState<number | null>(null);
-  useEffect(() => {
-    if (!isPaused || !sliceKeys) {
-      setAnchor(null);
-      return;
-    }
-    setAnchor((a) => a ?? sumLive());
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPaused, sliceKeys]);
-  if (!isPaused || !sliceKeys || anchor === null) return null;
-  const delta = Math.max(0, sumLive() - anchor);
+  const delta = usePausedNewCount(sliceKeys, isPaused);
   // Capped at 99+: a busy room passes thousands in seconds, and the pill
   // must stay one line.
   return delta > 0 ? <> ({fitCount(delta)} new)</> : null;
@@ -1532,14 +1524,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const [mentionQuery, setMentionQuery] = useState('');
   const [mentionSelectedIndex, setMentionSelectedIndex] = useState(0);
   const [mentionStartPosition, setMentionStartPosition] = useState<number | null>(null);
-  // The @ list on screen, kept with the query it answers.
-  const [mentionAnswer, setMentionAnswer] = useState<{ query: string; users: ChatUser[] }>({ query: '', users: [] });
-  const [mentionSeq] = useState(createRequestSeq);
   // These are stable store actions (vanilla zustand never recreates them), so we
   // read them imperatively rather than subscribing. Subscribing here made the
   // whole ChatWidget re-render on every chatUserStore write, and addUser fires
   // once per chatter, so on a busy channel that was a constant re-render storm.
-  const { addUser, clearUsers } = useChatUserStore.getState();
+  const { addUser, getMatchingUsers, clearUsers } = useChatUserStore.getState();
 
   // / command autocomplete state
   const [showCommandAutocomplete, setShowCommandAutocomplete] = useState(false);
@@ -1602,47 +1591,30 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     [provider, currentStream?.user_login, currentStream?.user_id],
   );
 
-  /** Rust's @ rows, each wearing its chatter's color and paint when they have
-   *  chatted here. */
-  const mentionUsersFrom = useCallback(
-    (rows: MentionSuggestion[]): ChatUser[] => {
-      const { users } = useChatUserStore.getState();
-      return rows.map((r) => {
-        const key = provider === 'twitch' ? r.userId : `${provider}:${r.userId}`;
-        return (
-          users.get(key) ?? {
-            userId: key || r.login,
-            username: r.login,
-            displayName: r.displayName,
-            color: '',
-            lastSeen: 0,
-          }
-        );
-      });
-    },
-    [provider],
-  );
+  /** The room's streamer, so the @ list leads with them: in a Twitch room even
+   *  before they chat, in a Kick or YouTube room once they have (a Kick room
+   *  key need not be the username, a YouTube one is a channel id). */
+  const mentionLead = useCallback((): ChatUser | null => {
+    const login = currentStream?.user_login?.toLowerCase();
+    if (!login) return null;
+    const chatted = useChatUserStore.getState().getUserByUsername(login, provider);
+    if (chatted) return chatted;
+    if (provider !== 'twitch') return null;
+    return {
+      userId: currentStream?.user_id || login,
+      username: login,
+      displayName: currentStream?.user_name || login,
+      color: '',
+      lastSeen: 0,
+    };
+  }, [provider, currentStream?.user_login, currentStream?.user_id, currentStream?.user_name]);
 
-  /** Ask Rust for the @ list (the streamer first, then the room's recent
-   *  chatters); a reply to an older keystroke is dropped. */
-  const askMentions = useCallback(
-    (query: string, commandArg: boolean) => {
-      const n = mentionSeq.next();
-      void matchMentions(emoteMatchTarget, query, commandArg).then((rows) => {
-        if (!mentionSeq.isCurrent(n)) return;
-        const users = mentionUsersFrom(rows);
-        setMentionAnswer({ query, users });
-        setShowMentionAutocomplete(users.length > 0);
-      });
-    },
-    [emoteMatchTarget, mentionSeq, mentionUsersFrom],
+  /** The @ list for what is typed, the streamer first. A command's username
+   *  argument (/ban, /timeout) keeps plain recency. */
+  const mentionMatches = useCallback(
+    (query: string, commandArg: boolean) => getMatchingUsers(query, 5, commandArg ? null : mentionLead()),
+    [getMatchingUsers, mentionLead],
   );
-
-  /** Close the @ list, so a reply still on its way cannot reopen it. */
-  const dropMentions = useCallback(() => {
-    mentionSeq.next();
-    setShowMentionAutocomplete(false);
-  }, [mentionSeq]);
 
   /**
    * Open (or re-query) the emote list for the text typed since `anchor`. The
@@ -2988,6 +2960,11 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     // always lands, then glide to the live bottom.
     setChatPaused(false, { scrollToBottom: true, force: true });
   };
+  // The same resume for the list (a reason picker that paused chat closing),
+  // stable so the list never re-renders for it.
+  const handleResumeIntent = useCallback(() => {
+    setChatPaused(false, { scrollToBottom: true, force: true });
+  }, [setChatPaused]);
 
   // A Twitch badge click opens its badge page in the Badges overlay with the
   // version id (the page's metadata, earn guide and window lookups key on it).
@@ -3717,14 +3694,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
           } : undefined, replyParentMsgId, senderAccount);
           noteChatLineSent();
         }
-
-        // Stats and emote tallies are keyed by the Twitch user id, so they only
-        // apply when a Twitch account is linked.
-        if (currentUser) {
-          // Tally emote usage from this message into the member's persisted
-          // most-used-emotes counts (best effort, non-blocking).
-          void trackEmoteUsage(messageToSend, currentStream?.user_id || null, currentUser.user_id);
-        }
       } catch (err) {
         Logger.error('Failed to send message:', err);
         setMessageInput(messageToSend);
@@ -3778,18 +3747,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
     // Handle autocomplete navigation when visible
     if (showMentionAutocomplete) {
-      const matchingUsers = mentionAnswer.users;
-      // The list on screen may answer an older keystroke. Picking from it would
-      // insert the wrong name (the streamer leads nearly every broad list), so
-      // a pick then asks for the answer to what is typed now.
-      const fresh = mentionAnswer.query === mentionQuery;
       const commandArg = mentionStartPosition !== null && messageInput.charAt(mentionStartPosition) === ' ';
-      const pickCurrent = () => {
-        void matchMentions(emoteMatchTarget, mentionQuery, commandArg).then((rows) => {
-          const first = mentionUsersFrom(rows)[0];
-          if (first) insertMention(first);
-        });
-      };
+      const matchingUsers = mentionMatches(mentionQuery, commandArg);
 
       if (e.key === 'ArrowUp') {
         e.preventDefault();
@@ -3809,10 +3768,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
       
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        if (!fresh) {
-          pickCurrent();
-          return;
-        }
         const selectedUser = matchingUsers[mentionSelectedIndex];
         if (selectedUser) {
           insertMention(selectedUser);
@@ -3822,16 +3777,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
 
       if (e.key === 'Escape') {
         e.preventDefault();
-        dropMentions();
+        setShowMentionAutocomplete(false);
         return;
       }
 
       if (e.key === 'Tab') {
         e.preventDefault();
-        if (!fresh) {
-          pickCurrent();
-          return;
-        }
         const selectedUser = matchingUsers[mentionSelectedIndex];
         if (selectedUser) {
           insertMention(selectedUser);
@@ -4134,7 +4085,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         setCommandSelectedIndex(0);
 
         // don't show mention autocomplete
-        dropMentions();
+        setShowMentionAutocomplete(false);
         return;
       } else {
         // We've typed past the command name (there's a space).
@@ -4150,7 +4101,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             flowReplaceFromRef.current = flow.replaceFrom;
             setShowCommandAutocomplete(true);
             setCommandSelectedIndex(0);
-            dropMentions();
+            setShowMentionAutocomplete(false);
             return;
           }
           // No suggestions for this step (e.g. typing the message body): drop the
@@ -4175,7 +4126,9 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             setMentionQuery(query);
             setMentionStartPosition(firstSpaceIndex);
             setMentionSelectedIndex(0);
-            askMentions(query, true);
+
+            const matches = mentionMatches(query, true);
+            setShowMentionAutocomplete(matches.length > 0);
             return;
           }
         }
@@ -4202,17 +4155,19 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         setMentionQuery(query);
         setMentionStartPosition(lastAtIndex);
         setMentionSelectedIndex(0);
-        // Shown once Rust answers with at least one name.
-        askMentions(query, false);
+
+        // Only show autocomplete if we have matches
+        const matches = mentionMatches(query, false);
+        setShowMentionAutocomplete(matches.length > 0);
         return;
       }
     }
 
     // No valid @ trigger found
-    dropMentions();
+    setShowMentionAutocomplete(false);
     setMentionQuery('');
     setMentionStartPosition(null);
-  }, [askMentions, dropMentions, isModerator, isBroadcaster, settings.chat_commands?.user_commands, settings.reminders?.reminders, settings.chat_input?.emote_colon_search_enabled, emoteTabState, emoteList, openEmoteList, closeEmoteList]);
+  }, [mentionMatches, isModerator, isBroadcaster, settings.chat_commands?.user_commands, settings.reminders?.reminders, settings.chat_input?.emote_colon_search_enabled, emoteTabState, emoteList, openEmoteList, closeEmoteList]);
 
   // Insert a command string directly from other UI elements (like UserProfileCard)
   const preFillCommand = useCallback((cmdText: string) => {
@@ -4312,7 +4267,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     setMessageInput(newValue);
 
     // Hide autocomplete
-    dropMentions();
+    setShowMentionAutocomplete(false);
     setMentionQuery('');
     setMentionStartPosition(null);
 
@@ -4322,7 +4277,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     setTimeout(() => {
       inputRef.current?.setSelectionRange(newCursorPos, newCursorPos);
     }, 0);
-  }, [messageInput, mentionStartPosition, mentionQuery, provider, dropMentions]);
+  }, [messageInput, mentionStartPosition, mentionQuery, provider]);
 
   // At the cursor, spaced from its neighbours. The textarea keeps its caret
   // while focus is elsewhere (the emote menu, or the popped-out one in another
@@ -4608,12 +4563,19 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // /usercard and /user commands) invoke the current closure.
   handleUsernameClickRef.current = handleUsernameClick;
 
-  const handlePauseIntent = useCallback(() => {
+  const handlePauseIntent = useCallback((opts?: { deliberate?: boolean }) => {
     // Fired the instant the user scrolls up by any amount. This
     // is the primary pause path — no distance threshold, just
     // like Twitch: scroll up at all and chat pauses. It is safe
     // from layout jolts because only a real wheel/touch gesture
     // reaches here (a tall message moving the scrollbar does not).
+    // A deliberate pause (a scrollbar press, a reason picker opening) is a
+    // press, not wheel inertia or a settling layout, so the windows below
+    // never drop it: the list has already stopped following.
+    if (opts?.deliberate) {
+      setChatPaused(true, { force: true });
+      return;
+    }
     const now = Date.now();
     if (now - mountTimeRef.current < 2000) return;       // initial layout settle
     if (now - lastResumeTimeRef.current < 1000) return;  // post-resume inertia
@@ -5304,8 +5266,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                   animate={{ opacity: 1, y: 0, scale: 1, height: 'auto' }}
                   exit={{ opacity: 0, y: -10, scale: 0.96, height: 0 }}
                   transition={{ duration: 0.3, ease: [0.175, 0.885, 0.32, 1.2] }}
-                  className={`${GLAZE_BANNER} w-full max-w-sm mt-2 pointer-events-auto overflow-hidden origin-top cursor-pointer`}
-                  style={BANNER_STYLE}
+                  // The emote, bits and mod menus' glass, blur and corners.
+                  className="glass-flyout rounded-xl !p-0 w-full max-w-sm mt-2 pointer-events-auto overflow-hidden origin-top cursor-pointer"
                   // Clicking the open pin folds it back to the bar, the same
                   // gesture that opened it. Interactive children (unpin, links,
                   // preview cards) keep their own click, and a drag that selected
@@ -5516,8 +5478,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                       setIsPinnedExpanded(true);
                       seenPinIdRef.current = pin.id;
                     }}
-                    className={`${GLAZE_BANNER} chrome-glaze--control group w-full max-w-sm mt-2 pointer-events-auto overflow-hidden flex items-center gap-2.5 px-3.5 py-2.5 text-left transition-colors`}
-                    style={BANNER_STYLE}
+                    className="glass-flyout rounded-xl group w-full max-w-sm mt-2 pointer-events-auto overflow-hidden flex items-center gap-2.5 !px-3.5 !py-2.5 text-left transition-colors"
                   >
                     <svg className="w-3.5 h-3.5 text-accent flex-shrink-0" fill="currentColor" viewBox="0 0 16 16">
                       <path d="M4.146.146A.5.5 0 0 1 4.5 0h7a.5.5 0 0 1 .5.5c0 .68-.342 1.174-.646 1.479-.126.125-.25.224-.354.298v4.431l.078.048c.203.127.476.314.751.555C12.36 7.775 13 8.527 13 9.5a.5.5 0 0 1-.5.5h-4v4.5a.5.5 0 0 1-1 0V10h-4A.5.5 0 0 1 3 9.5c0-.973.64-1.725 1.17-2.189A5.921 5.921 0 0 1 5 6.708V2.277a2.77 2.77 0 0 1-.354-.298C4.342 1.674 4 1.179 4 .5a.5.5 0 0 1 .146-.354z"/>
@@ -5661,6 +5622,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             override={panelOverride}
             isPaused={isPaused}
             onPauseIntent={handlePauseIntent}
+            onResumeIntent={handleResumeIntent}
             onScroll={handleListScroll}
             onUsernameClick={handleUsernameClick}
             onReplyClick={handleReplyClick}
@@ -5680,6 +5642,23 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             headerInset={chromeHeight}
             pinnedIds={pinnedIds}
             scrollToBottomRef={listScrollToBottomRef}
+            pausedPill={
+              isPaused ? (
+                <div className="sn-chat-paused absolute bottom-3 left-1/2 transform -translate-x-1/2 z-50 pointer-events-auto">
+                  <button onMouseDown={(e) => e.preventDefault()} onClick={handleResume} className="flex items-center gap-2 whitespace-nowrap px-4 py-2 chrome-glaze chrome-glaze--control chrome-glaze--frosted text-white text-sm font-medium shadow-lg">
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                    <span>Chat Paused<PausedNewCount sliceKeys={pausedCountKeys} isPaused={isPaused} /></span>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
+                  </button>
+                </div>
+              ) : null
+            }
+            listeningPill={
+              // While a song is identified for this chat, and its answer
+              // after. Its room is the one this widget's slash commands
+              // answer into (the Twitch login, or the provider's key).
+              <ListeningStrip room={isTwitch ? (currentStream?.user_login ?? null) : providerKey} />
+            }
           />
         )}
         {/* AutoMod held-message queue (moderators, Twitch). Rust owns the
@@ -5691,17 +5670,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             strip mirrors it and sends Approve / Deny to Helix. */}
         {activeView === 'chat' && isModerator && isTwitch && panelChannelKey && currentStream?.user_id && (
           <UnbanRequestsStrip channel={panelChannelKey} channelId={currentStream.user_id} />
-        )}
-
-        {/* Chat Paused indicator - positioned above input */}
-        {activeView === 'chat' && isPaused && (
-          <div className="absolute bottom-[60px] left-1/2 transform -translate-x-1/2 z-50 pointer-events-auto">
-            <button onClick={handleResume} className="flex items-center gap-2 whitespace-nowrap px-4 py-2 chrome-glaze chrome-glaze--control chrome-glaze--frosted text-white text-sm font-medium shadow-lg">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-              <span>Chat Paused<PausedNewCount sliceKeys={pausedCountKeys} isPaused={isPaused} /></span>
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-            </button>
-          </div>
         )}
 
         {/* Input container - static flex item at bottom (hidden when About view active) */}
@@ -6045,7 +6013,10 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                   {/* @ Mention Autocomplete */}
                   {showMentionAutocomplete && (
                     <MentionAutocomplete
-                      users={mentionAnswer.users}
+                      users={mentionMatches(
+                        mentionQuery,
+                        mentionStartPosition !== null && messageInput.charAt(mentionStartPosition) === ' ',
+                      )}
                       selectedIndex={mentionSelectedIndex}
                       onSelect={(user) => insertMention(user)}
                       onSelectedIndexChange={setMentionSelectedIndex}
@@ -6193,7 +6164,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     disabled={isInputDisabled}
                     onBlur={() => {
                       // Delay hiding to allow click on autocomplete
-                      setTimeout(dropMentions, 150);
+                      setTimeout(() => setShowMentionAutocomplete(false), 150);
                       setTimeout(() => setShowCommandAutocomplete(false), 150);
                       setEmoteTabState(null);
                       // Picking a row never blurs (rows act on mousedown), so a

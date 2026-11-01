@@ -43,6 +43,8 @@ pub fn frontend_owned_defaults() -> Value {
         "discovery_languages": [],
         "fullscreen_chat": {
             "phone_layout": "beside",
+            // A stream's landscape opens with chat shown until the person hides it.
+            "landscape_open": true,
             "opacity": 55,
             "width": 340,
             "side": "auto",
@@ -122,6 +124,7 @@ pub fn frontend_owned_defaults() -> Value {
             "emote_tab_complete_enabled": true,
             "emote_tab_complete_match_mode": "starts_with",
             "emote_tab_complete_include_chatters": true,
+            "emote_suggest_colon_only": false,
         },
     })
 }
@@ -274,18 +277,64 @@ fn settings_view(mut current: Value) -> SettingsView {
 /// Set one or more settings by dotted path (`chat_design.font_size`), each a
 /// read-modify-write on the canonical settings: every other key of the group
 /// is kept as Rust holds it. A null value removes the key.
+///
+/// `order` numbers one stream of edits (one editor in one page): a write
+/// numbered at or below one already applied on that stream is dropped, so a
+/// flush on unload that overtakes the write still in flight never loses to it.
 #[tauri::command]
 pub async fn set_settings_fields(
     app: AppHandle,
     changes: Map<String, Value>,
     source: Option<String>,
+    order: Option<WriteOrder>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     if changes.is_empty() {
         return Ok(());
     }
-    commit_settings_patch(&app, &state, source, |current| patch_for_changes(current, &changes))
+    commit_settings_patch(&app, &state, source, |current| {
+        // Under the settings lock, so the check and the write are one step.
+        if let Some(order) = &order {
+            let mut applied = APPLIED_ORDERS.lock().unwrap_or_else(|e| e.into_inner());
+            if !newest_write(&mut applied, order) {
+                return Ok(Map::new());
+            }
+        }
+        patch_for_changes(current, &changes)
+    })
 }
+
+/// One numbered write of a stream of field edits.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WriteOrder {
+    pub stream: String,
+    pub n: u64,
+}
+
+static APPLIED_ORDERS: once_cell::sync::Lazy<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Whether `order` is newer than every write applied on its stream; records it
+/// when it is.
+fn newest_write(applied: &mut std::collections::HashMap<String, u64>, order: &WriteOrder) -> bool {
+    match applied.get(&order.stream) {
+        Some(&last) if order.n <= last => false,
+        _ => {
+            // One stream per page that edits: the oldest (lowest numbered; the
+            // app numbers from the clock) goes once there are many.
+            if !applied.contains_key(&order.stream) && applied.len() >= ORDER_STREAMS_KEPT {
+                if let Some(oldest) = applied.iter().min_by_key(|(_, n)| **n).map(|(k, _)| k.clone()) {
+                    applied.remove(&oldest);
+                }
+            }
+            applied.insert(order.stream.clone(), order.n);
+            true
+        }
+    }
+}
+
+/// Streams of numbered writes remembered at once.
+const ORDER_STREAMS_KEPT: usize = 64;
 
 /// Put the given dotted paths back to a fresh install's values (removing the
 /// key where a fresh install has none), as one write.
@@ -314,6 +363,17 @@ pub async fn reset_settings(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_older_write_never_lands_after_a_newer_one() {
+        let mut applied = std::collections::HashMap::new();
+        let w = |n| WriteOrder { stream: "discord_presence:page-a".into(), n };
+        assert!(newest_write(&mut applied, &w(2)), "the flush lands first");
+        assert!(!newest_write(&mut applied, &w(1)), "the write it overtook is dropped");
+        assert!(newest_write(&mut applied, &w(3)));
+        let other = WriteOrder { stream: "discord_presence:page-b".into(), n: 1 };
+        assert!(newest_write(&mut applied, &other), "a new page counts on its own");
+    }
 
     #[test]
     fn set_path_creates_and_removes() {
@@ -361,5 +421,30 @@ mod tests {
         assert_eq!(get_path(&patch["chat_design"], "font_size"), Some(&json!(20)));
         assert_eq!(get_path(&patch["chat_design"], "show_badges"), Some(&json!(before)));
         assert_eq!(patch["fullscreen_chat"], json!({ "side": "left" }));
+    }
+
+    #[test]
+    fn presence_fields_patch_alone() {
+        let current = Settings::default();
+        let mut changes = Map::new();
+        changes.insert("discord_presence.large_image".into(), json!("streamer"));
+        let patch = patch_for_changes(&current, &changes).unwrap();
+        assert_eq!(get_path(&patch["discord_presence"], "large_image"), Some(&json!("streamer")));
+        assert_eq!(
+            get_path(&patch["discord_presence"], "watching_top"),
+            Some(&json!("Watching {streamer}")),
+            "the style's other fields stay"
+        );
+    }
+
+    #[test]
+    fn write_streams_are_capped() {
+        let mut applied = std::collections::HashMap::new();
+        for i in 0..(ORDER_STREAMS_KEPT as u64 + 5) {
+            let order = WriteOrder { stream: format!("discord_presence:page-{i}"), n: 1_000 + i };
+            assert!(newest_write(&mut applied, &order));
+        }
+        assert_eq!(applied.len(), ORDER_STREAMS_KEPT);
+        assert!(!applied.contains_key("discord_presence:page-0"), "the oldest goes first");
     }
 }

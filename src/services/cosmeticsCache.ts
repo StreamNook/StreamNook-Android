@@ -1,4 +1,5 @@
 import { Logger } from '../utils/logger';
+import { withoutLoopbackUrls } from '../utils/cacheFileUrl';
 // Service for caching cosmetics - user lookups in memory, image files on disk
 // User -> cosmetics mappings come from APIs fresh each time
 // Image files are cached to disk by their respective services (seventvService, thirdPartyBadges)
@@ -23,6 +24,17 @@ export interface CachedProfile {
   seventvCosmetics: CachedCosmetics;
   thirdPartyBadges: any[];
   lastUpdated: number;
+  /**
+   * Whether 7TV's full inventory answered (the owned counts are real). False
+   * when it failed or the account has no 7TV, and `seventvCosmetics` is the
+   * worn-only fallback. Absent on profiles built by the lighter paths.
+   */
+  inventoryAnswered?: boolean;
+  /**
+   * Whether the worn paint and badge are a real 7TV answer, decided for THIS
+   * fetch (a later read clearing the failure mark does not change it).
+   */
+  wornAnswered?: boolean;
 }
 
 // Small bounded LRU. Touch-on-hit keeps recently-used entries warm; least-recently
@@ -148,7 +160,8 @@ function persistOwnCosmetics(userId: string): void {
     if (!cosmetics) return;
     const store = readPersistedCosmetics();
     store[userId] = cosmetics;
-    localStorage.setItem(OWN_COSMETICS_KEY, JSON.stringify(store));
+    // A loopback image URL dies with this launch (new port and token): never saved.
+    localStorage.setItem(OWN_COSMETICS_KEY, JSON.stringify(store, withoutLoopbackUrls));
   } catch (e) {
     Logger.warn('[cosmeticsCache] persistOwnCosmetics failed:', e);
   }
@@ -299,7 +312,7 @@ const compactThirdPartyBadges = (badges: any[]): any[] =>
   badges.map(({ link: _link, ...rest }) => rest);
 
 // Track pending requests to prevent duplicate fetches
-const pendingCosmeticsRequests = new Map<string, Promise<CachedCosmetics>>();
+const pendingCosmeticsRequests = new Map<string, Promise<CosmeticsAnswer>>();
 const pendingThirdPartyBadgesRequests = new Map<string, Promise<any[]>>();
 const pendingTwitchBadgesRequests = new Map<string, Promise<any[]>>();
 const pendingProfileRequests = new Map<string, Promise<CachedProfile>>();
@@ -319,17 +332,27 @@ export function getCosmeticsFromMemoryCache(userId: string): CachedCosmetics | n
   return cached;
 }
 
+/** Cosmetics plus whether this very read hard-failed (decided with the read). */
+interface CosmeticsAnswer {
+  data: CachedCosmetics;
+  hardFail: boolean;
+}
+
 /**
  * Get cosmetics for a user - memory cache -> API fetch with deduplication
  * Image caching is handled by the seventvService internally
  */
 export async function getCosmeticsWithFallback(userId: string): Promise<CachedCosmetics> {
+  return (await getCosmeticsAnswer(userId)).data;
+}
+
+async function getCosmeticsAnswer(userId: string): Promise<CosmeticsAnswer> {
   // 1. Try in-memory cache first (instant, synchronous). A hard-failed entry
   //    past its retry TTL is treated as a miss so a transient 7TV failure
   //    earlier in the session doesn't strand the user without a paint.
   const memoryCached = inMemoryCosmeticsCache.get(userId);
   if (memoryCached && !(hasHardFailMark(userId) && isHardFailExpired(userId))) {
-    return memoryCached;
+    return { data: memoryCached, hardFail: hasHardFailMark(userId) };
   }
 
   // 2. Check if there's already a pending request for this user (dedupe)
@@ -339,7 +362,7 @@ export async function getCosmeticsWithFallback(userId: string): Promise<CachedCo
   }
 
   // 3. Create a new request and track it
-  const request = (async (): Promise<CachedCosmetics> => {
+  const request = (async (): Promise<CosmeticsAnswer> => {
     try {
       // Fetch from API. seventvService returns a wrapper that flags hard
       // failures vs. successful responses (including legitimate empties).
@@ -349,7 +372,7 @@ export async function getCosmeticsWithFallback(userId: string): Promise<CachedCo
       // Publish so listeners (chatUserStore et al.) react.
       publishCosmetics(userId, data, hardFail, stale === true);
 
-      return data;
+      return { data, hardFail };
     } finally {
       pendingCosmeticsRequests.delete(userId);
     }
@@ -427,6 +450,9 @@ export function getProfileFromMemoryCache(userId: string): CachedProfile | null 
   return inMemoryProfileCache.get(userId) || null;
 }
 
+/** Whether both 7TV reads of a cached profile answered (older entries have no flags). */
+const isFullyAnswered = (p: CachedProfile): boolean => p.inventoryAnswered !== false && p.wornAnswered !== false;
+
 /**
  * Get full profile data with cache-first strategy
  * Returns cached data immediately if available, then refreshes in background
@@ -437,9 +463,10 @@ export async function getFullProfileWithFallback(
   channelId?: string,
   channelName?: string
 ): Promise<CachedProfile> {
-  // 1. Try in-memory cache first (instant, synchronous)
+  // 1. Try in-memory cache first (instant, synchronous). A profile that 7TV
+  //    did not fully answer is kept only for the hard-fail retry window.
   const memoryCached = inMemoryProfileCache.get(userId);
-  if (memoryCached) {
+  if (memoryCached && (isFullyAnswered(memoryCached) || Date.now() - memoryCached.lastUpdated < HARD_FAIL_RETRY_MS)) {
     return memoryCached;
   }
 
@@ -464,10 +491,18 @@ export async function getFullProfileWithFallback(
       // cannot be reused here. Falls back to the worn-only shape if the heavier
       // query fails, so a profile still paints rather than showing nothing.
       const { fetchUserInventory } = await import('./seventvService');
-      const [badgeData, seventvCosmetics] = await Promise.all([
+      const [badgeData, sevenTv] = await Promise.all([
         getAllUserBadgesWithEarned(userId, username, effectiveChannelId, effectiveChannelName),
-        fetchUserInventory(userId).then((inv) => inv ?? getCosmeticsWithFallback(userId)),
+        fetchUserInventory(userId).then(async (inv) => {
+          // An account 7TV does not know answers an empty inventory; null is a
+          // failed read.
+          if (inv) return { cosmetics: inv as CachedCosmetics, inventoryAnswered: true, wornAnswered: true };
+          // The answer travels with this read, never a mark read later.
+          const { data: cosmetics, hardFail } = await getCosmeticsAnswer(userId);
+          return { cosmetics, inventoryAnswered: false, wornAnswered: !hardFail };
+        }),
       ]);
+      const seventvCosmetics = sevenTv.cosmetics;
 
       // Merge display and earned Twitch badges, then strip cache-dead fields.
       const uniqueTwitchBadges = new Map<string, any>();
@@ -492,7 +527,9 @@ export async function getFullProfileWithFallback(
         displayBadgeIds: badgeData.displayBadges.map((badge: any) => badge.id),
         seventvCosmetics,
         thirdPartyBadges,
-        lastUpdated: Date.now()
+        lastUpdated: Date.now(),
+        inventoryAnswered: sevenTv.inventoryAnswered,
+        wornAnswered: sevenTv.wornAnswered,
       };
 
       // Also cache individual components
@@ -500,7 +537,9 @@ export async function getFullProfileWithFallback(
       inMemoryTwitchBadgesCache.set(twitchCacheKey, twitchBadges);
       inMemoryThirdPartyBadgesCache.set(userId, thirdPartyBadges);
 
-      // Store in memory cache for this session
+      // Store in memory cache for this session. A profile 7TV failed for keeps
+      // its flags and is served only for the retry window (see the hit check
+      // above), so a reopen after 7TV recovers reads again.
       inMemoryProfileCache.set(userId, profile);
 
       return profile;

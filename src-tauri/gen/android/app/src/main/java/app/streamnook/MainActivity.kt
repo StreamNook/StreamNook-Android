@@ -20,6 +20,7 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import android.util.Rational
+import android.view.HapticFeedbackConstants
 import android.view.WindowManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
@@ -42,6 +43,12 @@ import org.json.JSONObject
 
 class MainActivity : TauriActivity() {
   private var webView: WebView? = null
+
+  // The landscape player's chat pull (SN-30): the side edge claimed from the
+  // Back gesture, or null, and the gesture strips' widths in device px.
+  private var backExclusionSide: String? = null
+  private var gestureLeftPx = 0
+  private var gestureRightPx = 0
 
   // Last known insets in CSS px, readable synchronously from JS via the
   // `SNInsets` bridge (covers boot and page reloads, when the pushed CSS vars
@@ -395,6 +402,16 @@ class MainActivity : TauriActivity() {
     }
 
     /** Hide/show the system bars (immersive playback, e.g. landscape watch). */
+    /** The landscape player's chat pull: claim one side edge ("left" or "right")
+     *  from the Back gesture, or "" to hand it back. */
+    @JavascriptInterface
+    fun setBackExclusion(side: String) {
+      runOnUiThread {
+        backExclusionSide = side.takeIf { it == "left" || it == "right" }
+        applyBackExclusion()
+      }
+    }
+
     /** The player's rotate button: hold landscape (either side) or portrait whatever the
      *  rotation lock says, or release back to the sensor when the player is left. */
     @JavascriptInterface
@@ -441,18 +458,50 @@ class MainActivity : TauriActivity() {
 
     /**
      * The brightness the player's swipe dial starts from, 0..1: our own
-     * override while one is in force, otherwise the system slider's position.
+     * override while one is in force, otherwise the phone's own level.
      * Reading the system value needs no permission; only writing it would.
      */
     @JavascriptInterface
     fun getScreenBrightness(): Float {
       val override = brightnessOverride
       if (override >= 0f) return override
+      return systemBrightness()
+    }
+
+    /**
+     * The phone's own level as 0..1. Android 11 alone keeps it as a float
+     * beside the old 0..255 number, in the same space as the window override,
+     * so there it is read first (later versions stopped writing it, and a row
+     * left over from an upgrade would be stale). Some vendors put the old
+     * number on a larger scale; a value past 255 is read against the
+     * framework's maximum. The answer is always clamped, so the dial never
+     * starts past full.
+     */
+    private fun systemBrightness(): Float {
+      if (Build.VERSION.SDK_INT == Build.VERSION_CODES.R) {
+        try {
+          val level = Settings.System.getFloat(contentResolver, "screen_brightness_float")
+          if (level in 0f..1f) return level
+        } catch (_: Exception) {
+          // Not readable here: use the number below.
+        }
+      }
       return try {
-        Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f
+        val raw = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS)
+        val scale = if (raw > 255) maxOf(raw, brightnessSettingMaximum()) else 255
+        (raw.toFloat() / scale).coerceIn(0f, 1f)
       } catch (_: Exception) {
         0.5f
       }
+    }
+
+    /** The framework's top brightness number, 255 when it cannot be read. */
+    private fun brightnessSettingMaximum(): Int = try {
+      val res = android.content.res.Resources.getSystem()
+      val id = res.getIdentifier("config_screenBrightnessSettingMaximum", "integer", "android")
+      if (id != 0) res.getInteger(id) else 255
+    } catch (_: Exception) {
+      255
     }
 
     /**
@@ -470,6 +519,33 @@ class MainActivity : TauriActivity() {
         lp.screenBrightness = value
         window.attributes = lp
       }
+    }
+
+    /**
+     * One touch-feedback pulse for the page's haptics (src/mobile/ui/haptics.ts).
+     * The WebView's navigator.vibrate needs the VIBRATE permission, which this
+     * app does not hold, so it does nothing; the view's own haptic feedback
+     * needs no permission and follows the phone's touch-feedback switch. A
+     * step is the light tick and a tick the click one notch firmer, both
+     * effects that fall back to a plain buzz on phones without fine haptics;
+     * commit and destructive use the confirm and reject effects where the
+     * phone has them. An unknown kind does nothing.
+     */
+    @JavascriptInterface
+    fun haptic(kind: String) {
+      val constant = when (kind) {
+        "arm" -> HapticFeedbackConstants.LONG_PRESS
+        "tick" -> HapticFeedbackConstants.VIRTUAL_KEY
+        "step" -> HapticFeedbackConstants.CONTEXT_CLICK
+        "commit" ->
+          if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.CONFIRM
+          else HapticFeedbackConstants.VIRTUAL_KEY
+        "destructive" ->
+          if (Build.VERSION.SDK_INT >= 30) HapticFeedbackConstants.REJECT
+          else HapticFeedbackConstants.LONG_PRESS
+        else -> return
+      }
+      runOnUiThread { webView?.performHapticFeedback(constant) }
     }
 
     /** Media-stream volume, 0..1. The dial moves the DEVICE volume: a WebView
@@ -924,6 +1000,16 @@ class MainActivity : TauriActivity() {
     super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
     // See onPause: keep the WebView live so the window keeps drawing and playing.
     if (isInPictureInPictureMode) webView?.onResume()
+    // A window's brightness applies to the whole display while the window is
+    // on screen, and the PiP window stays on screen over other apps: drop a
+    // dialed level at once. brightnessOverride keeps the level, so the web
+    // shell can set it aside and bring it back when the stream returns full
+    // screen.
+    if (isInPictureInPictureMode && brightnessOverride >= 0f) {
+      val lp = window.attributes
+      lp.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+      window.attributes = lp
+    }
     // A PiP window has no system bars, so coming back out re-lays them out
     // without carrying the appearance flags over. Nothing else restores them.
     if (!isInPictureInPictureMode) applyBarAppearance()
@@ -1072,6 +1158,9 @@ class MainActivity : TauriActivity() {
       // clear of them is cheaper and cannot be silently ignored by the system.
       val gest = insets.getInsets(WindowInsetsCompat.Type.systemGestures())
       val mand = insets.getInsets(WindowInsetsCompat.Type.mandatorySystemGestures())
+      gestureLeftPx = gest.left
+      gestureRightPx = gest.right
+      applyBackExclusion()
       fun px(v: Int): Int = (v / density).toInt()
       val kb = maxOf(0, px(ime.bottom) - px(bars.bottom))
       insetsJson = JSONObject()
@@ -1100,6 +1189,25 @@ class MainActivity : TauriActivity() {
       insets
     }
     ViewCompat.requestApplyInsets(webView)
+    // The claimed edge follows the WebView's size (a turn, a fold).
+    webView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> applyBackExclusion() }
+  }
+
+  /** Claims the whole side edge the page asked for from the Back gesture, as
+   *  wide as that edge's gesture strip (at least 24 dp), or hands it back.
+   *  Android lifts its 200 dp cap while the bars are hidden with transient
+   *  swipe, which is the landscape player's state. */
+  private fun applyBackExclusion() {
+    val view = webView ?: return
+    val side = backExclusionSide
+    if (side == null || view.width == 0 || view.height == 0) {
+      ViewCompat.setSystemGestureExclusionRects(view, emptyList())
+      return
+    }
+    val wide = maxOf(if (side == "left") gestureLeftPx else gestureRightPx, (24 * resources.displayMetrics.density).toInt())
+    val rect =
+      if (side == "left") Rect(0, 0, wide, view.height) else Rect(view.width - wide, 0, view.width, view.height)
+    ViewCompat.setSystemGestureExclusionRects(view, listOf(rect))
   }
 
   /**

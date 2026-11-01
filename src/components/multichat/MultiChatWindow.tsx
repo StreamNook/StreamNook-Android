@@ -76,6 +76,7 @@ import ClipModal from '../ClipModal';
 import VodModal from './VodModal';
 import { useCommandPaletteHotkey } from '../../hooks/useCommandPaletteHotkey';
 import { usePlatformAccountSync } from '../../hooks/usePlatformAccountSync';
+import { useMentionPing } from '../../hooks/useMentionPing';
 import { useKeybindings } from '../../keybindings';
 import { startSnippetSync } from '../../stores/snippetStore';
 import PluginUiHost from '../../plugins-ui/PluginUiHost';
@@ -109,6 +110,7 @@ import type { MentionEntry, TwitchStream } from '../../types';
 import streamNookLogoUrl from '../../assets/streamnook-logo-128.webp';
 import SplitLayout from './SplitLayout';
 import BadgeSpotlightHost from '../BadgeSpotlightHost';
+import { SongsPanelHost } from '../songs/SongsPanelHost';
 import { registerPaneFocusController } from '../../keybindings/paneFocusController';
 import {
   columnCount,
@@ -421,6 +423,8 @@ export default function MultiChatWindow() {
   // Keyboard moderation in the popout: the active pane registers the mod
   // controller (see ChatWidget), and this drives the hotkeys against it.
   useKeybindings();
+  // Hears every mention ping and plays the ones this window claims first.
+  useMentionPing();
   useEffect(() => {
     startSnippetSync();
   }, []);
@@ -1959,6 +1963,8 @@ export default function MultiChatWindow() {
     <div className="flex h-screen flex-col bg-background text-textPrimary">
       {/* Badge clicks here open their card in this window, not main. */}
       <BadgeSpotlightHost />
+      {/* Your songs opens here too: /songs and a song card's link in this window. */}
+      <SongsPanelHost />
       {/* This window has no full ToastManager (that one also fires live-stream
           notifications); a minimal surface paints add-channel feedback etc. */}
       <MultiChatToasts />

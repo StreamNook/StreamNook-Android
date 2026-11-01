@@ -8,6 +8,7 @@ import { makeKey, parseKey } from '../utils/providerKey';
 import { canGridProvider, gridRefusal } from '../types/providers';
 import { buildProviderUrl } from '../utils/streamProvider';
 import { Logger } from '../utils/logger';
+import { clearTileOnEnd } from '../utils/pausePark';
 import type { PlaybackAdapt } from '../utils/linkAdapt';
 
 /** Slot ids whose proxy start is currently in flight. The loader effect re-fires
@@ -86,6 +87,12 @@ function pickActiveChatChannel(slots: MultiNookSlot[]): string | null {
   return choice ? slotKey(choice) : null;
 }
 
+/** A new tile opens at the player's Start volume (only the first one is audible). */
+export function tileStartVolume(): number {
+  const raw = useAppStore.getState().settings?.video_player?.volume;
+  return typeof raw === 'number' && Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 1;
+}
+
 /** The slot the chat pane is currently showing, or null. Exported so App can
  *  route a non-Twitch active tile to the provider chat surface. */
 export function activeChatSlot(
@@ -96,74 +103,6 @@ export function activeChatSlot(
   const want = asSlotKey(activeId);
   return slots.find((s) => slotKey(s) === want) ?? null;
 }
-
-export const broadcastMultiNookPresence = (slots: MultiNookSlot[]) => {
-  const allSlots = slots;
-  
-  if (allSlots.length === 0) return;
-
-  // Determine majority game category
-  const gameCounts: Record<string, number> = {};
-  let maxGame = '';
-  let maxCount = 0;
-  
-  for (const slot of allSlots) {
-    if (slot.gameName && slot.gameName.trim() !== '') {
-      gameCounts[slot.gameName] = (gameCounts[slot.gameName] || 0) + 1;
-      if (gameCounts[slot.gameName] > maxCount) {
-        maxCount = gameCounts[slot.gameName];
-        maxGame = slot.gameName;
-      }
-    }
-  }
-
-  // Deterministic randomize phrasing based on channel names length
-  const phraseHash = allSlots.reduce((acc, s) => acc + s.channelLogin.length, 0);
-  
-  const phrases = [
-    `Watching ${allSlots.length} Streams`,
-    `Multi-POV: ${allSlots.length} Streams`,
-    `MultiNook \u2014 ${allSlots.length} Streams`
-  ];
-  const detailsPhrase = phrases[phraseHash % phrases.length];
-
-  const details = allSlots.length === 1
-    ? `Watching ${allSlots[0].channelName || allSlots[0].channelLogin}`
-    : detailsPhrase;
-
-  // Deterministic randomize separator
-  const separators = [', ', ' \u00B7 ', ' | '];
-  const separator = separators[(phraseHash + 1) % separators.length];
-
-  let streamerNames = allSlots
-    .map(s => s.channelName || s.channelLogin)
-    .join(separator);
-  
-  if (streamerNames.length > 120) {
-    streamerNames = streamerNames.substring(0, 110) + `... +${allSlots.length} more`; // Ensure it fits Discord's 128 char limit
-  }
-
-  const activityState = allSlots.length === 1
-    ? 'MultiNook'
-    : streamerNames;
-
-  const presenceArgs = {
-    details,
-    activityState,
-    largeImage: '', // Will be resolved by rust backend based on gameName
-    smallImage: '',
-    startTime: Date.now(),
-    gameName: maxGame,
-    streamUrl: 'https://streamnook.app',
-  };
-
-  // Discord (gated by settings toggle)
-  const settings = useAppStore.getState().settings;
-  if (settings?.discord_rpc_enabled) {
-    invoke('update_discord_presence', presenceArgs).catch(() => {});
-  }
-};
-
 
 interface MultiNookState {
   isMultiNookActive: boolean;
@@ -260,6 +199,11 @@ interface MultiNookState {
    *  multi_nook_meta: one batched poll for the grid, sent on change). All of
    *  it is ephemeral view data: this never writes to settings. */
   applySlotMetadata: (entries: MultiNookTileMeta[]) => void;
+  /** A provider tile's relay saw its stream end (services/multi_nook_server,
+   *  `multi-nook://tile-ended`). The tile is stopped and shows the offline card,
+   *  the same as a Twitch tile whose channel went offline. Matched by slot id,
+   *  never by login. */
+  markSlotEnded: (slotId: string) => void;
   loadPresetChannels: (channels: MultiNookPresetChannel[], mode: 'replace' | 'append', presetId?: string) => Promise<void>;
   /** Tag the current grid with the preset it was loaded from (null = no equipped preset). Persisted. */
   setActivePresetId: (id: string | null) => Promise<void>;
@@ -334,6 +278,13 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
             // A small tile of a main layout: Rust holds it to the cap.
             small: cap !== null,
           });
+          // The tile was removed while its start was in flight: removeSlot only
+          // stops a tile that already has a url, so the relay this start just
+          // brought up is stopped here.
+          if (!get().slots.some((s) => s.id === slot.id)) {
+            void invoke('stop_multi_nook', { streamId: slot.id }).catch(() => {});
+            return;
+          }
           set((state) => ({
             slots: state.slots.map((s) =>
               s.id === slot.id ? { ...s, streamUrl: url, loadError: false, startedCap: cap } : s,
@@ -379,10 +330,15 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       if (m.live && s.loadError) {
         streamUrl = undefined;
         loadError = false;
-      } else if (offline && s.offline === false && s.streamUrl) {
-        void invoke('stop_multi_nook', { streamId: s.id }).catch(() => {});
-        streamUrl = undefined;
-        loadError = true;
+      } else if (offline && s.offline === false) {
+        // The channel ended: its pause and own-channel hold go whether or not
+        // a player exists right now (a retry or quality change clears the URL).
+        clearTileOnEnd(s.id);
+        if (s.streamUrl) {
+          void invoke('stop_multi_nook', { streamId: s.id }).catch(() => {});
+          streamUrl = undefined;
+          loadError = true;
+        }
       }
       // Offline: no title (a stale live title on an offline tile is wrong),
       // the last known category kept.
@@ -417,6 +373,21 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
     // Title, category and partner mark are ephemeral; only a repaired
     // identity is worth saving.
     if (identityChanged) void get().saveSlots();
+  },
+
+  markSlotEnded: (slotId) => {
+    const slot = get().slots.find((s) => s.id === slotId);
+    if (!slot) return;
+    if (slot.offline === true && slot.loadError === true && !slot.streamUrl) return;
+    clearTileOnEnd(slotId);
+    if (slot.streamUrl) {
+      void invoke('stop_multi_nook', { streamId: slot.id }).catch(() => {});
+    }
+    set((state) => ({
+      slots: state.slots.map((s) =>
+        s.id === slotId ? { ...s, offline: true, streamUrl: undefined, loadError: true } : s,
+      ),
+    }));
   },
 
   loadPresetChannels: async (channels, mode, presetId) => {
@@ -491,7 +462,7 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       profileImageUrl: ch.profileImageUrl || undefined,
       quality: ch.quality || undefined,
       audioBoost: ch.audioBoost,
-      volume: 0.5,
+      volume: tileStartVolume(),
       muted: i > 0,
       isFocused: i === 0,
     }));
@@ -507,9 +478,6 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       }
     }
 
-    if (newSlots.length > 0) {
-      broadcastMultiNookPresence(newSlots);
-    }
     await get().saveSlots();
   },
 
@@ -637,12 +605,6 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       }
     }
     set({ slots: [], activeChatChannelId: null, isChatPinned: false, activePresetId: null, maximizedSlotId: null, isAllMuted: false });
-
-    // Revert presence to idle since nothing is playing.
-    const settings = useAppStore.getState().settings;
-    if (settings?.discord_rpc_enabled) {
-      invoke('set_idle_discord_presence').catch(() => {});
-    }
     await get().saveSlots();
   },
 
@@ -782,11 +744,10 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
         useAppStore.getState().toggleHome();
       }
       
-      // Broadcast restored slots after a short delay
+      // Register restored slots for channel points after a short delay
       setTimeout(() => {
         const currentSlots = get().slots;
         if (currentSlots.length > 0) {
-          broadcastMultiNookPresence(currentSlots);
           for (const slot of currentSlots) {
             if (slot.channelId) {
                invoke('register_active_channel', { channelId: slot.channelId }).catch(() => {});
@@ -809,17 +770,16 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
         }
       }
 
+      // Volume, mute and Audio Boost changes are written in place by Rust and
+      // never refresh this window's copy of the saved grid; re-entering
+      // restores from that copy, so bring it up to date before clearing.
+      if (currentSlots.length > 0) await get().saveSlots();
+
       set({ activeChatChannelId: null, isChatPinned: false, slots: [], maximizedSlotId: null, isAllMuted: false }); // Maintain chat hidden state
 
       // Restore Home view if no single stream is playing
       if (!useAppStore.getState().streamUrl) {
         useAppStore.setState({ isHomeActive: true });
-      }
-      
-      // Revert to idle presence
-      const settings = useAppStore.getState().settings;
-      if (settings?.discord_rpc_enabled) {
-        invoke('set_idle_discord_presence').catch(() => {});
       }
     }
 
@@ -916,7 +876,7 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       gameName: resolvedGameName || undefined,
       title: resolvedTitle || undefined,
       broadcasterType: resolvedBroadcasterType || undefined,
-      volume: 0.5,
+      volume: tileStartVolume(),
       muted: slots.length > 0, // Auto-mute if it's not the first one
       isFocused: slots.length === 0, // First slot is focused by default
     };
@@ -937,7 +897,6 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
     // wired in the Rust IRC service, so opening a tile's chat subscribes it
     // automatically. No per-slot call needed here.
 
-    broadcastMultiNookPresence(newSlots);
     await saveSlots();
   },
 
@@ -983,16 +942,6 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       set({ activeChatChannelId: pickActiveChatChannel(newSlots), isChatPinned: false });
     }
     
-    if (newSlots.length > 0) {
-      broadcastMultiNookPresence(newSlots);
-    } else {
-      // Revert to idle presence since there are no streams
-      const settings = useAppStore.getState().settings;
-      if (settings?.discord_rpc_enabled) {
-        invoke('set_idle_discord_presence').catch(() => {});
-      }
-    }
-
     await saveSlots();
   },
 
@@ -1149,6 +1098,9 @@ export const usemultiNookStore = create<MultiNookState>((set, get) => ({
       ),
     );
     stale.forEach((s) => inFlightStarts.delete(s.id));
+    // A tile cleared (a recovery's retry) while its quality change was running
+    // was skipped by the loader for the in-flight mark; start it now.
+    void get().batchLoadMissingStreams();
     if (restart.length > 0) {
       // Clearing the URL hands the tile to the missing-stream loader, which
       // starts it again under the cap its role now wants.

@@ -6,9 +6,11 @@ import { streamProvider, followIdentifier } from '../utils/streamProvider';
 import { useFollowsStore } from '../stores/followsStore';
 import { useChatConnectionStore } from '../stores/chatConnectionStore';
 import { useChannelState } from '../stores/channelStateStore';
-import { makeKey } from '../utils/providerKey';
+import { sliceLookupKey } from '../utils/providerKey';
 import type { ProviderId } from '../types/providers';
 import { IS_MOBILE } from '../utils/platform';
+import { isApprovalClosed } from '../utils/twitchApproval';
+import { subscribeBadgePending } from '../utils/subscribeBadge';
 
 interface ChannelSocialTarget {
   /** Which platform this channel is on. Pass it whenever the channel is NOT the
@@ -104,7 +106,8 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
     // LiveOverlayFeed's `void revision`.
     void chatRevision;
     if (isTwitch || !userLogin) return null;
-    const key = makeKey(provider, userLogin);
+    // The slice's stored (folded) key; `makeKey` keeps a YouTube id's case.
+    const key = sliceLookupKey(provider, userLogin);
     // A different channel invalidates whatever was found for the last one.
     if (chatBadgeRef.current && chatBadgeRef.current.key !== key) chatBadgeRef.current = null;
     const slice = useChatConnectionStore.getState().channels.get(key);
@@ -287,6 +290,30 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
     };
   }, [enabled, userId, userLogin, currentUser?.login, provider, providerChannel, providerFollows, hasPushed]);
 
+  // The channel's own subscriber art, from Rust (`channel_sub_badge`), for
+  // Twitch and Kick: the channel's badge, else the platform's standard one,
+  // signed in or not. Used when the relationship and chat have none, so the
+  // control never shows a placeholder.
+  // Art already known (the relationship's or a chatter's badge) needs no ask.
+  const knownArt = (pushed ? pushed.badge_url : subscriberBadgeUrl) || chatMemberBadge;
+  const artKey = !knownArt && enabled && userLogin && (provider === 'twitch' || provider === 'kick')
+    ? `${provider}:${userLogin.toLowerCase()}`
+    : '';
+  const [channelArt, setChannelArt] = useState<{ key: string; url: string } | null>(null);
+  useEffect(() => {
+    if (!artKey) return;
+    let cancelled = false;
+    void invoke<string>('channel_sub_badge', { provider, channelId: userId ?? null, login: userLogin, months: null })
+      .then((url) => {
+        if (!cancelled && url) setChannelArt({ key: artKey, url });
+      })
+      .catch((err) => Logger.warn('[useChannelSocial] channel sub badge:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [artKey, provider, userId, userLogin]);
+  const channelArtUrl = channelArt && channelArt.key === artKey ? channelArt.url : null;
+
   // What the controls show: the held relationship when Rust has one.
   const following = pushed ? pushed.following : isFollowing;
 
@@ -309,6 +336,7 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
     try {
       if (isTwitch) {
         // Rust also sets the held relationship, so every open menu flips with it.
+        // Without the Drops approval it asks Twitch for it first, then follows.
         const command = following ? 'unfollow_channel' : 'follow_channel';
         await invoke(command, { targetUserId: userId });
       } else {
@@ -325,11 +353,10 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
       setIsFollowing(nowFollowing);
       Logger.debug(`[useChannelSocial] Successfully ${action}ed ${userLogin}`);
     } catch (err) {
+      // Closing Twitch's approval sheet leaves things as they were, quietly.
+      if (isApprovalClosed(err)) return;
       Logger.error(`[useChannelSocial] ${action} error:`, err);
-      useAppStore.getState().addToast(
-        `Follow/Unfollow failed. Try logging out and back in via Settings to re-authenticate.`,
-        'error'
-      );
+      useAppStore.getState().addToast(`Couldn't ${action} ${userName || userLogin}. Try again.`, 'error');
     } finally {
       setFollowLoading(false);
     }
@@ -394,6 +421,8 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
     }
   }, [userLogin, userName, provider]);
 
+  const badgeUrl = (pushed ? pushed.badge_url : subscriberBadgeUrl) || chatMemberBadge || channelArtUrl;
+
   return {
     // Follow
     isFollowing: following,
@@ -404,9 +433,11 @@ export function useChannelSocial({ provider: providerProp, userId, userLogin, us
     // Subscribe
     isSubscribed: pushed ? pushed.subscribed : isSubscribed,
     // A member's OWN badge when we have it, else the channel's base-tier badge
-    // seen in chat, so the control is never a bare placeholder on a channel that
-    // clearly has member badges.
-    subscriberBadgeUrl: (pushed ? pushed.badge_url : subscriberBadgeUrl) || chatMemberBadge,
+    // seen in chat, else the channel's art from Rust, so the control is never a
+    // bare placeholder.
+    subscriberBadgeUrl: badgeUrl,
+    /** Twitch or Kick art still on its way: the control keeps an empty slot. */
+    subscriberBadgePending: subscribeBadgePending(provider, badgeUrl),
     offersMembership,
     membershipTier,
     membershipDuration,

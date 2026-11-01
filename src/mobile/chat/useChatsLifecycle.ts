@@ -12,6 +12,7 @@ import { useAppStore } from '../../stores/AppStore';
 import { useMobileNavStore } from '../navStore';
 import { streamProvider } from '../../utils/streamProvider';
 import { useChatTabsStore } from './chatTabsStore';
+import { watchLayerUp } from '../ui/coveredSurface';
 
 export function useChatsLifecycle(): void {
   const currentStream = useAppStore((s) => s.currentStream);
@@ -35,6 +36,8 @@ export function useChatsLifecycle(): void {
       currentStream?.profile_image_url ?? null,
       streamProv,
     );
+    // userId: another account's chats replace the list (and its stream tab),
+    // so the stream tab is pointed again after the load above.
   }, [
     currentStream?.user_login,
     currentStream?.user_id,
@@ -42,6 +45,7 @@ export function useChatsLifecycle(): void {
     currentStream?.profile_image_url,
     streamProv,
     syncStreamTab,
+    userId,
   ]);
 
   // The room on screen, for the mentions hub: mentions there are read as they
@@ -57,7 +61,9 @@ export function useChatsLifecycle(): void {
     document.addEventListener('visibilitychange', on);
     return () => document.removeEventListener('visibilitychange', on);
   }, []);
-  const playerFull = !!streamUrl && playerMode === 'full';
+  // The watch layer's own rule: a stream still loading at full size covers the tabs too.
+  const isLoading = useAppStore((s) => s.isLoading);
+  const playerFull = watchLayerUp(playerMode, streamUrl, isLoading);
   const shown = pageVisible && !!activeChannel && (playerFull || activeTab === 'chats');
   const onScreen = shown ? activeChannel : null;
   useEffect(() => {

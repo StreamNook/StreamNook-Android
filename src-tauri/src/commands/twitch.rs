@@ -864,9 +864,7 @@ pub async fn twitch_logout(state: State<'_, AppState>) -> Result<(), String> {
 pub async fn get_category_info(
     game_name: String,
 ) -> Result<Option<crate::models::stream::CategoryInfo>, String> {
-    TwitchService::get_category_info(&game_name)
-        .await
-        .map_err(|e| e.to_string())
+    crate::services::category_tags::category_info(&game_name).await
 }
 
 /// Clear WebView2 browsing data (cookies, cache, etc.) to force re-login
@@ -1386,6 +1384,10 @@ pub fn dismiss_login_overlay(app: &AppHandle, label: &str) {
         }
     }
     crate::services::ui_hang_watchdog::set_active_overlay(None);
+    // A Twitch approval waiting on this overlay learns it is gone.
+    if label == "drops-login" {
+        crate::services::twitch_approval::sheet_dismissed();
+    }
     // Back from Twitch's bits page: a purchase changed the balance.
     if label.starts_with("bits-") {
         crate::commands::bits::refresh_balance_after_purchase(app);
@@ -1506,15 +1508,6 @@ pub(crate) fn emit_overlay_open_with(
 #[tauri::command]
 pub fn open_twitch_login_window(app: AppHandle, url: String) -> Result<(), String> {
     emit_overlay_open(&app, "twitch-login", &url, "fullbody")
-}
-
-/// Take over the app body with the drops/points device-code login. The active
-/// account's profile already holds its twitch.tv session, so the user is shown as
-/// signed in and only authorizes the device. Shows the live URL in a bar at the top.
-#[cfg(desktop)]
-#[tauri::command]
-pub fn open_drops_login_window(app: AppHandle, url: String) -> Result<(), String> {
-    emit_overlay_open(&app, "drops-login", &url, "fullbody")
 }
 
 /// The memberships (`/join`) page for a YouTube identifier.
@@ -1782,6 +1775,7 @@ pub async fn get_streams_by_game(
         .map_err(|e| e.to_string())?;
     crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
     crate::services::home_snapshot::stamp_drops(&mut streams).await;
+    crate::services::category_tags::record_streams(&streams);
     Ok((streams, next))
 }
 
@@ -1810,7 +1804,24 @@ pub async fn get_streams_by_game_with_tags(
         .await
         .map_err(|e| e.to_string())?;
     crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    crate::services::home_snapshot::stamp_drops(&mut streams).await;
+    crate::services::category_tags::record_streams(&streams);
     Ok((streams, next))
+}
+
+/// The tag filter's choices for a category, for the desktop search box and
+/// both phones: with an empty `query`, the screen's row (new picks first, then
+/// what it already `shown`s, then the category's own tags and common tags of its
+/// live streams); otherwise the matches for the typed text.
+#[tauri::command]
+pub async fn category_tag_suggestions(
+    game_name: String,
+    query: String,
+    selected: Vec<String>,
+    shown: Vec<String>,
+    limit: u32,
+) -> Result<crate::services::category_tags::TagSuggestions, String> {
+    Ok(crate::services::category_tags::suggestions(&game_name, &query, &selected, &shown, limit).await)
 }
 
 #[tauri::command]
@@ -1829,12 +1840,13 @@ pub async fn get_user_by_login(login: String) -> Result<UserInfo, String> {
 
 #[tauri::command]
 pub async fn follow_channel(target_user_id: String) -> Result<(), String> {
-    TwitchService::follow_channel(&target_user_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Follow rides on the Drops approval; a missing one is asked for here.
+    crate::services::twitch_approval::run(|| TwitchService::follow_channel(&target_user_id)).await?;
     // A followers-only room you are in now words itself for the new follow.
     crate::services::irc_service::own_follow_changed(&target_user_id, true).await;
     crate::services::channel_state::own_follow_changed(&target_user_id, true).await;
+    // The live-alert sheet lists follows from a 10 minute cache.
+    crate::commands::settings_extras::clear_alert_follows_cache();
     // The phone's go-live pushes cover the new follow.
     #[cfg(mobile)]
     crate::services::push_alerts::server::schedule();
@@ -1843,11 +1855,10 @@ pub async fn follow_channel(target_user_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn unfollow_channel(target_user_id: String) -> Result<(), String> {
-    TwitchService::unfollow_channel(&target_user_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    crate::services::twitch_approval::run(|| TwitchService::unfollow_channel(&target_user_id)).await?;
     crate::services::irc_service::own_follow_changed(&target_user_id, false).await;
     crate::services::channel_state::own_follow_changed(&target_user_id, false).await;
+    crate::commands::settings_extras::clear_alert_follows_cache();
     #[cfg(mobile)]
     crate::services::push_alerts::server::schedule();
     Ok(())
@@ -1861,6 +1872,24 @@ pub async fn channel_relationship(
     channel_login: String,
 ) -> Result<crate::services::channel_relationship::Relationship, String> {
     Ok(crate::services::channel_relationship::twitch(&channel_id, &channel_login.to_lowercase()).await)
+}
+
+/// The subscriber badge art a Subscribe control shows for a Twitch or Kick
+/// channel: its own badge for `months` (0 when left out), else the platform's
+/// standard one. Never empty.
+#[tauri::command]
+pub async fn channel_sub_badge(
+    provider: String,
+    channel_id: Option<String>,
+    login: String,
+    months: Option<i64>,
+) -> Result<String, String> {
+    let months = months.unwrap_or(0).max(0);
+    match provider.as_str() {
+        "twitch" => Ok(crate::services::sub_badge::twitch_art(&login, channel_id.as_deref(), months).await),
+        "kick" => Ok(crate::services::sub_badge::kick_art(&login, months).await),
+        _ => Err("unsupported provider".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1880,15 +1909,6 @@ pub async fn get_streams_by_user_ids(user_ids: Vec<String>) -> Result<Vec<Twitch
     TwitchService::get_streams_by_user_ids(&user_ids)
         .await
         .map_err(|e| e.to_string())
-}
-
-/// `user_id -> [login, display_name, avatar]` for a batch of users. Backs the
-/// one-time identity back-fill for favourites saved as bare ids.
-#[tauri::command]
-pub async fn get_users_by_ids(
-    user_ids: Vec<String>,
-) -> Result<std::collections::HashMap<String, (String, String, Option<String>)>, String> {
-    Ok(TwitchService::users_by_ids(&user_ids).await)
 }
 
 #[tauri::command]
@@ -1989,6 +2009,7 @@ pub async fn get_streams_by_game_name(
     .await
     .map_err(|e| e.to_string())?;
     crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    crate::services::category_tags::record_streams(&streams);
     Ok((streams, next))
 }
 
@@ -2012,6 +2033,7 @@ pub async fn get_streams_by_game_id(
     .await
     .map_err(|e| e.to_string())?;
     crate::services::hidden_channels::retain_twitch(&mut streams, crate::services::hidden_channels::Realm::Browse);
+    crate::services::category_tags::record_streams(&streams);
     Ok((streams, next))
 }
 

@@ -19,6 +19,7 @@ import { usemultiNookStore } from '../../stores/multiNookStore';
 import { useAppStore } from '../../stores/AppStore';
 import { shareLinkFor } from '../../utils/shareLink';
 import { Logger } from '../../utils/logger';
+import { LiveAlertMenuRow } from '../LiveAlertMenuRow';
 
 const ROW =
   'flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm font-medium text-textSecondary transition-all hover:bg-white/[0.06] hover:text-white';
@@ -87,7 +88,7 @@ export const MultiNookTileMenu: React.FC = () => {
   // the pointer whatever height it ends up being. A tile menu is opened near the
   // bottom of the grid often enough for this to matter on every other click.
   const MENU_WIDTH = 210;
-  const ESTIMATED_HEIGHT = 300;
+  const ESTIMATED_HEIGHT = 430;
   const EDGE_GAP = 8;
   const viewportWidth = typeof window === 'undefined' ? 0 : window.innerWidth;
   const viewportHeight = typeof window === 'undefined' ? 0 : window.innerHeight;
@@ -314,6 +315,10 @@ export const MultiNookTileMenu: React.FC = () => {
             </>
           )}
         </button>
+
+        {/* Live alerts beside Follow, as in the card menu. Its slot is there
+            from the first frame and only its value waits, so nothing moves. */}
+        <LiveAlertMenuRow stream={stream} className={ROW} />
 
         <div className="mx-2 my-1 h-px bg-white/[0.06]" />
 

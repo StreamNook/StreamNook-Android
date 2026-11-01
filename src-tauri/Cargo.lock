@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "StreamNook"
-version = "8.8.15"
+version = "8.8.20"
 dependencies = [
  "aes-gcm",
  "ammonia",
@@ -37,6 +37,7 @@ dependencies = [
  "log",
  "lru",
  "minisign-verify",
+ "notify-rust",
  "objc2",
  "objc2-foundation",
  "objc2-user-notifications",
@@ -80,6 +81,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "toml 1.1.0+spec-1.1.0",
+ "unicode-segmentation",
  "uniffi",
  "url",
  "urlencoding",

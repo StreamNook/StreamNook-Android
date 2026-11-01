@@ -34,6 +34,20 @@ if [[ "${1:-}" == "--debug" ]]; then
   LABEL=debug
 fi
 
+# SN-235: release builds carry the push retry that relies on the push server
+# accepting removal-only registrations and device-only unregisters. Refuse to
+# build a release until that server is live (it says so at /version).
+if [[ "$LABEL" == "release" ]]; then
+  # Captured first, then searched: `curl | grep -q` under `set -o pipefail` can
+  # fail on curl's SIGPIPE when grep stops early, refusing a live server.
+  if ! ver=$(curl -fsS --max-time 10 https://notify.streamnook.app/version) \
+    || ! grep -q '"device_unregister":true' <<<"$ver"; then
+    echo "error: notify.streamnook.app/version does not report device_unregister (SN-235)." >&2
+    echo "Deploy the notify server first; phone releases rely on it." >&2
+    exit 1
+  fi
+fi
+
 # A leftover `tauri android dev` wedges a build for ~30 minutes and can leave a
 # stale APK in outputs. The bracket keeps pkill from matching its own cmdline -
 # but note it must be a SEPARATE invocation from the build, because the pattern
@@ -43,19 +57,12 @@ pkill -f "[t]auri android" 2>/dev/null || true
 sleep 1
 
 echo "building $LABEL ..."
-# TWO ABIs, deliberately.
-#
-# aarch64 is every real phone. x86_64 is what a standard Android emulator runs
-# on a Windows or Intel host, and without it the app cannot start there at all:
-# there is no matching libstreamnook_lib.so, so the native library fails to load
-# before a line of our code runs. (Apple Silicon emulators are arm64 and were
-# always fine, which is why this looked device-specific rather than ABI-shaped.)
-#
-# The cost is real: the native lib is most of the APK, so carrying both roughly
-# doubles the download for everyone. Taken deliberately over shipping a second
-# artifact, because the stable R2 key and the in-app updater both point at ONE
-# StreamNook.apk.
-RUSTFLAGS="-C strip=debuginfo" npx tauri android build --apk "${MODE_ARGS[@]}" --target aarch64 --target x86_64 2>&1 | tail -6
+# aarch64 only: every real phone is arm64. An x86_64 library would only serve
+# Android emulators on Windows or Intel hosts (BlueStacks, Intel Chromebooks),
+# which StreamNook neither tests on nor targets, and it roughly doubled the APK
+# (the native lib is most of it) and added a second full compile to every
+# release.
+RUSTFLAGS="-C strip=debuginfo" npx tauri android build --apk "${MODE_ARGS[@]}" --target aarch64 2>&1 | tail -6
 
 APK="src-tauri/gen/android/app/build/outputs/apk/universal/$LABEL/app-universal-$LABEL.apk"
 [[ "$LABEL" == release ]] || APK="src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"

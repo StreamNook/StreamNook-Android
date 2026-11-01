@@ -8,7 +8,7 @@
 // a re-render rather than a reconnect. This pane renders whichever tab is active
 // via `useChannelChat`.
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { CaretDown, HandPointing, X } from 'phosphor-react';
+import { HandPointing, X } from 'phosphor-react';
 import ChatMessageList from '../../components/ChatMessageList';
 import {
   setChannelPaused,
@@ -24,6 +24,10 @@ import { Logger } from '../../utils/logger';
 import { moderateWithToast } from '../../services/moderation';
 import { MobileChatInput, type ChatGating } from './MobileChatInput';
 import { UserProfileSheet, type SheetUser } from '../profile/UserProfileSheet';
+import { EmoteSheet } from './EmoteSheet';
+import type { EmoteCardTarget } from '../../stores/emoteCardStore';
+import type { EmoteCreator } from '../../services/emoteCredit';
+import { openExternal } from '../../utils/openExternal';
 import { ChatTabStrip } from './ChatTabStrip';
 import { AddChatSheet } from './AddChatSheet';
 import { useChatTabsStore } from './chatTabsStore';
@@ -45,10 +49,17 @@ import { useAutomodStore } from '../../stores/automodStore';
 import { heldRowMessage, heldRows, isHeldRowId, mergeHeld } from './heldRows';
 import { SwipeModerator } from './SwipeModerator';
 import { messageReach, reachCanDelete, reachCanTimeout, type MessageReach, type SwipeTarget, type TouchSlider } from './swipeSteps';
+import { REPLY_PROVIDERS, canReplyTo, composerTakesText, replyAfterSend, replyHintWords, replyRowOf, type ComposerState, type ReplyTarget } from './replySwipe';
+import { learnReplyHint, replyHintOnPause, useReplyHintLearned } from './replyHint';
+import { measureText } from './placeholderFit';
+import { usePlatformAccountStore } from '../../stores/platformAccountStore';
 import { invoke } from '@tauri-apps/api/core';
 import { setVodReplayShowing, useVodReplaySnapshot, useVodReplayStore, type ReplayShowing } from '../../stores/vodReplayStore';
 import { SegmentedControl, type Segment } from '../ui/SegmentedControl';
 import { HoldWhile } from '../ui/HoldWhile';
+import { PausedOverlay } from './ResumeLiveButton';
+import { useComposerRiserLift } from './pausedOverlay';
+import { inboxPaneOnScreen, watchLayerUp } from '../ui/coveredSurface';
 
 // How long a pause/resume transition is protected from being reversed. Matches
 // desktop's ChatWidget, and is what stops a touchmove and the compositor scroll
@@ -80,7 +91,7 @@ let lastBuzzed: string | null = null;
 
 /**
  * `readOnly`: the landscape overlay. Chat is for reading there; the composer,
- * tap-to-reply and the fan's Reply are gone, because a keyboard over a
+ * the reply swipe and the fan's Reply are gone, because a keyboard over a
  * sideways video is not something anyone asked for.
  *
  * `strip`: the tab strip over the list. The Chats screen draws its own, with
@@ -111,7 +122,10 @@ export const MobileChatPane: React.FC<{
   idle?: boolean;
   top?: React.ReactNode;
   surface?: InboxSurface;
-}> = ({ readOnly = false, strip = true, paused = false, idle = false, top, surface = 'watch' }) => {
+  /** The watch chat is not on screen (mini player, landscape with chat off): sheets that belong
+   *  to its rows close. The app going to the background is not this. */
+  hidden?: boolean;
+}> = ({ readOnly = false, strip = true, paused = false, idle = false, top, surface = 'watch', hidden = false }) => {
   const currentUser = useAppStore((s) => s.currentUser);
   const addToast = useAppStore((s) => s.addToast);
 
@@ -160,7 +174,7 @@ export const MobileChatPane: React.FC<{
 
   // A mention buzzes once. The flash the row paints is easy to miss on a
   // phone held at arm's length, or with the screen dimmed for a long watch.
-  // Rust stamps is_mentioned on every message, so this only has to notice
+  // Rust stamps is_mentioned and is_reply_to_me on every message, so this only has to notice
   // NEW rows: the ref remembers the newest id it has seen, and the first pass
   // for a room (or a reload's backfill) only primes it. Rows older than a few
   // seconds are history catching up, never a live mention.
@@ -184,8 +198,8 @@ export const MobileChatPane: React.FC<{
       const m = messages[i] as BackendChatMessage | string;
       if (typeof m === 'string') continue;
       if (m.id === cur.lastId) break;
-      if (!m.metadata?.is_mentioned) continue;
-      if (m.user_id && m.user_id === currentUser?.user_id) continue;
+      // Rust never flags your own rows, on any platform.
+      if (!m.metadata?.is_mentioned && !m.metadata?.is_reply_to_me) continue;
       const ts = Number(m.timestamp);
       const at = Number.isFinite(ts) ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(m.timestamp);
       if (Number.isFinite(at) && now - at > 8000) continue;
@@ -197,7 +211,7 @@ export const MobileChatPane: React.FC<{
       lastBuzzed = buzz;
       hapticCommit();
     }
-  }, [messages, activeChannel, mentionHaptic, currentUser?.user_id]);
+  }, [messages, activeChannel, mentionHaptic]);
 
   // Rebuilds the connection if it dies while the app is open. Every room rides
   // one connection, so watching the active one covers all of them.
@@ -211,7 +225,6 @@ export const MobileChatPane: React.FC<{
   // The room's chat modes in Rust's words (services/room_modes.rs), shown in
   // the composer while the setting is on.
   const showRoomModes = useAppStore((s) => s.settings.chat_input?.show_room_modes ?? true);
-  const roomModesAsPrompt = useAppStore((s) => s.settings.chat_input?.room_modes_style !== 'chip');
   const roomModes =
     showRoomModes && roomState?.modes && roomState.modes.modes.length > 0 ? roomState.modes : null;
   // Whether you can send here is Rust's call (your badges and your own follow
@@ -226,6 +239,20 @@ export const MobileChatPane: React.FC<{
       warning: view?.warning ?? null,
     };
   }, [roomState]);
+  // What the reply rule reads of this room's composer (replySwipe.ts `canReplyTo`): a swipe that
+  // ticks where no reply can be typed would be a lie.
+  const kickConnected = usePlatformAccountStore((s) => s.kick.connected);
+  const composer = useMemo<ComposerState>(
+    () => ({
+      readOnly: noSend,
+      blocked: gating.blocked,
+      warning: !!gating.warning,
+      kickSignedOut: activeProvider === 'kick' && !kickConnected,
+    }),
+    [noSend, gating.blocked, gating.warning, activeProvider, kickConnected],
+  );
+  // The room's own platform threads replies (YouTube and TikTok send a reply as a plain line).
+  const replyEnabled = REPLY_PROVIDERS.includes(activeProvider) && composerTakesText(composer);
   // Moderator tools are ON wherever you have the badge. A mod opening their own
   // channel expects their tools, and making them hunt for a toggle every time is
   // the wrong default. The destructive actions are protected by the fan's
@@ -261,6 +288,14 @@ export const MobileChatPane: React.FC<{
   // Long-press arms the fan-out over the pressed row; it owns every message
   // action now, so there is no separate action sheet.
   const [fanTarget, setFanTarget] = useState<FanTarget | null>(null);
+  // What the fan offers on its message, decided once when it arms: the live buffer keeps trimming
+  // while it is open, and a re-check would take tiles away and lay the rest out again under the
+  // finger. `armRules` holds the latest rules for the moment it arms.
+  const [fanArm, setFanArm] = useState<{ canReply: boolean; reach: MessageReach }>({ canReply: true, reach: 'all' });
+  const armRules = useRef<{ canReply: (id: string) => boolean; reach: (id: string) => MessageReach }>({
+    canReply: () => false,
+    reach: () => 'nothing',
+  });
   const [replyDraft, setReplyDraft] = useState<{
     messageId: string;
     username: string;
@@ -274,6 +309,12 @@ export const MobileChatPane: React.FC<{
   // easy one to miss: it is conditional, so it silently churns whenever the
   // active tab is a room you added by hand.
   const handleCancelReply = useCallback(() => setReplyDraft(null), []);
+  // A finished send clears the reply only if it is still the one it went out with: a reply started
+  // while it was on its way stays.
+  const handleReplySent = useCallback(
+    (sentWith: string | null) => setReplyDraft((d) => (replyAfterSend(d?.messageId ?? null, sentWith) ? null : d)),
+    [],
+  );
   const handleAddChat = useCallback(() => setAddChatOpen(true), []);
   const handleCloseAddChat = useCallback(() => setAddChatOpen(false), []);
   const handleCloseSheet = useCallback(() => setSheetUser(null), []);
@@ -437,8 +478,10 @@ export const MobileChatPane: React.FC<{
       isPausedRef.current = p;
       setPausedChannel(p ? activeChannel : null);
       setChannelPaused(activeChannel, p);
+      // The reply hint shows on a pause, a few times at most.
+      if (p && replyEnabled) replyHintOnPause();
     },
-    [activeChannel],
+    [activeChannel, replyEnabled],
   );
 
   // Scrolling back to the bottom resumes, the way tapping Resume does.
@@ -629,6 +672,8 @@ export const MobileChatPane: React.FC<{
     (messageId: string, x: number, y: number) => {
       const found = describeMessage(messageId);
       if (!found) return;
+      const rules = armRules.current;
+      setFanArm({ canReply: rules.canReply(messageId), reach: rules.reach(messageId) });
       setFanTarget({ ...found, originX: x, originY: y });
     },
     [describeMessage],
@@ -639,6 +684,8 @@ export const MobileChatPane: React.FC<{
   const swipeSetting = useAppStore((s) => s.settings.chat_design?.mod_slider ?? true);
   const holdModButtons = useAppStore((s) => s.settings.chat_design?.mod_hold_buttons ?? true);
   const swipeOn = swipeSetting && modToolsArmed && !!broadcasterId && !noSend;
+  // Rows take sideways swipes: right for a moderator's slider, left for a reply.
+  const rowSwipeOn = swipeOn || replyEnabled;
   const press = useLongPressDrag({
     resolve: resolveRow,
     onArm: onArmFan,
@@ -699,6 +746,8 @@ export const MobileChatPane: React.FC<{
       // Private storage is off; the hint just shows again next time.
     }
   }, []);
+  // "Swipe left on a message to reply" shows while paused until learned (replyHint.ts).
+  const replyHintLearned = useReplyHintLearned();
 
   // The viewer's standing here, for what Twitch allows on each message.
   const viewerRole: 'broadcaster' | 'moderator' | null = !modToolsArmed
@@ -744,6 +793,58 @@ export const MobileChatPane: React.FC<{
     },
     [reachOf, viewerRole, currentUser?.user_id],
   );
+  // The reply a row would start: the one rule for the swipe, the hold menu's Reply and the hint.
+  const replyFor = useCallback(
+    (messageId: string): ReplyTarget | null => {
+      if (isHeldRowId(messageId)) return null;
+      for (const message of messages) {
+        if (getMessageId(message) !== messageId) continue;
+        try {
+          const parsed = parseMessage(message as string | BackendChatMessage);
+          const provider = typeof message === 'string' ? undefined : (message as BackendChatMessage).provider;
+          const row = replyRowOf(messageId, parsed, provider, activeProvider);
+          return canReplyTo(row, composer) ? { messageId, username: row.username } : null;
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    },
+    [messages, getMessageId, composer, activeProvider],
+  );
+  // The rules the hold menu reads the moment it arms (`onArmFan`), kept current after each render.
+  useEffect(() => {
+    armRules.current = {
+      canReply: (id) => replyFor(id) != null,
+      reach: (id) => reachOf(id)?.reach ?? 'nothing',
+    };
+  });
+
+  // Every route into a reply (the swipe, the hold menu's Reply) starts it here, inside the touch's
+  // own handler, so the box's focus raises the keyboard (or opens the emote panel in an
+  // emote-only room). Only the swipe teaches its hint.
+  const composerFocusRef = useRef<(() => void) | null>(null);
+  const startReply = useCallback(
+    (t: ReplyTarget, via: 'swipe' | 'menu') => {
+      setReplyDraft({ messageId: t.messageId, username: t.username, channel: activeChannel ?? '' });
+      const focus = composerFocusRef.current;
+      focus?.();
+      requestAnimationFrame(() => {
+        const kb = getComputedStyle(document.documentElement).getPropertyValue('--sn-kb').trim() || '0px';
+        Logger.warn(
+          '[Swipe]',
+          `reply focus: ${focus ? 'called' : 'no composer'}, active ${document.activeElement?.tagName ?? 'none'}, keyboard ${kb}`,
+        );
+      });
+      if (via === 'swipe') learnReplyHint();
+    },
+    [activeChannel],
+  );
+  const onSwipeReply = useCallback((t: ReplyTarget) => startReply(t, 'swipe'), [startReply]);
+  // The swipe's ratio for the list's touch rule, read on every touch move.
+  const pauseRatioRef = useRef<() => number | undefined>(() => undefined);
+  const touchPauseRatio = useCallback(() => pauseRatioRef.current(), []);
+
   // The room's resolved role, logged when it changes.
   useEffect(() => {
     if (!isTwitchRoom) return;
@@ -763,15 +864,58 @@ export const MobileChatPane: React.FC<{
       : noSend
         ? OTHER_PLATFORM_READ_ONLY_HIDES
         : OTHER_PLATFORM_HIDES;
-    if (!holdModButtons) return [...(base ?? []), ...MOD_TILES];
+    // The hold menu's Reply follows the reply rule, as the swipe does, as it stood when it armed.
+    const noReply: FanAction[] = !noSend && fanTarget && !fanArm.canReply ? ['reply'] : [];
+    if (!holdModButtons) return [...(base ?? []), ...MOD_TILES, ...noReply];
     // Only what Twitch allows on the held message: Delete alone on your own.
-    const reach = fanTarget ? (reachOf(fanTarget.messageId)?.reach ?? 'nothing') : 'all';
+    const reach = fanTarget ? fanArm.reach : 'all';
     const refused: FanAction[] = [
+      ...noReply,
       ...(reachCanDelete(reach) ? [] : (['delete'] as FanAction[])),
       ...(reachCanTimeout(reach) ? [] : (['timeout', 'ban'] as FanAction[])),
     ];
     return refused.length ? [...(base ?? []), ...refused] : base;
-  }, [isTwitchRoom, noSend, holdModButtons, fanTarget, reachOf]);
+  }, [isTwitchRoom, noSend, holdModButtons, fanTarget, fanArm]);
+
+  // An emote tapped in a row opens its sheet (SN-38); a creator chip's profile opens once that
+  // sheet has gone. The opener keeps one identity (rows ignore a new callback) and reads the hold
+  // menu through a ref: an armed or open hold menu wins over the emote under it.
+  const [emoteSheet, setEmoteSheet] = useState<{ target: EmoteCardTarget; stack: EmoteCardTarget[] } | null>(null);
+  const [emoteOpen, setEmoteOpen] = useState(false);
+  const pendingProfile = useRef<SheetUser | null>(null);
+  const fanBusyRef = useRef<() => boolean>(() => false);
+  useEffect(() => {
+    fanBusyRef.current = () => press.isArmed() || fanTarget != null;
+  });
+  const onEmoteOpen = useCallback((target: EmoteCardTarget, stack: EmoteCardTarget[]) => {
+    if (fanBusyRef.current()) return;
+    pendingProfile.current = null;
+    setEmoteSheet({ target, stack });
+    setEmoteOpen(true);
+  }, []);
+  const closeEmote = useCallback(() => setEmoteOpen(false), []);
+  const switchEmote = useCallback(
+    (target: EmoteCardTarget) => setEmoteSheet((s) => (s ? { ...s, target } : s)),
+    [],
+  );
+  const onCreatorTwitch = useCallback(
+    (c: EmoteCreator) => {
+      const link = c.link;
+      if (link.kind !== 'twitch') return;
+      if (!isTwitchRoom || !link.id) {
+        void openExternal(`https://www.twitch.tv/${link.login}`);
+        return;
+      }
+      pendingProfile.current = { userId: link.id, username: link.login, displayName: c.name, color: '' };
+    },
+    [isTwitchRoom],
+  );
+  const onEmoteExited = useCallback(() => {
+    const profile = pendingProfile.current;
+    pendingProfile.current = null;
+    setEmoteSheet(null);
+    if (profile) setSheetUser(profile);
+  }, []);
 
   // Out of sight, nothing of this room stays up: the fan and the sheets draw
   // outside the pane, so hiding the pane would not hide them.
@@ -780,7 +924,15 @@ export const MobileChatPane: React.FC<{
     closeFan();
     setSheetUser(null);
     setAddChatOpen(false);
+    setEmoteOpen(false);
+    pendingProfile.current = null;
   }, [paused, closeFan]);
+  // The watch chat hidden (mini player, landscape with chat off): its emote sheet goes with it.
+  useEffect(() => {
+    if (!hidden) return;
+    setEmoteOpen(false);
+    pendingProfile.current = null;
+  }, [hidden]);
 
   const runFanAction = useCallback(
     (action: FanAction, timeoutSecs?: number) => {
@@ -789,11 +941,7 @@ export const MobileChatPane: React.FC<{
       if (!t) return;
       switch (action) {
         case 'reply':
-          setReplyDraft({
-            messageId: t.messageId,
-            username: t.username,
-            channel: activeChannel ?? '',
-          });
+          startReply({ messageId: t.messageId, username: t.username }, 'menu');
           break;
         case 'copy':
           void navigator.clipboard.writeText(t.content).catch(() => {});
@@ -854,43 +1002,41 @@ export const MobileChatPane: React.FC<{
           break;
       }
     },
-    [fanTarget, closeFan, activeChannel, broadcasterId, addToast],
+    [fanTarget, closeFan, startReply, broadcasterId, addToast],
   );
 
-  // Tap-to-reply, but only while paused. A live list scrolls under your finger,
-  // so a tap on a moving row is a coin flip; pausing makes the target stable.
-  // Paused rows get a visible reply affordance (see ChatMessageList styling via
-  // the data attribute below) so the gesture is discoverable rather than secret.
-  const onListClick = useCallback(
-    (e: React.MouseEvent) => {
-      if (noSend || !isPaused || press.isArmed()) return;
-      const el = e.target as HTMLElement;
-      // Usernames and links keep their own behaviour.
-      if (el.closest('a,[data-no-drag],button')) return;
-      const row = el.closest('[data-message-id]');
-      if (!row) return;
-      const messageId = row.getAttribute('data-message-id');
-      if (!messageId) return;
-      const found = describeMessage(messageId);
-      if (!found) return;
-      setReplyDraft({
-        messageId: found.messageId,
-        username: found.username,
-        channel: activeChannel ?? '',
-      });
-    },
-    [noSend, isPaused, press, describeMessage, activeChannel],
-  );
+  // Rides above the composer's suggestion strip while it covers the list.
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  const overlayLift = useComposerRiserLift(paneRef, listRef, isPaused, surface);
+  // The paused hint's column: the overlay's middle (the list less its 10 px and 56 px sides and
+  // the badge's own 16 px of padding), at the hint's 10.5 px.
+  const [hintBox, setHintBox] = useState<{ width: number; font: string }>({ width: 0, font: '' });
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => {
+      setHintBox({ width: Math.round(entry.contentRect.width) - 82, font: `10.5px ${getComputedStyle(el).fontFamily}` });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // Measured once per size change, not on every chat flush.
+  const hintWords = useMemo(() => replyHintWords(hintBox.width, (t) => measureText(t, hintBox.font)), [hintBox]);
 
 
-  // The inbox over this chat: its bottom sheet, or a new mention's card. The
-  // watch pane stays mounted under the mini player and behind Chats, so the
-  // card rises only where the chat is on screen.
-  const navTab = useMobileNavStore((s) => s.activeTab);
-  const playerFull = useMobileNavStore((s) => s.playerMode === 'full');
-  const onScreen = !paused && !idle && (surface === 'chats' || (navTab !== 'chats' && playerFull));
+  // The inbox over this chat: its bottom sheet, or a new mention's card, only
+  // where the chat is on screen. The full watch layer sits over everything,
+  // Chats included, from its first frame (a stream, a load, an offline room):
+  // while it is up its chat is the one on screen, and Chats' only while it is
+  // not. The layer rule rules out the mini box; the watch pane's own `idle`
+  // covers PiP and landscape with chat away.
+  const playerMode = useMobileNavStore((s) => s.playerMode);
+  const streamUrl = useAppStore((s) => s.streamUrl);
+  const isLoading = useAppStore((s) => s.isLoading);
+  const onScreen = inboxPaneOnScreen(surface, watchLayerUp(playerMode, streamUrl, isLoading), idle, paused);
   const inboxSide = useAppStore((s) => (s.settings.chat_input?.inbox_button_side === 'right' ? 'right' : 'left'));
-  const cardHere = useMentionsStore((s) => !!s.arrival && !s.composerBusy && !s.sheetIn) && onScreen && !readOnly;
+  const cardHere =
+    useMentionsStore((s) => !!s.arrival && !s.composerBusy[surface] && !s.sheetIn) && onScreen && !readOnly;
   // Rows under the card fade out above it instead of showing as slivers; the
   // top fade stays when the pane draws one.
   const clear = cardHere ? '62px' : null;
@@ -899,7 +1045,7 @@ export const MobileChatPane: React.FC<{
     : undefined;
 
   return (
-    <div className="flex-1 min-h-0 flex flex-col">
+    <div ref={paneRef} className="flex-1 min-h-0 flex flex-col">
       {strip && <ChatTabStrip />}
       {top}
       <div className="flex-1 min-h-0 relative flex flex-col">
@@ -911,19 +1057,16 @@ export const MobileChatPane: React.FC<{
         // long-press on text by starting its OWN text selection, which wins the
         // gesture and the fan never arms. Chat text needs no selection anyway —
         // the fan's Copy bucket is the way to take a message.
-        // With swiping on, a sideways move on a row is the swipe's from the first pixel: `sn-swipe-mod`
-        // gives the rows themselves `touch-action: pan-y`. On this wrapper it would do nothing, since
-        // the browser reads touch-action only from the touched element up to its scroll container.
-        className={`flex-1 min-h-0 relative select-none [-webkit-touch-callout:none] ${strip || listMask ? '' : 'sn-fade-top'} ${swipeOn ? 'sn-swipe-mod' : ''}`}
+        // With row swipes on, a sideways move on a row is the swipe's from the first pixel:
+        // `sn-row-swipe` gives the rows themselves `touch-action: pan-y`. On this wrapper it would do
+        // nothing, since the browser reads touch-action only from the touched element up to its
+        // scroll container.
+        className={`flex-1 min-h-0 relative select-none [-webkit-touch-callout:none] ${strip || listMask ? '' : 'sn-fade-top'} ${rowSwipeOn ? 'sn-row-swipe' : ''}`}
         onContextMenu={onListContextMenu}
         onPointerDown={press.onPointerDown}
         onPointerMove={press.onPointerMove}
         onPointerUp={press.onPointerUp}
         onPointerCancel={press.onPointerCancel}
-        onClick={onListClick}
-        // While paused, rows are tappable to reply. Signposted by the hint pill
-        // below rather than left as a secret gesture.
-        data-tap-reply={isPaused && !noSend ? 'true' : undefined}
       >
         <HoldWhile hold={idle}>
           <ChatMessageList
@@ -934,9 +1077,11 @@ export const MobileChatPane: React.FC<{
             isPaused={isPaused}
             onPauseIntent={() => pause(true)}
             onScroll={onScroll}
+            touchPauseRatio={rowSwipeOn ? touchPauseRatio : undefined}
             onUsernameClick={onUsernameClick}
             onReplyClick={handleReplyClick}
             onEmoteRightClick={() => {}}
+            onEmoteOpen={onEmoteOpen}
             onUsernameRightClick={() => {}}
             onBadgeClick={() => {}}
             highlightedMessageId={null}
@@ -961,25 +1106,17 @@ export const MobileChatPane: React.FC<{
             </div>
           </div>
         )}
-        {isPaused && (
-          <div className="absolute bottom-2 left-0 right-0 flex flex-col items-center gap-1 z-10 pointer-events-none">
-            {!noSend && (
-              <span className="glass-badge rounded-full px-2 py-0.5 text-[10.5px] text-textMuted">
-                Tap a message to reply
-              </span>
-            )}
-            <button
-              onClick={resumeLive}
-              className="pointer-events-auto glass-button flex items-center gap-1 whitespace-nowrap rounded-full px-3 py-1 text-[12px] font-medium text-textPrimary"
-            >
-              <CaretDown size={11} weight="bold" />
-              Resume live
-            </button>
-          </div>
-        )}
+        <PausedOverlay
+          paused={isPaused}
+          sliceKey={replayOn ? '' : (activeChannel ?? '').toLowerCase()}
+          hint={replyEnabled && !replyHintLearned}
+          hintWords={hintWords}
+          lift={overlayLift}
+          onResume={resumeLive}
+        />
       </div>
       {/* Outside the list, so a press in them never reaches its gestures. */}
-      {onScreen && !readOnly && <InboxArrival side={inboxSide} />}
+      {onScreen && !readOnly && <InboxArrival side={inboxSide} surface={surface} />}
       <InboxSheet surface={surface} />
       </div>
       {/* The landscape overlay has no room for it and shows whichever is chosen. */}
@@ -1007,10 +1144,11 @@ export const MobileChatPane: React.FC<{
           channelLabel={activeTab?.label ?? null}
           gating={gating}
           roomModes={roomModes}
-          roomModesAsPrompt={roomModesAsPrompt}
           emotes={emotes}
           replyTo={replyTo}
           onCancelReply={handleCancelReply}
+          onReplySent={handleReplySent}
+          focusRef={composerFocusRef}
           isModerator={isModerator}
           modToolsOn={modToolsOn}
           onToggleModTools={toggleModTools}
@@ -1028,16 +1166,30 @@ export const MobileChatPane: React.FC<{
         onClose={handleCloseSheet}
       />
       <AddChatSheet open={addChatOpen} onClose={handleCloseAddChat} />
+      <EmoteSheet
+        open={emoteOpen}
+        target={emoteSheet?.target ?? null}
+        stack={emoteSheet?.stack ?? []}
+        onClose={closeEmote}
+        onExited={onEmoteExited}
+        onSwitch={switchEmote}
+        onOpenTwitch={onCreatorTwitch}
+      />
       {/* Long-press fan-out. Owns every per-message action now, for everyone:
           moderators simply get more buckets. */}
       <SwipeModerator
         listRef={listRef}
-        enabled={swipeOn}
+        modEnabled={swipeOn}
+        replyEnabled={replyEnabled}
         broadcasterId={broadcasterId}
         targetFor={swipeTargetFor}
+        replyFor={replyFor}
         sliderFor={sliderFor}
         fanArmed={press.isArmed}
+        cancelHold={press.release}
         onDone={learnSwipe}
+        onReply={onSwipeReply}
+        pauseRatioRef={pauseRatioRef}
       />
       <ChatFanOut
         target={fanTarget}

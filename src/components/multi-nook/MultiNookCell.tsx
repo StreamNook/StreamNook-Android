@@ -24,6 +24,7 @@ import { PlayerVolumeOsd } from '../PlayerVolumeOsd';
 import { useVolumeOsd } from '../../hooks/useVolumeOsd';
 import StreamTitleWithEmojis from '../StreamTitleWithEmojis';
 import { Tooltip } from '../ui/Tooltip';
+import { LiveAlertBell } from '../LiveAlertBell';
 import { TwitchVerifiedMark } from '../ui/TwitchGlyph';
 import { ProviderLogo } from '../ProviderLogo';
 import { OfflineCard } from '../OfflineRoomScreen';
@@ -46,6 +47,9 @@ import { AudioBoostControls } from '../AudioBoostFaders';
 import { canGridProvider, PROVIDER_WATCH, type ProviderId } from '../../types/providers';
 import { SevenTvAvatar } from '../SevenTvAvatar';
 import { slotSevenTvId } from './slotSevenTvId';
+import { tileClickAction } from './tileClick';
+import { CLICK_TOGGLE_DELAY_MS, releaseTypingFocus } from '../../utils/pauseRoutes';
+import { setVideoSource } from '../../utils/activeVideo';
 
 interface MultiNookCellProps {
   slot: MultiNookSlot;
@@ -66,10 +70,17 @@ interface MultiNookCellProps {
  *  space) can cancel it first — that's what stops the audible mute/unmute flip on
  *  the way to maximizing. Focus-ON stays instant; only this toggle-off is deferred. */
 let pendingFocusToggle: ReturnType<typeof setTimeout> | null = null;
-const clearPendingFocusToggle = () => {
+/** The same deferral for a maximized tile's click, which toggles play and pause
+ *  once a double-click can no longer claim it. */
+let pendingPlayToggle: ReturnType<typeof setTimeout> | null = null;
+const clearPendingTileClick = () => {
   if (pendingFocusToggle) {
     clearTimeout(pendingFocusToggle);
     pendingFocusToggle = null;
+  }
+  if (pendingPlayToggle) {
+    clearTimeout(pendingPlayToggle);
+    pendingPlayToggle = null;
   }
 };
 
@@ -211,6 +222,26 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     };
   }, [videoRef]);
 
+  // What this tile plays, so a song identified from its audio says where it
+  // was heard in Your songs (utils/activeVideo.ts). A YouTube tile's login
+  // can be one broadcast's video id; the channel's own id (UC...) stays.
+  // A tile does not know when its broadcast started, so it gives no place.
+  const gameName = slot.gameName;
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+    setVideoSource(el, {
+      provider: provider ?? 'twitch',
+      channel_login: provider === 'youtube' && channelId?.startsWith('UC') ? channelId : channelLogin,
+      channel_name: channelName ?? null,
+      media: 'live',
+      title: title?.trim() || null,
+      category: gameName?.trim() || null,
+      avatar: profileImageUrl || null,
+    });
+    return () => setVideoSource(el, null);
+  }, [videoRef, provider, channelLogin, channelName, channelId, title, gameName, profileImageUrl]);
+
   // Volume readout for this tile's wheel/middle-click changes.
   const { osd, showOsd } = useVolumeOsd();
 
@@ -223,6 +254,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
   const socialEnabled = isFocused && !isMinimized;
   const playerOverlayButtons = useAppStore((s) => s.settings.player_overlay_buttons);
   const mediaGlowEnabled = useAppStore((s) => s.settings.media_glow !== false);
+  const clickToPause = useAppStore((s) => s.settings.video_player?.click_to_pause === true);
   const {
     isFollowing,
     followLoading,
@@ -233,6 +265,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
     hasSubHistory,
     cumulativeMonths,
     subscriberBadgeUrl,
+    subscriberBadgePending,
     handleSubscribeClick,
     offersMembership,
   } = useChannelSocial({
@@ -488,7 +521,7 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       if (target.closest('button') || target.closest('.plyr__controls') || ignoresPlayerMouse(target)) return;
       e.stopPropagation();
       e.preventDefault();
-      clearPendingFocusToggle(); // a double-click cancels any deferred unfocus
+      clearPendingTileClick(); // a double-click cancels any deferred unfocus or play toggle
       toggleMaximizeSlot(id);
     };
     el.addEventListener('dblclick', onDblCapture, { capture: true });
@@ -612,24 +645,40 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
       style={combinedStyle}
       onContextMenu={handleContextMenu}
       onClick={(e) => {
-        // Ignore clicks on buttons, tools, or plyr control sliders.
+        // Buttons, tools and plyr control sliders are not the picture. The
+        // second click of a double-click (detail >= 2) is left for the
+        // capture-phase dblclick handler that fills the space.
         const target = e.target as HTMLElement;
-        if (target.closest('button') || target.closest('.plyr__controls') || ignoresPlayerMouse(target)) return;
-        // While maximized, a bare click shouldn't change focus (you're already
-        // watching this one). The second click of a double-click (detail === 2)
-        // is left for the capture-phase dblclick handler that fills the space.
-        if (isMaximized || e.detail >= 2) return;
-        clearPendingFocusToggle();
-        if (!isFocused) {
+        const onControl = !!target.closest('button') || !!target.closest('.plyr__controls') || ignoresPlayerMouse(target);
+        // A click on the picture hands the player keys back from a text box.
+        if (!onControl) releaseTypingFocus();
+        const action = tileClickAction({
+          onControl,
+          isMaximized,
+          isFocused,
+          detail: e.detail,
+          clickToPause,
+        });
+        if (action === 'ignore') return;
+        clearPendingTileClick();
+        if (action === 'focus') {
           // Focusing a tile (the common audio switch) stays instant.
           toggleFocusSlot(id);
-        } else {
+        } else if (action === 'unfocus-later') {
           // Un-focusing (unmute-all) is deferred so a double-click can cancel it
           // before it fires — no mute/unmute flip while maximizing this tile.
           pendingFocusToggle = setTimeout(() => {
             pendingFocusToggle = null;
             toggleFocusSlot(id);
           }, 260);
+        } else {
+          // A maximized tile is already the one being watched, so a click on the
+          // picture plays or pauses it, held back so a double-click (which
+          // restores the grid) never blips the stream.
+          pendingPlayToggle = setTimeout(() => {
+            pendingPlayToggle = null;
+            playerRef.current?.togglePlay();
+          }, CLICK_TOGGLE_DELAY_MS);
         }
       }}
       className={`${gridSpanClass} relative w-full h-full overflow-hidden ${
@@ -653,7 +702,6 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
           backgroundColor: '#000',
           objectFit: isMaximized || isPortrait ? 'contain' : 'cover',
         }}
-        autoPlay
         playsInline
       />
 
@@ -845,6 +893,19 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
 
           {/* Controls Overlay - Top Right */}
           <div className="flex items-center gap-1.5 shrink-0">
+            {/* Live alerts, left of Follow so its arrival never moves Follow. */}
+            {showFollowButton && (
+              <LiveAlertBell
+                provider={(provider ?? 'twitch') as ProviderId}
+                userId={channelId}
+                userLogin={channelLogin}
+                userName={channelName}
+                isFollowing={isFollowing}
+                buttonClassName={glassButton}
+                iconClassName="w-4 h-4"
+                tooltipSide="top"
+              />
+            )}
             {/* Follow + Subscribe — focused tile only, honoring the Player
                 Overlay Buttons setting like the single-stream player */}
             {showFollowButton && (
@@ -901,6 +962,8 @@ const MultiNookCellInner: React.FC<MultiNookCellProps> = ({ slot, cssOrder, grid
                         className="w-4 h-4 object-contain"
                         referrerPolicy="no-referrer"
                       />
+                    ) : subscriberBadgePending ? (
+                      <span aria-hidden className="w-4 h-4" />
                     ) : (
                       <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20">
                         <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />

@@ -1,9 +1,10 @@
 // Touch-first player surface: the video element plus a tap-driven glass control
 // overlay. No Plyr; hls.js runs via useMobileHlsEngine.
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ArrowClockwise, Bell, BellSlash, CaretLeft, ChatTeardropText, Columns, Gear, MoonStars, Pause, Play, Rows, Screencast, ShareNetwork, SpeakerHigh, SpeakerSlash, Star, UsersThree, CaretDown, X, CornersIn, CornersOut } from 'phosphor-react';
+import { ArrowClockwise, Bell, BellSlash, CaretLeft, ChatTeardropText, Columns, Gear, MoonStars, Pause, Play, Rows, Screencast, ShareNetwork, SpeakerHigh, SpeakerSlash, UsersThree, CaretDown, X, CornersIn, CornersOut } from 'phosphor-react';
+import { SubscribeBadge } from '../ui/menuIcons';
 import { shareText } from '../nativeBridge';
-import { toggleChannelMuted } from '../notifyChannels';
+import { mutedIncludes, setLiveAlert } from '../notifyChannels';
 import { useVisibleInterval } from '../../utils/useVisibleInterval';
 import { shareLinkFor } from '../../utils/shareLink';
 import { buildProviderUrl, isTwitchStream, streamProvider } from '../../utils/streamProvider';
@@ -32,6 +33,8 @@ import { registerReplayClock } from '../../stores/vodReplayStore';
 import { VodSeekBar, VodTransport, useVodClock } from './VodControls';
 import { recordedLine, seekTarget } from '../watch/channelMedia';
 import { useChannelSheet } from '../watch/MobileChannelSheet';
+import { createZoomSurface, fillScale, registerZoomSurface, type ZoomSurface } from './videoFill';
+import { useZoomToFill } from './zoomToFill';
 
 const CONTROLS_HIDE_MS = 3000;
 // Every bottom-bar glyph at one size, so no button out-pulls another.
@@ -84,6 +87,27 @@ const GAP_METRICS = 8;
  *  (the iPhone has it there already). */
 const BAR_ORDER = ['cast', 'share', 'mute', 'reload', 'settings', 'chat', 'rotate', 'minimize'] as const;
 
+/** Close video (SN-37): a bare glyph a step quieter than the name, as the
+ *  header's other controls, in a 40 px target. */
+const CloseVideoButton: React.FC<{ onClose: () => void; className: string; style?: React.CSSProperties }> = ({
+  onClose,
+  className,
+  style,
+}) => (
+  <button
+    type="button"
+    onClick={(e) => {
+      e.stopPropagation();
+      onClose();
+    }}
+    className={`${className} w-10 h-10 flex items-center justify-center text-white/80 active:opacity-60`}
+    style={style}
+    aria-label="Close video"
+  >
+    <X size={18} />
+  </button>
+);
+
 export const MobilePlayer: React.FC<{
   /** Landscape immersive mode: overlay carries no bottom rounding, adds insets. */
   immersive?: boolean;
@@ -108,6 +132,11 @@ export const MobilePlayer: React.FC<{
   /** An offline room's card sits in a chin below the band (MobileOfflineChin),
    *  so the band draws the offline art alone. */
   offlineCardBelow?: boolean;
+  /** Landscape picture of a stream: Zoom to fill and the pinch apply. */
+  zoomable?: boolean;
+  /** Close video (SN-37): stops the stream; its chat carries on in Chats. Set
+   *  only where the button belongs (closeVideoShown). */
+  onCloseVideo?: () => void;
 }> = ({
   immersive = false,
   onToggleFullscreen,
@@ -120,6 +149,8 @@ export const MobilePlayer: React.FC<{
   chatOpen = false,
   controlsInset,
   offlineCardBelow = false,
+  zoomable = false,
+  onCloseVideo,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const { state, reason } = useMobileHlsEngine(videoRef);
@@ -292,7 +323,7 @@ export const MobilePlayer: React.FC<{
   // Subscribed rather than read through the helper, so toggling the bell
   // re-renders this overlay instead of leaving a stale icon behind.
   const mutedChannels = useAppStore((s) => s.settings.live_notifications?.muted_live_channels);
-  const alertsOff = !!currentStream && (mutedChannels ?? []).includes(currentStream.user_login.toLowerCase());
+  const alertsOff = !!currentStream && mutedIncludes(mutedChannels, currentStream.user_login);
 
   const [controlsVisible, setControlsVisible] = useState(true);
   const [paused, setPaused] = useState(false);
@@ -479,6 +510,41 @@ export const MobilePlayer: React.FC<{
     setLiveVideo(el);
   }, []);
 
+  // Zoom to fill (SN-30): the wrapper around the video is the zoom surface's,
+  // which alone writes its transform (videoFill.ts). Made once per wrapper; it
+  // follows the wrapper's box and the video's own size.
+  const zoomRef = useRef<HTMLDivElement>(null);
+  const zoomSurface = useRef<ZoomSurface | null>(null);
+  const fillWanted = useZoomToFill();
+  useLayoutEffect(() => {
+    const el = zoomRef.current;
+    if (!el) return;
+    const surface = createZoomSurface(el, () => document.documentElement.dataset.motion);
+    zoomSurface.current = surface;
+    const unregister = registerZoomSurface(surface);
+    const video = videoRef.current;
+    const measure = () =>
+      surface.setFill(fillScale(el.clientWidth, el.clientHeight, video?.videoWidth ?? 0, video?.videoHeight ?? 0));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    video?.addEventListener('loadedmetadata', measure);
+    video?.addEventListener('resize', measure);
+    return () => {
+      observer.disconnect();
+      video?.removeEventListener('loadedmetadata', measure);
+      video?.removeEventListener('resize', measure);
+      unregister();
+      surface.dispose();
+      zoomSurface.current = null;
+    };
+  }, []);
+  // A layout effect, so a pinch's release (a discrete event) lands the new rest
+  // before the browser paints: the picture never dips through the old one.
+  useLayoutEffect(() => {
+    zoomSurface.current?.setInputs({ zoomable, want: fillWanted });
+  }, [zoomable, fillWanted]);
+
   // Header give-way (see GIVE_WAY_*), decided from hidden copies of each part
   // at full size, so the choice never depends on what is already cut.
   const identityRowRef = useRef<HTMLDivElement>(null);
@@ -488,6 +554,9 @@ export const MobilePlayer: React.FC<{
   const measureFacesRef = useRef<HTMLSpanElement>(null);
   const measureNoUptimeRef = useRef<HTMLSpanElement>(null);
   const [giveWay, setGiveWay] = useState(0);
+  // Close video shows in the header unless the failure card is up, which
+  // carries its own at the same spot (and hides the header under it).
+  const closeInHeader = !!onCloseVideo && !(state === 'error' && !offline);
   const uptimeText = formatUptime(liveStartedAt, nowMs);
   const subLabel = sub.isSubscribed ? subTerms.paidGift : sub.hasSubHistory ? subTerms.paidAgain : subTerms.paid;
   useLayoutEffect(() => {
@@ -581,7 +650,12 @@ export const MobilePlayer: React.FC<{
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                void toggleChannelMuted(currentStream.user_login);
+                // Off now means turn on, and the other way round: the press
+                // sends the state it wants, never a toggle.
+                void setLiveAlert(
+                  { provider: 'twitch', userId: currentStream.user_id, userLogin: currentStream.user_login },
+                  alertsOff,
+                );
               }}
               aria-label={
                 alertsOff
@@ -609,11 +683,7 @@ export const MobilePlayer: React.FC<{
     'shrink-0 flex items-center gap-1 pl-1.5 pr-2 py-[3px] rounded-full bg-white/15 text-[12px] font-medium text-white/75 leading-none whitespace-nowrap';
   const subscribeInk = (
     <>
-      {sub.subscriberBadgeUrl ? (
-        <img src={sub.subscriberBadgeUrl} alt="" draggable={false} className="w-3.5 h-3.5" />
-      ) : (
-        <Star size={12} weight="fill" />
-      )}
+      <SubscribeBadge url={sub.subscriberBadgeUrl ?? null} size={14} />
       {subLabel}
     </>
   );
@@ -683,22 +753,26 @@ export const MobilePlayer: React.FC<{
       className="relative w-full h-full bg-black overflow-hidden"
       onClick={onSurfaceTap}
     >
-      <video
-        // Callback ref so the clip sheet can duck this element's audio while a
-        // clip plays. Assigns the same ref object the engine reads, then
-        // publishes it; both are cleared on unmount when React passes null.
-        ref={attachVideo}
-        className="w-full h-full object-contain"
-        playsInline
-        autoPlay
-        // A <video> with no poster gets Android WebView's own grey play-triangle
-        // placeholder until the first frame decodes. A transparent poster
-        // suppresses it, so what shows before playback is our logo below.
-        // 16x9, not 1x1: pre-metadata the element takes its intrinsic ratio
-        // from the poster, and a square one made the loading band render
-        // square before lurching to 16:9 at first frame (see playerBandClass).
-        poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 9' width='16' height='9'/%3E"
-      />
+      {/* Zoom to fill's wrapper, in every mode so the video never remounts;
+          its transform belongs to the zoom surface alone. */}
+      <div ref={zoomRef} className="absolute inset-0" style={{ transformOrigin: '50% 50%' }}>
+        <video
+          // Callback ref so the clip sheet can duck this element's audio while a
+          // clip plays. Assigns the same ref object the engine reads, then
+          // publishes it; both are cleared on unmount when React passes null.
+          ref={attachVideo}
+          className="w-full h-full object-contain"
+          playsInline
+          autoPlay
+          // A <video> with no poster gets Android WebView's own grey play-triangle
+          // placeholder until the first frame decodes. A transparent poster
+          // suppresses it, so what shows before playback is our logo below.
+          // 16x9, not 1x1: pre-metadata the element takes its intrinsic ratio
+          // from the poster, and a square one made the loading band render
+          // square before lurching to 16:9 at first frame (see playerBandClass).
+          poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 9' width='16' height='9'/%3E"
+        />
+      </div>
 
       {logoMounted && (
         <div
@@ -767,6 +841,22 @@ export const MobilePlayer: React.FC<{
           className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 bg-black/70 p-6"
           onClick={(e) => e.stopPropagation()}
         >
+          {/* The card takes every tap, so the controls cannot come up over it:
+              Close video is here instead, at the header button's exact spot
+              (the header's 8 px top and 12 px side, less the button's 10 px
+              overhang), clear of a landscape chat column on that side. */}
+          {onCloseVideo && (
+            <CloseVideoButton
+              onClose={onCloseVideo}
+              // Above the controls layer, which is drawn after the card and
+              // would take the first tap while the controls are up.
+              className="absolute z-10"
+              style={{
+                top: immersive ? 'calc(var(--sn-safe-t, 0px) - 2px)' : -2,
+                right: 2 + (controlsInset?.side === 'right' ? controlsInset.px : 0),
+              }}
+            />
+          )}
           <div className="text-[14px] text-white/80 text-center">{noticeLine ?? failureLine(reason)}</div>
           <button
             onClick={(e) => {
@@ -820,7 +910,7 @@ export const MobilePlayer: React.FC<{
             className="absolute inset-x-0 top-0 px-3 pt-2 [text-shadow:0_1px_2px_rgba(0,0,0,0.6)]"
             style={immersive ? { paddingTop: 'calc(var(--sn-safe-t, 0px) + 8px)' } : undefined}
           >
-            <div className="flex items-start gap-2.5">
+            <div className="relative flex items-start gap-2.5">
               {/* The face opens the channel's videos and clips (Twitch's), as on
                   the iPhone. The live red ring is for live alone. */}
               <button
@@ -857,7 +947,12 @@ export const MobilePlayer: React.FC<{
                 {/* Identity row: the name, then Subscribe, then the live
                     numbers opposite. One line always; parts give way in order
                     (GIVE_WAY_*) instead of wrapping. */}
-                <div ref={identityRowRef} className="relative flex items-center min-w-0 h-5">
+                {/* The Close video button sits over the row's corner: the row
+                    gives it room, so the give-way below measures what is left. */}
+                <div
+                  ref={identityRowRef}
+                  className={`relative flex items-center min-w-0 h-5${onCloseVideo ? ' mr-8' : ''}`}
+                >
                   <span className="flex items-center gap-1 min-w-0">{nameBlock(true)}</span>
                   {canSubscribe && giveWay < GIVE_WAY_SUBSCRIBE && (
                     <span className="ml-2 shrink-0 flex">{subscribePill(true)}</span>
@@ -916,6 +1011,10 @@ export const MobilePlayer: React.FC<{
                   </>
                 )}
               </div>
+              {/* Centered on the name line, its ink on the header's right edge. */}
+              {closeInHeader && onCloseVideo && (
+                <CloseVideoButton onClose={onCloseVideo} className="absolute -top-2.5 -right-2.5" />
+              )}
             </div>
           </div>
         )}

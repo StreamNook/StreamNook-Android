@@ -8,6 +8,7 @@ import { TooltipManager } from './components/ui/TooltipManager';
 // Side-effect import: starts the settings IPC now, before the lazy route
 // imports below, so it overlaps chunk loading.
 import './bootPreload';
+import { awaitCacheFileServer, waitsForCacheFileServer } from './utils/cacheFileUrl';
 
 // Route components are lazy so each window only downloads/parses the code it
 // actually renders. The MultiChat / profile / plugin popouts no longer pull in
@@ -101,6 +102,14 @@ const isChatOverlay = hash.startsWith('#/chat-overlay');
 const isPluginWindow = hash.startsWith('#/plugin/');
 const isEmotePalette = hash.startsWith('#/emote-palette');
 
+// The main window beats so a page that freezes leaves a [PageHang] line.
+if (!IS_MOBILE && !isProfileCard && !isMultiChat && !isChatOverlay && !isPluginWindow && !isEmotePalette) {
+  void import('./utils/pageHeartbeat').then((m) => m.startPageHeartbeat());
+  // The main window listens for the song a window with no player asks about
+  // (/song in a MultiChat window or a chat popout), from its first moment.
+  void import('./utils/songListening').then((m) => m.installSongIdentifyHost());
+}
+
 // The dedicated mobile shell (src/mobile/: bottom tabs, sheets, touch player,
 // drill-in settings) is the mobile DEFAULT. The in-place adapted App
 // (data-mobile CSS + MobileNav) remains reachable as an escape hatch: set
@@ -185,7 +194,7 @@ if (import.meta.env.DEV) {
     (window as unknown as { __snStore?: unknown }).__snStore = m.useAppStore;
   });
 }
-root.render(
+const paint = () => root.render(
   <React.StrictMode>
     <MotionScope>
       <Suspense fallback={null}>
@@ -202,3 +211,7 @@ root.render(
     </MotionScope>
   </React.StrictMode>,
 );
+// Android learns the cached-art server first, so no row starts on the asset
+// protocol and switches; every other window paints at once.
+if (waitsForCacheFileServer()) void awaitCacheFileServer().finally(paint);
+else paint();

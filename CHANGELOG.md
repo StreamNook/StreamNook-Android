@@ -1,3 +1,109 @@
+## [8.8.20] - 2026-11-01
+
+### ✨ Features
+- Settings > Integrations has a Discord Status editor with a live preview that looks like Discord, down to your banner, avatar decoration, nameplate and server tag. StreamNook subscribers can show the platform instead, like "Watching Twitch", and hide the StreamNook button.
+- Go-live alerts can be muted per channel: a bell beside Follow, a row in the channel menus, and a Which channels list where Copy from Twitch brings over the choices you made on Twitch. Requested by zoox (SN-235).
+- Category pages filter by stream tags. On desktop the search box suggests tags as you type; on the phones a chip row and a tag search sheet do it, and each card lists its tags. Requested by pacman00700 (SN-78).
+- Timestamps can sit on their own line above the message. The choice is under Settings > Chat > Timestamps > Position, with a preview.
+- Continue Watching can include live streams you left partway through. Turn it on under Resume VODs > Live streams. Requested by haku (SN-52).
+- A Media keys setting on Windows. Turn it off and the play/pause key goes to your music player instead. Requested by haku (SN-237).
+- A switch keeps atmospheres out of chat while profiles still show them.
+- On Android and iPhone, swipe left on a chat message to reply, with the keyboard up. Requested by zoox (SN-238).
+- On the phones, tap an emote in chat to see who made it, open its 7TV, BetterTTV, FFZ or Twitch page, and see the emotes stacked with it. Requested by Pears (SN-38).
+- Favorite channels on the phones from the hold menu or the chat menu, and Following shows a Favorites shelf. Requested by zoox (SN-239).
+- On the phones, Close video stops the stream and keeps its chat open in Chats. Requested by Pears (SN-37).
+- In landscape on the phones, swipe chat in and out, pinch to fill the screen (Zoom to fill, with a preview), and see faces in stream rows. Requested by Bas (SN-30).
+- Phone landscape opens with chat beside the stream until you hide it, and remembers your choice.
+- Phone chat has a round resume button that counts new messages while paused, emote suggestions that can wait for a colon, and profiles that list recent messages newest first. The message box names a chat mode when it holds you back.
+- Mention notifications on the phones show the sender's picture, the message they replied to and the channel.
+
+### 🐛 Bug Fixes
+- When someone changes their 7TV badge or paint, chat shows the new one within seconds. Reported by PieterVMB (SN-236).
+- Chat no longer shows two FFZ badges for one person when another badge source lags behind FFZ. Reported by Pears (SN-5).
+- With Battery Saver on, or animated emotes off, still emotes like KEKW show instead of a broken image.
+- The profile card keeps its counts and badges when 7TV or another service fails to answer, instead of showing them empty.
+- On the phones, saved settings apply from launch, so link previews stay off after a restart, Discord invite cards included. Reported by zoox (SN-234).
+- The phone message box hint uses wording that fits its line in landscape. Reported by gaga_maga (SN-1).
+- Expanding the mini player over Chats no longer leaves the player and chat ignoring taps.
+
+### ⚡ Performance
+- Android keeps its copy of emotes, badges and paints it already drew, so they stop loading again on every new chat line.
+
+### 🔧 Maintenance
+- Pages inside the app can load local files only from StreamNook's own media folders.
+
+## [8.8.19] - 2026-10-29
+
+## 🎉 New: Your songs
+> Every song you identify is kept now. Open Your songs from the arrow beside the player's song button, type /songs, or tap a song in the notification island. Each song wears its cover's colors and shows where you heard it, with links to play it in your music app or, through a QR code, on your phone.
+
+![Your songs](https://raw.githubusercontent.com/StreamNook/StreamNook/main/.github/assets/release-8.8.19-your-songs.webp)
+
+---
+
+### ✨ Features
+- Your songs keeps every song you identify, newest first, grouped by Today, Yesterday, This week and month. Search by song, artist, channel or category. On the phone it's under You > Songs.
+- Each song's page takes on its cover's colors and shows how often and where you heard it: the channel, the stream, and how far in.
+- Song links go straight to the track on Apple Music, Deezer, YouTube Music, YouTube and Beatport, and search the others. If you have Spotify, Apple Music, Cider, Tidal or Deezer installed, a link opens there.
+- A QR code beside each link opens the song on your phone.
+- The player's song button has an arrow that opens your recent songs. The note itself identifies, as before.
+- While a song is being identified, a small card above the chat box shows it listening, then shows the song for a few seconds before it tucks away. The song card still lands in chat.
+- /song in a MultiChat window listens to the main player.
+- The OBS chat overlay can show uploaded pictures in place of their links. It's off by default and shows pictures from trusted chatters, or from everyone.
+
+### 🐛 Bug Fixes
+- Song links work again. The service that gathered them stopped answering in July, so songs found since then only linked to Apple Music.
+- Moderators pause chat the way everyone does, by scrolling up or grabbing the scrollbar, and a resting pointer no longer freezes chat. Mod buttons act only on messages that hold still, so a click never lands on a row that scrolled under it.
+- On Kick, a follow Kick refuses no longer hides the live status of every channel you follow, every followed channel imports instead of the first 100, and subscriptions import too.
+- MultiNook tiles open at your Start volume and keep their volume when you leave and come back.
+- Emotes in pinned messages, prediction outcomes, the profile card's message history and the mod room match chat's.
+- In the OBS overlay, a zero-width emote no longer prints over a word.
+- The overlay builder's live preview shows a YouTube source's chat.
+- A renamed Twitch account's badge collection loads again.
+
+### ⚡ Performance
+- Kick and moderation connections back off between reconnects, and 7TV's live updates connect only once a chat needs them.
+
+## [8.8.18] - 2026-10-26
+
+### 🐛 Bug Fixes
+- A click on the video no longer pauses it. It moves focus out of the chat box instead, so Space, M and the other player keys work right away. To have a click pause and play again, turn on Click to pause in Settings > Player. A paused stream still stops downloading however you pause it.
+
+## [8.8.17] - 2026-10-26
+
+### 🐛 Bug Fixes
+- Hovering an emote in chat shows its preview again. 8.8.16 stopped it from opening.
+
+## [8.8.16] - 2026-10-26
+
+### ✨ Features
+- Pausing a live stream stops its download now. The pause holds through a restart and in MultiNook tiles, and play picks up at the live edge. Your own channel opens paused.
+- A click on the video pauses and plays it. Double-click still goes full screen.
+- Clips and VODs show the category they were recorded under, like a live stream does.
+- When follow, channel points or drops need Twitch's approval, StreamNook asks for it right there. Before, you got an error telling you to sign out and back in.
+- A mention notification for a reply quotes the message it answers.
+- The About page names the platform you're on and links the other apps.
+
+### 🐛 Bug Fixes
+- Replies to your Kick messages now highlight and play the mention sound, the same as on Twitch. Your Kick name and your YouTube @handle count as mentions on those chats, and the inbox and mention sound work without a Twitch sign-in.
+- The mention sound plays in MultiChat windows, including when MultiChat is the only window open, and each mention plays once.
+- New 7TV emotes show up as soon as their image exists, and a later refresh no longer undoes an emote edit. When someone's personal 7TV set loads late, the lines they already sent get their emotes.
+- Switching channels no longer replays a burst of old messages. A chat tab in the background keeps every message, and its emotes are current when you open it.
+- Timestamps lead the message line again and stay in a straight column. A chatter's atmosphere no longer shifts their message sideways.
+- The mod log keeps every action through a crash or a damaged save.
+- Stats and watch minutes go out in batches and when you quit, with nothing lost or counted twice. StreamNook's own requests take a backup route when a network blocks the usual one.
+- On macOS, updates install and reopen the app. Freezes and automatic stream reloads are written to the log, so a report shows what happened.
+- Paused TikTok and YouTube tiles hold still, and every player reports when a stream ends.
+- Toasts read clearly in every theme. Falling back to software drawing shows one warning, with an offer to restart.
+
+### ⚡ Performance
+- Chat opens faster: the newest messages paint first, and emotes and badges you've seen before load from disk.
+- Emote, cache and mod log work runs off the UI thread.
+- A paused stream downloads nothing, in the player and in MultiNook tiles.
+
+### 🔧 Maintenance
+- The log records chat delay, page lag, the drawing mode and backend stalls, so a "chat feels slow" or "the app froze" report can be traced.
+
 ## [8.8.15] - 2026-10-21
 
 ## 🎉 New: Send pictures in chat

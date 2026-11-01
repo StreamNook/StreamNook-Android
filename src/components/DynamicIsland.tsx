@@ -14,6 +14,7 @@ import { openMentionInMain } from '../stores/mentionJumpStore';
 import { MENTION_INBOX_CHANGED_EVENT, MENTION_NOTIFY_EVENT, toggleMentionChatMuted } from '../stores/mentionInboxStore';
 import { isProviderId } from '../types/providers';
 import { Logger } from '../utils/logger';
+import { LiveAlertIslandAction } from './LiveAlertIslandAction';
 import { formatBadgeDateInfo } from '../utils/badgeWindow';
 import { windowStatusAt, type WindowRun } from '../services/badgeStanding';
 import { lastUpdateStatus, type BundleUpdateStatus } from '../services/updateStatus';
@@ -32,11 +33,13 @@ import {
 import { Tooltip } from './ui/Tooltip';
 import { ProviderIcon } from './overlay/ProviderIcon';
 import { SevenTvAvatar } from './SevenTvAvatar';
+import { openSongs } from '../utils/songHistory';
 import { islandSurfaceGeometry } from '../utils/islandGeometry';
 import type { ProviderId } from '../types/providers';
 import type {
     DynamicIslandNotification,
     LiveNotificationData,
+    AlertChannel,
     WhisperNotificationData,
     UpdateNotificationData,
     DropsNotificationData,
@@ -187,6 +190,8 @@ interface LiveNotificationFromBackend {
     merge_into: string | null;
     /** The streamer's 7TV cosmetics id, keyed by Rust for their platform. */
     seventv_id?: string | null;
+    /** Every platform's channel this entry stands for (Rust's `AlertChannel`). */
+    channels?: AlertChannel[];
 }
 
 interface DropClaimedEvent {
@@ -373,6 +378,10 @@ const renderPreviewIcon = (n: IslandItem): React.ReactNode => {
             // glyph, and a source beats a status. This drives BOTH the stacked
             // faces on the trigger and the pop-up preview, so the two can never
             // disagree with the list they came from.
+            // A song's cover is square: it is a record sleeve, not a face.
+            if (d.song_key && d.avatar_url) {
+                return <img src={d.avatar_url} alt="" className="w-4 h-4 rounded-[3px] object-cover flex-shrink-0" />;
+            }
             if (d.avatar_url) {
                 return <SevenTvAvatar cosmeticsId={d.avatar_seventv_id} px={16} src={d.avatar_url} alt="" className="w-4 h-4 rounded-full object-cover flex-shrink-0" />;
             }
@@ -910,16 +919,17 @@ const DynamicIsland = () => {
             avatarUrl?: string;
             avatarSevenTvId?: string;
             source?: SystemNotificationData['source'];
+            songKey?: string;
         }>('action-notification', (event) => {
             if (!notificationsEnabled || !useDynamicIsland) return;
-            const { text, level, avatarUrl, avatarSevenTvId, source } = event.payload;
+            const { text, level, avatarUrl, avatarSevenTvId, source, songKey } = event.payload;
             if (!text) return;
             addNotification({
                 id: `system-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
                 type: 'system',
                 timestamp: Date.now(),
                 read: false,
-                data: { title: '', message: text, level, avatar_url: avatarUrl, avatar_seventv_id: avatarSevenTvId, source } as SystemNotificationData,
+                data: { title: '', message: text, level, avatar_url: avatarUrl, avatar_seventv_id: avatarSevenTvId, source, song_key: songKey } as SystemNotificationData,
             });
         });
         return () => { unlisten.then((fn) => fn()); };
@@ -1010,6 +1020,7 @@ const DynamicIsland = () => {
                             is_live: true,
                             is_test: true,
                             providers: data.providers,
+                            channels: data.channels,
                         } as LiveNotificationData,
                     });
                     setTimeout(() => {
@@ -1034,7 +1045,13 @@ const DynamicIsland = () => {
                                 ...n,
                                 // Unread again: something new happened on it.
                                 read: false,
-                                data: { ...(n.data as LiveNotificationData), providers: data.providers },
+                                // Rust sends every merged platform's channel, so
+                                // "Turn off alerts" mutes them all.
+                                data: {
+                                    ...(n.data as LiveNotificationData),
+                                    providers: data.providers,
+                                    channels: data.channels ?? (n.data as LiveNotificationData).channels,
+                                },
                             }
                             : n,
                     ));
@@ -1054,6 +1071,7 @@ const DynamicIsland = () => {
                             is_live: true,
                             providers: data.providers,
                             seventv_id: data.seventv_id ?? undefined,
+                            channels: data.channels,
                         } as LiveNotificationData,
                     });
                 }
@@ -1868,6 +1886,10 @@ const DynamicIsland = () => {
         } else if (notification.type === 'badge') {
             // Open badges overlay
             setShowBadgesOverlay(true);
+            setIsExpanded(false);
+        } else if (notification.type === 'system' && (notification.data as SystemNotificationData).song_key) {
+            // A song you identified: open it in Your songs.
+            openSongs((notification.data as SystemNotificationData).song_key ?? null);
             setIsExpanded(false);
         }
     };
@@ -2751,7 +2773,9 @@ const DynamicIsland = () => {
                                                                 return (
                                                                     <>
                                                                         <div className="relative flex-shrink-0">
-                                                                            {d.avatar_url ? (
+                                                                            {d.song_key && d.avatar_url ? (
+                                                                                <img src={d.avatar_url} alt="" loading="lazy" className="w-[34px] h-[34px] rounded-md object-cover" />
+                                                                            ) : d.avatar_url ? (
                                                                                 <>
                                                                                     <SevenTvAvatar
                                                                                         cosmeticsId={d.avatar_seventv_id}
@@ -2804,12 +2828,15 @@ const DynamicIsland = () => {
                                                                     onClick={(e) => notification.type === 'mention'
                                                                         ? markMentionRead(notification.data, e)
                                                                         : markAsRead(notification.id, e)}
-                                                                    className="text-white/30hover:text-green-400 transition-all p-0.5"
+                                                                    className="text-white/60 hover:text-green-400 transition-all p-0.5"
                                                                     data-keeps-player-fullscreen
                                                                 >
                                                                     <Check size={14} />
                                                                 </button>
                                                             </Tooltip>
+                                                        )}
+                                                        {notification.type === 'live' && (
+                                                            <LiveAlertIslandAction data={notification.data as LiveNotificationData} />
                                                         )}
                                                         {notification.type === 'mention' && (() => {
                                                             const muted = mutedRoomSet.has(notification.data.room.toLowerCase());
@@ -2820,7 +2847,7 @@ const DynamicIsland = () => {
                                                                         type="button"
                                                                         aria-label={label}
                                                                         onClick={(e) => toggleMentionMute(notification.data, e)}
-                                                                        className="text-white/30hover:text-white transition-all p-0.5"
+                                                                        className="text-white/60 hover:text-white transition-all p-0.5"
                                                                         data-keeps-player-fullscreen
                                                                     >
                                                                         {muted ? <Bell size={14} /> : <BellOff size={14} />}
@@ -2835,7 +2862,7 @@ const DynamicIsland = () => {
                                                                 onClick={(e) => notification.type === 'mention'
                                                                     ? removeMention(notification.data, e)
                                                                     : clearNotification(notification.id, e)}
-                                                                className="text-white/30hover:text-white transition-all p-0.5"
+                                                                className="text-white/60 hover:text-white transition-all p-0.5"
                                                                 data-keeps-player-fullscreen
                                                             >
                                                                 <X size={14} />

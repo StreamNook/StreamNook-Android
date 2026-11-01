@@ -216,6 +216,64 @@ fn gql_nodes(connection: Option<&serde_json::Value>) -> Vec<&serde_json::Value> 
         .unwrap_or_default()
 }
 
+/// The category tag filter's read. `options.freeformTags` is the field that
+/// filters by free-form tag NAME (case-insensitive), server-side, ranked by
+/// viewer count: Twitch's directory tag filter. The plain `tags` argument is
+/// silently ignored (legacy), so it must not be used. Partner status comes from
+/// `roles` (GQL `User` has no `broadcasterType`).
+const TAG_STREAMS_QUERY: &str = "query StreamNookGameStreamsByTags($name: String!, $first: Int!, $after: Cursor, $tags: [String!]) { \
+    game(name: $name) { id name \
+        streams(first: $first, after: $after, options: { sort: VIEWER_COUNT, freeformTags: $tags }) { \
+            edges { cursor node { id title viewersCount createdAt type language previewImageURL \
+                freeformTags { name } \
+                broadcaster { id login displayName profileImageURL(width: 70) roles { isPartner isAffiliate } } } } \
+            pageInfo { hasNextPage } } } }";
+
+/// The body of one tag-filtered page; `after` is the bare GQL cursor.
+fn tag_streams_body(game_name: &str, tags: &[String], after: Option<&str>, limit: u32) -> serde_json::Value {
+    serde_json::json!({
+        "operationName": "StreamNookGameStreamsByTags",
+        "query": TAG_STREAMS_QUERY,
+        "variables": { "name": game_name, "first": limit.clamp(1, 100), "after": after, "tags": tags },
+    })
+}
+
+/// One tag-filtered page's rows and the next public cursor.
+fn tag_streams_page(resp: &serde_json::Value, game_name: &str) -> (Vec<TwitchStream>, Option<String>) {
+    let game = resp.pointer("/data/game").filter(|g| !g.is_null());
+    let id = game.and_then(|g| g.get("id")).and_then(|v| v.as_str()).unwrap_or_default();
+    let name = game.and_then(|g| g.get("name")).and_then(|v| v.as_str()).unwrap_or(game_name);
+    let connection = game.and_then(|g| g.get("streams"));
+    let rows = gql_nodes(connection)
+        .into_iter()
+        .filter_map(|node| stream_row_from_gql_node(node, (id, name)))
+        .collect();
+    (rows, public_next_cursor(connection))
+}
+
+/// `get_category_info`'s answer from Twitch's reply. A refusal is an error,
+/// never "no such category": the tag filter keeps a missing category for ten
+/// minutes, and a refusal must not hide one. Only `data.game: null` means "no
+/// such category".
+fn category_info_from(status: u16, value: serde_json::Value) -> Result<Option<crate::models::stream::CategoryInfo>> {
+    if !(200..300).contains(&status) {
+        return Err(anyhow::anyhow!("Twitch answered HTTP {status}"));
+    }
+    if let Some(errors) = value.get("errors").and_then(|e| e.as_array()).filter(|e| !e.is_empty()) {
+        let msg = errors
+            .iter()
+            .filter_map(|e| e.get("message").and_then(|m| m.as_str()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(anyhow::anyhow!("Twitch GQL error: {msg}"));
+    }
+    if value.get("data").map_or(true, |d| d.is_null()) {
+        return Err(anyhow::anyhow!("Twitch sent no data for the category"));
+    }
+    let data: crate::models::stream::GqlDataResponse = serde_json::from_value(value)?;
+    Ok(data.data.and_then(|d| d.game))
+}
+
 /// A category as the category directory and category search answer it, under
 /// Helix's `games` field names so every caller reads it as before.
 /// `viewer_count` is Twitch's own live total for the category
@@ -304,28 +362,7 @@ fn search_page(resp: &serde_json::Value) -> Vec<CategoryRow> {
 /// A category name as search compares it: trimmed, lowercase, with Latin
 /// accents folded, so "pokemon" typed on any keyboard matches "Pokémon".
 fn fold_category_name(s: &str) -> String {
-    s.trim()
-        .chars()
-        .flat_map(char::to_lowercase)
-        .map(|c| match c {
-            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
-            'ç' | 'ć' | 'č' => 'c',
-            'ď' | 'đ' => 'd',
-            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ė' | 'ę' | 'ě' => 'e',
-            'ğ' => 'g',
-            'ì' | 'í' | 'î' | 'ï' | 'ī' | 'į' | 'ı' => 'i',
-            'ł' => 'l',
-            'ñ' | 'ń' | 'ň' => 'n',
-            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ő' => 'o',
-            'ř' => 'r',
-            'ś' | 'š' | 'ş' => 's',
-            'ť' => 't',
-            'ù' | 'ú' | 'û' | 'ü' | 'ū' | 'ů' | 'ű' => 'u',
-            'ý' | 'ÿ' => 'y',
-            'ź' | 'ż' | 'ž' => 'z',
-            c => c,
-        })
-        .collect()
+    crate::utils::text_fold::fold_search(s.trim())
 }
 
 /// Category search order: the category named exactly what was typed first
@@ -695,6 +732,67 @@ fn refresh_failure_message(kind: RefreshFailure, cause: &str) -> String {
     }
 }
 
+/// Why the primary Twitch token could not be had. Attached as the source of
+/// `get_token`'s error, under the same words it always carried (the pages
+/// read those), so a caller that needs the reason downcasts instead of
+/// matching text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenError {
+    /// No token is stored (signed out), or the stored one can never be read.
+    NoToken,
+    /// The credential store did not answer this time.
+    VaultUnavailable,
+    /// Twitch turned the refresh down: the sign-in is over.
+    Refused,
+    /// Twitch was not reached for a refresh; the sign-in holds.
+    Unreachable,
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoToken => "no usable Twitch token is stored",
+            Self::VaultUnavailable => "the credential store did not answer",
+            Self::Refused => "Twitch refused the token refresh",
+            Self::Unreachable => "Twitch was not reached for a token refresh",
+        })
+    }
+}
+
+impl std::error::Error for TokenError {}
+
+impl TokenError {
+    /// This reason under `text`, which is all `{e}` shows.
+    pub(crate) fn into_error(self, text: impl Into<String>) -> anyhow::Error {
+        anyhow::Error::new(self).context(text.into())
+    }
+}
+
+/// A stable fingerprint of an access token (SHA-256, hex), for remembering
+/// which token a server refused without keeping the token.
+#[cfg_attr(not(mobile), allow(dead_code))]
+pub(crate) fn token_hash(access_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(access_token.as_bytes());
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The one lock on the primary token slot. Held from a read of the slot to
+/// the write that follows it, by every writer (a refresh, a sign-in, an
+/// account switch, a sign-out), so none of them can file a token under the
+/// wrong account. Never take the push runner while holding it.
+static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Proof of holding `REFRESH_LOCK`: the slot's writers take one.
+pub(crate) struct SlotGuard {
+    _held: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Moves when the signed-in Twitch account changes (a sign-in, a switch, a
+/// sign-out), never on a refresh of the same account's token.
+static ACCOUNT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Token health status returned by verify_token_health
 #[derive(Debug, Clone, Serialize)]
 pub struct TokenHealthStatus {
@@ -764,6 +862,24 @@ pub fn helix_refusal_text(status: u16, body: &str) -> String {
 pub struct TwitchService;
 
 impl TwitchService {
+    /// Take the primary token slot (see `REFRESH_LOCK`).
+    pub(crate) async fn primary_slot() -> SlotGuard {
+        SlotGuard { _held: REFRESH_LOCK.lock().await }
+    }
+
+    /// Which signed-in account this is, as a number that moves only when the
+    /// account changes. Read it before a read that must belong to one account,
+    /// and compare after.
+    pub fn account_generation() -> u64 {
+        ACCOUNT_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Called by the account doors only, after their slot write, while
+    /// holding the slot.
+    pub(crate) fn bump_account_generation() {
+        ACCOUNT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn get_token_file_path() -> Result<PathBuf> {
         let mut path = get_app_data_dir()?;
 
@@ -796,20 +912,30 @@ impl TwitchService {
         token_vault::load_json(&Self::get_token_file_path()?)
     }
 
-    fn delete_token_file() -> Result<()> {
+    /// Empty the primary slot (a sign-out). An account door: it moves the
+    /// account generation.
+    fn delete_token_file(_slot: &SlotGuard) -> Result<()> {
         let result = token_vault::remove(&Self::get_token_file_path()?);
         crate::services::account_roster::set_twitch_identity(None);
+        Self::bump_account_generation();
+        #[cfg(mobile)]
+        crate::services::push_alerts::server::token_changed(None);
         result
     }
 
     /// Write a token to the primary slot. This is the single definition of
     /// "occupying the primary slot", so login, refresh, and account-switch all
-    /// persist it identically. `refresh_token` deliberately does NOT call this:
-    /// keeping refresh a pure transform is what stops a SECONDARY account's
-    /// refresh (via `AccountStore::get_token_for`) from silently clobbering the
-    /// primary's token.
-    pub(crate) async fn persist_primary_token(token: &StorableToken) -> Result<()> {
-        Self::store_token_to_file(token)
+    /// persist it identically, each holding the slot from its read to this
+    /// write. `refresh_token` deliberately does NOT call this: keeping refresh
+    /// a pure transform is what stops a SECONDARY account's refresh (via
+    /// `AccountStore::get_token_for`) from silently clobbering the primary's
+    /// token. A refresh never moves the account generation; the account doors
+    /// move it themselves after this.
+    pub(crate) async fn persist_primary_token(_slot: &SlotGuard, token: &StorableToken) -> Result<()> {
+        Self::store_token_to_file(token)?;
+        #[cfg(mobile)]
+        crate::services::push_alerts::server::token_changed(Some(&token_hash(&token.access_token)));
+        Ok(())
     }
 
     /// Read whatever token currently occupies the primary slot. The account
@@ -864,10 +990,6 @@ impl TwitchService {
                     #[cfg(desktop)]
                     crate::commands::twitch::dismiss_login_overlay(&app_handle, "twitch-login");
                     debug!(
-                        "[LOGIN] Access token (first 10 chars): {}...",
-                        &token_response.access_token[..10.min(token_response.access_token.len())]
-                    );
-                    debug!(
                         "[LOGIN] Refresh token present: {}",
                         token_response.refresh_token.is_some()
                     );
@@ -911,7 +1033,14 @@ impl TwitchService {
         app_handle: &crate::rt::AppHandle,
         storable_token: StorableToken,
     ) {
-        let store_result = Self::persist_primary_token(&storable_token).await;
+        let store_result = {
+            let slot = Self::primary_slot().await;
+            let stored = Self::persist_primary_token(&slot, &storable_token).await;
+            if stored.is_ok() {
+                Self::bump_account_generation();
+            }
+            stored
+        };
 
         // The web-session reads (stream resolver, follow/unfollow, entitlement
         // checks) gate on a logged_out flag that twitch_logout sets. A fresh
@@ -1057,13 +1186,15 @@ impl TwitchService {
             expires_at: expires_at.timestamp(),
         };
 
-        Self::persist_primary_token(&storable_token).await?;
+        {
+            let slot = Self::primary_slot().await;
+            Self::persist_primary_token(&slot, &storable_token).await?;
+            Self::bump_account_generation();
+        }
         crate::services::twitch_signin::clear();
-
-        debug!(
-            "Access token: {}...",
-            &token_response.access_token[..10.min(token_response.access_token.len())]
-        );
+        // A phone's go-live pushes register under the account that signed in.
+        #[cfg(mobile)]
+        crate::services::push_alerts::server::schedule();
 
         Ok("Login successful".to_string())
     }
@@ -1210,9 +1341,21 @@ impl TwitchService {
         }
     }
 
+    /// Sign the primary account out. Every sign-out path comes through here
+    /// (`AccountStore::sign_out_active`, `reset_all`, `twitch_logout`). On a
+    /// phone it first takes this device's go-live pushes off the server with
+    /// the leaving account's token, holding the push runner (taken before the
+    /// slot, the one lock order) until the token is deleted, so no queued
+    /// registration can put that account back in between.
     pub async fn logout() -> Result<()> {
-        // Delete token from file storage
-        let _ = Self::delete_token_file();
+        #[cfg(mobile)]
+        let runner = crate::services::push_alerts::server::unregister_before_sign_out().await;
+        {
+            let slot = Self::primary_slot().await;
+            let _ = Self::delete_token_file(&slot);
+        }
+        #[cfg(mobile)]
+        drop(runner);
 
         debug!("[LOGOUT] Complete - all tokens cleared from all storage locations");
         Ok(())
@@ -1262,50 +1405,98 @@ impl TwitchService {
         Ok(new_storable_token)
     }
 
-    pub async fn get_token() -> Result<String> {
-        // Serialized end to end. Two callers landing inside the 5-minute
-        // expiry buffer would otherwise BOTH refresh, and whichever persists
-        // last can write back a stale refresh token, killing the session until
-        // the user logs in again. The no-refresh path this also serializes is
-        // a file read, so contention costs nothing. (On Android the background
-        // notification worker shares this path with the running app, which
-        // widened the race enough to be worth closing.)
-        static REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        let _guard = REFRESH_LOCK.lock().await;
+    /// Why a slot read gave no token, or `None` when it gave one. No file is
+    /// signed out; a file that can never be parsed is as good as none; a store
+    /// that did not answer may answer next time.
+    pub(crate) fn token_error_for(load: &Result<Option<StorableToken>>) -> Option<TokenError> {
+        match load {
+            Ok(Some(_)) => None,
+            Ok(None) => Some(TokenError::NoToken),
+            Err(e) if e.chain().any(|c| c.is::<serde_json::Error>()) => Some(TokenError::NoToken),
+            Err(_) => Some(TokenError::VaultUnavailable),
+        }
+    }
 
-        let mut token = match Self::load_primary_token().await {
-            Ok(token) => token,
-            Err(e) => {
-                debug!("[GET_TOKEN] No usable stored token: {:#}", e);
-                return Err(anyhow::anyhow!(
-                    "Not authenticated. Please log in to Twitch first."
-                ));
+    /// The token in the primary slot, read while holding it, with a typed
+    /// reason when there is none.
+    fn load_slot_token(_slot: &SlotGuard) -> Result<StorableToken> {
+        const SIGNED_OUT: &str = "Not authenticated. Please log in to Twitch first.";
+        let load = Self::load_token_from_file();
+        if let Some(kind) = Self::token_error_for(&load) {
+            match &load {
+                Err(e) => debug!("[GET_TOKEN] No usable stored token: {:#}", e),
+                Ok(_) => debug!("[GET_TOKEN] No stored token"),
             }
+            return Err(kind.into_error(SIGNED_OUT));
+        }
+        match load {
+            Ok(Some(token)) => Ok(token),
+            _ => Err(TokenError::NoToken.into_error(SIGNED_OUT)),
+        }
+    }
+
+    /// A refresh failure as `get_token` reports it: today's words, typed.
+    fn refresh_error(e: anyhow::Error) -> anyhow::Error {
+        let kind = refresh_failure_kind(&e);
+        error!("[GET_TOKEN] Failed to refresh token ({kind:?}): {:?}", e);
+        let typed = match kind {
+            RefreshFailure::Unreachable => TokenError::Unreachable,
+            RefreshFailure::Refused => TokenError::Refused,
         };
+        typed.into_error(refresh_failure_message(kind, &format!("{e:#}")))
+    }
+
+    pub async fn get_token() -> Result<String> {
+        // Serialized end to end through the primary slot. Two callers landing
+        // inside the 5-minute expiry buffer would otherwise BOTH refresh, and
+        // whichever persists last can write back a stale refresh token,
+        // killing the session until the user logs in again. The no-refresh path
+        // this also serializes is a file read, so contention costs nothing. (On
+        // Android the background notification worker shares this path with the
+        // running app, which widened the race enough to be worth closing.)
+        let slot = Self::primary_slot().await;
+        let mut token = Self::load_slot_token(&slot)?;
 
         // Refresh when expired or within 5 minutes of expiring.
         let buffer_time = 300;
         if Utc::now().timestamp() >= (token.expires_at - buffer_time) {
             if token.refresh_token.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Token expired and no refresh token available. Please log in again."
-                ));
+                return Err(TokenError::Refused
+                    .into_error("Token expired and no refresh token available. Please log in again."));
             }
             debug!("[GET_TOKEN] Token expired or expiring soon, refreshing...");
             match Self::refresh_token(&token.refresh_token).await {
                 Ok(new_token) => {
                     token = new_token;
-                    let _ = Self::persist_primary_token(&token).await;
+                    let _ = Self::persist_primary_token(&slot, &token).await;
                 }
-                Err(e) => {
-                    let kind = refresh_failure_kind(&e);
-                    error!("[GET_TOKEN] Failed to refresh token ({kind:?}): {:?}", e);
-                    return Err(anyhow::anyhow!(refresh_failure_message(kind, &format!("{e:#}"))));
-                }
+                Err(e) => return Err(Self::refresh_error(e)),
             }
         }
 
         Ok(token.access_token)
+    }
+
+    /// After a server refused `rejected`: the token now in the slot, refreshed
+    /// first only if it is still that same token. Holds the slot throughout,
+    /// so a sign-in or switch that landed meanwhile is never overwritten.
+    #[cfg_attr(not(mobile), allow(dead_code))]
+    pub(crate) async fn get_token_after_reject(rejected: &str) -> Result<String> {
+        let slot = Self::primary_slot().await;
+        let token = Self::load_slot_token(&slot)?;
+        if token.access_token != rejected {
+            return Ok(token.access_token);
+        }
+        if token.refresh_token.is_empty() {
+            return Err(TokenError::Refused.into_error("No refresh token available. Please log in again."));
+        }
+        match Self::refresh_token(&token.refresh_token).await {
+            Ok(new_token) => {
+                Self::persist_primary_token(&slot, &new_token).await?;
+                Ok(new_token.access_token)
+            }
+            Err(e) => Err(Self::refresh_error(e)),
+        }
     }
 
     /// Verify the current token's health and return detailed status
@@ -1449,6 +1640,7 @@ impl TwitchService {
 
     /// Force refresh the token even if it hasn't expired yet
     pub async fn force_refresh_token() -> Result<String> {
+        let slot = Self::primary_slot().await;
         let token = Self::load_primary_token().await?;
 
         if token.refresh_token.is_empty() {
@@ -1461,7 +1653,7 @@ impl TwitchService {
         let new_token = Self::refresh_token(&token.refresh_token).await?;
 
         // This is an explicit PRIMARY refresh, so persist it to the primary slot.
-        let _ = Self::persist_primary_token(&new_token).await;
+        let _ = Self::persist_primary_token(&slot, &new_token).await;
 
         debug!("[Auth Debug] Token refreshed successfully!");
         Ok(new_token.access_token)
@@ -1761,9 +1953,12 @@ impl TwitchService {
             .header(AUTHORIZATION, format!("Bearer {}", token))
             .header("Client-Id", CLIENT_ID)
             .send()
-            .await?
-            .json::<serde_json::Value>()
             .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // A revoked token: typed, so the push runner refreshes once.
+            return Err(TokenError::Refused.into_error("Failed to get user info"));
+        }
+        let response = response.json::<serde_json::Value>().await?;
 
         let data = response
             .get("data")
@@ -2630,8 +2825,12 @@ impl TwitchService {
     /// the same app, which is why both come from the Android pair here.
     pub async fn follow_channel(target_user_id: &str) -> Result<()> {
         use crate::services::drops_auth_service::DropsAuthService;
+        use crate::services::twitch_approval::NEEDS_DROPS_AUTH;
 
-        let token = DropsAuthService::get_token().await?;
+        // No grant yet: the command asks for the approval and runs this again.
+        let token = DropsAuthService::get_token()
+            .await
+            .map_err(|_| anyhow::anyhow!(NEEDS_DROPS_AUTH))?;
         let client = crate::services::http::client().clone();
 
         const GQL_CLIENT_ID: &str = env!("TWITCH_ANDROID_CLIENT_ID");
@@ -2667,6 +2866,12 @@ impl TwitchService {
             .await?;
 
         let status = response.status();
+        // A revoked grant: validate_token clears it, so it is asked for again.
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && !DropsAuthService::validate_token().await.unwrap_or(true)
+        {
+            return Err(anyhow::anyhow!(NEEDS_DROPS_AUTH));
+        }
         if !status.is_success() {
             let error_text = response.text().await?;
             return Err(anyhow::anyhow!(
@@ -2697,8 +2902,11 @@ impl TwitchService {
     /// device-login token plus the Android Client-Id, integrity-free.
     pub async fn unfollow_channel(target_user_id: &str) -> Result<()> {
         use crate::services::drops_auth_service::DropsAuthService;
+        use crate::services::twitch_approval::NEEDS_DROPS_AUTH;
 
-        let token = DropsAuthService::get_token().await?;
+        let token = DropsAuthService::get_token()
+            .await
+            .map_err(|_| anyhow::anyhow!(NEEDS_DROPS_AUTH))?;
         let client = crate::services::http::client().clone();
 
         const GQL_CLIENT_ID: &str = env!("TWITCH_ANDROID_CLIENT_ID");
@@ -2733,6 +2941,11 @@ impl TwitchService {
             .await?;
 
         let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED
+            && !DropsAuthService::validate_token().await.unwrap_or(true)
+        {
+            return Err(anyhow::anyhow!(NEEDS_DROPS_AUTH));
+        }
         if !status.is_success() {
             let error_text = response.text().await?;
             return Err(anyhow::anyhow!(
@@ -3718,181 +3931,35 @@ impl TwitchService {
             .send()
             .await?;
 
-        if response.status().is_success() {
-            let data: crate::models::stream::GqlDataResponse = response.json().await?;
-            if let Some(game_data) = data.data {
-                return Ok(game_data.game);
-            }
-        }
-
-        Ok(None)
+        // A refusal's body is never read as an answer.
+        let status = response.status().as_u16();
+        let value: serde_json::Value =
+            if response.status().is_success() { response.json().await? } else { serde_json::Value::Null };
+        category_info_from(status, value)
     }
 
     /// Live streams in a category filtered by freeform tags, server-side, via
     /// GQL. Helix can't filter streams by tag, so this is the only way to match
-    /// Twitch's directory tag filter (returns every matching stream by viewer
-    /// count, not just whatever happens to be on the loaded Helix pages). `tags`
-    /// are tag display names (e.g. "Speedrun"); a stream must carry all of them.
+    /// Twitch's directory tag filter (every matching stream by viewer count, not
+    /// just whatever is on the loaded Helix pages). `tags` are tag display names
+    /// (e.g. "Speedrun"); a stream must carry all of them.
+    ///
+    /// Sent through `gql_public_read` (the Android client id): the anonymous web
+    /// id fails Twitch's integrity check from page 2 on. Its cursors carry the
+    /// `gql:` prefix like every public read; a cursor without it (an old Helix or
+    /// raw cursor) ends the list rather than starting it over.
     pub async fn get_streams_by_game_with_tags(
         game_name: &str,
         tags: Vec<String>,
         cursor: Option<String>,
         limit: u32,
     ) -> Result<(Vec<TwitchStream>, Option<String>)> {
-        let client = crate::services::http::client().clone();
-
-        // `options.freeformTags` is the field that actually filters by freeform
-        // tag NAME (case-insensitive), server-side, ranked by viewer count — this
-        // is Twitch's directory tag filter. The plain `tags` argument is silently
-        // ignored (legacy), so it must NOT be used. Partner status comes from
-        // `roles` (GQL `User` has no `broadcasterType`).
-        let query = "query($name: String!, $first: Int!, $after: Cursor, $tags: [String!]) { \
-            game(name: $name) { id name \
-                streams(first: $first, after: $after, options: { sort: VIEWER_COUNT, freeformTags: $tags }) { \
-                    edges { cursor node { \
-                        id title viewersCount createdAt type language \
-                        previewImageURL \
-                        freeformTags { name } \
-                        broadcaster { id login displayName profileImageURL(width: 70) roles { isPartner isAffiliate } } \
-                    } } \
-                    pageInfo { hasNextPage } \
-                } \
-            } }";
-
-        let body = serde_json::json!({
-            "query": query,
-            "variables": {
-                "name": game_name,
-                "first": limit,
-                "after": cursor,
-                "tags": tags,
-            }
-        });
-
-        let response = client
-            .post("https://gql.twitch.tv/gql")
-            .header("Client-Id", TWITCH_GQL_CLIENT_ID)
-            .json(&body)
-            .send()
-            .await?
-            .json::<serde_json::Value>()
-            .await?;
-
-        let game_id = response
-            .pointer("/data/game/id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let resolved_game_name = response
-            .pointer("/data/game/name")
-            .and_then(|v| v.as_str())
-            .unwrap_or(game_name)
-            .to_string();
-
-        let streams_node = response.pointer("/data/game/streams");
-        let edges = streams_node
-            .and_then(|s| s.get("edges"))
-            .and_then(|e| e.as_array());
-
-        let mut streams: Vec<TwitchStream> = Vec::new();
-        let mut last_cursor: Option<String> = None;
-
-        if let Some(edges) = edges {
-            for edge in edges {
-                if let Some(c) = edge.get("cursor").and_then(|c| c.as_str()) {
-                    last_cursor = Some(c.to_string());
-                }
-                let node = match edge.get("node") {
-                    Some(n) if !n.is_null() => n,
-                    _ => continue,
-                };
-                let broadcaster = match node.get("broadcaster") {
-                    Some(b) if !b.is_null() => b,
-                    _ => continue,
-                };
-
-                let user_login = broadcaster
-                    .get("login")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let user_name = broadcaster
-                    .get("displayName")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&user_login)
-                    .to_string();
-                let roles = broadcaster.get("roles");
-                let broadcaster_type = if roles
-                    .and_then(|r| r.get("isPartner"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    Some("partner".to_string())
-                } else if roles
-                    .and_then(|r| r.get("isAffiliate"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    Some("affiliate".to_string())
-                } else {
-                    None
-                };
-                let profile_image_url = broadcaster
-                    .get("profileImageURL")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let stream_tags: Vec<String> = node
-                    .get("freeformTags")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|t| {
-                                t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                streams.push(TwitchStream {
-                    id: node.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    user_id: broadcaster.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    user_name,
-                    user_login,
-                    title: node.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    viewer_count: node
-                        .get("viewersCount")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u32,
-                    game_id: game_id.clone(),
-                    game_name: resolved_game_name.clone(),
-                    thumbnail_url: node
-                        .get("previewImageURL")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    started_at: node.get("createdAt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                    broadcaster_type,
-                    profile_image_url,
-                    is_live: Some(true),
-                    tags: if stream_tags.is_empty() { None } else { Some(stream_tags) },
-                    language: node
-                        .get("language")
-                        .and_then(|v| v.as_str())
-                        .map(normalize_gql_language),
-                    drops_earnable: false,
-                });
-            }
+        if cursor.is_some() && public_cursor(cursor.as_deref()).is_none() {
+            return Ok((Vec::new(), None));
         }
-
-        let has_next = streams_node
-            .and_then(|s| s.get("pageInfo"))
-            .and_then(|p| p.get("hasNextPage"))
-            .and_then(|h| h.as_bool())
-            .unwrap_or(false);
-
-        Ok((streams, if has_next { last_cursor } else { None }))
+        let body = tag_streams_body(game_name, &tags, public_cursor(cursor.as_deref()), limit);
+        let resp = Self::gql_public_read(body).await?;
+        Ok(tag_streams_page(&resp, game_name))
     }
 
     pub async fn get_clips_by_game(
@@ -5629,20 +5696,19 @@ impl TwitchService {
 
     /// `user_id -> (login, display name, avatar)` for a batch of Twitch users.
     ///
-    /// Used to back-fill identity for favourites saved before the identity
-    /// sidecar existed: those are bare ids, and without a name and a face they
-    /// can't be drawn in the offline roster at all.
+    /// Fills in identity for favorites saved as bare ids, emote owner names and
+    /// channel faces. A missing token, a failed request, a refused status or an
+    /// unreadable answer is an error, so a caller never takes a failed call for
+    /// "no such user".
     pub async fn users_by_ids(
         ids: &[String],
-    ) -> std::collections::HashMap<String, (String, String, Option<String>)> {
+    ) -> Result<std::collections::HashMap<String, (String, String, Option<String>)>, String> {
         let mut out = std::collections::HashMap::new();
         if ids.is_empty() {
-            return out;
+            return Ok(out);
         }
 
-        let Ok(token) = Self::get_token().await else {
-            return out;
-        };
+        let token = Self::get_token().await.map_err(|e| e.to_string())?;
         let client = crate::services::http::client().clone();
 
         for chunk in ids.chunks(100) {
@@ -5653,24 +5719,21 @@ impl TwitchService {
                 .join("&");
             let url = format!("https://api.twitch.tv/helix/users?{}", query);
 
-            let Ok(response) = client
+            let response = client
                 .get(&url)
                 .header("Client-Id", CLIENT_ID)
                 .header(AUTHORIZATION, format!("Bearer {}", token))
                 .send()
                 .await
-            else {
-                continue;
-            };
+                .map_err(|e| e.to_string())?;
             if !response.status().is_success() {
-                continue;
+                return Err(format!("Twitch answered {} for users", response.status()));
             }
-            let Ok(json) = response.json::<serde_json::Value>().await else {
-                continue;
-            };
-            let Some(arr) = json.get("data").and_then(|d| d.as_array()) else {
-                continue;
-            };
+            let json = response.json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
+            let arr = json
+                .get("data")
+                .and_then(|d| d.as_array())
+                .ok_or_else(|| "Twitch's users answer had no data".to_string())?;
             for user in arr {
                 let Some(id) = user.get("id").and_then(|v| v.as_str()) else {
                     continue;
@@ -5695,7 +5758,7 @@ impl TwitchService {
             }
         }
 
-        out
+        Ok(out)
     }
 
     /// Get User Chat Color for a batch of users, returning `user_id -> hex color`.
@@ -8214,5 +8277,163 @@ mod blocked_term_tests {
         .to_string();
         assert_eq!(blocked_terms_refusal(403, &body), "You are not a moderator in this channel");
         assert_eq!(blocked_terms_refusal(502, ""), "Twitch answered HTTP 502");
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::*;
+
+    /// `get_token` waits for a held slot before it reads anything: with the
+    /// slot held it cannot finish (it would, reading the vault, without E11).
+    #[tokio::test]
+    async fn get_token_waits_for_the_slot() {
+        let held = TwitchService::primary_slot().await;
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), TwitchService::get_token()).await;
+        assert!(blocked.is_err(), "get_token took the slot while it was held");
+        drop(held);
+        // Once free, the slot is taken again at once. (Not `get_token` itself:
+        // that would read, and could refresh, this machine's real sign-in.)
+        tokio::time::timeout(std::time::Duration::from_secs(5), TwitchService::primary_slot())
+            .await
+            .expect("the slot is free again once dropped");
+    }
+
+    #[test]
+    fn a_slot_read_names_why_it_has_no_token() {
+        assert_eq!(TwitchService::token_error_for(&Ok(None)), Some(TokenError::NoToken));
+        let unparsable: Result<Option<StorableToken>> =
+            Err(anyhow::Error::from(serde_json::from_str::<serde_json::Value>("{").unwrap_err()));
+        assert_eq!(TwitchService::token_error_for(&unparsable), Some(TokenError::NoToken));
+        let io: Result<Option<StorableToken>> =
+            Err(anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::Other, "vault busy")));
+        assert_eq!(TwitchService::token_error_for(&io), Some(TokenError::VaultUnavailable));
+    }
+
+    /// The body of the first function whose signature starts with `sig`.
+    /// `src` must already have `\r\n` folded to `\n`.
+    fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} not found"));
+        let rest = &src[start..];
+        &rest[..rest.find("\n    }\n").expect("function end")]
+    }
+
+    #[test]
+    fn only_the_account_doors_move_the_generation_never_a_refresh() {
+        // The Windows checkout is CRLF (core.autocrlf), so fold line ends first.
+        let service = include_str!("twitch_service.rs").replace("\r\n", "\n");
+        let service = service.as_str();
+        for refresh in [
+            "pub async fn get_token()",
+            "pub(crate) async fn get_token_after_reject(",
+            "pub async fn force_refresh_token()",
+            "pub(crate) async fn persist_primary_token(",
+        ] {
+            assert!(!body(service, refresh).contains("bump_account_generation"), "{refresh} is a refresh");
+        }
+        for door in [
+            "pub(crate) async fn complete_primary_login(",
+            "pub async fn complete_device_login(",
+            "fn delete_token_file(_slot",
+        ] {
+            assert!(body(service, door).contains("bump_account_generation"), "{door} changes the account");
+        }
+        let store = include_str!("account_store.rs").replace("\r\n", "\n");
+        for door in ["pub async fn set_active(", "pub async fn sign_out_active("] {
+            assert!(body(&store, door).contains("bump_account_generation"), "{door} changes the account");
+        }
+    }
+
+    #[test]
+    fn a_token_fingerprint_is_stable_and_not_the_token() {
+        let h = token_hash("abc");
+        assert_eq!(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_ne!(token_hash("abd"), h);
+    }
+
+    #[test]
+    fn get_token_words_stay_what_the_pages_read() {
+        let e = TokenError::VaultUnavailable.into_error("Not authenticated. Please log in to Twitch first.");
+        assert_eq!(e.to_string(), "Not authenticated. Please log in to Twitch first.");
+        assert_eq!(e.chain().find_map(|c| c.downcast_ref::<TokenError>()), Some(&TokenError::VaultUnavailable));
+    }
+}
+
+#[cfg(test)]
+mod tag_stream_tests {
+    use super::*;
+
+    #[test]
+    fn tag_streams_body_names_its_document() {
+        let body = tag_streams_body("Art", &["English".to_string()], Some("abc"), 500);
+        let query = body["query"].as_str().unwrap();
+        let name = body["operationName"].as_str().unwrap();
+        assert!(query.starts_with(&format!("query {name}(")), "the document must name the operation it is sent as");
+        assert!(query.contains("options: { sort: VIEWER_COUNT, freeformTags: $tags }"));
+        assert_eq!(body["variables"]["first"], 100);
+        assert_eq!(body["variables"]["after"], "abc");
+        assert_eq!(body["variables"]["tags"], serde_json::json!(["English"]));
+        assert_eq!(tag_streams_body("Art", &[], None, 0)["variables"]["first"], 1);
+        assert!(tag_streams_body("Art", &[], None, 40)["variables"]["after"].is_null());
+    }
+
+    #[test]
+    fn tag_streams_page_reads_rows_and_prefixes_the_cursor() {
+        let resp = serde_json::json!({ "data": { "game": { "id": "509658", "name": "Just Chatting", "streams": {
+            "edges": [{ "cursor": "c1", "node": {
+                "id": "42", "title": "hi", "viewersCount": 10, "createdAt": "2026-10-30T00:00:00Z", "type": "live",
+                "language": "EN", "previewImageURL": "https://p/x.jpg", "freeformTags": [{ "name": "English" }],
+                "broadcaster": { "id": "7", "login": "bas", "displayName": "Bas", "roles": { "isPartner": true } } } }],
+            "pageInfo": { "hasNextPage": true } } } } });
+        let (rows, next) = tag_streams_page(&resp, "just chatting");
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].game_id.as_str(), rows[0].game_name.as_str()), ("509658", "Just Chatting"));
+        assert_eq!(rows[0].tags.as_deref(), Some(&["English".to_string()][..]));
+        assert_eq!(next.as_deref(), Some("gql:c1"));
+    }
+
+    #[test]
+    fn tag_streams_page_ends_without_a_next_page() {
+        let resp = serde_json::json!({ "data": { "game": { "id": "1", "name": "Art",
+            "streams": { "edges": [], "pageInfo": { "hasNextPage": false } } } } });
+        assert_eq!(tag_streams_page(&resp, "Art"), (Vec::new(), None));
+        assert_eq!(tag_streams_page(&serde_json::json!({ "data": { "game": null } }), "Art"), (Vec::new(), None));
+    }
+
+    #[tokio::test]
+    async fn an_unprefixed_cursor_ends_the_list() {
+        let page = TwitchService::get_streams_by_game_with_tags("Art", vec!["English".into()], Some("raw".into()), 40)
+            .await
+            .unwrap();
+        assert_eq!(page, (Vec::new(), None));
+    }
+
+    #[test]
+    fn category_info_reads_a_found_category_and_its_tags() {
+        let value = serde_json::json!({ "data": { "game": { "id": "509658", "name": "Just Chatting",
+            "tags": [{ "id": "t1", "localizedName": "English" }] } } });
+        let info = category_info_from(200, value).unwrap().expect("found");
+        assert_eq!(info.name, "Just Chatting");
+        assert_eq!(info.tags.unwrap()[0].localized_name, "English");
+    }
+
+    #[test]
+    fn category_info_null_game_is_no_such_category() {
+        let value = serde_json::json!({ "data": { "game": null } });
+        assert!(category_info_from(200, value).unwrap().is_none());
+    }
+
+    #[test]
+    fn category_info_refusal_and_errors_are_errors_never_none() {
+        assert!(category_info_from(403, serde_json::Value::Null).is_err());
+        let errors = serde_json::json!({ "errors": [{ "message": "failed integrity check" }], "data": null });
+        let err = category_info_from(200, errors).unwrap_err();
+        assert!(err.to_string().contains("failed integrity check"));
+    }
+
+    #[test]
+    fn category_info_without_data_is_an_error() {
+        assert!(category_info_from(200, serde_json::json!({})).is_err());
+        assert!(category_info_from(200, serde_json::json!({ "data": null })).is_err());
     }
 }

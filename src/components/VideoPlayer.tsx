@@ -6,9 +6,9 @@ import Plyr from 'plyr';
 // Plyr's CSS ships once, layered, via globals.css (@import ... layer(vendor));
 // a second unlayered copy here would beat the app's control-bar overrides.
 import { motion, AnimatePresence } from 'framer-motion';
-import { Loader2, RefreshCcw, LayoutGrid, Shield, ShieldCheck, ShieldAlert, Clapperboard, Music, Share2, Check, VolumeX } from 'lucide-react';
+import { Loader2, RefreshCcw, LayoutGrid, Shield, ShieldCheck, ShieldAlert, Clapperboard, Share2, Check, VolumeX } from 'lucide-react';
 import { Heart, HeartBreak, ArrowLeft, CaretRight, X as XIcon } from 'phosphor-react';
-import { useAppStore } from '../stores/AppStore';
+import { mainChatRoom, useAppStore, type AutoReloadReason } from '../stores/AppStore';
 import { streamProvider } from '../utils/streamProvider';
 import { currentCategoryTarget } from '../utils/streamCategory';
 import { makeKey } from '../utils/providerKey';
@@ -38,6 +38,7 @@ import { useCurrentChapter } from '../hooks/useCurrentChapter';
 import VodChapterMarks from './VodChapterMarks';
 import VodChaptersMenu from './VodChaptersMenu';
 import { Tooltip } from './ui/Tooltip';
+import { LiveAlertBell } from './LiveAlertBell';
 import { TwitchVerifiedMark } from './ui/TwitchGlyph';
 import { registerPlayerControls, type PlayerControls } from '../keybindings';
 import { qualitiesEquivalent, qualityLabel } from '../utils/quality';
@@ -92,11 +93,28 @@ const CHAPTERS_BUTTON_HTML =
   '<span class="plyr__tooltip" role="tooltip">Chapters</span>';
 
 
-import { open as openExternalUrl } from '@tauri-apps/plugin-shell';
-import { LIVE_BUTTON_HTML, paintLiveButton, type LiveButtonState } from '../utils/liveButton';
+import { initialLiveButtonState, LIVE_BUTTON_HTML, paintLiveButton, type LiveButtonState } from '../utils/liveButton';
+import { liveWake } from '../utils/liveWake';
 import { setActiveVideo } from '../utils/activeVideo';
 import { isWindowHidden } from '../utils/windowVisibility';
-import { recognizeNowPlaying, announceSong } from '../utils/songId';
+import {
+  clearPauseIntent,
+  createPausePark,
+  heldPause,
+  notePauseIntent,
+  windowedPauseTimings,
+  type PausePark,
+} from '../utils/pausePark';
+import { followLiveAfterResync } from '../utils/liveResync';
+import { HLS_START_CONFIG, resumeLoadAfterRecover, startLoadOnManifest } from '../utils/hlsStartLoad';
+import { watchStalls } from '../utils/stallWatchdog';
+import { createRecovery } from '../utils/recovery';
+import { attachPauseRoutes, releaseTypingFocus } from '../utils/pauseRoutes';
+import { recognizeNowPlaying, announceSong, isQuietResult } from '../utils/songId';
+import { SongsSplitButton } from './songs/SongsFlyout';
+import { songsFlyoutOpen } from './songs/songsPopover';
+import { toastLink } from './songs/songLinks';
+import { openSongLink } from '../utils/songLinks';
 import {
   ignoresPlayerMouse,
   createWheelAccumulator,
@@ -137,6 +155,12 @@ function providerLiveSync(targetDuration: number | undefined): number {
   }
   const want = targetDuration * PROVIDER_LIVE_SYNC_SEGMENTS;
   return Math.min(PROVIDER_LIVE_SYNC_MAX, Math.max(PROVIDER_LIVE_SYNC_MIN, want));
+}
+
+/** The pause intent key for the stream on screen. */
+function liveKeyNow(): string | null {
+  const s = useAppStore.getState().currentStream;
+  return s ? makeKey(streamProvider(s), s.user_login ?? s.user_name ?? '') : null;
 }
 
 const VideoPlayer = () => {
@@ -246,6 +270,14 @@ const VideoPlayer = () => {
   isAutoSwitchingRef.current = isAutoSwitching;
   const isLiveRef = useRef<boolean>(true);
   const userInitiatedPauseRef = useRef<boolean>(false);
+  // Stops the paused player's downloads and says how a play resumes
+  // (utils/pausePark.ts). One per hls.js instance.
+  const pauseParkRef = useRef<PausePark | null>(null);
+  // Cancels a running follow to the live edge after a long pause.
+  const resyncStopRef = useRef<(() => void) | null>(null);
+  // What the element's `pause` does for the current hls.js instance: cancel a
+  // resume in progress and arm its park. Null with no live instance.
+  const parkOnPauseRef = useRef<(() => void) | null>(null);
   const [availableQualities, setAvailableQualities] = useState<string[]>([]);
   // Tracked as STATE (not just the playerRef) so the quality-menu effect
   // re-runs the moment the player is created. The quality list now resolves
@@ -437,7 +469,11 @@ const VideoPlayer = () => {
       },
       onInserted: (btn) => {
         liveBtnNodeRef.current = btn;
-        const initial: LiveButtonState = useAppStore.getState().liveRewind ? 'behind' : liveStateRef.current;
+        const initial = initialLiveButtonState({
+          rewound: !!useAppStore.getState().liveRewind,
+          paused: videoRef.current?.paused ?? true,
+          last: liveStateRef.current,
+        });
         liveStateRef.current = initial;
         paintLiveButton(btn, initial);
       },
@@ -529,6 +565,7 @@ const VideoPlayer = () => {
     hasSubHistory,
     cumulativeMonths,
     subscriberBadgeUrl,
+    subscriberBadgePending,
     handleSubscribeClick,
     offersMembership,
     membershipTier,
@@ -543,40 +580,43 @@ const VideoPlayer = () => {
   const [isRestarting, setIsRestarting] = useState(false);
 
   // Song identification: capture a few seconds of player audio and name the
-  // track. The button surfaces the result as a toast (it isn't tied to chat);
-  // the /song chat command posts the same result into chat instead.
-  const [isIdentifyingSong, setIsIdentifyingSong] = useState(false);
+  // track. The note surfaces the result as a toast; the card also lands in
+  // the playing stream's chat, whose composer shows the listening strip
+  // meanwhile. The note's bars and its "Stop listening" come from the
+  // window's one listening state (SongsSplitButton reads it).
   const handleIdentifySong = useCallback(async () => {
     const addToast = useAppStore.getState().addToast;
-    setIsIdentifyingSong(true);
-    try {
-      const result = await recognizeNowPlaying(videoRef.current);
-      // Also drop the clickable card into chat (where the links live); the toast
-      // below is just the quick on-player confirmation.
-      announceSong(result);
-      if (result.status === 'match') {
-        const s = result.song;
-        const provider = s.providers[0];
-        const link = provider?.url || s.song_link || s.shazam_url || undefined;
-        addToast(
-          `♪ ${s.title} by ${s.artist}${s.album ? ` (${s.album})` : ''}`,
-          'success',
-          link
-            ? {
-                label: provider ? `Open in ${provider.name}` : 'Open',
-                onClick: () => {
-                  void openExternalUrl(link);
-                },
-              }
-            : undefined,
-        );
-      } else if (result.status === 'no-match') {
-        addToast("Couldn't identify the song. Try again when the music is clearer.", 'info');
-      } else {
-        addToast(result.message, 'error');
-      }
-    } finally {
-      setIsIdentifyingSong(false);
+    // The room the answer goes to, as the listening starts: a viewer who
+    // switches channels meanwhile does not get it in the new chat.
+    const room = mainChatRoom();
+    const result = await recognizeNowPlaying(videoRef.current, { room });
+    // A canceled listening, or one asked for while one runs, says nothing.
+    if (isQuietResult(result)) return;
+    // Also drop the clickable card into the playing stream's chat (where the
+    // links live); the toast below is just the quick on-player confirmation.
+    announceSong(result, room);
+    if (result.status === 'match') {
+      const s = result.song;
+      // The track's own link first; a search page says it is one.
+      const link = toastLink(s);
+      addToast(
+        `♪ ${s.title} by ${s.artist}${s.album ? ` (${s.album})` : ''}`,
+        'success',
+        link
+          ? {
+              label: link.label,
+              onClick: () => {
+                void openSongLink(link.url);
+              },
+            }
+          : undefined,
+        // The island row shows the cover and opens the song in Your songs.
+        { avatarUrl: s.album_art ?? undefined, songKey: s.key ?? undefined },
+      );
+    } else if (result.status === 'no-match') {
+      addToast("Couldn't identify the song. Try again when the music is clearer.", 'info');
+    } else {
+      addToast(result.message, 'error');
     }
   }, []);
 
@@ -805,6 +845,8 @@ const VideoPlayer = () => {
   // low-latency watchdog must not "recover" them to the edge.
   const deliberateBehindRef = useRef(false);
   const updateLiveTimeDisplay = useCallback(() => {
+    // This frame ran; a wake may ask for the next one.
+    progressUpdateIntervalRef.current = null;
     const video = videoRef.current;
     const container = containerRef.current;
     if (!video || !container || !isLiveRef.current) return;
@@ -885,7 +927,7 @@ const VideoPlayer = () => {
         // Buffering, a swap in flight, or the recording: not at the edge in
         // any sense the button should claim.
         const store = useAppStore.getState();
-        const atEdge = nextAtLive && !store.liveRewind && !store.isRestartingStream && !bufferingRef.current;
+        const atEdge = nextAtLive && !video.paused && !store.liveRewind && !store.isRestartingStream && !bufferingRef.current;
         let nextState: LiveButtonState = atEdge ? 'live' : 'behind';
         if (atEdge) catchingUpUntilRef.current = 0;
         else if (catchingUpUntilRef.current > now) nextState = 'catching-up';
@@ -912,8 +954,10 @@ const VideoPlayer = () => {
       }
     }
 
-    // Continue the animation loop
-    if (isLiveRef.current) {
+    // Continue the animation loop. A paused player's readout and button do not
+    // change until it plays or seeks, so the loop sleeps until the video's
+    // play, pause, seek or timeupdate wakes it (see wakeLiveTime).
+    if (isLiveRef.current && !(video.paused && !video.seeking)) {
       progressUpdateIntervalRef.current = requestAnimationFrame(updateLiveTimeDisplay);
     }
   }, []);
@@ -1117,6 +1161,13 @@ const VideoPlayer = () => {
       // here so the LEVEL_LOADED correction and the stall ramp share one base.
       let providerCushionBase = PROVIDER_LIVE_SYNC_FALLBACK;
       const hls = new Hls({
+        // Standard MSE everywhere it exists, macOS included. hls.js otherwise
+        // picks WebKit's ManagedMediaSource on a Mac, which may tell it to stop
+        // buffering (`endstreaming`) whenever WebKit judges the buffer full
+        // enough; on a low-latency cushion of a second or two that drained the
+        // buffer into stalls and reloads. Windows (WebView2) and Linux have
+        // only standard MSE, so this makes the Mac player behave the same.
+        preferManagedMediaSource: false,
         // A custom logger sink ONLY when diagnostics are enabled; otherwise
         // `false` so hls.js does zero internal logging (no per-line string
         // formatting / mirror work). When on, hls.js explains every internal
@@ -1165,6 +1216,9 @@ const VideoPlayer = () => {
             llDiagNote(msg);
           },
         } : false,
+        // Loading starts when the manifest is parsed (startLoadOnManifest) and
+        // after a pause only when the page says so (see pausePark).
+        ...HLS_START_CONFIG,
         enableWorker: true,
         lowLatencyMode: isLowLatencyChannel, // Per-channel: true only when the relay LL-HLS origin is serving parts. Universal true would activate hls.js's playback-rate controller on normal channels and fight liveLatencyGovernor.
         startFragPrefetch: false, // Disabled: prefetching double-buffers massive TS chunks in V8 heap
@@ -1254,6 +1308,50 @@ const VideoPlayer = () => {
       (hls as unknown as { __snPathHint?: string }).__snPathHint = livePath;
 
       hlsRef.current = hls;
+      // A paused live player stops downloading a moment into the pause; a play
+      // resumes loading, and past the live window also moves to the edge. A
+      // VOD keeps no live pause (it shares its channel's key).
+      pauseParkRef.current?.dispose();
+      resyncStopRef.current?.();
+      resyncStopRef.current = null;
+      parkOnPauseRef.current = null;
+      if (isVodPlayback) clearPauseIntent('main');
+      pauseParkRef.current = isVodPlayback
+        ? null
+        : createPausePark({
+            stopLoad: () => hls.stopLoad(),
+            startLoad: () => hls.startLoad(),
+            // Past the resync cut-off the relay's origin rebuilds its window at
+            // the live edge before loading starts again, so the play never
+            // meets the window held across the pause.
+            resyncLoad: isLowLatencyChannel
+              ? () => {
+                  invoke<boolean>('relay_rebuild_live_edge', { tile: null })
+                    .catch(() => false)
+                    .finally(() => {
+                      if (hlsRef.current === hls && !video.paused) hls.startLoad();
+                    });
+                }
+              : undefined,
+            stillPaused: () => hlsRef.current === hls && video.paused,
+            log: (m) => Logger.warn(`[Player] ${m}`),
+            timings: () => windowedPauseTimings(hls, video),
+          });
+      const park = pauseParkRef.current;
+      // The viewer paused this channel before this player was built (a
+      // restart, an ad pivot, a quality change), or it is their own channel:
+      // stay on the frame with loading stopped and say so to the earning gate.
+      // True when it held.
+      const holdHeldPause = (): boolean => {
+        const held = isVodPlayback ? null : heldPause('main', liveKeyNow());
+        if (!held) return false;
+        invoke('report_player_state', { state: 'paused' }).catch(() => {});
+        park?.paused(held.at);
+        liveStateRef.current = 'behind';
+        if (liveBtnNodeRef.current?.isConnected) paintLiveButton(liveBtnNodeRef.current, 'behind');
+        Logger.warn('[Player] stays paused: paused before this player was built');
+        return true;
+      };
       // Dev bundles expose the live hls.js instance beside the store
       // (`window.__snStore`, main.tsx) so a CDP session can read latency,
       // buffer and playing date on every path without the recorder.
@@ -1406,6 +1504,33 @@ const VideoPlayer = () => {
         clearInterval(behindLiveWatchdogRef.current);
         behindLiveWatchdogRef.current = null;
       }
+      // One recovery per player: the resume check, the freeze watchdog and the
+      // behind-live watchdog all end here, so a single freeze can restart the
+      // stream once, never while a quality change, rewind, return to live or
+      // auto-switch confirmation is already swapping it, and an ended stream is
+      // not restarted in a loop. A refused call leaves the recovery unused.
+      let stopFrozenWatch: (() => void) | null = null;
+      const recover = createRecovery({
+        current: () => hlsRef.current === hls,
+        refused: () => {
+          const s = useAppStore.getState();
+          return s.isRestartingStream || s.isAutoSwitching;
+        },
+        stop: () => {
+          resyncStopRef.current?.();
+          resyncStopRef.current = null;
+          stopFrozenWatch?.();
+        },
+        // `reason` marks an automatic reload, which Rust counts per channel.
+        restart: (why: string, quiet: boolean = true, reason?: AutoReloadReason) => {
+          Logger.warn(why);
+          void useAppStore.getState().restartStream({
+            quiet,
+            ifUrl: useAppStore.getState().streamUrl ?? undefined,
+            reason,
+          });
+        },
+      });
       if (isLowLatencyChannel) {
         let over = 0;
         let frozen = 0;
@@ -1451,7 +1576,7 @@ const VideoPlayer = () => {
               lastRecover = Date.now();
               over = 0;
               if (end === 0) {
-                restartStream();
+                recover(`[HLS] behind-live watchdog: nothing buffered after ${fwd.toFixed(1)}s behind; reloading the stream`, true, 'no-buffer');
               } else {
                 const target = end - cushion;
                 if (target > v.currentTime + 0.5) {
@@ -1481,15 +1606,14 @@ const VideoPlayer = () => {
                 // A range strictly ahead of the stuck playhead with real content.
                 if (b.start(i) > v.currentTime + 0.1 && b.end(i) - b.start(i) > 0.5) {
                   const target = Math.max(b.start(i) + 0.1, b.end(i) - cushion);
-                  Logger.debug(`[HLS] behind-live watchdog: playhead frozen at ${v.currentTime.toFixed(1)}, snapping into live range -> ${target.toFixed(1)}`);
+                  Logger.warn(`[HLS] behind-live watchdog: playhead frozen at ${v.currentTime.toFixed(1)}, snapping into live range -> ${target.toFixed(1)}`);
                   v.currentTime = target;
                   snapped = true;
                   break;
                 }
               }
               if (!snapped) {
-                Logger.debug('[HLS] behind-live watchdog: playhead frozen with no reachable buffer, restarting to re-anchor to live');
-                restartStream();
+                recover(`[HLS] behind-live watchdog: playhead frozen at ${v.currentTime.toFixed(1)} for ~8s with no reachable buffer; reloading the stream`, true, 'stall');
               }
             }
           } else {
@@ -1511,6 +1635,7 @@ const VideoPlayer = () => {
 
       // HLS.js event handlers
       hls.on(Hls.Events.MANIFEST_PARSED, (_event, data) => {
+        startLoadOnManifest(hls, park);
         Logger.debug('[HLS] Manifest parsed, starting playback');
         Logger.debug('[HLS] Available quality levels:', data.levels.map(l => `${l.height}p @ ${l.bitrate}bps`).join(', '));
 
@@ -1634,12 +1759,27 @@ const VideoPlayer = () => {
           // Listen for Plyr events
           player.on('play', () => {
             userInitiatedPauseRef.current = false;
+            clearPauseIntent('main');
           });
 
           player.on('pause', () => {
             setTimeout(() => {
               if (video.paused) {
                 userInitiatedPauseRef.current = true;
+                // The viewer's live pause outlives a rebuild of this channel's
+                // player. A rebuild pauses the element too, but it destroys this
+                // Plyr and clears the ref first, and a restart says so in the
+                // store; neither pause is the viewer's.
+                const key = liveKeyNow();
+                if (
+                  playerRef.current === player &&
+                  isLiveRef.current &&
+                  key &&
+                  !video.ended &&
+                  !useAppStore.getState().isRestartingStream
+                ) {
+                  notePauseIntent('main', key);
+                }
               }
             }, 50);
           });
@@ -1685,6 +1825,13 @@ const VideoPlayer = () => {
             Logger.debug(
               `[HLS] Level loaded (LL) — starting playback at ${video.currentTime.toFixed(2)}`,
             );
+            if (holdHeldPause()) return;
+            if (!currentSettings.autoplay) {
+              // Autoplay is off: nothing plays, and the wait arms the park so
+              // the downloads stop until the viewer presses play.
+              park?.paused();
+              return;
+            }
             video.play().catch(() => {
               video.muted = true;
               video.play().catch(() => Logger.debug('[HLS] LL muted autoplay also failed'));
@@ -1796,7 +1943,7 @@ const VideoPlayer = () => {
             }
 
             // Try to recover by seeking slightly forward if video is paused
-            if (video.paused && !userInitiatedPauseRef.current) {
+            if (video.paused && !userInitiatedPauseRef.current && !heldPause('main', liveKeyNow())) {
               Logger.debug('[HLS] Video is paused due to stall, attempting to resume playback');
               video.play().catch(e => Logger.debug('[HLS] Resume play failed:', e));
             }
@@ -1850,8 +1997,8 @@ const VideoPlayer = () => {
               !isAutoSwitchingRef.current;
 
             if (shouldTriggerOffline) {
-              Logger.debug('[HLS] Multiple non-fatal errors with stalled fragments detected. Stream appears to have ended.');
-              Logger.debug(`[HLS] Non-fatal errors: ${nonFatalErrorCountRef.current}, Time since frag: ${timeSinceLastFrag}ms`);
+              Logger.warn('[HLS] Multiple non-fatal errors with stalled fragments detected. Stream appears to have ended.');
+              Logger.warn(`[HLS] Non-fatal errors: ${nonFatalErrorCountRef.current}, Time since frag: ${timeSinceLastFrag}ms`);
 
               // Reset error counts
               nonFatalErrorCountRef.current = 0;
@@ -1886,7 +2033,7 @@ const VideoPlayer = () => {
           // A rejected refresh on a live channel: accept the next one rather
           // than stall against the stale playlist. Not a sign of an offline
           // channel, so it does not count toward the offline threshold.
-          if (recoverFromSequenceMismatch(hls, data)) {
+          if (recoverFromSequenceMismatch(hls, data, () => !park?.loadStopped)) {
             Logger.warn('[HLS] playlist refresh rejected for a sequence mismatch; accepting the next refresh');
             return;
           }
@@ -1899,6 +2046,7 @@ const VideoPlayer = () => {
                 if (hlsRef.current !== hls) return; // the stream moved on meanwhile
                 if (!restart) {
                   hls.recoverMediaError();
+                  resumeLoadAfterRecover(hls, park);
                   return;
                 }
                 Logger.warn('[HLS] codec failed to decode; restarting on a tier this device plays');
@@ -1922,7 +2070,7 @@ const VideoPlayer = () => {
 
           // Check if we've exceeded max fatal errors - likely stream is offline
           if (fatalErrorCountRef.current >= maxFatalErrorsBeforeOffline && !isAutoSwitchingRef.current) {
-            Logger.debug('[HLS] Max fatal errors reached, stream appears to be offline. Triggering auto-switch...');
+            Logger.warn(`[HLS] Max fatal errors reached (last: ${data.type}/${data.details}), stream appears to be offline. Triggering auto-switch...`);
 
             // Reset error count
             fatalErrorCountRef.current = 0;
@@ -1956,7 +2104,7 @@ const VideoPlayer = () => {
                   (!hasPlayedSuccessfully || timeSinceStart > minPlayTimeBeforeOfflineMs);
 
                 if (shouldTriggerOffline && !isAutoSwitchingRef.current) {
-                  Logger.debug('[HLS] Multiple manifest errors, stream likely offline. Triggering auto-switch...');
+                  Logger.warn(`[HLS] Multiple manifest errors (last: ${data.details}), stream likely offline. Triggering auto-switch...`);
                   Logger.debug(`[HLS] Has played: ${hasPlayedSuccessfully}, Time since start: ${timeSinceStart}ms`);
                   manifestErrorCountRef.current = 0;
                   fatalErrorCountRef.current = 0;
@@ -1965,11 +2113,13 @@ const VideoPlayer = () => {
                 }
               }
 
-              hls.startLoad();
+              // A parked player stopped its downloads on purpose; its play restarts them.
+              if (!park?.loadStopped) hls.startLoad();
               break;
             case Hls.ErrorTypes.MEDIA_ERROR:
               Logger.debug('[HLS] Fatal media error, attempting recovery...');
               hls.recoverMediaError();
+              resumeLoadAfterRecover(hls, park);
               break;
             default:
               Logger.error('[HLS] Fatal error, cannot recover. Recreating player...');
@@ -2043,7 +2193,15 @@ const VideoPlayer = () => {
       hls.on(Hls.Events.FRAG_BUFFERED, () => {
         // LL path started playback in MANIFEST_PARSED and positions via hls.js; the
         // whole-segment gate doesn't apply (and FRAG_BUFFERED is unreliable per-part).
-        if (playStarted || !currentSettings.autoplay || isLowLatencyChannel) return;
+        if (playStarted || isLowLatencyChannel) return;
+        if (!currentSettings.autoplay) {
+          // Autoplay is off: nothing will play, so a held or own-channel pause
+          // reports and arms the park, and a plain wait arms it too, which
+          // stops the downloads until the viewer presses play.
+          playStarted = true;
+          if (!holdHeldPause()) park?.paused();
+          return;
+        }
 
         const buffered = video.buffered;
         if (buffered.length === 0) return;
@@ -2066,6 +2224,7 @@ const VideoPlayer = () => {
           video.currentTime = target;
         }
 
+        if (holdHeldPause()) return;
         Logger.debug(`[HLS] Buffer gate cleared: ${depth.toFixed(1)}s buffered, edge ${bufEnd.toFixed(1)}, snap to ${target.toFixed(1)} — starting playback`);
         video.play().catch(e => {
           Logger.debug('[HLS] Autoplay failed:', e);
@@ -2079,6 +2238,7 @@ const VideoPlayer = () => {
         bufferGateTimeoutRef.current = setTimeout(() => {
           if (!playStarted && currentSettings.autoplay) {
             playStarted = true;
+            if (holdHeldPause()) return;
             Logger.debug('[HLS] Buffer gate timeout — starting playback');
             video.play().catch(() => {});
           }
@@ -2255,6 +2415,55 @@ const VideoPlayer = () => {
         video.addEventListener('playing', () => stalls.end(), opts);
         video.addEventListener('pause', () => stalls.cancel(), opts);
         video.addEventListener('seeking', () => stalls.cancel(), opts);
+        // The park arms on a pause after this player played. A rebuild's own
+        // teardown pause lands before that and must not stop the new player
+        // while it waits to start; a held pause arms it at the autoplay point.
+        let playedHere = false;
+        video.addEventListener('playing', () => {
+          playedHere = true;
+        }, opts);
+        // The element's pause (attachPauseRoutes) lands here: a pause during a
+        // resume cancels it, and one after play arms the park.
+        parkOnPauseRef.current = () => {
+          resyncStopRef.current?.();
+          resyncStopRef.current = null;
+          if (!playedHere || video.ended || useAppStore.getState().isRestartingStream) return;
+          park?.paused();
+        };
+        video.addEventListener('play', () => {
+          const outcome = park?.play();
+          // Resuming at the paused frame is the viewer's place; the watchdog
+          // must not read it as a drought and snap to the edge.
+          if (outcome === 'resume') deliberateBehindRef.current = true;
+          if (outcome !== 'resync') return;
+          clearPauseIntent('main');
+          Logger.warn('[Player] paused past the live window; loading again from the live edge');
+          resyncStopRef.current?.();
+          resyncStopRef.current = followLiveAfterResync(
+            hls,
+            video,
+            () => recover('[Player] no video after the resync; restarting the stream'),
+            (m) => Logger.info(`[Player] ${m}`),
+          );
+        }, opts);
+        // A pinned playhead while playing on the whole-segment path restarts
+        // the stream (the low-latency path has its own watchdog above). The
+        // watch starts when playback does and ends with the listeners.
+        if (!isLowLatencyChannel) {
+          video.addEventListener('playing', () => {
+            if (stopFrozenWatch) return;
+            stopFrozenWatch = watchStalls(video, {
+              onFrozen: () => {
+                if (heldPause('main', liveKeyNow())) return;
+                recover('[Player] playhead frozen while playing; restarting the stream');
+              },
+            });
+          }, opts);
+          opts.signal.addEventListener('abort', () => {
+            stopFrozenWatch?.();
+            stopFrozenWatch = null;
+          }, { once: true });
+        }
         linkReportRef.current = { stalls, listeners };
       }
 
@@ -2372,6 +2581,8 @@ const VideoPlayer = () => {
   }, [isRestartingStream]);
 
   useEffect(() => {
+    // The offline room plays nothing live: no pause to keep.
+    if (streamUrl === 'offline') clearPauseIntent('main');
     const videoElement = videoRef.current;
     if (!videoElement || !streamUrl) return;
 
@@ -2379,6 +2590,19 @@ const VideoPlayer = () => {
     progressUpdateIntervalRef.current = requestAnimationFrame(updateLiveTimeDisplay);
 
     const video = videoElement;
+
+    // Wakes the readout loop, which sleeps while the player is paused. A
+    // play, pause or seek also reopens the 250 ms gate when a frame is already
+    // pending, so that frame recomputes the readout and the LIVE button.
+    const wakeLiveTime = (e: Event) => {
+      const wake = liveWake(e.type, progressUpdateIntervalRef.current !== null);
+      if (wake.resetGate) liveTextComputedAtRef.current = 0;
+      if (wake.schedule) {
+        progressUpdateIntervalRef.current = requestAnimationFrame(updateLiveTimeDisplay);
+      }
+    };
+    const wakeEvents = ['play', 'pause', 'seeking', 'seeked', 'timeupdate'] as const;
+    for (const ev of wakeEvents) video.addEventListener(ev, wakeLiveTime);
 
     // Deferred-recreate timeout id for the stream-swap path. Held in an
     // effect-scoped variable (not a partial early-return cleanup) so the SINGLE
@@ -2450,6 +2674,13 @@ const VideoPlayer = () => {
 
       // Close any active LL diagnostic recording.
       stopLLDiagnostics();
+
+      for (const ev of wakeEvents) videoElement.removeEventListener(ev, wakeLiveTime);
+      pauseParkRef.current?.dispose();
+      pauseParkRef.current = null;
+      parkOnPauseRef.current = null;
+      resyncStopRef.current?.();
+      resyncStopRef.current = null;
 
       // Destroy HLS.js instance
       if (hlsRef.current) {
@@ -2618,39 +2849,29 @@ const VideoPlayer = () => {
     return () => registerPlayerControls(null);
   }, []);
 
-  // Click vs double-click on the video surface (live/VOD Plyr path only).
-  // Single click toggles play/pause; double click toggles fullscreen. A short
-  // timer holds the single-click action just long enough that a following
-  // double-click can cancel it, so a double-click never blips play/pause (which
-  // on a live stream would force a rebuffer). Listeners live on the <video>
-  // node itself, so clicks on the controls bar and the overlay buttons are
-  // unaffected. Clip playback uses native controls (no Plyr); there playerRef
-  // is null and these handlers no-op, leaving native behavior intact.
+  // The <video> element's own routes (utils/pauseRoutes.ts). Click vs
+  // double-click on the video surface (live/VOD Plyr path only): a single click
+  // toggles play/pause, a double click leaves fullscreen to Plyr and only
+  // cancels the pending click, so it never blips play/pause (which on a live
+  // stream would force a rebuffer).
+  // Listeners live on the <video> node itself, so clicks on the controls bar and
+  // the overlay buttons are unaffected. Clip playback uses native controls (no
+  // Plyr); there playerRef is null and the click routes no-op, leaving native
+  // behavior intact. Every pause of the element reports to Rust's earning gate
+  // (which counts it only once it outlives its grace window, so the transient
+  // pause of a source reload never gates earning off) and reaches the park.
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    let clickTimer: ReturnType<typeof setTimeout> | null = null;
-    const onClick = () => {
-      if (clickTimer) return; // second click of a pair — let dblclick handle it
-      clickTimer = setTimeout(() => {
-        clickTimer = null;
-        playerRef.current?.togglePlay();
-      }, 250);
-    };
-    const onDblClick = () => {
-      if (clickTimer) {
-        clearTimeout(clickTimer);
-        clickTimer = null;
-      }
-      playerRef.current?.fullscreen.toggle();
-    };
-    video.addEventListener('click', onClick);
-    video.addEventListener('dblclick', onDblClick);
-    return () => {
-      if (clickTimer) clearTimeout(clickTimer);
-      video.removeEventListener('click', onClick);
-      video.removeEventListener('dblclick', onDblClick);
-    };
+    return attachPauseRoutes(video, {
+      togglePlay: () => playerRef.current?.togglePlay(),
+      clickToPause: () => playerSettingsRef.current.click_to_pause === true,
+      releaseFocus: releaseTypingFocus,
+      reportPaused: () => {
+        invoke('report_player_state', { state: 'paused' }).catch(() => {});
+      },
+      parkPaused: () => parkOnPauseRef.current?.(),
+    });
   }, []);
 
   // Mouse volume: wheel to change it, middle click to mute. One-handed control
@@ -2804,8 +3025,11 @@ const VideoPlayer = () => {
   /// Plyr marks the open menu with `aria-expanded="true"` on its toggle, which
   /// is the only reliable signal — the menu itself is only visually hidden, so
   /// checking for its presence in the DOM is always true.
+  ///
+  /// The Songs popover counts too. It is portaled to the page's body, so it
+  /// is found on the document, not inside the player.
   const isPlayerMenuOpen = useCallback(
-    () => !!containerRef.current?.querySelector('.plyr__menu [aria-expanded="true"]'),
+    () => !!containerRef.current?.querySelector('.plyr__menu [aria-expanded="true"]') || songsFlyoutOpen(document),
     [],
   );
   // The seek bar is held: a fine drag on a VOD, or Plyr's own range mid-drag.
@@ -3229,11 +3453,6 @@ const VideoPlayer = () => {
           // finishing keeps earning uninterrupted.
           invoke('report_player_state', { state: 'playing' }).catch(() => {});
         }}
-        onPause={() => {
-          // Rust counts a pause only once it outlives its grace window, so the
-          // transient pause of a source reload never gates earning off.
-          invoke('report_player_state', { state: 'paused' }).catch(() => {});
-        }}
       />
 
       {/* A channel's offline room: its offline art and a card that says when
@@ -3403,7 +3622,8 @@ const VideoPlayer = () => {
                 </h3>
                 </Tooltip>
               )}
-              {currentStream.game_name && (
+              {/* A clip or VOD keeps its views and date when it has no category. */}
+              {(currentStream.game_name || currentMediaType === 'clip' || currentMediaType === 'video') && (
                 // With the chip the line is a flex row, so the date beside it
                 // centers on the chip instead of riding its text baseline.
                 <p className={`text-white/70 text-xs drop-shadow-md ${categoryLink ? 'mt-1 flex items-center gap-1.5 min-w-0' : 'mt-0.5'}`}>
@@ -3439,9 +3659,14 @@ const VideoPlayer = () => {
                       </span>
                     </button>
                   ) : (
-                    currentStream.game_name
+                    currentStream.game_name || null
                   )}
-                  {categorySuffix && (categoryLink ? <span className="truncate">{categorySuffix}</span> : ` ${categorySuffix}`)}
+                  {categorySuffix &&
+                    (!currentStream.game_name
+                      ? categorySuffix.replace(/^• /, '')
+                      : categoryLink
+                        ? <span className="truncate">{categorySuffix}</span>
+                        : ` ${categorySuffix}`)}
                 </p>
               )}
             </div>
@@ -3547,6 +3772,19 @@ const VideoPlayer = () => {
             transition={{ duration: 0.3, ease: 'easeInOut' }}
             className="subscribe-overlay absolute top-3 right-3 z-50 flex items-center gap-2"
           >
+          {/* Live alerts, left of Follow so its arrival never moves Follow.
+              It rides the Follow overlay option. */}
+          {overlayButtonOn('follow') && (
+            <LiveAlertBell
+              provider={streamProvider(currentStream)}
+              userId={currentStream.user_id}
+              userLogin={currentStream.user_login}
+              userName={currentStream.user_name}
+              isFollowing={isFollowing}
+              buttonClassName="flex items-center justify-center p-2 aspect-square chrome-glaze chrome-glaze--control chrome-glaze--frosted"
+              iconClassName="w-4 h-4"
+            />
+          )}
           {/* Follow Button - Icon Only with Glow */}
           {overlayButtonOn('follow') && (
           <Tooltip content={checkingFollowStatus
@@ -3614,6 +3852,8 @@ const VideoPlayer = () => {
                 className="w-5 h-5 object-contain"
                 referrerPolicy="no-referrer"
               />
+            ) : subscriberBadgePending ? (
+              <span aria-hidden className="w-5 h-5" />
             ) : (
               <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
                 <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" />
@@ -3643,27 +3883,15 @@ const VideoPlayer = () => {
             </Tooltip>
           )}
 
-          {/* Identify Song Button — fingerprints a few seconds of player audio
-              and names the track (the /song chat command does the same). */}
+          {/* Songs: the note fingerprints a few seconds of player audio and
+              names the track (the /song chat command does the same); the
+              arrow beside it opens the Songs popover (Your songs). */}
           {overlayButtonOn('song') && (
-            <Tooltip
-              content={AUDIO_GRAPH_SUPPORTED ? 'Identify song' : AUDIO_GRAPH_REFUSAL}
-              side="bottom"
-            >
-            <button
-              onClick={() => handleIdentifySong()}
-              disabled={isIdentifyingSong || !AUDIO_GRAPH_SUPPORTED}
-              className={`flex items-center justify-center p-2 aspect-square chrome-glaze chrome-glaze--control chrome-glaze--frosted ${
-                isIdentifyingSong ? 'cursor-wait opacity-70' : ''
-              } ${!AUDIO_GRAPH_SUPPORTED ? 'opacity-40 cursor-default' : ''}`}
-            >
-              {isIdentifyingSong ? (
-                <Loader2 className="w-4 h-4 text-accent animate-spin" />
-              ) : (
-                <Music className="w-4 h-4 text-white hover:text-accent transition-colors duration-200" />
-              )}
-            </button>
-            </Tooltip>
+            <SongsSplitButton
+              onIdentify={() => void handleIdentifySong()}
+              supported={AUDIO_GRAPH_SUPPORTED}
+              refusal={AUDIO_GRAPH_REFUSAL}
+            />
           )}
 
           {/* Share button. Copies the stream's streamnook.app link; the icon

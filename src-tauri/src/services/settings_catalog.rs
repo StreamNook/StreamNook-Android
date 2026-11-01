@@ -300,6 +300,34 @@ mod tests {
     }
 
     #[test]
+    fn zoom_to_fill_row_on_both_phones() {
+        for ios in [false, true] {
+            let hit = search_on("zoom to fill", 3, ios, &nothing);
+            assert_eq!(hit.first().map(|r| r.title.as_str()), Some("Zoom to fill"), "ios {ios}");
+            assert_eq!(hit[0].paths, vec!["video_player.zoom_to_fill".to_string()]);
+            let changed = changed_rows_on(&["video_player.zoom_to_fill".to_string()], ios, &nothing);
+            assert!(titles(&changed).contains(&"Zoom to fill"), "ios {ios}");
+        }
+        let fresh = serde_json::to_value(crate::models::settings::Settings::default()).unwrap();
+        assert!(crate::commands::settings_fields::get_path(&fresh, "video_player.zoom_to_fill").is_some());
+    }
+
+    #[test]
+    fn timestamp_position_defaults_inline_and_sits_under_timestamps() {
+        let fresh = serde_json::to_value(crate::models::settings::Settings::default()).unwrap();
+        assert_eq!(
+            crate::commands::settings_fields::get_path(&fresh, "chat_design.timestamp_position"),
+            Some(&serde_json::json!("inline"))
+        );
+        let row = rows()
+            .iter()
+            .find(|r| r.paths.iter().any(|p| p == "chat_design.timestamp_position"))
+            .expect("a Position row");
+        assert!(row.nested);
+        assert_eq!(row.under.as_deref(), Some("Timestamps"));
+    }
+
+    #[test]
     fn rows_a_build_lacks_are_hidden_from_search_and_changed() {
         // A build without combined chat (a phone) finds none of its rows, on
         // Android as well as the iPhone.
@@ -394,6 +422,20 @@ mod tests {
             assert_eq!(hit[0].paths, ["chat_design.mention_hold"]);
             assert_eq!(hit[0].under.as_deref(), Some("Highlight"));
         }
+    }
+
+    #[test]
+    fn only_after_a_colon_sits_under_emotes_and_matching_under_chatter_names() {
+        for ios in [false, true] {
+            let hit = search_on("only after a colon", 3, ios, &nothing);
+            assert_eq!(hit[0].paths, ["chat_input.emote_suggest_colon_only"]);
+            assert_eq!(hit[0].under.as_deref(), Some("Emotes"));
+        }
+        let matching = rows().iter().find(|r| r.paths.iter().any(|p| p == "chat_input.emote_tab_complete_match_mode")).unwrap();
+        assert_eq!(matching.under.as_deref(), Some("Chatter names"));
+        // A fresh install has it off, so on then off again is not a change.
+        let defaults = crate::commands::settings_fields::default_settings_value();
+        assert_eq!(defaults["chat_input"]["emote_suggest_colon_only"], serde_json::json!(false));
     }
 
     #[test]

@@ -82,6 +82,16 @@ export function holdChatRow(row: HTMLElement, on: boolean): void {
   row.dispatchEvent(new CustomEvent(ROW_HOLD_EVENT, { bubbles: true, detail: { on } }));
 }
 
+/** Fired (bubbling) on a chat row when a reason picker opens for it and when
+ *  it closes. The list pauses chat while it is open, so the row stays put
+ *  under it, and resumes when it closes unless the viewer paused chat
+ *  themselves meanwhile. */
+export const PICKER_EVENT = 'sn-reason-picker';
+
+export function pickerOpen(row: Element, open: boolean): void {
+  row.dispatchEvent(new CustomEvent(PICKER_EVENT, { bubbles: true, detail: { open } }));
+}
+
 /** A timeout length the viewer typed ("45m", "1h30m", "2d", a bare number of
  *  minutes), read by Rust. Rejects with the words Settings shows when it is
  *  not a length Twitch takes (1 s to 14 d). */

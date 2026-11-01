@@ -56,6 +56,10 @@ fn reconnect_delay(failures: u32) -> Duration {
 
 static FALLBACK_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Prefix of an id made up here for a row Kick sent without one. Such an id
+/// changes on every load, so it can never dedupe anything.
+pub const KICK_LOCAL_ID: &str = "kick-local-";
+
 /// What the connected account is IN a given channel. One request answers all of
 /// it, so it is fetched and cached together rather than per-question.
 #[derive(Clone, Default, serde::Serialize)]
@@ -1407,7 +1411,7 @@ fn parse_chat_message(frame: &Value, channel_key: &str) -> Option<ChatMessage> {
         .get("id")
         .and_then(|x| x.as_str())
         .map(String::from)
-        .unwrap_or_else(|| format!("kick-{}", FALLBACK_SEQ.fetch_add(1, Ordering::Relaxed)));
+        .unwrap_or_else(|| format!("{KICK_LOCAL_ID}{}", FALLBACK_SEQ.fetch_add(1, Ordering::Relaxed)));
     let timestamp = data
         .get("created_at")
         .and_then(|x| x.as_str())
@@ -1498,6 +1502,7 @@ fn parse_chat_message(frame: &Value, channel_key: &str) -> Option<ChatMessage> {
         content: plain,
         provider: "kick".to_string(),
         channel: channel_key.to_string(),
+        received_at_ms: None,
         emotes: Vec::new(),
         tags,
         layout: LayoutResult {
@@ -1547,6 +1552,7 @@ fn build_event_message(
         content: String::new(),
         provider: "kick".to_string(),
         channel: channel_key.to_string(),
+        received_at_ms: None,
         emotes: Vec::new(),
         tags,
         layout: LayoutResult {
@@ -2021,6 +2027,19 @@ fn match_sub_badge(subs: &[(u32, String)], months: u32) -> Option<String> {
         })
 }
 
+/// A channel's custom subscriber art for `months`: the tier held, else its
+/// lowest tier (what a new subscriber would wear). `None` when it has none.
+pub(crate) fn sub_badge_or_lowest(subs: &[(u32, String)], months: u32) -> Option<String> {
+    match_sub_badge(subs, months).or_else(|| subs.iter().min_by_key(|(m, _)| *m).map(|(_, s)| s.clone()))
+}
+
+/// The Kick channel `slug`'s custom subscriber art from the resolve cache, as
+/// `sub_badge_or_lowest` picks it.
+pub fn sub_badge_art(slug: &str, months: u32) -> Option<String> {
+    let subs = sub_badges_cache().lock().ok().and_then(|m| m.get(&slug.to_lowercase()).cloned())?;
+    sub_badge_or_lowest(&subs, months)
+}
+
 /// Split Kick content into text + emote segments. Kick inlines its native emotes
 /// as `[emote:<id>:<name>]` (image at files.kick.com); between those tokens we
 /// match words against the channel's 7TV set so 7TV emotes render too. Returns
@@ -2047,6 +2066,7 @@ fn parse_segments(content: &str, slug: &str) -> (Vec<MessageSegment>, String) {
                     is_zero_width: None,
                     modifier_flags: None,
                     is_personal: None,
+                    local_path: None,
                 });
                 plain.push_str(name);
             } else {
@@ -2097,6 +2117,7 @@ fn push_text_run(segments: &mut Vec<MessageSegment>, plain: &mut String, text: &
                     is_zero_width: Some(e.zero_width),
                     modifier_flags: None,
                     is_personal: None,
+                    local_path: None,
                 });
             }
             None => buf.push_str(&word),
@@ -2333,12 +2354,14 @@ async fn resolve_via_http(slug: &str) -> Option<ResolvedChannel> {
 /// the response only when it succeeded. Shared by the channel resolve and the
 /// native-emote fetch so both present identically.
 /// `browser_get` plus caller-supplied headers — used by the account sync to
-/// attach the session cookie and bearer it read from the webview.
+/// attach the session cookie and bearer it read from the webview. A failure
+/// keeps its reason, because the follow import treats "signed out" (401),
+/// "slow down" (429) and "gone" (404) differently.
 pub(crate) async fn browser_get_with(
     url: &str,
     slug: &str,
     extra: &[(&str, String)],
-) -> Option<reqwest::Response> {
+) -> Result<reqwest::Response, GetFailure> {
     let mut headers = browser_headers(slug);
     for (name, value) in extra {
         if let (Ok(n), Ok(v)) = (
@@ -2352,14 +2375,23 @@ pub(crate) async fn browser_get_with(
         Ok(r) => r,
         Err(e) => {
             log::warn!("[Kick] request to {} failed: {}", url, e);
-            return None;
+            return Err(GetFailure::Network);
         }
     };
     if !resp.status().is_success() {
         log::warn!("[Kick] {} returned {}", url, resp.status());
-        return None;
+        return Err(GetFailure::Status(resp.status().as_u16()));
     }
-    Some(resp)
+    Ok(resp)
+}
+
+/// Why `browser_get_with` came back without a usable response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetFailure {
+    /// No answer at all: DNS, TLS, a dropped connection or a timeout.
+    Network,
+    /// Kick answered with this non-success status.
+    Status(u16),
 }
 
 pub(crate) async fn browser_get(url: &str, slug: &str) -> Option<reqwest::Response> {

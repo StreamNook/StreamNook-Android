@@ -310,9 +310,15 @@ fn restore_rect_size(_window: &Window) -> Option<(u32, u32)> {
 /// before the process can die. Every flush is a no-op when nothing is dirty.
 #[cfg(mobile)]
 #[command]
-pub fn flush_persistent_stores() -> Result<(), String> {
-    crate::flush_debounced_stores();
-    Ok(())
+pub async fn flush_persistent_stores() -> Result<(), String> {
+    // Unsent stat counts and watch minutes go out now too: the process can be
+    // killed right after this. Both sends start without waiting.
+    let _ = crate::services::member_stats::flush_on_exit();
+    let _ = crate::services::watch_minutes::flush_on_exit();
+    // On the blocking pool: each flush writes a file.
+    tauri::async_runtime::spawn_blocking(crate::flush_debounced_stores)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The phone app moved to the front or background (PiP counts as front). The one

@@ -10,6 +10,7 @@ import { useAccountRosterStore } from '../../stores/accountRosterStore';
 // It hides rows whose backing feature does not exist on Android, so the phone
 // settings stop offering knobs that quietly do nothing.
 import { IS_MOBILE } from '../../utils/platform';
+import { setSettingsFields } from '../../utils/settingsFields';
 import PanelChannelList from '../plugins/PanelChannelList';
 import { Tooltip } from '../ui/Tooltip';
 import { Dropdown } from '../ui/Dropdown';
@@ -538,6 +539,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     show_timestamps: stored?.show_timestamps ?? false,
     show_timestamp_seconds: stored?.show_timestamp_seconds ?? false,
     timestamp_format: stored?.timestamp_format ?? '12h',
+    timestamp_position: stored?.timestamp_position ?? 'inline',
     username_separator: stored?.username_separator ?? (stored?.username_colon ? 'colon' : 'none'),
     username_style: stored?.username_style ?? 'plain',
     username_accent_source: stored?.username_accent_source ?? 'user',
@@ -571,6 +573,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     ffz_custom_role_badges: stored?.ffz_custom_role_badges ?? true,
     show_third_party_badges: stored?.show_third_party_badges ?? true,
     hidden_badge_providers: stored?.hidden_badge_providers ?? [],
+    show_chat_atmospheres: stored?.show_chat_atmospheres ?? true,
     message_entrance: (stored?.message_entrance ?? ENTRANCE_FALLBACK) as 'none' | 'fade' | 'slide' | 'rise',
     emoji_style: (stored?.emoji_style ?? 'apple') as 'system' | 'apple' | 'google' | 'twitter' | 'facebook',
     show_personal_emotes: stored?.show_personal_emotes ?? true,
@@ -1565,7 +1568,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           title="Timestamps"
           onReset={resetFor(['chat_design.show_timestamps', false])}
           description="Shows the time each message was sent, next to the name."
-          help="Clock is 12-hour (7:42 PM) or 24-hour (19:42). Seconds turns 7:42 PM into 7:42:30 PM."
+          help="Position puts the time beside the name, or on its own line above the message. Clock is 12-hour (7:42 PM) or 24-hour (19:42). Seconds turns 7:42 PM into 7:42:30 PM."
           control={
             <Toggle
               enabled={cd.show_timestamps ?? false}
@@ -1575,6 +1578,20 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
         >
           {cd.show_timestamps && (
             <SubControls>
+              <SubControl
+                title="Position"
+                onReset={resetFor(['chat_design.timestamp_position', 'inline'])}
+                control={
+                  <SegmentedSelect<'inline' | 'own_line'>
+                    value={cd.timestamp_position}
+                    onChange={(timestamp_position) => setDesign({ timestamp_position })}
+                    options={[
+                      { value: 'inline', label: 'Beside' },
+                      { value: 'own_line', label: 'Own line' },
+                    ]}
+                  />
+                }
+              />
               <SubControl
                 title="Clock"
                 onReset={resetFor(['chat_design.timestamp_format', '12h'])}
@@ -1606,7 +1623,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
 
       <SettingsSection
         label="Names & Badges"
-        description="How chatter names, badges and 7TV paints look."
+        description="How chatter names, badges, 7TV paints and atmospheres look."
       >
         <SettingPreview caption="how your name looks in chat">
           <NamePrefixPreview
@@ -1901,6 +1918,18 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
             ]}
           />
         </SettingsRow>
+
+        <SettingsRow
+          title="Atmospheres"
+          onReset={resetFor(['chat_design.show_chat_atmospheres', true])}
+          description="A StreamNook member's atmosphere behind their messages. Off keeps every message plain; their profile still shows it."
+          control={
+            <Toggle
+              enabled={cd.show_chat_atmospheres}
+              onChange={() => setDesign({ show_chat_atmospheres: !cd.show_chat_atmospheres })}
+            />
+          }
+        />
       </SettingsSection>
 
       <SettingsSection
@@ -2583,7 +2612,11 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
               ? 'Shows when a channel limits who can chat, like emote-only or slow mode.'
               : "Tells you when a channel's chat limits stop you from chatting, like followers-only, subscriber-only or slow mode."
           }
-          help={`When it limits you names the mode in place of Send a message only while it stops you from chatting, and says what to do, like Follow to chat or You can chat in 4 minutes. A mode that spares you, say as a moderator or a long-time follower, shows nothing. Always keeps one small chip at the end of the message box whenever a mode is on; ${IS_MOBILE ? 'tap' : 'hover or tap'} it for every mode. During slow mode the send button counts down until you can send again. Shown for Twitch and Kick.`}
+          help={
+            IS_MOBILE
+              ? 'While a mode stops you from chatting, the message box names it in place of Send a message and says what to do, like Follow to chat or You can chat in 4 minutes. A mode that spares you, say as a moderator or a long-time follower, shows nothing. The chat menu lists every mode that is on. During slow mode the send button counts down until you can send again. Shown for Twitch and Kick.'
+              : 'When it limits you names the mode in place of Send a message only while it stops you from chatting, and says what to do, like Follow to chat or You can chat in 4 minutes. A mode that spares you, say as a moderator or a long-time follower, shows nothing. Always keeps one small chip at the end of the message box whenever a mode is on; hover or tap it for every mode. During slow mode the send button counts down until you can send again. Shown for Twitch and Kick.'
+          }
           control={
             <Toggle
               enabled={settings.chat_input?.show_room_modes ?? true}
@@ -2591,7 +2624,8 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
             />
           }
         >
-          {(settings.chat_input?.show_room_modes ?? true) && (
+          {/* The style picks the chip in the message box, which phones do not draw. */}
+          {!IS_MOBILE && (settings.chat_input?.show_room_modes ?? true) && (
             <SubControls>
               <SubControl
                 title="Style"
@@ -2612,7 +2646,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           )}
           {(settings.chat_input?.show_room_modes ?? true) && (
             <div className="pt-3">
-              <RoomModesPreview style={roomModesStyleHover ?? settings.chat_input?.room_modes_style ?? 'prompt'} />
+              <RoomModesPreview style={IS_MOBILE ? 'prompt' : (roomModesStyleHover ?? settings.chat_input?.room_modes_style ?? 'prompt')} />
             </div>
           )}
         </SettingsRow>
@@ -2634,7 +2668,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
             // On this phone the suggestions strip inserts an emote but does
             // not open the picker, so its words promise only the strip.
             IS_MOBILE
-              ? 'Removes the smiley from inside the message box, and with it the emote picker. Emote suggestions still show as you type.'
+              ? 'Removes the smiley from inside the message box, and with it the emote picker. Emote suggestions still show above the box.'
               : 'Removes the smiley from inside the message box, and with it the menu of emotes, GIFs and commands. Tab completion, : search and typing / still work.'
           }
           help={
@@ -2729,8 +2763,8 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
         shownLabel={IS_MOBILE ? 'Suggestions' : undefined}
         description={
           IS_MOBILE
-            ? 'Type part of an emote name in chat to see matching emotes above the input. Swipe the strip to see more, tap one to use it.'
-            : 'Press Tab to complete the emote you are typing, or type : and two letters to see every emote you can use.'
+            ? 'Type part of an emote name in chat to see matching emotes above the input. Swipe the strip to see more, tap one to use it. With Only after a colon on, start the word with a colon.'
+            : 'Press Tab to complete the emote you are typing, or type : and a letter to see every emote you can use.'
         }
         id="settings-section-emote-tab-completion"
       >
@@ -2744,7 +2778,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           }
           help={
             IS_MOBILE
-              ? 'Matching: Starts With needs the emote to begin with what you typed; Contains matches it anywhere in the name.'
+              ? 'Only after a colon: a plain word gets no suggestions. Start it with a colon, like :lul, to see matching emotes, or with @ to see chatters.'
               : 'Style: Carousel puts the best match straight into your message, and each Tab after that swaps in the next one (Shift+Tab goes back; on an empty spot it starts with your favorites and this channel\'s emotes). List opens every emote you can use with where it comes from; Tab or the arrows move, Enter inserts, Esc closes. Matching: Starts With needs the emote to begin with what you typed, Contains matches anywhere in the name. The : list always looks inside names, so :love finds vulpLove.'
           }
           control={
@@ -2776,20 +2810,45 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
                   }
                 />
               )}
-              <SubControl
-                title="Matching"
-                onReset={resetFor(['chat_input.emote_tab_complete_match_mode', 'starts_with'])}
-                control={
-                  <SegmentedSelect<'starts_with' | 'includes'>
-                    value={settings.chat_input?.emote_tab_complete_match_mode ?? 'starts_with'}
-                    options={[
-                      { value: 'starts_with', label: 'Starts With' },
-                      { value: 'includes', label: 'Contains' },
-                    ]}
-                    onChange={(v) => setInput({ emote_tab_complete_match_mode: v })}
-                  />
-                }
-              />
+              {!IS_MOBILE && (
+                <SubControl
+                  title="Matching"
+                  onReset={resetFor(['chat_input.emote_tab_complete_match_mode', 'starts_with'])}
+                  control={
+                    <SegmentedSelect<'starts_with' | 'includes'>
+                      value={settings.chat_input?.emote_tab_complete_match_mode ?? 'starts_with'}
+                      options={[
+                        { value: 'starts_with', label: 'Starts With' },
+                        { value: 'includes', label: 'Contains' },
+                      ]}
+                      onChange={(v) => setInput({ emote_tab_complete_match_mode: v })}
+                    />
+                  }
+                />
+              )}
+              {/* The phones' strip: Rust answers only a colon or @ word
+                  (emote_match.rs fill_gate). One path per write, so a stale
+                  copy of chat_input never writes the rest back. */}
+              {IS_MOBILE && (
+                <SubControl
+                  title="Only after a colon"
+                  onReset={
+                    (settings.chat_input?.emote_suggest_colon_only ?? false)
+                      ? () => void setSettingsFields({ 'chat_input.emote_suggest_colon_only': false }).catch(() => {})
+                      : undefined
+                  }
+                  control={
+                    <Toggle
+                      enabled={settings.chat_input?.emote_suggest_colon_only ?? false}
+                      onChange={() =>
+                        void setSettingsFields({
+                          'chat_input.emote_suggest_colon_only': !(settings.chat_input?.emote_suggest_colon_only ?? false),
+                        }).catch(() => {})
+                      }
+                    />
+                  }
+                />
+              )}
             </SubControls>
           )}
         </SettingsRow>
@@ -2797,7 +2856,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           <SettingsRow
             title="Colon list"
             onReset={resetFor(['chat_input.emote_colon_search_enabled', true])}
-            description="Type a colon and two letters to see every emote you can use and where it comes from."
+            description="Type a colon and a letter to see every emote you can use and where it comes from."
             control={
               <Toggle
                 enabled={settings.chat_input?.emote_colon_search_enabled ?? true}
@@ -2819,6 +2878,11 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
               ? 'Also suggest display names of users currently in chat.'
               : 'Also cycles through the names of people currently in chat.'
           }
+          help={
+            IS_MOBILE
+              ? 'With Only after a colon on, names show only for a word that starts with @. Matching: Starts With needs the name to begin with what you typed; Contains matches it anywhere in the name.'
+              : undefined
+          }
           control={
             <Toggle
               enabled={settings.chat_input?.emote_tab_complete_include_chatters ?? true}
@@ -2829,7 +2893,39 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
               }
             />
           }
-        />
+        >
+          {/* On the phones the strip always looks inside emote names (the
+              desktop fill), so Matching only changes which chatters match. */}
+          {IS_MOBILE &&
+            (settings.chat_input?.emote_tab_complete_enabled ?? true) &&
+            (settings.chat_input?.emote_tab_complete_include_chatters ?? true) && (
+              <SubControls>
+                <SubControl
+                  title="Matching"
+                  onReset={
+                    (settings.chat_input?.emote_tab_complete_match_mode ?? 'starts_with') !== 'starts_with'
+                      ? () =>
+                          void setSettingsFields({ 'chat_input.emote_tab_complete_match_mode': 'starts_with' }).catch(
+                            () => {},
+                          )
+                      : undefined
+                  }
+                  control={
+                    <SegmentedSelect<'starts_with' | 'includes'>
+                      value={settings.chat_input?.emote_tab_complete_match_mode ?? 'starts_with'}
+                      options={[
+                        { value: 'starts_with', label: 'Starts With' },
+                        { value: 'includes', label: 'Contains' },
+                      ]}
+                      onChange={(v) =>
+                        void setSettingsFields({ 'chat_input.emote_tab_complete_match_mode': v }).catch(() => {})
+                      }
+                    />
+                  }
+                />
+              </SubControls>
+            )}
+        </SettingsRow>
       </SettingsSection>
 
       <SettingsSection

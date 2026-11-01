@@ -410,6 +410,11 @@ pub(crate) fn toast_xml(
         xml.push_str(&format!("<image placement=\"hero\" src=\"{}\"/>", src(path)));
     }
     xml.push_str(&format!("<text hint-maxLines=\"1\">{}</text>", xml_escape(&notice.title)));
+    // The quoted line sits between the title and the body, one line, in the
+    // body's quieter ink (Windows only keeps text order for top-level lines).
+    if let Some(quote) = notice.quote.as_deref().filter(|q| !q.is_empty()) {
+        xml.push_str(&format!("<text hint-maxLines=\"1\">{}</text>", xml_escape(quote)));
+    }
     if !notice.body.is_empty() {
         xml.push_str(&format!("<text>{}</text>", xml_escape(&notice.body)));
     }
@@ -684,6 +689,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
     use tauri_plugin_notification::NotificationExt;
 
     /// Title and text only: the rows and the small line join the text, and a
@@ -707,18 +713,46 @@ mod platform {
                 body.push_str(&line);
             }
         }
-        let mut builder = app.notification().builder().title(&notice.title);
-        if !body.is_empty() {
-            builder = builder.body(&body);
+        // macOS: notify-rust directly, on this blocking-pool thread. Through
+        // the plugin, show() ran notify-rust's delivery wait (up to 2 s per
+        // notification) inside an async task, so a burst of alerts (go-live
+        // notices at startup, a busy chat's mentions) could hold every async
+        // worker at once and commands stopped answering.
+        #[cfg(target_os = "macos")]
+        {
+            let _ = image;
+            static APP_SET: std::sync::Once = std::sync::Once::new();
+            APP_SET.call_once(|| {
+                let id = if tauri::is_dev() {
+                    "com.apple.Terminal".to_string()
+                } else {
+                    app.config().identifier.clone()
+                };
+                let _ = notify_rust::set_application(&id);
+            });
+            let mut n = notify_rust::Notification::new();
+            n.summary(&notice.title);
+            if !body.is_empty() {
+                n.body(&body);
+            }
+            n.auto_icon();
+            return n.show().map(|_| ()).map_err(|e| e.to_string());
         }
-        // Linux draws a picture from a file path; macOS shows the app icon.
-        #[cfg(target_os = "linux")]
-        if let Some(path) = rich.and_then(|r| r.logo_path.as_deref()).or(image) {
-            builder = builder.icon(path.display().to_string());
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut builder = app.notification().builder().title(&notice.title);
+            if !body.is_empty() {
+                builder = builder.body(&body);
+            }
+            // Linux draws a picture from a file path.
+            #[cfg(target_os = "linux")]
+            if let Some(path) = rich.and_then(|r| r.logo_path.as_deref()).or(image) {
+                builder = builder.icon(path.display().to_string());
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = image;
+            return builder.show().map_err(|e| e.to_string());
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = image;
-        builder.show().map_err(|e| e.to_string())
     }
 }
 
@@ -764,6 +798,7 @@ mod tests {
             kind: "mention".into(),
             title: "Viewer mentioned you in <somechannel>".into(),
             body: "hey @you & \"friends\"".into(),
+            quote: None,
             image_url: None,
             round_image: true,
             action_label: Some("Open chat".into()),
@@ -800,6 +835,17 @@ mod tests {
         assert_eq!(attr("arguments", 2), attr("launch", 1));
         let send = ToastArgs::decode(&attr("arguments", 1)).unwrap();
         assert!(send.send && send.reply.is_some());
+    }
+
+    #[test]
+    fn a_quote_sits_between_the_title_and_the_body_escaped() {
+        let quoted = MirroredNotice { quote: Some("\u{201C}a <b> & \"c\"\u{201D}".into()), ..notice() };
+        let xml = toast_xml(&quoted, None, None, &[]);
+        let quote = "<text hint-maxLines=\"1\">\u{201C}a &lt;b&gt; &amp; &quot;c&quot;\u{201D}</text>";
+        let (title, body) = (xml.find("you in &lt;somechannel&gt;").unwrap(), xml.find("hey @you").unwrap());
+        let at = xml.find(quote).expect("the quote line, escaped");
+        assert!(title < at && at < body, "title, quote, body: {xml}");
+        assert!(!toast_xml(&notice(), None, None, &[]).contains("\u{201C}"), "no quote, no line");
     }
 
     #[test]

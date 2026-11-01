@@ -120,6 +120,15 @@ pub async fn provider_send_message(
             let outcome = p.send(&channel, &text, reply_to.as_deref()).await.map_err(|e| e.to_string())?;
             if outcome.is_sent {
                 crate::services::member_stats::count(crate::services::member_stats::Stat::MessagesSent, 1);
+                // Only Kick has a channel emote set in Rust; YouTube and TikTok
+                // sends are not tallied for emote usage.
+                if provider == "kick" {
+                    let (channel, text) = (channel.clone(), text.clone());
+                    tauri::async_runtime::spawn(async move {
+                        let set = crate::services::providers::kick_emotes::channel_emote_set(&channel).await;
+                        crate::services::member_stats::count_emotes(crate::services::recent_emotes::used_in_set(&set, &text));
+                    });
+                }
             }
             Ok(outcome)
         }
@@ -468,9 +477,15 @@ pub async fn kick_chat_history(
         .await
         .into_iter()
         .filter_map(|mut m| {
-            if crate::services::chat_rules::ChatRules::evaluate(&mut m, &rules).drop {
+            let verdict = crate::services::chat_rules::ChatRules::evaluate(&mut m, &rules);
+            if verdict.drop {
                 None
             } else {
+                // A mention from before you opened the chat still reaches the
+                // inbox (once: it dedupes by id), with no sound or notice.
+                if !m.id.starts_with(crate::services::providers::kick::KICK_LOCAL_ID) {
+                    crate::services::mention_inbox::on_backfill(&m, &verdict);
+                }
                 m.metadata.from_backfill = true;
                 crate::services::chat_row_view::stamp(&mut m);
                 // Patched in later if the channel's whole 7TV table is not in yet.
@@ -495,7 +510,9 @@ pub async fn get_kick_channel_emotes(
     tier: Option<String>,
 ) -> crate::services::emote_service::EmoteSet {
     let mut set = crate::services::providers::kick_emotes::channel_emote_set(&slug).await;
-    super::emotes::stamp_set_paths(&mut set, super::emotes::render_tier(tier.as_deref()));
+    let tier = super::emotes::render_tier(tier.as_deref());
+    let paths = super::emotes::cached_emote_paths(super::emotes::set_cache_keys(&set, tier)).await;
+    super::emotes::stamp_set_paths(&mut set, tier, &paths);
     set
 }
 
@@ -508,7 +525,9 @@ pub async fn get_youtube_channel_emotes(
     tier: Option<String>,
 ) -> crate::services::emote_service::EmoteSet {
     let mut set = crate::services::providers::youtube_emotes::channel_emote_set(&channel).await;
-    super::emotes::stamp_set_paths(&mut set, super::emotes::render_tier(tier.as_deref()));
+    let tier = super::emotes::render_tier(tier.as_deref());
+    let paths = super::emotes::cached_emote_paths(super::emotes::set_cache_keys(&set, tier)).await;
+    super::emotes::stamp_set_paths(&mut set, tier, &paths);
     set
 }
 
@@ -583,7 +602,7 @@ pub async fn platform_account_info(provider: String) -> PlatformAccountInfo {
 /// `account-roster-changed`; this is the first read.
 #[tauri::command]
 pub async fn get_account_roster() -> crate::services::account_roster::AccountRoster {
-    let roster = crate::services::account_roster::build().await;
+    let roster = crate::services::account_roster::build_followed().await;
     // Every read reports what changed (linked accounts dedupe on their own).
     crate::services::linked_accounts::on_roster(&roster);
     roster
@@ -767,6 +786,11 @@ pub async fn send_chat_message(
         crate::services::member_stats::count(crate::services::member_stats::Stat::MessagesSent, 1);
         if let Some(channel) = target_channel.as_deref() {
             crate::services::recent_emotes::record(channel, &message).await;
+            let (channel, text) = (channel.to_string(), message.clone());
+            tauri::async_runtime::spawn(async move {
+                let uses = crate::services::recent_emotes::used_in(&channel, &text).await;
+                crate::services::member_stats::count_emotes(uses);
+            });
         }
     }
     let pin_error = if pin_after_send.unwrap_or(false) {
@@ -1001,6 +1025,8 @@ pub async fn load_channel_history(
     limit: Option<u32>,
     after_ms: Option<u64>,
     before_ms: Option<u64>,
+    // The 7TV size the page draws, for the disk files stamped on the rows.
+    tier: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<ChatMessage>, String> {
     let key = channel.trim().trim_start_matches('#').to_lowercase();
@@ -1054,16 +1080,24 @@ pub async fn load_channel_history(
     let restamp_lines = (!seeded).then(|| raw.clone());
     // Remembered with the live lines, so a table that lands or changes later
     // (a partial first answer, an emote added since) repairs these rows too.
+    // The table generation is read before the parse below, so these rows are
+    // never stamped newer than the table they are parsed under.
     if !windowed {
+        let table_generation = crate::services::emote_restamp::generation(&key);
         for line in &raw {
-            crate::services::emote_restamp::remember(&key, line);
+            crate::services::emote_restamp::remember(&key, line, table_generation);
         }
     }
     let parsed = IrcService::parse_historical_messages(raw.clone()).await;
     // A native shell draws each row from its stamped view and only has these
     // rows once this answer returns, so the backlog waits briefly for its
     // authors' cosmetics and patches in the rest (`history_cosmetics`).
-    let parsed = crate::services::history_cosmetics::decorate(&key, &raw, parsed).await;
+    let mut parsed = crate::services::history_cosmetics::decorate(&key, &raw, parsed).await;
+    // The 7TV emotes' disk files at the page's size, so the rows' first paint
+    // is the disk copy (the page seeds its disk map from them).
+    let tier = super::emotes::render_tier(tier.as_deref());
+    let paths = super::emotes::cached_emote_paths(super::emotes::row_cache_keys(&parsed, tier)).await;
+    super::emotes::stamp_row_emote_files(&mut parsed, tier, &paths);
     if let Some(lines) = restamp_lines {
         IrcService::spawn_history_restamp(&key, lines, &parsed);
     }
@@ -1128,7 +1162,7 @@ pub fn get_youtube_channel_emojis(
 /// named by a `PERSONAL_EMOTES` bridge frame (their set arrived after the row
 /// did). `None` when nothing changes.
 #[tauri::command]
-pub fn apply_personal_emotes(
+pub async fn apply_personal_emotes(
     user_id: String,
     segments: Vec<crate::models::chat_layout::MessageSegment>,
 ) -> Option<Vec<crate::models::chat_layout::MessageSegment>> {

@@ -42,7 +42,6 @@ import {
   setActiveCosmetic,
   getProfilePrefs,
   setProfileTheme,
-  patchProfileSnapshotTheme,
   setHiddenSections,
   setChatAtmosphere,
   getAccolades,
@@ -451,11 +450,6 @@ const ProfileSettings = () => {
     if (!bypassTier && !tierMet(tier)) return; // locked until the required tier is met
     setProfileThemeState(id);
     void setProfileTheme(currentUser.user_id, id).catch((e) => Logger.warn('[ProfileSettings] theme write failed:', e));
-    // Keep the cached profile snapshot's theme in sync so the profile CARD (ours
-    // and anyone else's) reflects the change on the next open, instead of serving
-    // the old atmosphere until the lazy stale-rewrite. Without this the stale
-    // snapshot could also clobber the fresh prefs read on our own card.
-    void patchProfileSnapshotTheme(currentUser.user_id, id);
     // Push the new theme to chat immediately (no Supabase read race) so our own
     // messages update in real time; switching away from an Atmosphere clears it.
     refreshAtmosphere(currentUser.user_id, getAtmosphere(id) ? id : null);
@@ -1576,7 +1570,7 @@ const ProfileSettings = () => {
           <div
             className={`relative text-sm leading-relaxed ${
               previewFrost
-                ? `inline-block max-w-full rounded-md px-1.5 py-0.5 ${features.richAtmospheres ? 'atm-frost' : 'atm-frost atm-frost--flat'}`
+                ? `inline-block max-w-[calc(100%+0.75rem)] rounded-md px-1.5 -mx-1.5 py-0.5 ${features.richAtmospheres ? 'atm-frost' : 'atm-frost atm-frost--flat'}`
                 : ''
             }`}
           >

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { streamProvider } from '../utils/streamProvider';
-import { favoriteIdOf, favoriteMetaOf } from '../utils/favorites';
+import { favoriteIdOf } from '../utils/favorites';
+import { favoriteRefOf, isFavoriteNow, setFavoriteChannel } from '../utils/favoriteDoor';
 import { useContextMenuStore } from '../stores/contextMenuStore';
 import { useAppStore } from '../stores/AppStore';
 import { usemultiNookStore } from '../stores/multiNookStore';
@@ -12,10 +13,13 @@ import { replaceInputRange } from '../utils/chatInputWord';
 import { addToCustomDictionary } from '../utils/spellcheck';
 import { Tooltip } from './ui/Tooltip';
 import { gridRefusal } from '../types/providers';
+import { LiveAlertMenuRow } from './LiveAlertMenuRow';
 
 export const StreamContextMenu: React.FC = () => {
     const { isOpen, x, y, stream, inputElement, selectionText, menuType, spellStatus, spell, isFollowing, isCheckingFollow, closeMenu, toggleFollow } = useContextMenuStore();
-    const { toggleFavoriteStreamer, isFavoriteStreamer, setProfileModalUser } = useAppStore();
+    // The whole store, so the Favorite row's label (read during render below)
+    // follows every change it reads.
+    const { setProfileModalUser } = useAppStore();
     const hiddenChannels = useAppStore((s) => s.settings.hidden_channels);
     const { addSlot, slots } = usemultiNookStore();
     
@@ -47,7 +51,7 @@ export const StreamContextMenu: React.FC = () => {
     // the pointer. Anchoring `bottom` instead means the menu meets the pointer
     // at whatever height it happens to be, and grows away from it.
     const MENU_WIDTH = 200;
-    const ESTIMATED_HEIGHT = menuType === 'input' ? 220 : 215;
+    const ESTIMATED_HEIGHT = menuType === 'input' ? 220 : 310;
     const EDGE_GAP = 8;
 
     const viewportWidth = typeof window === 'undefined' ? 0 : window.innerWidth;
@@ -263,7 +267,8 @@ export const StreamContextMenu: React.FC = () => {
     // ids, so right-clicking a Kick row used to write a key that could collide
     // with a Twitch favourite (and never resolve as live either way).
     const favoriteId = favoriteIdOf(stream);
-    const isFavorite = !!favoriteId && isFavoriteStreamer(favoriteId);
+    const favoriteRef = favoriteRefOf(stream);
+    const isFavorite = isFavoriteNow(favoriteRef);
     const hasRoomForMultiNook = slots.length < 25;
     // Two separate reasons the item can be unavailable, and they read
     // differently: the grid is full, or this platform cannot be a tile at all.
@@ -273,9 +278,8 @@ export const StreamContextMenu: React.FC = () => {
 
     const handleFavorite = (e: React.MouseEvent) => {
         e.stopPropagation();
-        if (!favoriteId) return;
-        // Identity rides along so the channel can still be drawn once offline.
-        void toggleFavoriteStreamer(favoriteId, favoriteMetaOf(stream, favoriteId));
+        // Rust names the channel, a YouTube row known only by its video included.
+        void setFavoriteChannel(favoriteRef, !isFavorite);
         closeMenu();
     };
 
@@ -300,7 +304,14 @@ export const StreamContextMenu: React.FC = () => {
                 .catch((err) => addToast(typeof err === 'string' ? err : `Could not show ${name} again`, 'error'));
             return;
         }
-        invoke('set_channel_hidden', { channel: favoriteMetaOf(stream, favoriteId), hidden: true })
+        invoke('set_channel_hidden', {
+            provider: favoriteRef.provider,
+            userId: favoriteRef.userId ?? null,
+            userLogin: favoriteRef.userLogin,
+            userName: favoriteRef.userName ?? null,
+            avatar: favoriteRef.avatar ?? null,
+            hidden: true,
+        })
             .then(() => {
                 // A grid already on screen came from an answer Rust cannot
                 // take back; it drops the card now (Home listens).
@@ -480,8 +491,8 @@ export const StreamContextMenu: React.FC = () => {
                     <span>{copied ? 'Link copied!' : 'Share'}</span>
                 </button>
 
-                {/* Favorite */}
-                {favoriteId && (
+                {/* Favorite: every row, since Rust names the channel itself */}
+                {(
                 <button
                     onClick={handleFavorite}
                     className="flex items-center gap-2 px-2 py-2 rounded-lg text-sm font-medium text-textSecondary hover:text-pink-400 hover:bg-white/[0.06] transition-all"
@@ -531,6 +542,13 @@ export const StreamContextMenu: React.FC = () => {
                         </>
                     )}
                 </button>
+
+                {/* Live alerts: last; its slot is there from the first frame and
+                    only its value waits, so nothing moves in either menu anchoring. */}
+                <LiveAlertMenuRow
+                    stream={stream}
+                    className="flex items-center gap-2 px-2 py-2 rounded-lg text-sm font-medium text-textSecondary hover:text-textPrimary hover:bg-white/[0.06] transition-all"
+                />
             </div>
         </div>
     );
