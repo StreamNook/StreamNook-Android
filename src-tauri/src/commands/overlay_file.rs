@@ -136,6 +136,7 @@ const FIELDS: &[(&str, Kind)] = &[
     ("showThirdPartyBadges", Kind::Bool),
     ("showAtmospheres", Kind::Bool),
     ("hiddenBadgeProviders", Kind::IdList { max_items: 32 }),
+    ("badgeLimit", Kind::Num { min: 0.0, max: 5.0, step: 1.0 }),
     ("hiddenTwitchBadgeCategories", Kind::IdList { max_items: 32 }),
     ("ffzCustomRoleBadges", Kind::Bool),
     ("emojiStyle", Kind::Choice(&["system", "apple", "google", "twitter", "facebook"])),
@@ -487,6 +488,10 @@ fn file_dialog(app: &AppHandle, window: &Window) -> tauri_plugin_dialog::FileDia
 #[tauri::command]
 pub async fn export_overlay_file(app: AppHandle, window: Window, name: String, style: Value) -> Result<Option<String>, String> {
     let text = build_overlay_file(&name, &style);
+    // The save dialog is StreamNook's own: Performance mode keeps the full
+    // look while it is open.
+    #[cfg(desktop)]
+    let _dialog = crate::services::performance_mode::DialogGuard::new(window.label());
     let (tx, rx) = tokio::sync::oneshot::channel();
     file_dialog(&app, &window)
         .set_title("Export overlay")
@@ -519,6 +524,9 @@ pub async fn export_overlay_file(_app: AppHandle, _window: Window, _name: String
 #[cfg(not(target_os = "ios"))]
 #[tauri::command]
 pub async fn import_overlay_file(app: AppHandle, window: Window) -> Result<Option<ImportedOverlay>, String> {
+    // The open dialog is StreamNook's own (see export_overlay_file).
+    #[cfg(desktop)]
+    let _dialog = crate::services::performance_mode::DialogGuard::new(window.label());
     let (tx, rx) = tokio::sync::oneshot::channel();
     file_dialog(&app, &window)
         .set_title("Import overlay")

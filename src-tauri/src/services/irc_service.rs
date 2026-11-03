@@ -1258,7 +1258,10 @@ impl IrcService {
                 },
             );
             if let Some(room_id) = Self::extract_tag_value(line, "room-id") {
-                crate::services::chat_send_limiter::note_room_id(ch, &room_id);
+                // An own sub seen before this room's id was known counts now.
+                if crate::services::chat_send_limiter::note_room_id(ch, &room_id) {
+                    crate::services::channel_rewards::note_own_sub(ch);
+                }
             }
             // Ship the merged room, with its modes in words, so the page
             // and the replay cache never hold a partial frame.
@@ -2789,6 +2792,13 @@ impl IrcService {
                 let mine = crate::services::account_store::AccountStore::primary()
                     .is_some_and(|me| me.login.eq_ignore_ascii_case(&subscriber));
                 if mine {
+                    // Twitch sends the account's new badges only after its next
+                    // message, which sub-only chat refuses: the open chat (its
+                    // message box, sub-only rewards) learns the sub from here.
+                    for ch in crate::services::chat_send_limiter::note_own_sub(&room) {
+                        crate::services::channel_rewards::note_own_sub(&ch);
+                        reship_room_state(&ch).await;
+                    }
                     tauri::async_runtime::spawn(async move {
                         crate::services::channel_state::own_sub_seen(&room).await;
                     });
@@ -3018,8 +3028,9 @@ impl IrcService {
             }
             send_to_bridge(BridgeFrame::maybe_channel(clear.channel.as_deref(), clear.frame().to_string()), false).await;
         } else if trimmed.contains("NOTICE") {
-            // System notices — forward to frontend for user-facing handling
-            debug!("[IRC Chat] Notice: {}", trimmed);
+            // System notices — forward to frontend for user-facing handling.
+            // Info, not debug: a refused send shows only in chat otherwise.
+            info!("[IRC Chat] Notice: {}", trimmed);
 
             // Extract the msg-id tag (e.g. "msg_followersonly", "msg_subsonly")
             // Present when twitch.tv/tags capability is active (requested at connect)
@@ -8007,6 +8018,8 @@ mod chat_fixture_tests {
     fn frames() -> (Value, Vec<String>) {
         // The rule tests set their own account; hold the identity until done.
         let _own = crate::services::chat_rules::ChatRules::own_identity_test_lock();
+        // The member list is shared with the registry's own tests.
+        let _members = crate::services::cosmetics_registry::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let inputs: Value = serde_json::from_str(INPUTS).expect("chat inputs parse");
         let channel = inputs["channel"].as_str().unwrap().to_string();
         let set: EmoteSet = serde_json::from_value(inputs["emotes"].clone()).expect("emote set");
@@ -8054,6 +8067,20 @@ mod chat_fixture_tests {
                 },
             );
         }
+        // Chat clients' badges and StreamNook members, as the badge feeds and the member list
+        // would hold them, so a chatter's add-on badges fold on the phone.
+        for (user_id, worn) in inputs["third_party"].as_object().into_iter().flatten() {
+            let badges = serde_json::from_value(worn.clone()).expect("third-party badges");
+            crate::commands::badge_service::set_worn_for_test(user_id, badges);
+        }
+        let members: Vec<(String, u32)> = inputs["members"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| (m[0].as_str().unwrap().to_string(), m[1].as_u64().unwrap() as u32))
+            .collect();
+        let members: Vec<(&str, u32)> = members.iter().map(|(id, n)| (id.as_str(), *n)).collect();
+        crate::services::cosmetics_registry::set_for_test(&members, vec![], &[], &[], vec![]);
         ChatRules::set_own_identity(
             inputs["own"]["login"].as_str().unwrap(),
             inputs["own"]["user_id"].as_str().unwrap(),
@@ -8083,6 +8110,9 @@ mod chat_fixture_tests {
             out.push(frame);
         }
         out.push("HEARTBEAT".to_string());
+        // Leave no seeded badges or members behind for the tests that run after.
+        crate::commands::badge_service::clear_worn_for_test();
+        crate::services::cosmetics_registry::set_for_test(&[], vec![], &[], &[], vec![]);
         (inputs, out)
     }
 
@@ -8110,6 +8140,18 @@ mod chat_fixture_tests {
         assert_eq!(invite["url"], json!("https://discord.gg/discord-developers"));
         assert_eq!(invite["preview"]["kind"], json!("discord"));
         assert_eq!(invite["preview"]["member_count"], json!(308559));
+
+        // A chatter with enough add-ons to fold on the phone: Twitch's two, 7TV, four chat
+        // clients and their StreamNook badge, in the one surface order.
+        let fold = row(&parsed, "fx-fold");
+        let providers: Vec<&str> = fold["metadata"]["view"]["badges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["provider"].as_str().unwrap())
+            .collect();
+        assert_eq!(providers, ["twitch", "twitch", "7tv", "ffz", "chatterino", "moltorino", "limerino", "streamnook"]);
+        assert_eq!(fold["metadata"]["view"]["badges"][0]["role"], json!(true));
 
         // Paints, Twitch badge art and the 7TV badge for a chatter the cache knows.
         let owl = row(&parsed, "fx-0001");

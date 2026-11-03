@@ -3126,13 +3126,18 @@ html[data-player-fullscreen] {
    Driven by data-motion on <html>, set by MotionScope. The JS-driven side is
    handled separately via framer-motion's MotionConfig reducedMotion. */
 
-/* Off: collapse every transition and animation to instant. Spinners are exempt
-   so loading indicators still read as "working" rather than frozen mid-spin. */
-html[data-motion="off"] *:not(.animate-spin),
-html[data-motion="off"] *:not(.animate-spin)::before,
-html[data-motion="off"] *:not(.animate-spin)::after {
+/* Off: collapse every transition and animation to instant, loops included: a
+   0.001ms duration alone leaves an infinite loop running at that period, which
+   repaints on every frame. Spinners, the Penrose rotate and marked loaders
+   (.sn-loader) are exempt so loading still reads as "working" rather than
+   frozen. Every name on the exempt list is a single class, so the selector stays
+   at 0,2,1, which the Penrose and offline-drift restatements below outrank. */
+html[data-motion="off"] *:not(.animate-spin, .animate-penrose-rotate, .sn-loader, .sn-loader *),
+html[data-motion="off"] *:not(.animate-spin, .animate-penrose-rotate, .sn-loader, .sn-loader *)::before,
+html[data-motion="off"] *:not(.animate-spin, .animate-penrose-rotate, .sn-loader, .sn-loader *)::after {
   animation-duration: 0.001ms !important;
   animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
   transition-duration: 0.001ms !important;
   transition-delay: 0ms !important;
 }
@@ -3142,15 +3147,16 @@ html[data-motion="off"] {
 
 /* The Penrose mark IS the app's loading indicator, so it keeps marching here for
    exactly the reason spinners are exempt above: a frozen loader reads as a hung
-   app, not as a preference being honoured. The exemption above can only name one
-   class (`.animate-spin`) and the mark uses its own, so it was being collapsed to
-   0.001ms and standing perfectly still. Timing is restated verbatim from the
-   loader's own rule; it outranks the kill on specificity (0,3,1 vs 0,2,1).
+   app, not as a preference being honoured. Its cubes stay off the exempt list
+   because their timing lives on `.pm-cube`: timing and the endless loop are
+   restated verbatim from the loader's own rule, and outrank the kill on
+   specificity (0,3,1 vs 0,2,1).
    NOTE: the OS-level `prefers-reduced-motion` freeze further down is deliberate
    and stays — that one is a real accessibility signal, not an app preference. */
 html[data-motion="off"] .penrose-march .pm-cube {
   animation-duration: 1.5s !important;
   animation-delay: 0ms !important;
+  animation-iteration-count: infinite !important;
 }
 
 /* Reduced: keep quick fades, but strip the larger movements, the glass-button
@@ -3382,6 +3388,198 @@ html[data-motion="reduced"] .sub-progress-fill {
 .sn-chat-badge--sn {
   box-sizing: border-box;
   padding: 0.09em;
+}
+
+/* The "peek" pill after a row's kept badges: thumbnails of the next two hidden
+   badges overlapping, then "+N". Exactly one badge tall; grows with its text, so
+   a two-digit count never clips. Its own font is 0.72em, so its box is the
+   badge's 1.4em divided by 0.72. One element plus at most three children, only
+   on folded rows (which drop two or more badge elements), so rows get lighter. */
+.sn-badge-fold-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(1.9444em * var(--sn-badge-scale, 1));
+  min-width: calc(1.9444em * var(--sn-badge-scale, 1));
+  padding: 0 0.5em 0 0.55em;
+  border-radius: 999px;
+  font-size: 0.72em;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  color: var(--color-text-secondary);
+  /* No outline: no badge in the row has one, so a ring read as a button. */
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  transition: background-color 150ms ease, color 150ms ease;
+  cursor: pointer;
+}
+.sn-badge-fold-chip:hover,
+.sn-badge-fold-chip[aria-expanded='true'] {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, currentColor 18%, transparent);
+}
+/* Peek thumbnails: 60% of a badge (in the pill's em: 1.4 * 0.6 / 0.72). The
+   second overlaps the first and its overlapping edge is cut away (a mask, not a
+   ring in a fixed color, which framed them and let the first show through
+   transparent art), so a sliver of the pill's own fill separates them on any
+   row background. */
+.sn-badge-fold-peek {
+  width: calc(1.1667em * var(--sn-badge-scale, 1));
+  height: calc(1.1667em * var(--sn-badge-scale, 1));
+  border-radius: 0.25em;
+  object-fit: contain;
+  transition: opacity 120ms ease;
+}
+.sn-badge-fold-peek + .sn-badge-fold-peek {
+  margin-left: -0.2em;
+  -webkit-mask-image: linear-gradient(to right, transparent 0.32em, #000 0.32em);
+  mask-image: linear-gradient(to right, transparent 0.32em, #000 0.32em);
+}
+.sn-badge-fold-peek:last-of-type {
+  margin-right: 0.3em;
+}
+/* While open the strip shows those badges beside the pill, so its thumbnails
+   step back instead of reading twice. */
+.sn-badge-fold-chip[aria-expanded='true'] .sn-badge-fold-peek {
+  opacity: 0.35;
+}
+.sn-badge-fold-chip:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--color-accent, currentColor);
+}
+
+/* Rarity foil (data-tier 1 to 4, from every add-on the chatter wears, never the
+   viewer's limit). More colors read rarer: silver, then gold, then a cosmos
+   nebula, then full rainbow. Only the top two tiers get a rim. Two layers over
+   the tier's fill: a shimmer in the tier's own colors (::before) and the light,
+   one soft diagonal band and a thin streak (::after). Plain linear gradients
+   and blend modes only, so the iPhone draws the same layers in Core Graphics
+   (BadgeFoldPill.swift). A still frame in chat; hovering brightens it and
+   slides the light with the pointer (--sn-foil-band, set by BadgeFold). Both
+   layers are pseudo-elements, so a rare pill adds no element to its row. */
+.sn-badge-fold-chip:not([data-tier='0']) {
+  --sn-foil-k: 1;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+}
+.sn-badge-fold-chip:not([data-tier='0']):hover {
+  --sn-foil-k: 1.4;
+}
+.sn-badge-fold-chip > .sn-badge-fold-peek,
+.sn-badge-fold-chip > .sn-badge-fold-count {
+  position: relative;
+  z-index: 2;
+}
+.sn-badge-fold-chip:not([data-tier='0']) > .sn-badge-fold-count {
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
+}
+.sn-badge-fold-chip:not([data-tier='0'])::before,
+.sn-badge-fold-chip:not([data-tier='0'])::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+  pointer-events: none;
+  transition: opacity 350ms ease;
+}
+/* The shimmer: the tier's colors across the pill (--sn-foil-s1..s3). */
+.sn-badge-fold-chip:not([data-tier='0'])::before {
+  opacity: min(1, calc(var(--sn-foil-shim) * var(--sn-foil-k)));
+  mix-blend-mode: var(--sn-foil-blend, soft-light);
+  background: linear-gradient(100deg, var(--sn-foil-s1), var(--sn-foil-s2) 50%, var(--sn-foil-s3));
+}
+/* The light: a soft band left of center and a thin streak right of it. */
+.sn-badge-fold-chip:not([data-tier='0'])::after {
+  opacity: min(1, calc(var(--sn-foil-light) * var(--sn-foil-k)));
+  mix-blend-mode: screen;
+  background:
+    linear-gradient(115deg, transparent 56%, rgba(255, 255, 255, 0.6) 61%, transparent 65%),
+    linear-gradient(115deg, transparent 12%, rgba(255, 255, 255, 0.55) 32%, transparent 52%);
+  background-repeat: no-repeat;
+  background-position: var(--sn-foil-band, 0px) 0;
+}
+/* Uncommon: silver, one tone. */
+.sn-badge-fold-chip[data-tier='1'],
+.sn-badge-fold-chip[data-tier='1']:hover {
+  color: #eef1f6;
+  background: #2b2f37;
+  --sn-foil-s1: #8d96a6;
+  --sn-foil-s2: #f4f7fb;
+  --sn-foil-s3: #7a8394;
+  --sn-foil-shim: 0.7;
+  --sn-foil-light: 0.35;
+}
+/* Rare: gold, no rim. */
+.sn-badge-fold-chip[data-tier='2'],
+.sn-badge-fold-chip[data-tier='2']:hover {
+  color: #fff6dc;
+  background: linear-gradient(120deg, #4a3410, #7a5a1c 45%, #3e2b0c);
+  --sn-foil-s1: #c08a2a;
+  --sn-foil-s2: #ffeab0;
+  --sn-foil-s3: #a06b18;
+  --sn-foil-shim: 0.85;
+  --sn-foil-light: 0.45;
+}
+/* Epic: cosmos, a nebula with its own stars, and a thin rim. */
+.sn-badge-fold-chip[data-tier='3'],
+.sn-badge-fold-chip[data-tier='3']:hover {
+  color: #fff;
+  box-shadow: inset 0 0 0 1px rgba(230, 170, 255, 0.55);
+  background:
+    /* Stars along the top and bottom edges, clear of the count. */
+    radial-gradient(1px 1px at 30% 12%, #fff, transparent),
+    radial-gradient(1px 1px at 62% 88%, #fff, transparent),
+    radial-gradient(1.2px 1.2px at 94% 18%, #ffe9b0, transparent),
+    radial-gradient(circle at 32% 40%, #b0389a, #3a1060 55%, #120720);
+  --sn-foil-s1: #a77bff;
+  --sn-foil-s2: #62e3ff;
+  --sn-foil-s3: #ff6fc8;
+  --sn-foil-shim: 0.55;
+  --sn-foil-blend: overlay;
+  --sn-foil-light: 0.4;
+}
+/* Legendary: full rainbow with a prismatic rim and a glow. */
+.sn-badge-fold-chip[data-tier='4'],
+.sn-badge-fold-chip[data-tier='4']:hover {
+  color: #fff;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(#1b1d2c, #1b1d2c) padding-box,
+    conic-gradient(from 210deg, #ff7a7a, #ffd36b, #7dffb0, #6bc8ff, #c58bff, #ff7ad1, #ff7a7a) border-box;
+  box-shadow: 0 0 10px rgba(180, 150, 255, 0.45);
+  --sn-foil-shim: 0.62;
+  --sn-foil-blend: screen;
+  --sn-foil-light: 0.45;
+}
+.sn-badge-fold-chip[data-tier='4']::before {
+  background: linear-gradient(100deg, #ff7a7a, #ffd36b 20%, #7dffb0 40%, #6bc8ff 60%, #c58bff 80%, #ff7ad1);
+}
+/* A rare pill keeps its foil when focused; the focus ring sits outside it. */
+.sn-badge-fold-chip:not([data-tier='0']):focus-visible {
+  outline: 1px solid var(--color-accent, currentColor);
+  outline-offset: 1px;
+}
+/* The unfolded badges: fixed at the chip (class `fixed` keeps the glass rules
+   from making it relative), above everything but tooltips, so each badge's own
+   hover card still shows over it. Motion is framer's alone. */
+.sn-badge-fold-strip {
+  z-index: calc(var(--sn-z-tooltip) - 1);
+  transition: none;
+}
+.sn-badge-fold-strip > .sn-badge-fold-glass {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25em;
+  padding: 0.3em 0.6em;
+  border-radius: 999px;
+  transition: none;
+}
+.sn-badge-fold-strip > .sn-badge-fold-glass:has(> :nth-child(9)) {
+  border-radius: 0.6em;
 }
 
 /* A Twitch Shared Chat row from a partner channel: that channel's own color
@@ -3799,15 +3997,19 @@ html[data-motion="reduced"] .sub-progress-fill {
   }
 }
 
+/* Channel points rows. `--sn-redeem` (the viewer's Redemption color, set on
+   the row) replaces both of the theme's hues; the gradient keeps its shape. */
 .highlight-message-gradient {
+  --sn-redeem-a: var(--sn-redeem, var(--color-highlight-cyan));
+  --sn-redeem-b: var(--sn-redeem, var(--color-highlight-blue));
   background-color: var(--color-background);
   background-image: linear-gradient(
     90deg,
-    color-mix(in srgb, var(--color-highlight-cyan) 18%, transparent) 0%,
-    color-mix(in srgb, var(--color-highlight-blue) 12%, transparent) 25%,
-    color-mix(in srgb, var(--color-highlight-cyan) 10%, transparent) 50%,
-    color-mix(in srgb, var(--color-highlight-blue) 12%, transparent) 75%,
-    color-mix(in srgb, var(--color-highlight-cyan) 18%, transparent) 100%
+    color-mix(in srgb, var(--sn-redeem-a) 18%, transparent) 0%,
+    color-mix(in srgb, var(--sn-redeem-b) 12%, transparent) 25%,
+    color-mix(in srgb, var(--sn-redeem-a) 10%, transparent) 50%,
+    color-mix(in srgb, var(--sn-redeem-b) 12%, transparent) 75%,
+    color-mix(in srgb, var(--sn-redeem-a) 18%, transparent) 100%
   );
   background-size: 100% 100%;
 }
@@ -3816,11 +4018,11 @@ html[data-motion="reduced"] .sub-progress-fill {
   background-color: var(--color-background);
   background-image: linear-gradient(
     90deg,
-    color-mix(in srgb, var(--color-highlight-cyan) 25%, transparent) 0%,
-    color-mix(in srgb, var(--color-highlight-blue) 18%, transparent) 25%,
-    color-mix(in srgb, var(--color-highlight-cyan) 15%, transparent) 50%,
-    color-mix(in srgb, var(--color-highlight-blue) 18%, transparent) 75%,
-    color-mix(in srgb, var(--color-highlight-cyan) 25%, transparent) 100%
+    color-mix(in srgb, var(--sn-redeem-a) 25%, transparent) 0%,
+    color-mix(in srgb, var(--sn-redeem-b) 18%, transparent) 25%,
+    color-mix(in srgb, var(--sn-redeem-a) 15%, transparent) 50%,
+    color-mix(in srgb, var(--sn-redeem-b) 18%, transparent) 75%,
+    color-mix(in srgb, var(--sn-redeem-a) 25%, transparent) 100%
   );
   background-size: 100% 100%;
 }
@@ -4948,21 +5150,150 @@ html[data-sn-hidden] video {
 }
 
 
-html[data-watching] .automation-pulse {
+/* Held still while a stream is on screen, and in the cheap look (see Cheap
+   draw below), on a static value taken from inside each animation's range. */
+html[data-watching] .automation-pulse,
+html[data-sn-low-power] .automation-pulse,
+html[data-motion="off"] .automation-pulse {
   animation: none;
 }
-html[data-watching] .automation-pulse-shift {
+html[data-watching] .automation-pulse-shift,
+html[data-sn-low-power] .automation-pulse-shift,
+html[data-motion="off"] .automation-pulse-shift {
   display: none;
 }
 
-html[data-watching] .update-pill {
+html[data-watching] .update-pill,
+html[data-sn-low-power] .update-pill {
   animation: none;
   box-shadow: 0 0 13px rgba(132, 255, 87, 0.32);
 }
 
 /* The badge already carries this shadow statically, so only the pulse stops. */
-html[data-watching] .drops-progress-inline {
+html[data-watching] .drops-progress-inline,
+html[data-sn-low-power] .drops-progress-inline,
+html[data-motion="off"] .drops-progress-inline {
   animation: none;
+}
+
+/* ===== Cheap draw =====
+   html[data-sn-low-power] is set while a window should draw cheaply: the
+   phone's Battery Saver, or desktop Performance mode (utils/lowPower.ts). Every
+   CSS loop plays at most once, so a running loop snaps to its un-animated style
+   and resumes in phase when the mode ends. The exempt list keeps loaders moving,
+   keeps emote modifiers (chat content; Freeze emotes stops them below), keeps
+   the offline room's drift (its corner hits need the loop), and keeps the
+   one-shot cues whose meaning is in their middle frames: the settings search
+   wash, the mention, reply, phrase and highlight flashes, the whisper
+   highlight, the phone's jump flash, the ban arming bars and the hype marquee.
+   The :not() takes the specificity of its most specific argument (0,2,0), so
+   the cap is 0,3,1 (0,3,2 on the pseudo elements) and its !important longhands
+   beat every other animation rule; the named rests further down still win,
+   because they set animation-name: none, which the cap never touches.
+   src/styles/loopCap.test.ts holds a decision for every animation in the app. */
+html[data-sn-low-power] *:not(
+    .animate-spin, .animate-penrose-rotate, .pm-cube, .animate-pulse:not(.sn-decor),
+    .ghost-card, .sn-listen-dots > i, .sn-loader, .sn-loader *,
+    [class*="sn-ffz-anim-"], [class*="sn-bttv-anim-"], .offline-bounce-x, .offline-bounce-y,
+    .settings-row-found, .animate-highlight-flash, .animate-mention-flash,
+    .animate-reply-flash, .animate-phrase-highlight, .whisper-highlight,
+    .chat-message-row[data-sn-flash], .sn-mod-dwell, .sn-mod-cap-dwell, .animate-hype-marquee
+  ),
+html[data-sn-low-power] *:not(
+    .animate-spin, .animate-penrose-rotate, .pm-cube, .animate-pulse:not(.sn-decor),
+    .ghost-card, .sn-listen-dots > i, .sn-loader, .sn-loader *,
+    [class*="sn-ffz-anim-"], [class*="sn-bttv-anim-"], .offline-bounce-x, .offline-bounce-y,
+    .settings-row-found, .animate-highlight-flash, .animate-mention-flash,
+    .animate-reply-flash, .animate-phrase-highlight, .whisper-highlight,
+    .chat-message-row[data-sn-flash], .sn-mod-dwell, .sn-mod-cap-dwell, .animate-hype-marquee
+  )::before,
+html[data-sn-low-power] *:not(
+    .animate-spin, .animate-penrose-rotate, .pm-cube, .animate-pulse:not(.sn-decor),
+    .ghost-card, .sn-listen-dots > i, .sn-loader, .sn-loader *,
+    [class*="sn-ffz-anim-"], [class*="sn-bttv-anim-"], .offline-bounce-x, .offline-bounce-y,
+    .settings-row-found, .animate-highlight-flash, .animate-mention-flash,
+    .animate-reply-flash, .animate-phrase-highlight, .whisper-highlight,
+    .chat-message-row[data-sn-flash], .sn-mod-dwell, .sn-mod-cap-dwell, .animate-hype-marquee
+  )::after {
+  animation-iteration-count: 1 !important;
+}
+
+/* Performance mode (html[data-sn-perf], desktop only) also completes every CSS
+   animation at once: menus, popovers, island alerts and chat rows appear
+   without their fade or slide, and a loop that mounts while it is on never
+   plays a cycle. Battery Saver keeps its quick fades. Transitions are untouched.
+   The same exempt list. */
+html[data-sn-perf] *:not(
+    .animate-spin, .animate-penrose-rotate, .pm-cube, .animate-pulse:not(.sn-decor),
+    .ghost-card, .sn-listen-dots > i, .sn-loader, .sn-loader *,
+    [class*="sn-ffz-anim-"], [class*="sn-bttv-anim-"], .offline-bounce-x, .offline-bounce-y,
+    .settings-row-found, .animate-highlight-flash, .animate-mention-flash,
+    .animate-reply-flash, .animate-phrase-highlight, .whisper-highlight,
+    .chat-message-row[data-sn-flash], .sn-mod-dwell, .sn-mod-cap-dwell, .animate-hype-marquee
+  ),
+html[data-sn-perf] *:not(
+    .animate-spin, .animate-penrose-rotate, .pm-cube, .animate-pulse:not(.sn-decor),
+    .ghost-card, .sn-listen-dots > i, .sn-loader, .sn-loader *,
+    [class*="sn-ffz-anim-"], [class*="sn-bttv-anim-"], .offline-bounce-x, .offline-bounce-y,
+    .settings-row-found, .animate-highlight-flash, .animate-mention-flash,
+    .animate-reply-flash, .animate-phrase-highlight, .whisper-highlight,
+    .chat-message-row[data-sn-flash], .sn-mod-dwell, .sn-mod-cap-dwell, .animate-hype-marquee
+  )::before,
+html[data-sn-perf] *:not(
+    .animate-spin, .animate-penrose-rotate, .pm-cube, .animate-pulse:not(.sn-decor),
+    .ghost-card, .sn-listen-dots > i, .sn-loader, .sn-loader *,
+    [class*="sn-ffz-anim-"], [class*="sn-bttv-anim-"], .offline-bounce-x, .offline-bounce-y,
+    .settings-row-found, .animate-highlight-flash, .animate-mention-flash,
+    .animate-reply-flash, .animate-phrase-highlight, .whisper-highlight,
+    .chat-message-row[data-sn-flash], .sn-mod-dwell, .sn-mod-cap-dwell, .animate-hype-marquee
+  )::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+}
+
+/* Rests where the un-animated style is not the still look. The atmosphere
+   drift and breath, the Cologne wash and the hype train's moving fills stop
+   outright; the chip shine and the automation sweep rest as visible bands and
+   the looping row glints (the chase ring above all) as a bright arc, so they
+   leave the picture. Motion Off caps the same loops, so it rests them the
+   same way. */
+html[data-sn-low-power] .sn-aurora-1,
+html[data-sn-low-power] .sn-aurora-2,
+html[data-sn-low-power] .sn-atm-breathe-1,
+html[data-sn-low-power] .sn-atm-breathe-2,
+html[data-sn-low-power] .cologne-wash,
+html[data-sn-low-power] .hype-train-fill-wave,
+html[data-sn-low-power] .hype-train-progress-rainbow::before,
+html[data-sn-low-power] .hype-train-progress-golden::before,
+html[data-motion="off"] .sn-aurora-1,
+html[data-motion="off"] .sn-aurora-2,
+html[data-motion="off"] .sn-atm-breathe-1,
+html[data-motion="off"] .sn-atm-breathe-2,
+html[data-motion="off"] .cologne-wash,
+html[data-motion="off"] .hype-train-fill-wave,
+html[data-motion="off"] .hype-train-progress-rainbow::before,
+html[data-motion="off"] .hype-train-progress-golden::before {
+  animation: none !important;
+}
+html[data-sn-low-power] .card-chip-shine > span,
+html[data-sn-low-power] .automation-shimmer-overlay::after,
+html[data-motion="off"] .card-chip-shine > span,
+html[data-motion="off"] .automation-shimmer-overlay::after {
+  display: none;
+}
+html[data-sn-low-power] .sn-ft-anim-ring.sn-ft-loop::after,
+html[data-sn-low-power] .sn-ft-anim-bar.sn-ft-loop::after,
+html[data-motion="off"] .sn-ft-anim-ring.sn-ft-loop::after,
+html[data-motion="off"] .sn-ft-anim-bar.sn-ft-loop::after {
+  animation: none !important;
+  opacity: 0 !important;
+}
+
+/* Freeze emotes (and the phone's Battery Saver): emote modifiers stop with the
+   emotes they move. */
+html[data-sn-still-chat] [class*="sn-ffz-anim-"],
+html[data-sn-still-chat] [class*="sn-bttv-anim-"] {
+  animation: none !important;
 }
 
 /* Deliberately NOT gated: shared chat and hype trains are rare, transient events
@@ -8391,16 +8722,19 @@ html[data-os="linux"] .sn-chat-overlay-frame {
 }
 /* The drift IS the feature, so the app's Motion preference does not stop it,
    the same call the Penrose loader makes above: Off would otherwise squeeze it
-   to 0.001ms, which on an endless alternate flickers between corners. Timing
-   is restated so it outranks the kill (0,2,2 vs 0,2,1). The OS reduced-motion
-   setting is an accessibility signal and still stills it. */
+   to 0.001ms and play it once, which ends the corner hits for good. Timing and
+   the endless loop are restated so they outrank the kill (0,2,2 vs 0,2,1); the
+   cheap-draw caps exempt the drift outright. The OS reduced-motion setting is
+   an accessibility signal and still stills it. */
 html[data-motion] div.offline-bounce-x {
   animation-duration: 24s !important;
   animation-delay: -7s !important;
+  animation-iteration-count: infinite !important;
 }
 html[data-motion] div.offline-bounce-y {
   animation-duration: 15s !important;
   animation-delay: -7s !important;
+  animation-iteration-count: infinite !important;
 }
 @media (prefers-reduced-motion: reduce) {
   html .offline-bounce-x,
@@ -8443,15 +8777,19 @@ html[data-motion] div.offline-bounce-y {
   78%, 100% { transform: translate(110px, 62px); }
 }
 /* Reduced drops decorative loops (see the Motion preferences block), so the
-   preview rests on its revealed frame there as well as with motion off. */
+   preview rests on its revealed frame there, with motion off, and in the cheap
+   look (Cheap draw). */
 html[data-motion="off"] .sn-tbt-bar,
 html[data-motion="off"] .sn-tbt-pointer,
 html[data-motion="reduced"] .sn-tbt-bar,
-html[data-motion="reduced"] .sn-tbt-pointer {
+html[data-motion="reduced"] .sn-tbt-pointer,
+html[data-sn-low-power] .sn-tbt-bar,
+html[data-sn-low-power] .sn-tbt-pointer {
   animation: none;
 }
 html[data-motion="off"] .sn-tbt-pointer,
-html[data-motion="reduced"] .sn-tbt-pointer {
+html[data-motion="reduced"] .sn-tbt-pointer,
+html[data-sn-low-power] .sn-tbt-pointer {
   transform: translate(58px, 2px);
 }
 @media (prefers-reduced-motion: reduce) {

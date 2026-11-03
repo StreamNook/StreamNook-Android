@@ -510,6 +510,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Chat',
     section: 'Chat Events',
     sectionId: 'settings-section-chat-events',
+    title: 'Redemption color',
+    description: 'The tint behind channel points messages, like Highlight My Message. Highlighted message color, redeem color, channel points color.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Chat Events',
+    sectionId: 'settings-section-chat-events',
     title: 'Gift sub batches',
     description: "Shows one 'gifting N subs' row with the recipients attached when someone gifts a batch, instead of a row per gift. Previously \"Collapse gift-sub floods\"."
   },
@@ -1562,8 +1569,14 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Chat',
     section: 'Names & Badges',
+    title: 'Badges before +N',
+    description: "Add-on badges past this many fold into a +N you can hover (tap on phones) to see. Twitch's own badges always show."
+  },
+  {
+    tab: 'Chat',
+    section: 'Names & Badges',
     title: 'Add-on badges',
-    description: 'Badges from 7TV, FFZ, Chatterino, Homies and the other badge services, plus StreamNook membership badges. Third-party badges.'
+    description: 'Badges from 7TV, FFZ, Chatterino, Homies, Limerino, JilChat and the other badge services, plus StreamNook membership badges. Third-party badges.'
   },
   {
     tab: 'Chat',
@@ -2131,6 +2144,12 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Overlay',
     section: 'Emotes & Badges',
+    title: 'Badges before +N',
+    description: "Add-on badges past this many fold into a +N on the overlay. Twitch's own badges always show."
+  },
+  {
+    tab: 'Overlay',
+    section: 'Emotes & Badges',
     title: 'Add-on badges',
     description: 'Third-party badges on the overlay: 7TV, FFZ, Chatterino, and more, plus the StreamNook member badge. Previously "Third-party badges".'
   },
@@ -2471,6 +2490,21 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     sectionId: 'settings-section-hidden-channels',
     title: 'Channels',
     description: 'Every channel you hid, with where each one is hidden. Show one again, or block a Twitch channel on Twitch too. Block a stream, hide streamer, never see, not interested, blocklist, hidden channels.'
+  },
+  {
+    tab: 'Interface',
+    section: 'Performance mode',
+    sectionId: 'settings-section-performance-mode',
+    title: 'Mode',
+    description: 'A lighter look for when a game runs next to StreamNook: no frosted blur, no player glow, no looping effects, and menus that open at once. Off, In the background (once another app has been in front for 10 seconds) or Always. Game mode, low-end PC, fps, frame drops, CPU, GPU, lag, stutter, battery.'
+  },
+  {
+    tab: 'Interface',
+    section: 'Performance mode',
+    sectionId: 'settings-section-performance-mode',
+    title: 'Freeze emotes',
+    parent: 'Mode',
+    description: 'While Performance mode is on, animated emotes, 7TV paints, animated badges and profile pictures hold their first frame, and chat GIFs show as a button you click to play. Still emotes, stop emote animations.'
   },
   {
     tab: 'Interface',

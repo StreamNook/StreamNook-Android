@@ -23,7 +23,7 @@ import UserOverridesSettings from './UserOverridesSettings';
 import UserCommandsSettings from './UserCommandsSettings';
 import ChatBurstSettings from './ChatBurstSettings';
 import RemindersSettings from './RemindersSettings';
-import { SettingsSection, SettingsRow, SegmentedSelect } from './_primitives';
+import { SettingsSection, SettingsRow, SegmentedSelect, SwitchList } from './_primitives';
 import { useSettingReset } from './settingReset';
 import { Toggle } from '../ui/Toggle';
 import { usePhonePrefs } from '../../mobile/phonePrefs';
@@ -57,6 +57,9 @@ import moltorinoLogo from '../../assets/moltorino-logo.svg';
 import chatsenLogo from '../../assets/chatsen-logo.png';
 import chattyLogo from '../../assets/chatty-logo.png';
 import dankchatLogo from '../../assets/dankchat-logo.png';
+import limerinoLogo from '../../assets/limerino-logo.png';
+import jilchatLogo from '../../assets/jilchat-logo.png';
+import { badgeFoldLimit } from '../../utils/badgeFold';
 
 /** Platforms that can join a combined feed. Derived from the chat-capability
  *  flags rather than hand-listed, so a newly chat-enabled platform appears here
@@ -86,7 +89,7 @@ import { useChatUserStore } from '../../stores/chatUserStore';
 import { getUserCosmetics, computePaintStyle } from '../../services/seventvService';
 import { StyledChatName, type NameSeparator, type NameStyle } from '../chat/StyledChatName';
 import type { DeletedMessageStyle } from '../chat/deletedMessage';
-import { DeletedMessagePreview, EventRowPreview, InboxButtonPreview, MentionPreview, MentionRowPreview, MessageLayoutPreview, RoomModesPreview, SettingPreview } from './ChatPreview';
+import { BadgeFoldPreview, DeletedMessagePreview, EventRowPreview, InboxButtonPreview, MentionPreview, MentionRowPreview, MessageLayoutPreview, RoomModesPreview, SettingPreview } from './ChatPreview';
 import { ProfilePicturePreview } from './ProfilePicturePreview';
 import {
   DEFAULT_PROFILE_PICTURE_ANIMATION,
@@ -397,6 +400,8 @@ const BADGE_PROVIDERS: { id: string; label: string }[] = [
   { id: 'homies', label: 'Homies' },
   { id: 'homies-custom', label: 'Homies custom' },
   { id: 'moltorino', label: 'Moltorino' },
+  { id: 'limerino', label: 'Limerino' },
+  { id: 'jilchat', label: 'JilChat' },
   { id: 'chatsen', label: 'Chatsen' },
   { id: 'chatty', label: 'Chatty' },
   { id: 'dankchat', label: 'DankChat' },
@@ -409,6 +414,8 @@ const SERVICE_ICONS: Record<string, string> = {
   homies: homiesLogo,
   'homies-custom': homiesLogo,
   moltorino: moltorinoLogo,
+  limerino: limerinoLogo,
+  jilchat: jilchatLogo,
   chatsen: chatsenLogo,
   chatty: chattyLogo,
   dankchat: dankchatLogo,
@@ -504,6 +511,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
   const [glintHover, setGlintHover] = useState<'none' | 'sheen' | 'pulse' | 'chase' | null>(null);
   const [pictureAnimationHover, setPictureAnimationHover] = useState<ProfilePictureAnimation | null>(null);
   const [pictureSourceHover, setPictureSourceHover] = useState<ProfilePictureSource | null>(null);
+  const [foldPreview, setFoldPreview] = useState<number | null>(null);
   const pictureSource = profilePictureSource(settings.cosmetics?.profile_picture_source);
   const savedPictureAnimation = (settings.cosmetics?.profile_picture_animation ??
     DEFAULT_PROFILE_PICTURE_ANIMATION) as ProfilePictureAnimation;
@@ -570,6 +578,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     name_color_adjustment: (stored?.name_color_adjustment ?? 'hsl_loop') as 'off' | 'hsl_loop',
     show_badges: stored?.show_badges ?? true,
     badge_scale: stored?.badge_scale ?? 1,
+    badge_fold_limit: stored?.badge_fold_limit ?? 3,
     ffz_custom_role_badges: stored?.ffz_custom_role_badges ?? true,
     show_third_party_badges: stored?.show_third_party_badges ?? true,
     hidden_badge_providers: stored?.hidden_badge_providers ?? [],
@@ -719,7 +728,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
 
   const browseLogFolder = async () => {
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
+      const { open } = await import('../../utils/dialog');
       const picked = await open({ directory: true, multiple: false });
       if (typeof picked === 'string' && picked) setLogging({ folder: picked });
     } catch {
@@ -1194,6 +1203,19 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
         />
 
         <SettingsRow
+          title="Redemption color"
+          onReset={resetFor(['chat_events.redemption_color', ''])}
+          description="The tint behind channel points messages, like Highlight My Message."
+          help="Until you pick one, they wear your theme's cyan and blue."
+        >
+          <ColorSwatch
+            value={chatEvents.redemption_color || '#6bffc0'}
+            onChange={(color) => setEvents({ redemption_color: color })}
+            tooltip="Redemption color"
+          />
+        </SettingsRow>
+
+        <SettingsRow
           title="Gift sub batches"
           onReset={resetFor(['collapse_gift_subs', true])}
           description="One 'gifting N subs' row with the recipients attached when someone gifts a batch, instead of a row per gift."
@@ -1351,36 +1373,28 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
         <SettingsRow
           title="Platforms"
           onReset={resetFor(['chat_events.hidden_provider_events', []])}
-          description="Turn event kinds off per platform. Lit means shown."
+          description="Turn event kinds off per platform."
         >
-          <div className="flex flex-col gap-2 w-full">
+          {/* The same rule and indent as the other switch lists (Services under
+              Add-on badges), one titled group per platform. */}
+          <SubControls>
             {(Object.keys(PROVIDER_EVENT_CATEGORIES) as Array<keyof typeof PROVIDER_EVENT_CATEGORIES>).filter(canWatch).map((provider) => (
-              <div key={provider} className="flex flex-wrap items-center gap-1.5">
-                <span className="flex w-[78px] shrink-0 items-center gap-1 text-[12px] text-textSecondary">
+              <div key={provider} className="w-full space-y-2">
+                <div className="flex min-w-0 items-center gap-1.5 text-[12.5px] font-medium text-textPrimary">
                   <ProviderMark provider={provider} size={13} />
                   {PROVIDER_LABELS[provider] ?? provider}
-                </span>
-                {(PROVIDER_EVENT_CATEGORIES[provider] ?? []).map((cat) => {
-                  const key = `${provider}:${cat}`;
-                  const on = !hiddenEvents.includes(key);
-                  const label = PROVIDER_CATEGORY_LABELS[provider]?.[cat] ?? EVENT_CATEGORIES.find((c) => c.id === cat)?.label ?? cat;
-                  return (
-                    <button
-                      key={key}
-                      type="button"
-                      aria-pressed={on}
-                      onClick={() => toggleHiddenEvent(key)}
-                      className={`px-2.5 py-1 rounded-full text-[12px] font-medium transition-colors ${
-                        on ? 'chrome-glaze chrome-glaze--flat chrome-glaze--control text-textPrimary' : 'glass-button-static text-textMuted'
-                      }`}
-                    >
-                      {label}
-                    </button>
-                  );
-                })}
+                </div>
+                <SwitchList
+                  items={(PROVIDER_EVENT_CATEGORIES[provider] ?? []).map((cat) => ({
+                    id: `${provider}:${cat}`,
+                    label: PROVIDER_CATEGORY_LABELS[provider]?.[cat] ?? EVENT_CATEGORIES.find((c) => c.id === cat)?.label ?? cat,
+                  }))}
+                  isOn={(key) => !hiddenEvents.includes(key)}
+                  onToggle={toggleHiddenEvent}
+                />
               </div>
             ))}
-          </div>
+          </SubControls>
         </SettingsRow>
       </SettingsSection>
 
@@ -1786,10 +1800,34 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
         </SettingsRow>
 
         <SettingsRow
+          title="Badges before +N"
+          onReset={resetFor(['chat_design.badge_fold_limit', 3])}
+          description="Add-on badges past this many fold into a +N you can hover (tap on phones) to see. Twitch's own badges always show."
+          help="The +N wears a foil by how many add-on badges someone has in all, whatever this is set to: silver from 2, gold from 3, cosmos from 5, and rainbow from 8."
+        >
+          <div className="space-y-3">
+            <SegmentedSelect<'0' | '2' | '3' | '4' | '5'>
+              fullWidth={IS_MOBILE}
+              value={String(badgeFoldLimit(cd.badge_fold_limit)) as '0' | '2' | '3' | '4' | '5'}
+              onChange={(v) => setDesign({ badge_fold_limit: Number(v) })}
+              onPreview={(v) => setFoldPreview(v === null ? null : Number(v))}
+              options={[
+                { value: '0', label: 'Show all' },
+                { value: '2', label: '2' },
+                { value: '3', label: '3' },
+                { value: '4', label: '4' },
+                { value: '5', label: '5' },
+              ]}
+            />
+            <BadgeFoldPreview limit={foldPreview ?? badgeFoldLimit(cd.badge_fold_limit)} />
+          </div>
+        </SettingsRow>
+
+        <SettingsRow
           title="Add-on badges"
           onReset={resetFor(['chat_design.show_third_party_badges', true])}
-          description="Badges from 7TV, FFZ, Chatterino, Homies and the other badge services, plus StreamNook membership badges."
-          help="Services turns individual badge services off. Lit means shown."
+          description="Badges from 7TV, FFZ, Chatterino, Homies, Limerino, JilChat and the other badge services, plus StreamNook membership badges."
+          help="Services turns individual badge services off."
           control={
             <Toggle
               enabled={cd.show_third_party_badges}
@@ -1804,29 +1842,11 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
                 onReset={resetFor(['chat_design.hidden_badge_providers', []])}
                 stacked
                 control={
-                  <div className="flex flex-wrap gap-1.5">
-                    {BADGE_PROVIDERS.map((p) => {
-                      const on = !badgeProviderHidden(p.id);
-                      return (
-                        <button
-                          key={p.id}
-                          type="button"
-                          aria-pressed={on}
-                          onClick={() => toggleBadgeProvider(p.id)}
-                          className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[12px] font-medium transition-colors ${
-                            on ? 'chrome-glaze chrome-glaze--flat chrome-glaze--control text-textPrimary' : 'glass-button-static text-textMuted'
-                          }`}
-                        >
-                          {/* The service's own mark, dimmed with its chip while
-                              that service's badges are hidden. */}
-                          <span className={`flex transition-opacity ${on ? '' : 'opacity-45'}`}>
-                            <ServiceMark id={p.id} size={14} />
-                          </span>
-                          {p.label}
-                        </button>
-                      );
-                    })}
-                  </div>
+                  <SwitchList
+                    items={BADGE_PROVIDERS.map((p) => ({ id: p.id, label: p.label, mark: <ServiceMark id={p.id} size={14} /> }))}
+                    isOn={(id) => !badgeProviderHidden(id)}
+                    onToggle={toggleBadgeProvider}
+                  />
                 }
               />
             </SubControls>

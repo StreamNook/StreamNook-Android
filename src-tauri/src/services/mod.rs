@@ -7,6 +7,7 @@ pub mod background_service;
 pub mod badge_feed;
 pub mod badge_polling_service;
 pub mod badge_earn;
+pub mod badge_fold;
 pub mod badge_service;
 pub mod browse_languages;
 pub mod badge_standing;
@@ -41,6 +42,7 @@ pub mod chat_logger_service;
 pub mod automod_queue;
 pub mod chat_bridge_route;
 pub mod chat_history;
+pub mod bidi_text;
 pub mod chat_rules;
 pub mod chat_row_view;
 pub mod shared_chat_emotes;
@@ -317,6 +319,10 @@ pub mod whisper_inbox;
 pub mod whisper_service;
 pub mod whisper_storage_service;
 pub mod window_visibility;
+// Desktop-only: Performance mode, the cheap look while StreamNook is in the
+// background (or always).
+#[cfg(desktop)]
+pub mod performance_mode;
 // The operating system's own notifications (desktop).
 #[cfg(desktop)]
 pub mod system_notify;

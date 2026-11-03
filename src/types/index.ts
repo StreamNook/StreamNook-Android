@@ -366,8 +366,11 @@ export interface ChatDesignSettings {
   show_third_party_badges?: boolean;
   // Add-on badge providers to leave out (lowercase ids: 'streamnook', '7tv',
   // 'ffz', 'bttv', 'chatterino', 'homies', 'moltorino', 'chatsen', 'chatty',
-  // 'dankchat'). Default none.
+  // 'dankchat', 'limerino', 'jilchat'). Default none.
   hidden_badge_providers?: string[];
+  // How many badges a chat row shows before folding the rest into a "+N"
+  // chip that unfolds on hover (tap on phones). 0 shows all. Default 3.
+  badge_fold_limit?: number;
   // StreamNook atmospheres (and the Cologne event look) behind members' chat
   // rows. Off keeps every row plain; profiles still show them. Default true.
   show_chat_atmospheres?: boolean;
@@ -1216,6 +1219,10 @@ export type KeybindingOverrides = Record<string, string[]>;
 // everything; 'reduced' keeps quick fades but drops movement; 'off' is instant.
 export type MotionMode = 'full' | 'reduced' | 'off';
 
+// When Performance mode (Interface > Performance mode) draws the cheap look:
+// never, while StreamNook is not the app in front, or always.
+export type PerformanceMode = 'off' | 'background' | 'always';
+
 // Which of the two floating chat cards sits on top when both are live. Twitch
 // allows a poll and a prediction to run at once, so both stack either way.
 export type ChatOverlayOrder = 'prediction-first' | 'poll-first';
@@ -1272,6 +1279,9 @@ export interface ChatEventSettings {
   event_animate_repeat?: boolean;
   // A Twitch cheer as its own card (default) or as an ordinary message.
   cheer_display?: 'card' | 'message';
+  // Hex tint of channel points rows (Highlight My Message, rewards that post
+  // to chat); empty keeps the theme's cyan and blue.
+  redemption_color?: string;
   // Show Super Chat amounts converted to this currency code; empty = as sent.
   superchat_currency?: string;
   // Event categories to leave out, keyed "provider:category" (e.g. "twitch:gift").
@@ -1525,6 +1535,14 @@ export interface Settings {
   motion_mode?: MotionMode;
   // What closing the main window does. Read by the Rust window-event handler.
   close_to_tray?: CloseToTrayMode;
+  // Performance mode (Interface > Performance mode): when every window draws
+  // the cheap look (no blur, no player glow, decoration still, entrances
+  // instant). Typed in Rust too (services::performance_mode reads it).
+  performance_mode?: PerformanceMode;
+  // Performance mode also freezes chat emotes, 7TV paints, animated badges and
+  // pictures on their first frame and shows chat GIFs as chips. Default false.
+  // Typed in Rust too.
+  performance_still_chat?: boolean;
   // Float the window above other apps while Compact View is active, so the
   // small player stays visible over a browser. Scoped to Compact View on
   // purpose: a full-size window glued in front of everything is overbearing.

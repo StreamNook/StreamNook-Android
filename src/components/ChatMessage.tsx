@@ -20,6 +20,7 @@ import { computePaintStyle, getBadgeImageUrl, pickPaintLayerImage, queueCosmetic
 import { StyledChatName } from './chat/StyledChatName';
 import { ChatBadgeIcons, type ResolvedTwitchBadge } from './chat/ChatBadgeIcons';
 import { visibleChatterBadges } from '../utils/chatterBadges';
+import { badgeFoldLimit } from '../utils/badgeFold';
 import { usePinStore } from '../stores/pinStore';
 import { getCosmeticsWithFallback } from '../services/cosmeticsCache';
 import type { ThirdPartyBadge as ThirdPartyBadgeType } from '../services/badgeService';
@@ -50,7 +51,7 @@ import { useStreamerMode } from '../utils/streamerMode';
 import { hasNoStillFrame, markNoStillFrame, sevenTvSrcSet, staticEmoteUrl, static7tvSrcSet } from '../utils/staticEmoteUrl';
 import { emoteImageRetry } from '../utils/emoteImageRetry';
 import { flashTitle } from '../utils/titleFlasher';
-import { useLowPower } from '../utils/lowPower';
+import { useStillChat } from '../utils/lowPower';
 import { playSoundThrottled } from '../utils/notificationSound';
 import { chatterId, chatterProvider } from '../utils/chatterIdentity';
 import type { ProviderId } from '../types/providers';
@@ -639,8 +640,8 @@ const MentionSpan: React.FC<{
   onUsernameClick?: ChatMessageProps['onUsernameClick'];
 }> = ({ username, provider, label, onUsernameClick }) => {
   const shown = label ?? `@${username}`;
-  // Battery Saver draws the paint's first frame (utils/lowPower).
-  const stillPaints = useLowPower();
+  // Battery Saver or Freeze emotes draws the paint's first frame (utils/lowPower).
+  const stillPaints = useStillChat();
   // Subscribe to the specific user from the store (reactive updates)
   const cachedUser = useChatUserStore((state) => state.getUserByUsername(username, provider));
   
@@ -836,8 +837,8 @@ function UsernameWithCosmetics({
   paintShadowMode: Parameters<typeof computePaintStyle>[2];
   onUsernameClick: ChatMessageProps['onUsernameClick'];
 }) {
-  // Battery Saver draws the paint's first frame (utils/lowPower).
-  const stillPaints = useLowPower();
+  // Battery Saver or Freeze emotes draws the paint's first frame (utils/lowPower).
+  const stillPaints = useStillChat();
   const [userCosmetics, setUserCosmetics] = useState<{ badges: any[]; paints: any[] } | null>(null);
   const [userBadges] = useState<Array<{ key: string; info: any }>>([]);
 
@@ -910,7 +911,7 @@ function UsernameWithCosmetics({
             }
           }}
         >
-          {getDisplayedName(userIdProp, displayName || username, userOverrides)}
+          <bdi>{getDisplayedName(userIdProp, displayName || username, userOverrides)}</bdi>
         </span>
       </Tooltip>
     </span>
@@ -1228,7 +1229,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const replyMentionNode =
     replyStyle === 'mention' && parsed.replyInfo ? (
       <span className="font-semibold opacity-85">
-        @{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}{' '}
+        @<bdi>{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}</bdi>{' '}
       </span>
     ) : null;
   const giantJustify =
@@ -1318,6 +1319,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       thirdPartyBadgesAll,
     ],
   );
+  const foldLimit = badgeFoldLimit(chatDesign?.badge_fold_limit);
   const atmosphere = atmosphereId ? getAtmosphere(atmosphereId) : null;
   // Frost behind the text only when the atmosphere declares it needs it (busy
   // washes); subtle ones render the text bare. A backdrop-filter per message row
@@ -1342,9 +1344,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // "Animate emotes: on hover" needs a live hover flag; the other modes never
   // write it, so rows do not re-render on pointer traffic unless asked.
   const animateEmotes = chatDesign?.animate_emotes ?? 'always';
-  // System Battery Saver (phone only, utils/lowPower): emotes, 7TV badges and
-  // paints draw their first frame, whatever Animate emotes says.
-  const stillEmotes = useLowPower();
+  // Battery Saver (phones) or Performance mode's Freeze emotes (desktop),
+  // utils/lowPower: emotes, 7TV badges, paints and pictures draw their first
+  // frame and chat GIFs show as chips, whatever Animate emotes says.
+  const stillEmotes = useStillChat();
   const [rowHovering, setRowHovering] = useState(false);
   // Twitch chat GIFs: shown, or a chip that reveals on click. Reveals are
   // per row and per GIF, and follow the Animate emotes mode the same way
@@ -1943,11 +1946,12 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       // Twitch puts in the message text is the tooltip and the chip label.
       const gifKey = segment.gifId || segment.gifUrl;
       const label = segment.content.replace(/^\[|\]$/g, '');
+      // Still (Battery Saver, Freeze emotes) shows the chip, like Never; a
+      // click still reveals that one GIF.
       const reveal =
         showChatGifs &&
-        (animateEmotes === 'always' ||
-          (animateEmotes === 'hover' && rowHovering) ||
-          revealedGifs.has(gifKey));
+        (revealedGifs.has(gifKey) ||
+          (!stillEmotes && (animateEmotes === 'always' || (animateEmotes === 'hover' && rowHovering))));
       if (!reveal) {
         return (
           <Tooltip key={key} content={label} describe requirePointerMove>
@@ -2198,8 +2202,12 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     return renderSegment(group, index.toString(), false, false, undefined, giant);
   };
 
-  const renderContent = (segments: EmoteSegment[]) =>
-    groupSegments(segments).map((g, i) => renderGroup(g, i));
+  // The body is a chatter's own text, so it is a bidi island (<bdi>): Arabic
+  // or Hebrew reads right to left inside it, and an RLO/RLE/RLI it opens ends
+  // at its edge instead of reordering the name, the badges or the tags after.
+  const renderContent = (segments: EmoteSegment[]) => (
+    <bdi>{groupSegments(segments).map((g, i) => renderGroup(g, i))}</bdi>
+  );
 
   // Gigantified emote (Twitch "Gigantify an Emote" power-up, msg-id
   // gigantified-emote-message): the LAST non-emoji emote leaves the inline
@@ -2213,7 +2221,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     const groups = groupSegments(segments);
     // 'inline' keeps the emote in the text at its usual size.
     if (chatDesign?.giant_emote_align === 'inline') {
-      return { inline: groups.map((g, i) => renderGroup(g, i)), giant: null };
+      return { inline: <bdi>{groups.map((g, i) => renderGroup(g, i))}</bdi>, giant: null };
     }
     let giantIdx = -1;
     for (let i = groups.length - 1; i >= 0; i--) {
@@ -2228,10 +2236,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       }
     }
     if (giantIdx === -1) {
-      return { inline: groups.map((g, i) => renderGroup(g, i)), giant: null };
+      return { inline: <bdi>{groups.map((g, i) => renderGroup(g, i))}</bdi>, giant: null };
     }
     return {
-      inline: groups.filter((_, i) => i !== giantIdx).map((g, i) => renderGroup(g, i)),
+      inline: <bdi>{groups.filter((_, i) => i !== giantIdx).map((g, i) => renderGroup(g, i))}</bdi>,
       giant: renderGroup(groups[giantIdx], giantIdx, true),
     };
   };
@@ -2577,7 +2585,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               }
             }}
           >
-            {effectiveDisplayName || displayName || username}
+            <bdi>{effectiveDisplayName || displayName || username}</bdi>
           </span>
         </Tooltip>
       );
@@ -2598,6 +2606,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             thirdPartyBadges={thirdPartyBadges}
             streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
             onBadgeClick={onBadgeClick}
+            foldLimit={foldLimit}
             keyPrefix="ev0"
           />
         </span>
@@ -2749,7 +2758,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               }
             }}
           >
-            {effectiveDisplayName || displayName || username}
+            <bdi>{effectiveDisplayName || displayName || username}</bdi>
           </span>
         </Tooltip>
       );
@@ -2770,6 +2779,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             thirdPartyBadges={thirdPartyBadges}
             streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
             onBadgeClick={onBadgeClick}
+            foldLimit={foldLimit}
             keyPrefix="ev1"
           />
         </span>
@@ -2895,7 +2905,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               }
             }}
           >
-            {effectiveDisplayName || displayNameProp || username}
+            <bdi>{effectiveDisplayName || displayNameProp || username}</bdi>
           </span>
         </Tooltip>
       );
@@ -2916,6 +2926,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             thirdPartyBadges={thirdPartyBadges}
             streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
             onBadgeClick={onBadgeClick}
+            foldLimit={foldLimit}
             keyPrefix="ev2"
           />
         </span>
@@ -3001,6 +3012,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             thirdPartyBadges={thirdPartyBadges}
             streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
             onBadgeClick={onBadgeClick}
+            foldLimit={foldLimit}
             keyPrefix="ev3"
           />
         </span>
@@ -3244,6 +3256,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             thirdPartyBadges={thirdPartyBadges}
             streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
             onBadgeClick={onBadgeClick}
+            foldLimit={foldLimit}
             keyPrefix="ev4"
           />
         </span>
@@ -3281,7 +3294,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                         }
                       }}
                     >
-                      {effectiveDisplayName || displayName}
+                      <bdi>{effectiveDisplayName || displayName}</bdi>
                     </span>
                   </Tooltip>
                   <span className="text-highlight-red font-bold">
@@ -3481,6 +3494,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         ...messageStyle,
         // A partner row's channel color (sn-shared-row's edge and wash).
         ...(isFromSharedChat && sharedSource ? ({ '--sn-src': sharedSource.color } as React.CSSProperties) : {}),
+        // The viewer's own tint for channel points rows (highlight-message-gradient).
+        ...(isRedemption && chatEvents?.redemption_color
+          ? ({ '--sn-redeem': chatEvents.redemption_color } as React.CSSProperties)
+          : {}),
         ...(mentionHoldBg ?? builtInEventBg ? { backgroundImage: mentionHoldBg ?? builtInEventBg } : {}),
         ...(ftRing ? ({ '--sn-ft-color': builtInEventColor } as React.CSSProperties) : {}),
         borderLeftColor: (isMentioned || isReplyToMe)
@@ -3610,9 +3627,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               <svg className="flex-shrink-0" style={{ width: '1.1em', height: '1.1em' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
               </svg>
-              <span className="font-semibold">{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}</span>
+              <span className="font-semibold"><bdi>{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}</bdi></span>
               <span className="truncate flex-1">
-                {replyPreviewSegments
+                <bdi>{replyPreviewSegments
                   ? replyPreviewSegments.map((seg, i) =>
                       (seg.type === 'emote' || seg.type === 'emoji') && (seg.emoteUrl || seg.emojiUrl) ? (
                         <img
@@ -3626,7 +3643,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                         seg.content
                       ),
                     )
-                  : parsed.replyInfo.parentMsgBody}
+                  : parsed.replyInfo.parentMsgBody}</bdi>
               </span>
             </div>
           </div>
@@ -3684,6 +3701,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             <SevenTvAvatar
               cosmeticsId={cosmeticsKey}
               ask={false}
+              animation={stillEmotes ? 'never' : undefined}
               px={Math.round((chatDesign?.font_size ?? 14) * 1.4)}
               src={parsed.tags.get('avatar')}
               alt=""
@@ -3712,6 +3730,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                 <Tooltip content={`From ${sharedSource?.display_name || fetchedChannelName || 'a shared chat'}`} side="top">
                   <SevenTvAvatar
                     cosmeticsId={sourceRoomId}
+                    animation={stillEmotes ? 'never' : undefined}
                     px={Math.round((chatDesign?.font_size ?? 14) * 1.3)}
                     src={channelProfileImage}
                     alt={`From ${sharedSource?.display_name || fetchedChannelName || 'a shared chat'}`}
@@ -3738,6 +3757,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                 thirdPartyBadges={thirdPartyBadges}
                 streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
                 onBadgeClick={onBadgeClick}
+                foldLimit={foldLimit}
                 keyPrefix="badge"
               />
             </span>

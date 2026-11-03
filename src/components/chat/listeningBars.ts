@@ -14,10 +14,12 @@
 // the bars (never React state), and the loop runs only while a listening
 // exists and the window is in view. The Motion setting is honored: 'off'
 // draws a still shape with no loop, 'reduced' follows the level with no
-// ripple or wave.
+// ripple or wave and loops only while it follows the level; a still shape is
+// drawn once.
 
 import { getListening, subscribeLevel, subscribeListening, type Listening } from '../../utils/songListening';
 import { isWindowHidden, onWindowVisibility } from '../../utils/windowVisibility';
+import { isLowPower, subscribeLowPower } from '../../utils/lowPower';
 
 export const BAR_WEIGHTS = [0.55, 0.85, 1, 0.8, 0.6] as const;
 /** Each bar's ripple, rad/s, and where it starts. */
@@ -76,10 +78,21 @@ export function barScales(state: BarsState, level: number, t: number, mode: Moti
   return BAR_WEIGHTS.map((_, i) => 0.22 + reach * (0.5 + 0.5 * Math.sin(t * speed - i * 0.85)));
 }
 
-/** The window's Motion setting (MotionScope writes it on <html>). */
+/** Whether the bars move from frame to frame, so the loop has to keep
+ *  running: always in Full, and in Reduced only while they follow the level
+ *  (its breathing and finding shapes are still there). */
+export function barsMove(state: BarsState, mode: MotionMode): boolean {
+  if (mode === 'full') return true;
+  return mode === 'reduced' && state === 'level';
+}
+
+/** The window's Motion setting (MotionScope writes it on <html>). The cheap
+ *  look (Performance mode, Battery Saver) draws Full like Reduced: the bars
+ *  follow the sound with no ripple and hold still otherwise. */
 export function motionMode(): MotionMode {
   const m = typeof document === 'undefined' ? undefined : document.documentElement.dataset.motion;
-  return m === 'off' || m === 'reduced' ? m : 'full';
+  if (m === 'off' || m === 'reduced') return m;
+  return isLowPower() ? 'reduced' : 'full';
 }
 
 // ---------------------------------------------------------------- the loop
@@ -115,10 +128,11 @@ function tick(at: number): void {
   const dt = lastAt ? at - lastAt : FRAME_MS;
   lastAt = at;
   env = stepEnvelope(env, now.phase === 'finding' ? 0 : level, dt);
-  paint(stateOf(now), at / 1000, mode);
-  // A still shape needs no loop: it is drawn again when the setting or the
-  // listening changes.
-  if (mode !== 'off') frame = requestAnimationFrame(tick);
+  const state = stateOf(now);
+  paint(state, at / 1000, mode);
+  // A still shape needs no loop: it is drawn again when the setting, the
+  // listening or the first heard level changes.
+  if (barsMove(state, mode)) frame = requestAnimationFrame(tick);
 }
 
 /** Start the loop when there is something to draw, or draw the still shape. */
@@ -139,10 +153,15 @@ function start(): void {
   stops = [
     subscribeLevel((l) => {
       level = l;
+      // The first level turns breathing into following, which moves under
+      // Reduced too, so a resting loop starts again.
+      const first = !heard;
       heard = true;
+      if (first) wake();
     }),
     subscribeListening(wake),
     onWindowVisibility(wake),
+    subscribeLowPower(wake),
   ];
   // The Motion setting can change while bars are up.
   const observer = new MutationObserver(wake);

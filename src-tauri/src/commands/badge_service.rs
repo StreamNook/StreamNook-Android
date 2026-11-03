@@ -35,9 +35,31 @@ pub fn third_party_ready() -> bool {
     BADGE_SERVICE.try_read().is_ok_and(|guard| guard.is_some())
 }
 
+/// Worn badges a test hands in, by Twitch user id, answered ahead of the service (the
+/// iPhone's chat fixtures give a chatter chat-client badges this way).
+#[cfg(test)]
+static WORN_FOR_TEST: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<crate::services::badge_service::UserBadge>>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub fn set_worn_for_test(user_id: &str, badges: Vec<crate::services::badge_service::UserBadge>) {
+    let mut worn = WORN_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner());
+    worn.get_or_insert_with(Default::default).insert(user_id.to_string(), badges);
+}
+
+/// Forgets every badge `set_worn_for_test` handed in.
+#[cfg(test)]
+pub fn clear_worn_for_test() {
+    *WORN_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// The third-party badges a chatter wears, without waiting on the service
 /// (see `BadgeService::worn_third_party_now`); empty before it is ready.
 pub fn third_party_worn_now(user_id: &str) -> Vec<crate::services::badge_service::UserBadge> {
+    #[cfg(test)]
+    if let Some(found) = WORN_FOR_TEST.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|w| w.get(user_id)) {
+        return found.clone();
+    }
     let Ok(guard) = BADGE_SERVICE.try_read() else { return Vec::new() };
     guard.as_ref().map(|s| s.worn_third_party_now(user_id)).unwrap_or_default()
 }
@@ -132,7 +154,7 @@ pub async fn get_user_badges_with_earned_unified(
 }
 
 /// Resolve ONLY a user's real chat-client (third-party) badges — their actual
-/// BTTV / FFZ / Chatterino / Homies / Chatsen / Chatty / DankChat badges — from
+/// BTTV / FFZ / Chatterino / Homies / Moltorino / Limerino / JilChat / Chatsen / Chatty / DankChat badges — from
 /// the prefetched provider databases. Cache-only (no Twitch token, no channel,
 /// no network), so chat can call it once per chatter without the per-user round
 /// trip the full unified path needs. display_badges / earned_badges come back
@@ -207,7 +229,7 @@ pub async fn prefetch_channel_badges_unified(channel_id: String) -> Result<(), S
     service.fetch_channel_badges(&channel_id, &token).await
 }
 
-/// Pre-fetch third-party badge databases (FFZ, Chatterino, Homies)
+/// Pre-fetch third-party badge databases (FFZ, Chatterino, Homies, Moltorino, Limerino, JilChat)
 #[tauri::command]
 pub async fn prefetch_third_party_badges() -> Result<(), String> {
     let service_lock = get_service().await?;
@@ -279,7 +301,7 @@ pub async fn get_global_badge_collection(
 }
 
 /// Get the full distinct badge set for every third-party chat client (FFZ,
-/// BetterTTV, Chatterino, Homies, Chatsen, Chatty, DankChat) for the browse gallery.
+/// BetterTTV, Chatterino, Homies, Moltorino, Limerino, JilChat, Chatsen, Chatty, DankChat) for the browse gallery.
 /// Pass the current user's Twitch ID to flag which badges they own.
 #[tauri::command]
 pub async fn get_all_third_party_badges(
@@ -310,7 +332,7 @@ pub async fn get_all_third_party_badges(
 }
 
 /// What the badge spotlight shows for a clicked third-party badge (FFZ,
-/// BetterTTV, Chatterino, Homies, Moltorino, Chatsen, Chatty, DankChat):
+/// BetterTTV, Chatterino, Homies, Moltorino, Limerino, JilChat, Chatsen, Chatty, DankChat):
 /// provider name and site, and whatever the in-memory feeds know about the
 /// badge (title, art, description, holder count, whether the viewer holds
 /// it). Accepts any of the badge id spaces (`ffz-3`, `ffz:ffz-3`, `3`); a

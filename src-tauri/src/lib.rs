@@ -1037,6 +1037,13 @@ pub fn run() {
         // relay sessions, and nothing in the new page knows their ids, so the
         // sessions are released as it starts loading. The first load finds none.
         .on_page_load(|webview, payload| {
+            // A reload drops the old page's open dialogs: its wrapper never got
+            // to say they closed, so Performance mode would read the window as
+            // in front until it closed.
+            #[cfg(desktop)]
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                services::performance_mode::note_window_destroyed(webview.label());
+            }
             if webview.label() == "main" && payload.event() == tauri::webview::PageLoadEvent::Started {
                 // What the old page declared to Discord presence goes with it.
                 #[cfg(desktop)]
@@ -1640,6 +1647,11 @@ pub fn run() {
             // document.visibilityState, which isWindowHidden() reads first.
             #[cfg(desktop)]
             services::window_visibility::start(app_handle.clone());
+            // Performance mode: what every window draws, and whether StreamNook
+            // is the app in front. Here on the main thread, which the Windows
+            // foreground hook needs.
+            #[cfg(desktop)]
+            services::performance_mode::start(app_handle.clone());
             services::user_message_history_service::UserMessageHistoryService::set_app_handle(app_handle.clone());
             // Badge-drop feed socket, owned here so drops still arrive while the
             // main window is destroyed (live mode, tray). See services::badge_feed.
@@ -1877,6 +1889,10 @@ pub fn run() {
             reveal_main_window,
             #[cfg(desktop)]
             ensure_main_window,
+            #[cfg(desktop)]
+            get_performance_state,
+            #[cfg(desktop)]
+            set_dialog_open,
             #[cfg(desktop)]
             open_chat_overlay,
             #[cfg(desktop)]
@@ -2883,8 +2899,16 @@ pub fn run() {
                 commands::popout_window::note_geometry(window, event);
             }
 
+            // Performance mode's "In the background": focus moves are checked
+            // against the OS (Windows watches the foreground window itself).
+            #[cfg(not(windows))]
+            if let WindowEvent::Focused(focused) = event {
+                services::performance_mode::note_focus(*focused);
+            }
+
             if let WindowEvent::Destroyed = event {
                 services::app_exit::note_window_destroyed(&label);
+                services::performance_mode::note_window_destroyed(&label);
                 // A destroyed webview never runs its React cleanup, so any
                 // chat consumer claims it still holds would pin those channels
                 // JOINed (and their IRC traffic flowing) forever. Sweep them;

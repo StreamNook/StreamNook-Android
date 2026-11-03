@@ -144,6 +144,35 @@ pub fn set_web_cookies(origin: String, cookies_json: String) {
     }
 }
 
+/// One badge as the iPhone row layout knows it, for `badge_fold_plan`.
+#[derive(uniffi::Record)]
+pub struct BadgeFoldInput {
+    pub provider: String,
+    pub role: bool,
+}
+
+#[derive(uniffi::Record)]
+pub struct BadgeFoldPlan {
+    pub shown: Vec<u32>,
+    pub hidden: Vec<u32>,
+    /// The chip's rarity, 0 plain to 4 legendary, from every add-on worn.
+    pub tier: u32,
+}
+
+/// The chat-row badge fold (`services::badge_fold`) for the iPhone layout:
+/// `badges` in chat order, `limit` the "Badges before +N" setting as stored
+/// (`chat_design.badge_fold_limit`; nil reads as the default).
+#[uniffi::export]
+pub fn badge_fold_plan(badges: Vec<BadgeFoldInput>, limit: Option<f64>) -> BadgeFoldPlan {
+    let pairs: Vec<(&str, bool)> = badges.iter().map(|b| (b.provider.as_str(), b.role)).collect();
+    let fold = crate::services::badge_fold::fold_plan(&pairs, limit);
+    BadgeFoldPlan {
+        shown: fold.shown.into_iter().map(|i| i as u32).collect(),
+        hidden: fold.hidden.into_iter().map(|i| i as u32).collect(),
+        tier: u32::from(fold.tier),
+    }
+}
+
 /// The app's lifecycle as the shell sees it: `foreground`, `background`,
 /// `terminating` or `memory_warning`.
 #[uniffi::export]

@@ -586,6 +586,22 @@
   {
    "page": "chat",
    "section": "Chat Events",
+   "title": "Redemption color",
+   "paths": [
+    "chat_events.redemption_color"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "The tint behind channel points messages, like Highlight My Message.",
+   "aliases": [
+    "highlighted message color",
+    "highlight my message",
+    "redeem color"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Chat Events",
    "title": "Gift sub batches",
    "paths": [
     "collapse_gift_subs"
@@ -698,7 +714,7 @@
    ],
    "nested": false,
    "logo": null,
-   "detail": "Turn event kinds off per platform. Lit means shown.",
+   "detail": "Turn event kinds off per platform.",
    "aliases": []
   },
   {
@@ -981,7 +997,7 @@
    ],
    "nested": false,
    "logo": null,
-   "detail": "Badges from 7TV, FFZ, Chatterino, Homies and the other badge services, plus StreamNook membership badges.",
+   "detail": "Badges from 7TV, FFZ, Chatterino, Homies, Limerino, JilChat and the other badge services, plus StreamNook membership badges.",
    "aliases": [
     "third party badges",
     "7tv badges",
@@ -1000,6 +1016,24 @@
    "logo": null,
    "detail": "",
    "aliases": []
+  },
+  {
+   "page": "chat",
+   "section": "Names & Badges",
+   "title": "Badges before +N",
+   "paths": [
+    "chat_design.badge_fold_limit"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "Add-on badges past this many fold into a +N you can hover (tap on phones) to see. Twitch's own badges always show.",
+   "aliases": [
+    "badge limit",
+    "fold badges",
+    "plus n",
+    "more badges",
+    "overflow"
+   ]
   },
   {
    "page": "chat",

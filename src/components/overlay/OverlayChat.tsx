@@ -35,6 +35,8 @@ import { AtmosphereChatWash } from './AtmosphereChatWash';
 import { convertMoneyInText, loadRates, ratesReady } from './currency';
 import { giftBombOriginOf, isGiftBombAnnouncement, isGiftBombChild } from '../../utils/giftBombCollapse';
 import { adjustNameColor } from '../../utils/nameColor';
+import { badgeFoldLimit, foldBadges, foldKind, type FoldKind } from '../../utils/badgeFold';
+import { fitCount } from '../../utils/fitNumber';
 import { cachedBadgeUrl, emoteCandidates, gifLineIndex, hiResBadgeUrl, messageLineClamp, overlayBackdropIsDark, zeroWidthLayout } from './overlayLayout';
 
 // The StreamNook identity badge on the overlay is just the member's equipped
@@ -1019,42 +1021,112 @@ const OverlayRow = ({ message, style, expiring, enterDelay }: { message: Overlay
   // badges never stack their shadows on each other.
   const shadow = overlayShadow(style);
   const badgeShadow = style.shadowOnBadges === true ? shadow?.filter(style.shadowDarkBadges === true) ?? null : null;
-  const badgesNode = anyBadge ? (
-    <span className="inline-flex items-center" style={{ gap: '0.2em', verticalAlign: '-0.18em', ...(provider === 'youtube' ? { marginLeft: '0.3em', marginRight: '0.15em' } : { marginRight: '0.4em' }), ...(badgeShadow ? { filter: badgeShadow } : null) }} data-ov-badges="">
-      {showNativeBadges && nativeBadges.map((b, i) => {
+  const badgeSlots: { key: string; kind: FoldKind; url?: string; fallbacks?: (string | undefined)[]; node: ReactNode }[] = [];
+  if (anyBadge) {
+    if (showNativeBadges) {
+      nativeBadges.forEach((b, i) => {
         // YouTube rows resolve role badges (no API image) to their own platform
         // art; everything else uses the badge's resolved image.
         const url = badgeUrl(b) || (provider === 'youtube' ? YT_ROLE_BADGES[b.name] : undefined);
-        if (!url) return null;
-        return (
-          <BadgeImg key={`tw-${b.name}-${i}-${url}`} src={url} fallbacks={badgeFallbacks(b)} alt={b.title || b.name} boxPx={badgePx} style={{ height: badgeSize, width: badgeSize }} />
-        );
-      })}
-      {showSeventvBadge && message.seventvBadgeUrl && (
-        <BadgeImg key={`seventv-${message.seventvBadgeUrl}`} src={message.seventvBadgeUrl} alt={message.seventvBadgeTitle || '7TV badge'} boxPx={badgePx} style={{ height: badgeSize, width: badgeSize }} />
-      )}
-      {showExtraBadges && visibleExtraBadges.map((b, i) => (
+        if (!url) return;
+        const fallbacks = badgeFallbacks(b);
+        const key = `tw-${b.name}-${i}-${url}`;
+        badgeSlots.push({
+          key,
+          kind: foldKind(provider, b.name),
+          url,
+          fallbacks,
+          node: <BadgeImg key={key} src={url} fallbacks={fallbacks} alt={b.title || b.name} boxPx={badgePx} style={{ height: badgeSize, width: badgeSize }} />,
+        });
+      });
+    }
+    if (showSeventvBadge && message.seventvBadgeUrl) {
+      const key = `seventv-${message.seventvBadgeUrl}`;
+      badgeSlots.push({
+        key,
+        kind: 'seventv',
+        url: message.seventvBadgeUrl,
+        node: <BadgeImg key={key} src={message.seventvBadgeUrl} alt={message.seventvBadgeTitle || '7TV badge'} boxPx={badgePx} style={{ height: badgeSize, width: badgeSize }} />,
+      });
+    }
+    if (showExtraBadges) {
+      visibleExtraBadges.forEach((b, i) => {
         // A glyph badge (FFZ:AP) carries its backdrop colour: the rounded
         // square its own client draws behind it (radius side / 9).
-        <BadgeImg
-          key={`tp-${i}-${b.url}`}
-          src={b.url}
-          alt={b.title || 'badge'}
-          boxPx={badgePx}
-          style={{ height: badgeSize, width: badgeSize, ...(b.backdrop ? { backgroundColor: b.backdrop, borderRadius: `calc(${badgeSize} / 9)` } : null) }}
-        />
-      ))}
-      {/* StreamNook identity badge sits rightmost, next to the name, mirroring
-          the real chat row (see utils/badgeOrder in the app repo). */}
-      {showSnBadge && (
-        <BadgeImg
-          key={`sn-${message.streamNookBadgeUrl || SN_DEFAULT_LOGO}`}
-          src={message.streamNookBadgeUrl || SN_DEFAULT_LOGO}
-          alt="StreamNook"
-          loading="lazy"
-          boxPx={badgePx}
-          style={{ height: badgeSize, width: badgeSize, objectFit: 'contain' }}
-        />
+        const key = `tp-${i}-${b.url}`;
+        badgeSlots.push({
+          key,
+          kind: 'addon',
+          url: b.url,
+          node: (
+            <BadgeImg
+              key={key}
+              src={b.url}
+              alt={b.title || 'badge'}
+              boxPx={badgePx}
+              style={{ height: badgeSize, width: badgeSize, ...(b.backdrop ? { backgroundColor: b.backdrop, borderRadius: `calc(${badgeSize} / 9)` } : null) }}
+            />
+          ),
+        });
+      });
+    }
+    // StreamNook identity badge sits rightmost, next to the name, mirroring
+    // the real chat row (see utils/badgeOrder in the app repo).
+    if (showSnBadge) {
+      const snUrl = message.streamNookBadgeUrl || SN_DEFAULT_LOGO;
+      const key = `sn-${snUrl}`;
+      badgeSlots.push({
+        key,
+        kind: 'streamnook',
+        url: snUrl,
+        node: (
+          <BadgeImg
+            key={key}
+            src={snUrl}
+            alt="StreamNook"
+            loading="lazy"
+            boxPx={badgePx}
+            style={{ height: badgeSize, width: badgeSize, objectFit: 'contain' }}
+          />
+        ),
+      });
+    }
+  }
+  const badgeFold = foldBadges(badgeSlots.map((s) => s.kind), badgeFoldLimit(style.badgeLimit));
+  const peekSlots = badgeFold.hidden.map((i) => badgeSlots[i]).flatMap((s) => (s.url ? [{ url: s.url, fallbacks: s.fallbacks }] : [])).slice(0, 2);
+  const peekPx = Math.round(badgePx * 0.6);
+  const badgesNode = anyBadge ? (
+    <span className="inline-flex items-center" style={{ gap: '0.2em', verticalAlign: '-0.18em', ...(provider === 'youtube' ? { marginLeft: '0.3em', marginRight: '0.15em' } : { marginRight: '0.4em' }), ...(badgeShadow ? { filter: badgeShadow } : null) }} data-ov-badges="">
+      {badgeFold.shown.map((i) => badgeSlots[i].node)}
+      {badgeFold.hidden.length > 0 && (
+        <span
+          key="fold"
+          data-ov-badge-fold=""
+          // The chatter's rarity foil (sn-ov-fold rules below), the same tiers as chat.
+          data-tier={badgeFold.tier}
+          className="sn-ov-fold"
+          style={{
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            height: badgeSize, minWidth: badgeSize, padding: peekSlots.length > 0 ? '0 0.3em 0 0.15em' : '0 0.3em', borderRadius: 999,
+            fontSize: `calc(${badgeSize} * 0.52)`, fontWeight: 700, lineHeight: 1,
+            fontVariantNumeric: 'tabular-nums',
+            ...(badgeFold.tier === 0
+              ? { color: 'rgba(255,255,255,0.92)', background: 'rgba(255,255,255,0.16)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.18)' }
+              : null),
+          }}
+        >
+          {peekSlots.map((s, n) => (
+            <BadgeImg
+              key={`pk-${n}-${s.url}`}
+              src={s.url}
+              fallbacks={s.fallbacks}
+              alt=""
+              boxPx={peekPx}
+              style={{ position: 'relative', zIndex: 2, height: `calc(${badgeSize} * 0.6)`, width: `calc(${badgeSize} * 0.6)`, borderRadius: '0.2em', marginLeft: n === 1 ? `calc(${badgeSize} * -0.22)` : 0, marginRight: n === peekSlots.length - 1 ? '0.25em' : 0, boxShadow: '0 0 0 0.1em rgba(0,0,0,0.55)' }}
+            />
+          ))}
+          <span style={{ position: 'relative', zIndex: 2 }}>+{fitCount(badgeFold.hidden.length, 99)}</span>
+        </span>
       )}
     </span>
   ) : null;
@@ -1411,16 +1483,20 @@ const OverlayRow = ({ message, style, expiring, enterDelay }: { message: Overlay
         }}
       >
         {replyMention && (
-          <span style={{ fontWeight: 700, opacity: 0.85 }}>@{stripAt(replyMention.parent_display_name)} </span>
+          <span style={{ fontWeight: 700, opacity: 0.85 }}>@<bdi>{stripAt(replyMention.parent_display_name)}</bdi> </span>
         )}
-        {bodySegs.map((seg, i) => {
-          if (zw.skip.has(i) || (i === giantIdx && !giantInline)) return null;
-          const giant = i === giantIdx && giantInline;
-          const overlays = zw.attached.get(i);
-          return overlays
-            ? <StackedEmote key={i} segs={[seg, ...overlays.map((o) => bodySegs[o])]} style={style} giant={giant} />
-            : <OverlaySegment key={i} segment={seg} style={style} giant={giant} images={imagesHere} />;
-        })}
+        {/* The chatter's own text is a bidi island: right-to-left text reads
+            correctly inside it and never reorders the name or badges. */}
+        <bdi>
+          {bodySegs.map((seg, i) => {
+            if (zw.skip.has(i) || (i === giantIdx && !giantInline)) return null;
+            const giant = i === giantIdx && giantInline;
+            const overlays = zw.attached.get(i);
+            return overlays
+              ? <StackedEmote key={i} segs={[seg, ...overlays.map((o) => bodySegs[o])]} style={style} giant={giant} />
+              : <OverlaySegment key={i} segment={seg} style={style} giant={giant} images={imagesHere} />;
+          })}
+        </bdi>
       </span>
     </div>
   );
@@ -1551,7 +1627,7 @@ const OverlayRow = ({ message, style, expiring, enterDelay }: { message: Overlay
         {reply && (
           <div style={{ fontSize: '0.82em', opacity: 0.7, marginBottom: '0.1em' }}>
             <span aria-hidden="true" style={{ marginRight: '0.3em' }}>↳</span>
-            Replying to <span style={{ fontWeight: 700 }}>{showAt ? '@' : ''}{stripAt(reply.parent_display_name)}</span>: {renderReplyBody(reply.parent_msg_body)}
+            Replying to <span style={{ fontWeight: 700 }}>{showAt ? '@' : ''}<bdi>{stripAt(reply.parent_display_name)}</bdi></span>: <bdi>{renderReplyBody(reply.parent_msg_body)}</bdi>
           </div>
         )}
         {atmosphereFrost ? (
@@ -2015,7 +2091,7 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
         @keyframes snOvPop { 0% { opacity: 0; transform: scale(0.5) } 62% { opacity: 1; transform: scale(1.09) } 100% { opacity: 1; transform: scale(1) } }
         @keyframes snOvStamp { 0% { opacity: 0; transform: scale(1.45) } 28% { opacity: 1 } 52% { transform: scale(0.93) } 76% { transform: scale(1.04) } 100% { opacity: 1; transform: scale(1) } }
         @keyframes snOvOut { to { opacity: 0; transform: translateX(-12px) } }
-        .sn-ov-row { word-break: break-word; overflow-wrap: anywhere; }
+        .sn-ov-row { word-break: break-word; overflow-wrap: anywhere; direction: ltr; }
         /* Border accent animations (first-time highlight + Outline events).
            They ride the BORDER only, never the fill. Ring geometry: an ::after
            masked to a band matching the em-sized border (the padding-box XOR
@@ -2110,6 +2186,19 @@ export const OverlayChat = ({ messages, style: rawStyle, superSample = 1 }: { me
         /* Moderation retract fade — declared AFTER the entrance classes so it
            overrides them on the same row (same specificity, later wins). */
         .sn-ov-out { animation: snOvOut 260ms ease both; pointer-events: none; }
+        /* The fold pill's rarity foil, the same tiers as chat's (globals.css
+           .sn-badge-fold-chip[data-tier]), as one still frame: an overlay has no
+           pointer, so the light rests where chat's does. */
+        .sn-ov-fold:not([data-tier='0']) { position: relative; isolation: isolate; overflow: hidden; }
+        .sn-ov-fold:not([data-tier='0'])::before, .sn-ov-fold:not([data-tier='0'])::after { content: ''; position: absolute; inset: 0; z-index: 1; border-radius: inherit; pointer-events: none; }
+        .sn-ov-fold:not([data-tier='0'])::before { opacity: var(--sn-foil-shim); mix-blend-mode: var(--sn-foil-blend, soft-light); background: linear-gradient(100deg, var(--sn-foil-s1), var(--sn-foil-s2) 50%, var(--sn-foil-s3)); }
+        .sn-ov-fold:not([data-tier='0'])::after { opacity: var(--sn-foil-light); mix-blend-mode: screen; background: linear-gradient(115deg, transparent 56%, rgba(255,255,255,0.6) 61%, transparent 65%), linear-gradient(115deg, transparent 12%, rgba(255,255,255,0.55) 32%, transparent 52%); }
+        .sn-ov-fold:not([data-tier='0']) > * { text-shadow: 0 0 2px rgba(0,0,0,0.6); }
+        .sn-ov-fold[data-tier='1'] { color: #eef1f6; background: #2b2f37; --sn-foil-s1: #8d96a6; --sn-foil-s2: #f4f7fb; --sn-foil-s3: #7a8394; --sn-foil-shim: 0.7; --sn-foil-light: 0.35; }
+        .sn-ov-fold[data-tier='2'] { color: #fff6dc; background: linear-gradient(120deg, #4a3410, #7a5a1c 45%, #3e2b0c); --sn-foil-s1: #c08a2a; --sn-foil-s2: #ffeab0; --sn-foil-s3: #a06b18; --sn-foil-shim: 0.85; --sn-foil-light: 0.45; }
+        .sn-ov-fold[data-tier='3'] { color: #fff; box-shadow: inset 0 0 0 1px rgba(230,170,255,0.55); background: radial-gradient(1px 1px at 30% 12%, #fff, transparent), radial-gradient(1px 1px at 62% 88%, #fff, transparent), radial-gradient(1.2px 1.2px at 94% 18%, #ffe9b0, transparent), radial-gradient(circle at 32% 40%, #b0389a, #3a1060 55%, #120720); --sn-foil-s1: #a77bff; --sn-foil-s2: #62e3ff; --sn-foil-s3: #ff6fc8; --sn-foil-shim: 0.55; --sn-foil-blend: overlay; --sn-foil-light: 0.4; }
+        .sn-ov-fold[data-tier='4'] { color: #fff; border: 1px solid transparent; background: linear-gradient(#1b1d2c, #1b1d2c) padding-box, conic-gradient(from 210deg, #ff7a7a, #ffd36b, #7dffb0, #6bc8ff, #c58bff, #ff7ad1, #ff7a7a) border-box; box-shadow: 0 0 10px rgba(180,150,255,0.45); --sn-foil-shim: 0.62; --sn-foil-blend: screen; --sn-foil-light: 0.45; }
+        .sn-ov-fold[data-tier='4']::before { background: linear-gradient(100deg, #ff7a7a, #ffd36b 20%, #7dffb0 40%, #6bc8ff 60%, #c58bff 80%, #ff7ad1); }
         /* StreamNook event style — per-category washes baked from globals.css's
            event gradients (highlight colors resolved to hex) so they render
            self-contained on the hosted overlay, no theme vars needed. Each category
