@@ -6,8 +6,8 @@
 //! at once and switch between them without reconnecting. The rules for that
 //! list live here so the two shells cannot drift: the stream tab is first and
 //! cannot be closed, a room already open is never opened twice, closing the
-//! room on screen falls back to the first one left, and the stream tab follows
-//! the player unless the viewer is sitting on another room.
+//! room on screen falls back to the first one left, and every stream the player
+//! starts puts its own tab on screen.
 //!
 //! A room you opened yourself is "kept": it is one of your chats, saved per
 //! account and restored at launch, and it stays when the player closes even if
@@ -245,6 +245,17 @@ impl ChatTabs {
         fx
     }
 
+    /// The return from the background: joins the tabs again after a park. A
+    /// list never looked at (restored, waiting for the Chats screen) or already
+    /// joined stays as it is.
+    pub fn connect_parked(&mut self) -> Effects {
+        if self.connection == Connection::Parked {
+            self.connect()
+        } else {
+            Effects::default()
+        }
+    }
+
     /// Leaves every room after a while in the background, unless a stream is
     /// on (the player keeps playing, and its chat with it).
     pub fn park(&mut self) -> Effects {
@@ -327,8 +338,10 @@ impl ChatTabs {
     ///
     /// Closing the stream drops its tab unless it is kept, and keeps every
     /// room opened beside it. A room already open by hand is promoted to the
-    /// stream tab rather than opened twice, and stays kept. The room on screen
-    /// follows the stream unless the viewer sits on another room.
+    /// stream tab rather than opened twice, and stays kept. A stream the tab did
+    /// not show yet goes on screen, whatever room was in front (a chat restored
+    /// at launch, or one picked beside the last stream); the same stream again
+    /// only refreshes its name and face.
     pub fn sync_stream(&mut self, room: Option<&ChatRoomInput>) -> Effects {
         let mut fx = Effects::default();
         let current = self.tabs.iter().position(|t| t.pinned_to_stream);
@@ -354,7 +367,7 @@ impl ChatTabs {
         }
         // A stream starting joins your restored chats too.
         fx = fx.and(self.connect());
-        let old_channel = self.retire_stream_tab(&mut fx);
+        self.retire_stream_tab(&mut fx);
         let mut next = next;
         match self.tabs.iter().position(|t| t.channel == next.channel) {
             Some(i) => {
@@ -371,14 +384,20 @@ impl ChatTabs {
             }
             None => fx.acquire.push(next.clone()),
         }
-        let key = next.channel.clone();
+        self.active = Some(next.channel.clone());
         self.tabs.insert(0, next);
-        let sitting_elsewhere = self
-            .active
-            .as_deref()
-            .is_some_and(|a| Some(a) != old_channel.as_deref() && a != key && self.tabs.iter().any(|t| t.channel == a));
-        if !sitting_elsewhere {
-            self.active = Some(key);
+        fx
+    }
+
+    /// A stream the viewer opened (a tap, a raid followed, a VOD or the offline
+    /// room of the channel already in the tab): `sync_stream`, and its tab goes
+    /// on screen even when the tab already showed that stream. A plain
+    /// `sync_stream` of the same stream (a name or picture arriving) leaves the
+    /// room on screen alone.
+    pub fn open_stream(&mut self, room: &ChatRoomInput) -> Effects {
+        let fx = self.sync_stream(Some(room));
+        if let Some(tab) = self.tabs.iter().find(|t| t.pinned_to_stream) {
+            self.active = Some(tab.channel.clone());
         }
         fx
     }
@@ -725,14 +744,54 @@ mod tests {
     }
 
     #[test]
-    fn the_room_on_screen_follows_the_stream_unless_the_viewer_sits_elsewhere() {
+    fn opening_the_stream_already_in_the_tab_brings_it_to_the_front() {
+        let mut t = ChatTabs::default();
+        t.sync_stream(Some(&room("twitch", "s", Some("1"), "S")));
+        t.add(&room("twitch", "b", Some("2"), "B"));
+        assert_eq!(t.active.as_deref(), Some("b"));
+        let fx = t.open_stream(&room("twitch", "s", Some("1"), "S"));
+        assert!(fx.acquire.is_empty() && fx.release.is_empty(), "the same room stays joined");
+        assert_eq!(t.active.as_deref(), Some("s"));
+        assert!(t.tab("b").is_some(), "the room picked beside it stays open");
+        let fx = t.open_stream(&room("twitch", "n", Some("3"), "N"));
+        assert_eq!(names(&fx.acquire), ["twitch:n"]);
+        assert_eq!(t.active.as_deref(), Some("n"), "a new stream opened is in front too");
+    }
+
+    #[test]
+    fn every_new_stream_comes_to_the_front() {
         let mut t = ChatTabs::default();
         t.sync_stream(Some(&room("twitch", "s1", Some("1"), "S1")));
         t.sync_stream(Some(&room("twitch", "s2", Some("2"), "S2")));
         assert_eq!(t.active.as_deref(), Some("s2"));
         t.add(&room("twitch", "other", Some("3"), "Other"));
-        t.sync_stream(Some(&room("twitch", "s3", Some("4"), "S3")));
         assert_eq!(t.active.as_deref(), Some("other"));
+        t.sync_stream(Some(&room("twitch", "s3", Some("4"), "S3")));
+        assert_eq!(t.active.as_deref(), Some("s3"));
+        assert!(t.tab("other").is_some(), "the room picked beside the last stream stays open");
+    }
+
+    #[test]
+    fn a_stream_after_a_restore_comes_to_the_front() {
+        let mut t = ChatTabs::default();
+        let saved = SavedChats {
+            tabs: vec![ChatTabs::tab_for(&room("twitch", "a", Some("1"), "A"), false).unwrap()],
+            active: Some("a".into()),
+        };
+        t.restore("42".into(), saved);
+        assert_eq!(t.active.as_deref(), Some("a"), "with no stream the saved room is in front");
+        t.sync_stream(Some(&room("twitch", "s", Some("2"), "S")));
+        assert_eq!(t.active.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn the_same_stream_again_leaves_the_room_on_screen() {
+        let mut t = ChatTabs::default();
+        t.sync_stream(Some(&room("twitch", "s", None, "s")));
+        t.add(&room("twitch", "b", Some("2"), "B"));
+        t.sync_stream(Some(&room("twitch", "S", Some("1"), "Streamer")));
+        assert_eq!(t.active.as_deref(), Some("b"));
+        assert_eq!(t.tab("s").unwrap().label, "Streamer");
     }
 
     #[test]
@@ -882,6 +941,23 @@ mod tests {
     }
 
     #[test]
+    fn a_return_joins_only_a_parked_list() {
+        let saved = SavedChats {
+            tabs: vec![ChatTabs::tab_for(&room("twitch", "a", Some("1"), "A"), false).unwrap()],
+            active: None,
+        };
+        let mut t = ChatTabs::default();
+        t.restore("42".into(), saved);
+        assert!(t.connect_parked().acquire.is_empty(), "a list never looked at stays waiting");
+        assert_eq!(t.connection, Connection::Idle);
+        assert_eq!(names(&t.connect().acquire), ["twitch:a"]);
+        assert!(t.connect_parked().acquire.is_empty(), "already joined");
+        assert_eq!(names(&t.park().release), ["twitch:a"]);
+        assert_eq!(names(&t.connect_parked().acquire), ["twitch:a"]);
+        assert_eq!(t.connection, Connection::Connected);
+    }
+
+    #[test]
     fn only_your_chats_are_saved() {
         let mut t = ChatTabs::default();
         t.add(&room("twitch", "a", Some("1"), "A"));
@@ -941,7 +1017,8 @@ mod tests {
         let mut t = ChatTabs::default();
         t.add(&room("twitch", "other", Some("3"), "Other"));
         t.sync_stream(Some(&room("kick", "XQC", None, "xQc")));
-        assert_eq!(t.active.as_deref(), Some("other"));
+        assert_eq!(t.active.as_deref(), Some("kick:xqc"), "the stream starts in front");
+        assert!(t.set_active("other"));
         assert!(t.keep("kick:xqc", true));
         assert!(t.sync_stream(None).release.is_empty());
         assert_eq!(keys(&t), ["kick:xqc", "other"]);

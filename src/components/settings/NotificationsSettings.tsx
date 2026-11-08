@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useFreshIds } from '../../hooks/useFreshIds';
 import { Dropdown } from '../ui/Dropdown';
 import { Tooltip } from '../ui/Tooltip';
 import { Toggle } from '../ui/Toggle';
@@ -21,12 +22,9 @@ import { useSettingReset } from './settingReset';
 import { InlineSlider, SubControl, SubControls } from '../plugins/settingsPageKit';
 import { useSoundOptions } from '../../hooks/useSoundOptions';
 import { playTestNotificationSound } from '../../utils/notificationSound';
-import { grantAccolade } from '../../services/supabaseService';
-import {
-  RESTLESS_ACCOLADE_ID,
-  NOTIF_CLICK_THRESHOLD,
-  bumpTestNotificationClicks,
-} from '../../utils/notifAchievement';
+import { RESTLESS_ACCOLADE_ID, bumpTestNotificationClicks } from '../../utils/notifAchievement';
+import { restlessReached } from '../../utils/clientAccolades';
+import { earnClientAccolade } from '../../utils/earnAccolade';
 import { alertKey, loadAlertTypes, useAlertTypes } from '../../mobile/alertTypes';
 import { openSystemNotifySettings, useSystemNotifyPermission } from '../../utils/systemNotifyPermission';
 
@@ -53,6 +51,7 @@ const IS_WINDOWS_DESKTOP = !IS_MAC && !IS_LINUX;
 const TYPE_HELP: Record<string, string> = {
   live: 'The moment it starts streaming. Clicking it opens the stream.',
   favorite_live: 'Even a favorite you do not follow on Twitch. Clicking it opens the stream.',
+  favorite_category: 'Says what it switched from and to, at most once every few minutes per channel. Clicking it opens the stream.',
   mentions: 'While that chat is not on screen. Clicking it opens the chat at that message.',
   whispers: 'Each new whisper. Clicking it opens the conversation.',
   drops: 'A notification confirms each drop StreamNook claims for you. New drops: at startup, StreamNook checks your favorite categories and tells you when they have new drops to earn.',
@@ -65,9 +64,9 @@ const TYPE_HELP: Record<string, string> = {
   updates: 'It opens the changelog to what is new. Turning this off leaves the update button in the title bar and Check for updates in the changelog.',
 };
 
-// Every type's switch starts on except predictions, as Rust's defaults have
-// them; read only when a saved copy lacks the key.
-const OFF_BY_DEFAULT = new Set(['predictions']);
+// Every type's switch starts on except predictions and favorite category
+// changes, as Rust's defaults have them; read only when a saved copy lacks the key.
+const OFF_BY_DEFAULT = new Set(['predictions', 'favorite_category']);
 
 // The six supported toast anchors, placed on a 3x3 grid that stands in for the
 // screen. The middle row's sides are intentionally inert (vertically-centered
@@ -165,7 +164,7 @@ const TryButton = ({ onClick }: { onClick: () => void }) => (
 );
 
 const NotificationsSettings = () => {
-  const { settings, updateSettings, currentUser, addToast } = useAppStore();
+  const { settings, updateSettings, addToast } = useAppStore();
   const resetFor = useSettingReset();
   const alertTypes = useAlertTypes();
   // macOS asks before StreamNook's first system notification; elsewhere this
@@ -197,6 +196,26 @@ const NotificationsSettings = () => {
     toast_edge_offset: DEFAULT_TOAST_EDGE_OFFSET,
   };
   const systemOn = liveNotifications.use_native_notifications ?? false;
+
+  // Where notifications show, previewed for real: a change to the island,
+  // toasts, toast position or edge distance sends one silent sample through
+  // the Test path (Rust's go-live mock, `is_test`), so it lands in the island
+  // and as a toast exactly where your settings put them. Half a second after
+  // the last change, so dragging the edge distance sends one, not dozens.
+  const displaySig = [
+    liveNotifications.use_dynamic_island ?? true,
+    liveNotifications.use_toast ?? true,
+    liveNotifications.toast_position ?? DEFAULT_TOAST_POSITION,
+    liveNotifications.toast_edge_offset ?? DEFAULT_TOAST_EDGE_OFFSET,
+  ].join('|');
+  const displayChanged = useFreshIds([displaySig]).has(displaySig);
+  useEffect(() => {
+    if (!displayChanged) return;
+    const timer = setTimeout(() => {
+      invoke('send_test_notification').catch((error) => Logger.error('Failed to send the display preview:', error));
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [displaySig, displayChanged]);
 
   const soundOptions = useSoundOptions({ defaultId: 'boop' });
 
@@ -290,14 +309,12 @@ const NotificationsSettings = () => {
     try {
       await invoke('send_test_notification');
       // "Insomniac" easter egg: reward the stubborn Test-clicker. The running
-      // count is local; on the 50th click persist the accolade (which also
-      // unlocks the Midnight Atmosphere for any member, no sub required) and
-      // celebrate exactly once.
+      // count is local. From the 50th click on, Rust is asked to save the
+      // accolade (which also unlocks the Midnight Atmosphere for any member, no
+      // sub required); the toast comes once, after Rust says yes, and a refused
+      // save is asked again on the next click.
       const clicks = bumpTestNotificationClicks();
-      if (clicks === NOTIF_CLICK_THRESHOLD && currentUser?.user_id) {
-        void grantAccolade(currentUser.user_id, RESTLESS_ACCOLADE_ID);
-        addToast('Achievement unlocked: Restless. The Midnight Atmosphere is yours.', 'success', undefined, { alwaysShow: true });
-      }
+      if (restlessReached(clicks)) void earnClientAccolade(RESTLESS_ACCOLADE_ID);
     } catch (error) {
       Logger.error('Failed to send test notification:', error);
     }

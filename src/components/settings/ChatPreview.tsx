@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -18,6 +19,7 @@ import { eventCardClass, eventCardStyle } from '../chat/eventCard';
 import type { ModerationContext, RoomModeView } from '../../stores/chatConnectionStore';
 import { RoomModeIndicator } from '../chat/RoomModeIndicator';
 import { mentionHoldBackground } from '../chat/mentionHold';
+import { withEmoteWord, type EmoteWordsLook } from '../chat/emoteWords';
 import type { ChatEventSettings } from '../../types';
 import { Tooltip } from '../ui/Tooltip';
 import { calculateHalfPadding } from '../../utils/chatLayoutUtils';
@@ -30,7 +32,7 @@ import type { ChatDesignSettings } from '../../types';
 import { ModSlider } from '../chat/ModSlider';
 import { ModLineButtons } from '../chat/ModLineButtons';
 import { HoverModButtons } from '../chat/HoverModButtons';
-import { Copy, PushPin } from 'phosphor-react';
+import { ArrowBendUpLeft, Copy, PushPin } from 'phosphor-react';
 import { formatDuration } from '../../utils/timeoutRamp';
 import { lineButtons, type LineButton } from '../chat/modLine';
 import { bindLineStrips, bindLineWheel, useLineArt, useLineButtons, type LineArt } from '../chat/lineArt';
@@ -286,6 +288,79 @@ export const DeletedMessagePreview = ({
   );
 };
 
+// 7TV global emotes, so every viewer's sample draws real art.
+const SAMPLE_EMOTES = {
+  EZ: '01GB4CK01800090V9B3D8CGEEX',
+  FeelsOkayMan: '01GB46137R000BJ5HR8F6XV8J1',
+  peepoSad: '01GAZ4SBX80007YCE2RXBT44B2',
+  Clap: '01GAM8EFQ00004MXFXAJYKA859',
+} as const;
+type SampleEmote = keyof typeof SAMPLE_EMOTES;
+
+const EMOTE_WORD_SAMPLES: { who: Chatter; parts: (string | { emote: SampleEmote })[] }[] = [
+  { who: PIXELFOX, parts: ['that boss was', { emote: 'EZ' }, 'for him', { emote: 'FeelsOkayMan' }] },
+  { who: MOSSY, parts: ['i really thought we had it', { emote: 'peepoSad' }] },
+  { who: LOOTGOBLIN, parts: [{ emote: 'Clap' }, { emote: 'Clap' }, { emote: 'Clap' }] },
+];
+
+const EMOTE_WORD_CAPTIONS: Record<EmoteWordsLook, string> = {
+  off: 'emotes on their own',
+  under: 'the word in small print under each emote',
+  after: 'the word right after each emote',
+  chips: 'each emote and its word in a small pill',
+};
+
+/** Three lines of emote-heavy chat in the chosen Emote words look; the last
+ *  is emotes alone, which stays bare while "Sentences only" is on. */
+export const EmoteWordsPreview = ({
+  design,
+  look,
+  sentencesOnly,
+  wordScale,
+}: {
+  design: PreviewDesign;
+  look: EmoteWordsLook;
+  sentencesOnly: boolean;
+  /** Word size, set as the chat list sets it (`--sn-emote-word-scale`). */
+  wordScale: number;
+}) => {
+  const rows = EMOTE_WORD_SAMPLES.map(({ who, parts }, line) => {
+    const worded = look !== 'off' && (!sentencesOnly || parts.some((p) => typeof p === 'string'));
+    const text = parts.map((part, i) => {
+      const gap = i > 0 ? ' ' : '';
+      if (typeof part === 'string') return `${gap}${part}`;
+      const img = (
+        <img
+          key={i}
+          src={`https://cdn.7tv.app/emote/${SAMPLE_EMOTES[part.emote]}/2x.webp`}
+          alt={part.emote}
+          className="inline-block w-auto align-middle"
+          style={{ height: '2em', marginLeft: '0.125rem', marginRight: '0.125rem' }}
+          referrerPolicy="no-referrer"
+        />
+      );
+      return (
+        <Fragment key={i}>
+          {gap}
+          {worded ? withEmoteWord(look, img, part.emote, `w${i}`) : img}
+        </Fragment>
+      );
+    });
+    return (
+      <Row key={who.name}>
+        <PreviewLine design={design} who={who} text={text} minutesAgo={3 - line} first={line === 0} />
+      </Row>
+    );
+  });
+  return (
+    <SettingPreview caption={EMOTE_WORD_CAPTIONS[look]}>
+      <div style={{ '--sn-emote-word-scale': wordScale } as CSSProperties}>
+        <PreviewChat design={design}>{rows}</PreviewChat>
+      </div>
+    </SettingPreview>
+  );
+};
+
 /** The preview design from a stored chat design, for tabs other than Chat
  *  that show a sample (same fallbacks as ChatSettings' `cd`). */
 const previewDesignOf = (stored: ChatDesignSettings | undefined): PreviewDesign => ({
@@ -421,14 +496,15 @@ export const ModLinePreview = ({ stored }: { stored: ChatDesignSettings | undefi
 
 /** Sample chat whose middle line shows the hover buttons as chat draws them
  *  under the pointer (here at rest, so they can be seen): the real Ban, Delete
- *  and quick timeout, the other lengths one click away, then Pin and Copy. A
+ *  and quick timeout, the other lengths one click away, then Pin, Copy and
+ *  Reply. A
  *  click only names the action; nothing is sent from a preview. */
 export const ModHoverPreview = ({ stored }: { stored: ChatDesignSettings | undefined }) => {
   const design = previewDesignOf(stored);
   const [clicked, setClicked] = useState<string | null>(null);
   const [lengthsOpen, setLengthsOpen] = useState(false);
   const target = LOOTGOBLIN.name;
-  const dockButton = 'p-1 rounded-md text-white/50 hover:text-white hover:bg-surface-hover transition-colors';
+  const dockButton = 'p-1 rounded-md text-textSecondary hover:text-textPrimary hover:bg-surface-hover transition-colors';
   return (
     <SettingPreview
       caption={
@@ -461,12 +537,15 @@ export const ModHoverPreview = ({ stored }: { stored: ChatDesignSettings | undef
                 }
                 onDelete={() => setClicked(`delete ${target}'s message`)}
               />
-              <div className="mx-0.5 h-4 w-px bg-white/10" />
+              <div className="mx-0.5 h-4 w-px bg-textPrimary/15" />
               <button type="button" aria-label="Pin message" onClick={() => setClicked('pin the message')} className={dockButton}>
                 <PushPin size={14} weight="bold" />
               </button>
               <button type="button" aria-label="Copy message" onClick={() => setClicked('copy the message')} className={dockButton}>
                 <Copy size={14} weight="bold" />
+              </button>
+              <button type="button" aria-label="Reply" onClick={() => setClicked(`reply to ${target}`)} className={dockButton}>
+                <ArrowBendUpLeft size={14} weight="bold" />
               </button>
             </div>
           </div>

@@ -1,7 +1,7 @@
 // Followed live channels: card feed or compact list, user's choice persisted.
 // Live favorites sit on their own shelf above the rest, as on desktop.
 import React, { useEffect, useMemo, useState } from 'react';
-import { Star } from 'phosphor-react';
+import { Users } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { SettleIn, useSettleIn } from '../ui/SettleIn';
 import { useAppStore } from '../../stores/AppStore';
@@ -18,6 +18,7 @@ import { ALL_PLATFORMS, KICK_PLATFORM, PlatformMenu, TWITCH_PLATFORM } from '../
 import { EmptyNote } from '../ui/EmptyNote';
 import { ScreenHeader } from '../ui/ScreenHeader';
 import { TitleCapsule, ViewToggle } from '../ui/TitleControls';
+import { GlassHeart } from '../ui/menuIcons';
 
 /** Which platform Following shows. null is everything. */
 type PlatformFilter = 'twitch' | 'kick' | null;
@@ -174,34 +175,47 @@ export const FollowingScreen: React.FC = () => {
         ) : (
           <div className="sn-tabbar-clearance">
             {favorites.length > 0 && (
-              <section aria-label="Favorites">
-                {/* The shelf's mark is the gold star; the label keeps the
-                    phone's quiet group style and the count sits beside it. */}
-                <h2 className="flex items-center gap-1.5 px-5 pb-2 text-[12px] font-semibold uppercase tracking-wide text-textMuted">
-                  <Star size={14} weight="fill" className="text-yellow-400" aria-hidden />
+              // Desktop's favorites shelf: a faint wash and a hairline, in the
+              // theme's accent (the heart keeps its pink), so the personal
+              // watchlist reads as its own block. The bordered shelf is the
+              // divider; nothing else separates it from the follows. Inset
+              // 8 px around the cards, with corners to match theirs.
+              <section
+                aria-label="Favorites"
+                className="mx-2 rounded-[26px] pt-3 pb-2"
+                style={{
+                  background: 'color-mix(in srgb, var(--color-accent) 2%, transparent)',
+                  border: '1px solid color-mix(in srgb, var(--color-accent) 8%, transparent)',
+                }}
+              >
+                {/* Insets are a pixel short of 12 and 8 to give back the
+                    border's pixel, so label and cards line up with Followed. */}
+                <h2 className="flex items-center gap-1.5 px-[11px] pb-2 text-[12px] font-semibold uppercase tracking-wide text-textMuted">
+                  <GlassHeart on size={15} />
                   <span>Favorites</span>
                   <span className="tabular-nums">{favorites.length}</span>
                 </h2>
-                <AdaptiveGrid variant={gridVariant} gap={gridGap} className="px-4">
+                <AdaptiveGrid variant={gridVariant} gap={gridGap} className="px-[7px]">
                   {favorites.map((s, i) => card(s, i))}
                 </AdaptiveGrid>
-                {/* Feathered at both ends, only when more rows follow. */}
-                {rows.length > 0 && (
-                  <div
-                    aria-hidden
-                    className="mx-4 my-5 h-px bg-borderSubtle/70"
-                    style={{
-                      WebkitMaskImage: 'linear-gradient(to right, transparent, black 26%, black 74%, transparent)',
-                      maskImage: 'linear-gradient(to right, transparent, black 26%, black 74%, transparent)',
-                    }}
-                  />
-                )}
               </section>
             )}
             {rows.length > 0 && (
-              <AdaptiveGrid variant={gridVariant} gap={gridGap} className="px-4">
-                {rows.map((s, i) => card(s, favorites.length + i))}
-              </AdaptiveGrid>
+              <section aria-label="Followed">
+                {/* Labeled only under a Favorites shelf, so the two groups read
+                    as a pair; alone, the list is plainly the follows. Its mark
+                    is desktop's Followed one, quieter than the heart. */}
+                {favorites.length > 0 && (
+                  <h2 className="mt-5 flex items-center gap-1.5 px-5 pb-2 text-[12px] font-semibold uppercase tracking-wide text-textMuted">
+                    <Users size={15} strokeWidth={2} className="shrink-0 text-textSecondary" aria-hidden />
+                    <span>Followed</span>
+                    <span className="tabular-nums">{rows.length}</span>
+                  </h2>
+                )}
+                <AdaptiveGrid variant={gridVariant} gap={gridGap} className="px-4">
+                  {rows.map((s, i) => card(s, favorites.length + i))}
+                </AdaptiveGrid>
+              </section>
             )}
           </div>
         )}

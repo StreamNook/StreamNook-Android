@@ -4,13 +4,14 @@
 
 # StreamNook
 
-A native desktop client for Twitch, Kick, and YouTube.
+A native desktop client for Twitch, YouTube, Kick, and TikTok.
 
 <p>
   <a href="https://github.com/StreamNook/StreamNook/releases/latest"><img src="https://img.shields.io/github/v/release/StreamNook/StreamNook?color=ff6b6b&style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e" alt="Latest release" /></a>
   <a href="https://github.com/StreamNook/StreamNook/stargazers"><img src="https://img.shields.io/github/stars/StreamNook/StreamNook?color=00d9ff&style=for-the-badge&logo=star&logoColor=white&labelColor=1a1a2e" alt="Stars" /></a>
   <a href="https://github.com/StreamNook/StreamNook/issues"><img src="https://img.shields.io/badge/Issues-ff6b6b?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e" alt="Issues" /></a>
   <a href="https://github.com/StreamNook/StreamNook/discussions"><img src="https://img.shields.io/badge/Discussions-4ecdc4?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e" alt="Discussions" /></a>
+  <a href="https://discord.gg/2xvuF9TES7"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white&labelColor=1a1a2e" alt="Join the StreamNook Discord" /></a>
 </p>
 
 <p>
@@ -23,13 +24,17 @@ A native desktop client for Twitch, Kick, and YouTube.
 
 <sub>Windows. Extract and run, everything else is built in.</sub>
 
+<br />
+
+<a href="https://discord.gg/2xvuF9TES7"><img src="src-tauri/images/discord_invite.svg" alt="Join the StreamNook Discord server" width="440" /></a>
+
 </div>
 
 ---
 
 You're grinding through your 47th hour of that indie roguelike, talking to yourself about optimal build paths, when you realize *I need human voices*. But opening a stream in a browser? That's like inviting a resource-hungry elephant to sit on your CPU. Your fans spin up, your frame rate tanks, and suddenly you're choosing between watching streams and actually playing games.
 
-StreamNook is the answer to this very specific but deeply relatable problem. Built from the ground up with Rust and React, it delivers a smooth viewing experience that sips resources instead of chugging them. The cozy corner of the internet where you can watch streams, chat with communities, and track your favorite streamers without turning your PC into a space heater. Twitch, Kick, and YouTube, all in the same window.
+StreamNook is the answer to this very specific but deeply relatable problem. Built from the ground up with Rust and React, it delivers a smooth viewing experience that sips resources instead of chugging them. The cozy corner of the internet where you can watch streams, chat with communities, and track your favorite streamers without turning your PC into a space heater. Twitch, YouTube, Kick, and TikTok, all in the same window.
 
 ## Platforms
 
@@ -37,7 +42,7 @@ StreamNook is the answer to this very specific but deeply relatable problem. Bui
   <img src="src-tauri/images/platforms.png" alt="Platform picker showing Twitch, Kick, and YouTube with live counts" width="1000" />
 </div>
 
-**One list, every platform.** A picker in the title bar switches between Twitch, Kick, and YouTube, or shows all of them at once, with a live count for each. Your follows from every connected account land in one list on Home and in the sidebar, so a single glance tells you what is live.
+**One list, every platform.** A picker in the title bar switches between Twitch, YouTube, Kick, and TikTok, or shows all of them at once, with a live count for each. Your follows from every connected account land in one list on Home and in the sidebar, so a single glance tells you what is live.
 
 **Browse and watch the same way everywhere.** Directories, categories, and channel search per platform, all opening in the same player with the same quality control, theater mode, Compact View, and MultiNook.
 
@@ -45,7 +50,7 @@ StreamNook is the answer to this very specific but deeply relatable problem. Bui
   <img src="src-tauri/images/home_platforms.png" alt="Followed channels from every platform in one list" width="1000" />
 </div>
 
-**Chat with the tools you already use.** Replies, mentions, tab completion, moderation, user cards, and room mode indicators on every platform, plus each one's own events rendered properly: Kick subscriptions, gifted subs, and pins, YouTube Super Chats, Super Stickers, memberships, and gift redemptions. Chat opens with recent history instead of an empty pane.
+**Chat with the tools you already use.** Replies, mentions, tab completion, moderation, user cards, and room mode indicators on every platform, plus each one's own events rendered properly: Kick subscriptions, gifted subs, and pins; YouTube Super Chats, Super Stickers, memberships, and gift redemptions; TikTok gifts, follows, shares, and likes. Chat opens with recent history instead of an empty pane.
 
 **7TV everywhere.** Channel emote sets, paints, and badges resolve on Kick and YouTube too, for you and for everyone else in chat. Kick's own channel emotes are in the picker, and YouTube's custom emoji are learned from chat as they arrive.
 
@@ -216,7 +221,7 @@ Rust, TypeScript, React, and Tailwind. Packaged as a native desktop app with Tau
 
 1. Grab the latest build from the [Releases page](https://github.com/StreamNook/StreamNook/releases/latest).
 2. Extract and run.
-3. Follow the setup wizard to sign in with Twitch, then connect Kick or YouTube from Settings whenever you want them.
+3. Follow the setup wizard to sign in with Twitch, then connect YouTube, Kick, or TikTok from Settings whenever you want them.
 
 Everything's built in. Nothing else to install.
 
@@ -226,7 +231,7 @@ Everything's built in. Nothing else to install.
 - [Plyr](https://plyr.io/), video player.
 - [HLS.js](https://github.com/video-dev/hls.js), HLS streaming support.
 - [7TV](https://7tv.app/), extended emotes and cosmetics.
-- [Twitch](https://dev.twitch.tv/), [Kick](https://kick.com/), and [YouTube](https://www.youtube.com/), platforms and APIs.
+- [Twitch](https://dev.twitch.tv/), [YouTube](https://www.youtube.com/), [Kick](https://kick.com/), and [TikTok](https://www.tiktok.com/live), platforms and APIs.
 
 ## License
 

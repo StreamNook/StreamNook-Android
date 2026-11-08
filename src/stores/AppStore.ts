@@ -8,6 +8,7 @@ import { getAppVersion } from '../utils/appVersion';
 // Direct import (not via the keybindings index) to avoid a storecommands cycle.
 import { getPlayerControls } from '../keybindings/playerControls';
 import { qualitiesEquivalent } from '../utils/quality';
+import { compactChatPlacement } from '../utils/compactView';
 import { reportCodecPreference } from '../utils/codecPreference';
 import { setInlineEmoteScale } from '../services/emoteService';
 import { updatePresence } from '../services/supabaseService';
@@ -206,25 +207,6 @@ interface DropsCache {
 // Cache duration: 15 minutes in milliseconds (backend uses 5 min, we use 15 for frontend)
 const DROPS_CACHE_DURATION = 15 * 60 * 1000;
 
-// Whisper import progress tracking
-export interface WhisperImportProgress {
-  step: number;
-  status: 'pending' | 'running' | 'complete' | 'error';
-  detail: string;
-  current: number;
-  total: number;
-}
-
-export interface WhisperImportState {
-  isImporting: boolean;
-  progress: WhisperImportProgress;
-  estimatedEndTime: number | null; // Unix timestamp when import should finish
-  totalConversations: number;
-  exportProgress: { current: number; total: number; username: string };
-  result: { conversations: number; messages: number } | null;
-  error: string | null;
-}
-
 export interface AppState {
   settings: Settings;
   followedStreams: TwitchStream[];
@@ -320,6 +302,10 @@ export interface AppState {
   offlineRoomLive: TwitchStream | null;
   /** The room is starting its now-live stream. */
   offlineRoomJoining: boolean;
+  /** Counts the viewer's opens (a stream, its offline room, a VOD or clip),
+   *  so the phone puts that chat in front even when the channel did not
+   *  change. A restart or a quality change is not an open. */
+  streamOpenSeq: number;
   /** Whether the current live broadcast can be rewound (the channel keeps
    *  VODs). null while unknown or not live; Rust answers once per live start
    *  from a cached lookup, so the player can say "VODs are off" up front. */
@@ -441,8 +427,6 @@ export interface AppState {
   songsPanel: { focus: string | null } | null;
   showDashboardOverlay: boolean;
   whisperTargetUser: { id: string; login: string; display_name: string; profile_image_url?: string } | null;
-  // Whisper import state (persistent across wizard open/close)
-  whisperImportState: WhisperImportState;
   isHomeActive: boolean;
   isAuthenticated: boolean;
   // True from launch until the initial credential check resolves. The boot
@@ -567,7 +551,9 @@ export interface AppState {
   patchCurrentStream: (partial: Partial<TwitchStream>) => void;
   /** `sticky` keeps the toast on screen until it is dismissed or removed by
    *  id; pass `id` to be able to remove it. */
-  addToast: (message: string | React.ReactNode, type: 'info' | 'success' | 'warning' | 'error' | 'live' | 'channel_points', action?: { label: string; onClick: () => void }, options?: { skipIsland?: boolean; alwaysShow?: boolean; avatarUrl?: string; avatarSevenTvId?: string; source?: 'plugin'; sticky?: boolean; id?: number; title?: string; songKey?: string }) => void;
+  /** `islandOnly` records it in the Dynamic Island's history without the
+   *  toast, for an answer already shown elsewhere. */
+  addToast: (message: string | React.ReactNode, type: 'info' | 'success' | 'warning' | 'error' | 'live' | 'channel_points', action?: { label: string; onClick: () => void }, options?: { skipIsland?: boolean; islandOnly?: boolean; alwaysShow?: boolean; avatarUrl?: string; avatarSevenTvId?: string; source?: 'plugin'; sticky?: boolean; id?: number; title?: string; songKey?: string }) => void;
   removeToast: (id: number) => void;
   loadSettings: () => Promise<void>;
   updateSettings: (newSettings: Settings) => Promise<void>;
@@ -719,9 +705,6 @@ export interface AppState {
   loadActiveDropsCache: (forceRefresh?: boolean) => Promise<void>;
   getDropsCampaignByGameId: (gameId: string) => DropCampaign | undefined;
   getDropsCampaignByGameName: (gameName: string) => DropCampaign | undefined;
-  // Whisper import actions
-  setWhisperImportState: (state: Partial<WhisperImportState>) => void;
-  resetWhisperImportState: () => void;
   // Mod Logs State
   modLogs: ModLogEvent[];
   /** Channels whose persisted history has already been merged in this session (avoids re-loading). */
@@ -801,7 +784,7 @@ function whenBootSettled(task: () => void): void {
 // the chat panes stay here.
 
 /** Why the player reloaded a live stream by itself (see `note_playback_reload`). */
-export type AutoReloadReason = 'stall' | 'no-buffer' | 'gave-up';
+export type AutoReloadReason = 'stall' | 'no-buffer' | 'gave-up' | 'wedge';
 
 type StoreSet = (partial: Partial<AppState>) => void;
 type StoreGet = () => AppState;
@@ -1078,6 +1061,16 @@ let transientSwapSeq = 0;
 // The restart that is running. A second restart asked for meanwhile is that
 // one, so two relay cycles never overlap.
 let restartInFlight: Promise<void> | null = null;
+/**
+ * Counts an automatic reload in Rust once its restart is the one running and
+ * still wanted, before its relay stops (Rust reads the channel the relay
+ * serves): repeated reloads hold low latency, and HEVC and AV1 on a Twitch
+ * channel, off for a while, which the start that follows then honors.
+ */
+async function countReload(login: string, reason: AutoReloadReason | undefined): Promise<void> {
+  if (!reason) return;
+  await invoke<boolean>('note_playback_reload', { login, reason }).catch(() => false);
+}
 async function settleTransientSwap(): Promise<void> {
   if (transientSwapInFlight) await transientSwapInFlight.catch(() => {});
 }
@@ -1229,7 +1222,7 @@ async function startProviderStream(
   const superseded = () => seq !== providerStartSeq;
   const loadTicket = ++startLoadSeq;
   showSwitchAtOnce(provider, channel, seed, set, get);
-  set({ isLoading: true });
+  set({ isLoading: true, streamOpenSeq: get().streamOpenSeq + 1 });
   trackActivity(`Started watching: ${key}`);
 
   // Tear down the previous provider stream's chat. Drops and channel points
@@ -1578,6 +1571,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   offlineRoom: null,
   offlineRoomLive: null,
   offlineRoomJoining: false,
+  streamOpenSeq: 0,
   liveRewindAvailable: null,
   liveRewindAnchor: null,
   liveLeftOffSecs: null,
@@ -1892,17 +1886,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       void invoke('refresh_home_section', { section: 'continue_watching' }).catch(() => {});
     }
   },
-  // Whisper import state
-  whisperImportState: {
-    isImporting: false,
-    progress: { step: 0, status: 'pending', detail: '', current: 0, total: 4 },
-    estimatedEndTime: null,
-    totalConversations: 0,
-    exportProgress: { current: 0, total: 0, username: '' },
-    result: null,
-    error: null,
-  },
-
   patchCurrentStream: (partial) => {
     const current = get().currentStream;
     if (!current) return;
@@ -1969,6 +1952,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }).catch(() => {});
       }
     }
+    if (options?.islandOnly) return;
 
     // Gate the minor "action feedback" toasts (copy, follow, mod result,
     // quality change, login, etc.) behind the user's notification settings.
@@ -2053,7 +2037,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     // (Settings::retire_oled_v2), so every shell gets it.
     const state = get();
     if (state.isTheaterMode) {
-      set({ settings, originalChatPlacement: settings.chat_placement });
+      // Compact View hides chat unless the viewer keeps it there.
+      set({
+        settings,
+        originalChatPlacement: settings.chat_placement,
+        chatPlacement: compactChatPlacement(settings.chat_placement, settings.keep_chat_in_compact === true),
+      });
     } else {
       set({ settings, chatPlacement: settings.chat_placement });
     }
@@ -2097,8 +2086,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     for (const key of RUST_ONLY_KEYS) kept[key] = (state.settings as unknown as Record<string, unknown>)[key];
     const next = { ...newSettings, ...kept } as Settings;
     if (state.isTheaterMode) {
-      // Don't un-hide the chat if we're in compact/theater mode, just quietly update the original placement
-      set({ settings: next, originalChatPlacement: next.chat_placement });
+      // Compact View keeps chat hidden unless the viewer keeps it there; either
+      // way the placement to come back to follows the change.
+      set({
+        settings: next,
+        originalChatPlacement: next.chat_placement,
+        chatPlacement: compactChatPlacement(next.chat_placement, next.keep_chat_in_compact === true),
+      });
     } else {
       set({ settings: next, chatPlacement: next.chat_placement });
     }
@@ -2304,6 +2298,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         currentStream: parsedInfo,
         currentMediaType: type,
         originalMediaUrl: url,
+        streamOpenSeq: get().streamOpenSeq + 1,
         vodPlayback:
           type === 'video' && result.vod
             ? info.start_at != null
@@ -2582,14 +2577,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     Logger.info(`[Stream] Restarting stream for ${currentStream.user_login}...`);
     trackActivity('Restarted stream');
-    if (options?.reason) {
-      // Counted and logged in Rust; repeated reloads turn low latency off
-      // for a while, which the start below then honors.
-      await invoke<boolean>('note_playback_reload', {
-        login: currentStream.user_login,
-        reason: options.reason,
-      }).catch(() => false);
-    }
 
     // Save current stream info
     const channel = currentStream.user_login;
@@ -2615,6 +2602,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         release();
         return;
       }
+      await countReload(channel, options?.reason);
       try {
         set({ isRestartingStream: true });
         await invoke('stop_stream');
@@ -2677,6 +2665,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       release();
       return;
     }
+    await countReload(channel, options?.reason);
 
     try {
       // Freeze the running player's loader BEFORE the backend goes down: the relay
@@ -2869,12 +2858,13 @@ export const useAppStore = create<AppState>((set, get) => ({
             ? `https://twitch.tv/${currentStream.user_login}`
             : buildProviderUrl(provider, currentStream.user_login);
         const targetUrl = currentMediaType !== 'live' && originalMediaUrl ? originalMediaUrl : liveUrl;
-        const result = await invoke<StreamStartResult>('change_stream_quality', {
+        // `start_stream`, not `change_stream_quality`: this swap is not the
+        // viewer's pick, so a codec hold on the channel stays.
+        const result = await invoke<StreamStartResult>('start_stream', {
           url: targetUrl,
           quality,
         });
-        // change_stream_quality is start_stream underneath: it brought the relay
-        // up for `login`. Closing PiP with its X fires visibilitychange (this
+        // start_stream brought the relay up for `login`. Closing PiP with its X fires visibilitychange (this
         // downshift) and sn:pip-closed (exitStream) in the same instant, and the
         // late swap used to remount the player on an audio-only URL with
         // currentStream already null: audio, no overlay, no card, nothing on
@@ -2994,6 +2984,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Phone: the new channel's header now, the old video gone now.
     const loadTicket = ++startLoadSeq;
     showSwitchAtOnce('twitch', channel, providedStreamInfo, set, get);
+    set({ streamOpenSeq: get().streamOpenSeq + 1 });
 
     // Leaving a provider stream for a Twitch one: drop its chat + offline poll
     // before the Twitch session sets up its own.
@@ -3172,6 +3163,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // chatOnly: live, but playback failed. The room offers it again.
         offlineRoomLive: opts?.chatOnly ? (room?.live ?? null) : null,
         offlineRoomJoining: false,
+        streamOpenSeq: get().streamOpenSeq + 1,
       });
 
       // Warm up the chat bridge. claim:false for the same reason as the live
@@ -3219,6 +3211,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         // The overlay names what is playing; the login (and so the chat and the
         // go-live watch) stays the room's.
         currentStream: cs ? { ...cs, title: vod.title, game_name: vod.category || cs.game_name, started_at: vod.created_at } : cs,
+        streamOpenSeq: get().streamOpenSeq + 1,
       });
       // The VOD's own chat (synced replay) by default, with the toggle back to
       // the channel's live chat.
@@ -3404,11 +3397,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     trackActivity(newTheaterMode ? 'Enabled Theater Mode' : 'Disabled Theater Mode');
 
     if (newTheaterMode) {
-      // Entering theater mode - save current chat placement and hide chat
+      // Entering Compact View - save the chat placement and hide chat, unless
+      // the viewer keeps chat in Compact View.
       set({
         isTheaterMode: true,
         originalChatPlacement: state.chatPlacement,
-        chatPlacement: 'hidden'
+        chatPlacement: compactChatPlacement(state.chatPlacement, state.settings.keep_chat_in_compact === true),
       });
     } else {
       // Exiting theater mode - restore original chat placement
@@ -3761,14 +3755,6 @@ export const useAppStore = create<AppState>((set, get) => ({
             avatarSevenTvId: userInfo.id,
           }),
         );
-      }
-
-      // Start whisper listener after successful authentication
-      try {
-        await invoke('start_whisper_listener');
-        Logger.debug('[Auth] Whisper listener started');
-      } catch (whisperError) {
-        Logger.warn('[Auth] Could not start whisper listener:', whisperError);
       }
     } catch (e) {
       // Check if user was previously authenticated (session expired)
@@ -4127,27 +4113,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   getDropsCampaignByGameName: (gameName: string) => {
     const campaigns = get().dropsCache?.byGameName.get(gameName.toLowerCase());
     return campaigns?.[0];
-  },
-
-  // Whisper import state management
-  setWhisperImportState: (state: Partial<WhisperImportState>) => {
-    set((prev) => ({
-      whisperImportState: { ...prev.whisperImportState, ...state },
-    }));
-  },
-
-  resetWhisperImportState: () => {
-    set({
-      whisperImportState: {
-        isImporting: false,
-        progress: { step: 0, status: 'pending', detail: '', current: 0, total: 4 },
-        estimatedEndTime: null,
-        totalConversations: 0,
-        exportProgress: { current: 0, total: 0, username: '' },
-        result: null,
-        error: null,
-      },
-    });
   },
 }));
 

@@ -31,7 +31,7 @@ extern crate sn_tauri_headless as tauri;
 uniffi::setup_scaffolding!();
 
 use commands::chat_query::{
-    get_chat_history_stats, get_chat_rule_errors, search_chat, validate_chat_filter,
+    get_chat_history_stats, get_chat_rule_errors, search_chat, preview_chat_rows, validate_chat_filter,
     validate_chat_phrase,
 };
 use commands::moderation_tools::{
@@ -47,7 +47,7 @@ use commands::stream_manager::{
     check_stream_info, get_reward_queue, get_stream_manager, search_raid_targets, stream_manager_act,
 };
 use commands::{
-    accounts::*, activity_history::*, announcements::*, app::*, automation::*, badge_metadata::*, badge_service::*,
+    accounts::*, activity_history::*, announcements::*, app::*, badge_metadata::*, badge_service::*,
     badges::*, bits::*, cache::*, channel_links::*, channel_panels::*, channel_state::*, chat::*, chat_identity::*, components::*,
     cosmetics_cache::*, diagnostic_logging::*, drops::*, emoji::*, emote_prefetch::*,
     emotes::*, eventsub::*, ffz::*, gifs::*, helix::*, home_snapshot::*, shared_chat::*, fonts::*, hype_train::*, identity::*, justlog::*, layout::*,
@@ -57,7 +57,7 @@ use commands::{
     seventv_cosmetics_fetch::*, sn_cosmetics::*, song_id::*, spellcheck::*, streamnook_api::*, streaming::*, subscriptions::*,
     text_segments::*, twitch::*,
     universal_cache::*,
-    user_profile::*, vod_progress::*, watch_session::*, watch_streak::*, whisper_storage::*, mention_inbox::*, window_state::*,
+    user_profile::*, vod_progress::*, watch_session::*, watch_streak::*, whispers::*, mention_inbox::*, window_state::*,
 };
 // Desktop-only feature modules, excluded from the phone app (watch/earn/chat
 // only): MultiNook tiling, Discord RPC, and profile-card screen capture.
@@ -423,6 +423,7 @@ fn load_settings_from_file() -> Result<Settings, Box<dyn std::error::Error>> {
     settings.enable_low_latency_engine_once();
     settings.scope_blend_header_marks_once();
     settings.move_room_modes_to_prompt_once();
+    settings.move_badge_fold_to_show_all_once();
     settings.adopt_first_run_look_once();
     settings.retire_mod_tiles();
     settings.lift_custom_theme_muted();
@@ -684,7 +685,7 @@ pub(crate) fn flush_debounced_stores() {
     let _ = commands::settings::flush_settings_now();
     let _ = services::universal_cache_service::flush_manifest_now();
     let _ = services::mod_log_storage_service::ModLogStorageService::flush_now();
-    let _ = services::whisper_storage_service::WhisperStorageService::flush_now();
+    let _ = services::whisper_store::flush_now();
     let _ = services::mention_inbox::flush_now();
     let _ = services::vod_progress_service::flush_now();
     #[cfg(desktop)]
@@ -1043,6 +1044,8 @@ pub fn run() {
             #[cfg(desktop)]
             if payload.event() == tauri::webview::PageLoadEvent::Started {
                 services::performance_mode::note_window_destroyed(webview.label());
+                // A new page shows no whisper conversation until it says so.
+                services::whisper_claims::clear_label(webview.label());
             }
             if webview.label() == "main" && payload.event() == tauri::webview::PageLoadEvent::Started {
                 // What the old page declared to Discord presence goes with it.
@@ -1071,6 +1074,10 @@ pub fn run() {
             // below, once its data folder is known.
             #[cfg(desktop)]
             services::asset_scope::allow_app_assets(app.handle());
+            // Every connected 7TV session re-minted before its 30 days run out,
+            // at launch and every few hours while the app stays open.
+            #[cfg(desktop)]
+            commands::seventv_cosmetics::spawn_seventv_keepalive(app.handle().clone());
             // Linux builds the main window here instead of from the config
             // (tauri.linux.conf.json sets `create: false`), after every plugin
             // has registered its init script, and always opaque: the CEF
@@ -1531,6 +1538,10 @@ pub fn run() {
             // Manage AppState directly, not wrapped in Arc
             app.manage(app_state);
 
+            // Drops progress for the channel being earned on: one model for
+            // every surface, and the app's one inventory reader.
+            services::watch_drops::start(app_handle.clone());
+
             // Discord Rich Presence reads the switch and the style from AppState.
             #[cfg(desktop)]
             services::discord_presence::init(&app_handle);
@@ -1571,6 +1582,13 @@ pub fn run() {
             );
             services::cosmetics_registry::start();
             services::member_theme::start();
+            // The update manifest's reserved words, read once in the background so
+            // the page link has the live list (the committed one stands until it
+            // answers). Nothing waits on it.
+            services::client_config::warm();
+            // Your own accolades: a clock that notices a new local date (and claims the
+            // day's login accolades again) and pokes the grant every half hour.
+            services::own_accolades::start();
 
             // Twitch Recap hours for the signed-in member, published so the profile
             // can count the watching they did before joining. Daily, and a no-op
@@ -1883,6 +1901,10 @@ pub fn run() {
             #[cfg(mobile)]
             set_app_foreground,
             #[cfg(mobile)]
+            set_app_interactive,
+            #[cfg(mobile)]
+            twitch_integrity_minted,
+            #[cfg(mobile)]
             set_low_power,
             #[cfg(mobile)]
             get_app_presence,
@@ -2060,12 +2082,7 @@ pub fn run() {
             get_games_by_ids,
             get_videos_by_game,
             get_user_videos,
-            send_whisper,
-            start_whisper_listener,
-            get_whisper_history,
             search_whisper_user,
-            import_all_whisper_history,
-            refresh_whisper_history,
             // Streaming commands
             start_stream,
             resolve_clip_media,
@@ -2163,6 +2180,7 @@ pub fn run() {
             validate_chat_phrase,
             get_chat_rule_errors,
             get_chat_history_stats,
+            preview_chat_rows,
             get_automod_queue,
             resolve_automod_message,
             moderate_chatter,
@@ -2394,6 +2412,7 @@ pub fn run() {
             equip_evolution_lane,
             get_badge_drop_campaign,
             get_badge_earn_guide,
+            resolve_watch_places,
             // Badge Metadata commands
             fetch_badge_metadata,
             // Link preview commands
@@ -2483,7 +2502,6 @@ pub fn run() {
             open_drop_details,
             // Prediction commands
             place_prediction,
-            get_active_prediction,
             get_channel_points_for_channel,
             // Poll commands
             vote_on_poll,
@@ -2544,10 +2562,17 @@ pub fn run() {
             whisper_set_active,
             whisper_mark_read,
             whisper_send,
-            whisper_import,
-            whisper_refresh,
             whisper_list,
-            whisper_thread,
+            whisper_page,
+            whisper_mark_all_read,
+            whisper_retry,
+            whisper_discard,
+            whisper_archive,
+            whisper_load_older,
+            whisper_sync_now,
+            whisper_island_clear,
+            inbox_opened,
+            whisper_status,
             // Mentions inbox
             get_mention_inbox,
             get_inbox_view,
@@ -2579,6 +2604,12 @@ pub fn run() {
             user_profile_sheet_cached,
             own_identity_header,
             own_identity_header_cached,
+            streamnook_profile_link,
+            profile_changed,
+            sn_member_ids,
+            own_accolades,
+            own_accolades_cached,
+            grant_own_accolade,
             cosmetics_picker_state,
             external_cosmetics_state,
             // Server-controlled client switches
@@ -2589,6 +2620,10 @@ pub fn run() {
             get_rewards_drops,
             // The phones' in-player drop bar
             get_watch_drop,
+            // Drops progress in chat: the shared model and its stall episode
+            get_watch_drops,
+            set_drops_lip_hidden,
+            ack_drop_stall,
             // 7TV cosmetics, resolved once for every window
             seventv_user_cosmetics,
             seventv_user_inventory,
@@ -2662,17 +2697,6 @@ pub fn run() {
             get_all_seventv_badges,
             get_all_seventv_paints,
             get_seventv_paint_usage,
-            // Automation commands (whisper scraper only — desktop-only webview scrape)
-            #[cfg(desktop)]
-            scrape_whispers,
-            #[cfg(desktop)]
-            receive_whisper_export,
-            emit_whisper_progress,
-            // Whisper Storage commands
-            load_whisper_storage,
-            delete_whisper_conversation,
-            get_whisper_storage_path,
-            migrate_whispers_from_localstorage,
             // Log commands
             log_message,
             log_messages_batch,
@@ -2906,9 +2930,16 @@ pub fn run() {
                 services::performance_mode::note_focus(*focused);
             }
 
+            // A whisper conversation counts as read only while its own window
+            // has focus, on every desktop OS.
+            if let WindowEvent::Focused(focused) = event {
+                services::whisper_claims::note_focus(&label, *focused);
+            }
+
             if let WindowEvent::Destroyed = event {
                 services::app_exit::note_window_destroyed(&label);
                 services::performance_mode::note_window_destroyed(&label);
+                services::whisper_claims::forget_window(&label);
                 // A destroyed webview never runs its React cleanup, so any
                 // chat consumer claims it still holds would pin those channels
                 // JOINed (and their IRC traffic flowing) forever. Sweep them;

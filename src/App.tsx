@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
 import { IS_MOBILE, isPortrait, onOrientationChange } from './utils/platform';
 import MobileNav from './components/mobile/MobileNav';
-import { useAppStore, type WhisperImportProgress, type SettingsTab } from './stores/AppStore';
+import { useAppStore, type SettingsTab } from './stores/AppStore';
 import { listenForSettingsUpdates } from './utils/settingsBroadcast';
 import { trackPresence, isSupabaseConfigured, incrementStat, subscribeToStreamNookRegistry, subscribeToCosmeticsRegistry, subscribeToAtmospheresRegistry, refreshEntitlementRegistries } from './services/supabaseService';
 import { primeClientConfig } from './services/clientConfig';
@@ -65,6 +65,7 @@ import { useThemeBoot } from './boot/useThemeBoot';
 import { getLogicalInnerSize, clampToWorkArea } from './utils/windowSizing';
 import { isTitlebarDragActive } from './utils/titleBarDrag';
 import { getSelectedCompactViewPreset } from './constants/compactViewPresets';
+import { compactChatSlot } from './utils/compactView';
 import { afterBoot, type BootTier } from './utils/startupScheduler';
 import { getAppVersion, primeClientIdentity } from './utils/appVersion';
 import { OPEN_CHANGELOG_EVENT, requestChangelog, type OpenChangelogDetail } from './utils/changelogEvents';
@@ -1058,21 +1059,8 @@ function App() {
       if (isAuthenticated && currentUser?.user_id) {
         Logger.debug('[App] Pre-fetching cosmetics for current user...');
 
-        // Keep the 7TV session alive. Its tokens last 30 days and an expired one
-        // reads as signed out; the hidden-window re-mint has existed for linked
-        // accounts all along and simply never ran for the primary. Deferred past
-        // the boot burst and throttled inside.
-        {
-          const primaryId = currentUser.user_id;
-          setTimeout(() => {
-            void Promise.all([
-              import('./services/sevenTvSession'),
-              import('./services/accountService'),
-            ]).then(([session, accounts]) =>
-              session.maybeRefreshSevenTvSession(() => accounts.refreshSeventvForAccount(primaryId)),
-            );
-          }, 10000);
-        }
+        // The 7TV session is kept alive in Rust (seventv_cosmetics.rs,
+        // spawn_seventv_keepalive): at launch and every 6 hours while open.
         const { registerOwnCosmeticAccounts, revalidateOwnCosmetics, getFullProfileWithFallback } =
           await import('./services/cosmeticsCache');
         const { seedOwnIdentitiesFromCache, getResolvedIdentity, getIdentityWithCache } =
@@ -1192,65 +1180,6 @@ function App() {
         Logger.debug('[App] Automation status update:', event.payload.active);
         useAppStore.getState().setDropProgressActive(event.payload.active);
       });
-
-      // Listen for whisper import events (global listener so import works from any UI)
-      await addListener<{ step: number; status: string; detail: string; current: number; total: number }>(
-        'whisper-import-progress',
-        (event) => {
-          const { step, status, detail, current, total } = event.payload;
-          const { setWhisperImportState } = useAppStore.getState();
-          setWhisperImportState({
-            progress: { step, status: status as WhisperImportProgress['status'], detail, current, total }
-          });
-
-          // Track export progress for step 3
-          if (step === 3 && status === 'running') {
-            const match = detail.match(/Exporting: (.+)/);
-            setWhisperImportState({
-              exportProgress: { current, total, username: match ? match[1] : '' }
-            });
-          }
-
-          // When step 2 completes, set the estimated end time
-          if (step === 2 && status === 'complete') {
-            const countMatch = detail.match(/Found (\d+) conversations/);
-            if (countMatch) {
-              const count = parseInt(countMatch[1], 10);
-              const SECONDS_PER_CONVERSATION = 3;
-              const estimatedSeconds = count * SECONDS_PER_CONVERSATION;
-              const endTime = Date.now() + (estimatedSeconds * 1000);
-              setWhisperImportState({
-                totalConversations: count,
-                estimatedEndTime: endTime
-              });
-            }
-          }
-        }
-      );
-
-      await addListener<{ success: boolean; message: string; conversations: number; messages: number }>(
-        'whisper-import-complete',
-        (event) => {
-          const { success, message, conversations, messages } = event.payload;
-          const { setWhisperImportState, addToast } = useAppStore.getState();
-          if (success) {
-            Logger.debug('[App] Whisper import completed:', conversations, 'conversations,', messages, 'messages');
-            setWhisperImportState({
-              isImporting: false,
-              result: { conversations, messages },
-              error: null
-            });
-            addToast(`Imported ${messages.toLocaleString()} whisper messages from ${conversations} conversations`, 'success');
-          } else {
-            Logger.error('[App] Whisper import failed:', message);
-            setWhisperImportState({
-              isImporting: false,
-              error: message
-            });
-            addToast(`Whisper import failed: ${message}`, 'error');
-          }
-        }
-      );
 
       // Listen for reserved stream going offline (watch token allocation feature)
       await addListener('reserved-stream-offline', () => {
@@ -1559,11 +1488,39 @@ function App() {
           const targetWidth = preset.width - windowBorderWidth;
           // Recalculate height to maintain 16:9 aspect ratio based on adjusted width
           const videoHeight = Math.round(targetWidth / 16 * 9);
-          const targetHeight = videoHeight + titleBarHeight;
+          let targetHeight = videoHeight + titleBarHeight;
+          let windowWidth = targetWidth;
 
-          Logger.debug(`Entering compact view - resizing to: ${targetWidth}x${targetHeight} (${preset.name}, video: ${targetWidth}x${videoHeight})`);
+          // "Keep chat": the preset is still the whole window, and docked chat
+          // fits inside it by the aspect lock's own rule (Rust): side chat keeps
+          // the width and the window gets shorter, bottom chat keeps the height
+          // and it gets narrower, so the picture stays 16:9 with no bars.
+          // chatSizeRef, not chatSize: a placement change resets the size in the
+          // placement effect, which runs before this one in the same commit.
+          const slot = compactChatSlot({
+            placement: chatPlacement,
+            chatSize: chatSizeRef.current,
+            revealOnHover: autoHideActive,
+            chatInPopout: activeChatChannelInPopoutRef.current,
+          });
+          if (slot) {
+            const [fitWidth, fitHeight] = await invoke<[number, number]>('calculate_aspect_ratio_size', {
+              currentWidth: targetWidth,
+              currentHeight: targetHeight,
+              chatSize: slot.chatSize,
+              chatPlacement: slot.placement,
+              titleBarHeight: titleBarHeight,
+              targetAspectRatio: 16.0 / 9.0,
+              uiWidthOffset: slot.uiWidthOffset,
+              uiHeightOffset: slot.uiHeightOffset,
+            });
+            windowWidth = fitWidth;
+            targetHeight = fitHeight;
+          }
+
+          Logger.debug(`Entering compact view - resizing to: ${windowWidth}x${targetHeight} (${preset.name}, chat: ${slot ? `${slot.placement} ${slot.chatSize}` : 'hidden'})`);
           selfResizeUntilRef.current = Date.now() + 300;
-          await window.setSize(new LogicalSize(targetWidth, targetHeight));
+          await window.setSize(new LogicalSize(windowWidth, targetHeight));
         } else if (savedWindowSize) {
           // Exiting theater mode - restore previous size
           Logger.debug('Exiting compact view - restoring to:', savedWindowSize.maximized ? 'maximized' : `${savedWindowSize.width}x${savedWindowSize.height}`);
@@ -1580,7 +1537,7 @@ function App() {
 
     handleTheaterMode();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isTheaterMode, streamUrl, settings.compact_view?.selectedPresetId, aspectBarReserve]); // Re-run if the preset or the title bar's row changes while in compact view
+  }, [isTheaterMode, streamUrl, settings.compact_view?.selectedPresetId, aspectBarReserve, chatPlacement, autoHideActive]); // Re-run if the preset, the title bar's row, or where chat sits changes while in compact view (Keep chat moves chatPlacement)
 
   // Keep-on-top, scoped to Compact View. The only place that calls
   // setAlwaysOnTop for the main window: the store action just writes the

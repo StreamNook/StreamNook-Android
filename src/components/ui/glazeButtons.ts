@@ -16,6 +16,10 @@ export const ACCENT_FILL: CSSProperties = { background: 'color-mix(in srgb, var(
  *  the theme's red mixed into black, kept dark enough for white text. */
 export const DANGER_FILL: CSSProperties = { background: 'color-mix(in srgb, var(--color-error) 62%, black)' };
 
+/** The filled button for taking something earned (Claim on a drop): the
+ *  theme's green mixed into black, kept dark enough for white text. */
+export const SUCCESS_FILL: CSSProperties = { background: 'color-mix(in srgb, var(--color-success) 62%, black)' };
+
 /** Every other button beside it (Deny, Cancel, a timeout length, a saved
  *  reason): the same capsule and `glaze-inset` lighting on a light film, a
  *  step quieter than the filled one. Callers set height, padding and size. */
@@ -33,3 +37,9 @@ export const GLAZE_BANNER = 'chrome-glaze';
  *  rounded utilities, so it is set inline), and a little frost, so the banner's
  *  quieter lines stay readable over a theme's art. */
 export const BANNER_STYLE = { borderRadius: 14, '--glaze-frost': '24%' } as CSSProperties;
+
+/** A one or two line strip just above the message box (the reply card, a
+ *  /spam run's progress, the /nuke dry run): the banner's glaze, a little
+ *  tighter. Pair with `COMPOSER_STRIP_STYLE`. */
+export const COMPOSER_STRIP = `${GLAZE_BANNER} relative mb-2 flex items-center gap-2.5 py-2 pl-3 pr-1.5`;
+export const COMPOSER_STRIP_STYLE = { borderRadius: 12, '--glaze-frost': '24%' } as CSSProperties;

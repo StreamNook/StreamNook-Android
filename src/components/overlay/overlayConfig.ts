@@ -247,6 +247,9 @@ export interface OverlayStyle {
    *  '7tv'). Each provider toggles independently, on top of the global
    *  showThirdPartyBadges master. See THIRD_PARTY_BADGE_PROVIDERS. */
   hiddenBadgeProviders: string[];
+  /** Opt-in badge providers switched ON, by id (OPT_IN_BADGE_PROVIDERS). Those
+   *  start off, so an overlay saved before one existed never gains it. */
+  shownBadgeProviders: string[];
   /** Badges shown before the rest fold into a static "+N" (0 = all). The
    *  overlay's own choice, apart from chat's. Default 3. */
   badgeLimit: number;
@@ -336,6 +339,9 @@ export interface OverlayStyle {
   /** Hide chat messages containing any of these words/phrases (case-insensitive
    *  substring). Never hides events. */
   hidePhrases: string[];
+  /** Hide chat messages that are nothing but links (punctuation aside). A link
+   *  with any words or emotes beside it still shows. Never hides events. */
+  hideLinkOnly: boolean;
   /** Remove a message this many seconds after it appeared on the overlay
    *  (0 = keep it until it scrolls off). */
   maxMessageAgeSec: number;
@@ -623,11 +629,26 @@ export const THIRD_PARTY_BADGE_PROVIDERS: { id: string; label: string }[] = [
   { id: 'moltorino', label: 'Moltorino' },
   { id: 'limerino', label: 'Limerino' },
   { id: 'jilchat', label: 'JilChat' },
+  { id: 'bchat', label: 'bChat' },
   { id: 'bttv', label: 'BTTV' },
   { id: 'chatsen', label: 'Chatsen' },
   { id: 'chatty', label: 'Chatty' },
   { id: 'dankchat', label: 'DankChat' },
 ];
+
+// Badge providers added after overlays were in use start OFF: an overlay shows
+// one only once its streamer switches it on (shownBadgeProviders), so a saved
+// overlay never gains badges it was not built with. Every new provider goes
+// here; the older ones show unless hidden (hiddenBadgeProviders).
+export const OPT_IN_BADGE_PROVIDERS: ReadonlySet<string> = new Set(['limerino', 'jilchat', 'bchat']);
+
+/** Whether a badge provider (a badge's `source`) is switched off in this overlay. */
+export function badgeProviderHidden(style: Pick<OverlayStyle, 'hiddenBadgeProviders' | 'shownBadgeProviders'>, id: string): boolean {
+  const key = id.toLowerCase();
+  return OPT_IN_BADGE_PROVIDERS.has(key)
+    ? !(style.shownBadgeProviders ?? []).includes(key)
+    : (style.hiddenBadgeProviders ?? []).includes(key);
+}
 
 // Twitch badge categories a streamer can hide, each listing its Twitch badge SET
 // ids. The same table as TWITCH_BADGE_CATEGORY_SETS in the backend's
@@ -729,6 +750,7 @@ export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
   showThirdPartyBadges: true,
   showAtmospheres: true,
   hiddenBadgeProviders: [],
+  shownBadgeProviders: [],
   badgeLimit: 3,
   hiddenTwitchBadgeCategories: [],
   ffzCustomRoleBadges: false,
@@ -741,6 +763,7 @@ export const DEFAULT_OVERLAY_STYLE: OverlayStyle = {
   firstTimeColor: '',
   eventOutlineColor: '',
   hidePhrases: [],
+  hideLinkOnly: false,
   maxMessageAgeSec: 0,
   maxMessageLines: 0,
   showAvatars: true,
@@ -925,11 +948,17 @@ export const clampOverlayStyle = (s: OverlayStyle): OverlayStyle => {
     hidePhrases: phrases,
     hiddenEvents: [],
     hiddenProviderEvents: Array.from(providerEvents),
-    badgeLimit: badgeFoldLimit(s.badgeLimit),
+    // The overlay keeps its own default; chat's "show all" default is not its.
+    badgeLimit: typeof s.badgeLimit === 'number' ? badgeFoldLimit(s.badgeLimit) : DEFAULT_OVERLAY_STYLE.badgeLimit,
     // Absent on configs saved before badge categories existed → every badge shows.
     hiddenTwitchBadgeCategories: Array.from(new Set(
       (Array.isArray(s.hiddenTwitchBadgeCategories) ? s.hiddenTwitchBadgeCategories : [])
         .filter((id) => TWITCH_BADGE_CATEGORIES.some((c) => c.id === id)),
+    )),
+    // Absent on configs saved before opt-in providers existed → all of them off.
+    shownBadgeProviders: Array.from(new Set(
+      (Array.isArray(s.shownBadgeProviders) ? s.shownBadgeProviders : [])
+        .filter((id) => typeof id === 'string' && OPT_IN_BADGE_PROVIDERS.has(id)),
     )),
     bubbleOpacity: clamp(s.bubbleOpacity ?? 0.55, OVERLAY_LIMITS.bubbleOpacity.min, OVERLAY_LIMITS.bubbleOpacity.max),
     bubbleRadius: Math.round(clamp(s.bubbleRadius ?? 10, OVERLAY_LIMITS.bubbleRadius.min, OVERLAY_LIMITS.bubbleRadius.max)),

@@ -41,12 +41,13 @@ import { RewardsScreen } from './screens/RewardsScreen';
 import { CosmeticsScreen } from './screens/CosmeticsScreen';
 import { MentionsScreen } from './screens/MentionsScreen';
 import { installMentionInbox } from './mentions/mentionInbox';
-import { WhispersScreen } from './screens/WhispersScreen';
+import { WhisperSheet } from './whispers/WhisperSheet';
 import { SongsScreen } from './screens/SongsScreen';
 import { installWhisperInbox } from './whispers/whisperInbox';
 import { MobileClipSheet } from './watch/MobileClipSheet';
 import { MobileChannelSheet } from './watch/MobileChannelSheet';
 import { ChannelHoldSheet } from './ui/ChannelHold';
+import { BadgeSheet } from './chat/BadgeSheet';
 import LoadingWidget from '../components/LoadingWidget';
 import DeviceLoginOverlay from '../components/DeviceLoginOverlay';
 import ToastManager from '../components/ToastManager';
@@ -176,7 +177,7 @@ const MobileApp: React.FC = () => {
   useEffect(() => installLifecycle(), []);
   // The mentions unread count (the You row and the chat menu read it).
   useEffect(() => installMentionInbox(), []);
-  // The whisper list and its unread count, kept current by Rust's events.
+  // Whisper status and Rust's whisper changes, for the inbox and the conversation sheet.
   useEffect(() => installWhisperInbox(), []);
   // Teach the resolver what this screen can show, before any stream resolves.
   useEffect(() => installVideoCap(), []);
@@ -256,8 +257,8 @@ const MobileApp: React.FC = () => {
           <SettingsScreen />
           {/* Over settings and the watch layer: the chat menu opens it too. */}
           <MentionsScreen />
-          {/* Over Mentions too: a whisper notification tap opens it from anywhere. */}
-          <WhispersScreen />
+          {/* Over the inbox too: a whisper notification tap opens a conversation from anywhere. */}
+          <WhisperSheet />
           {/* Over Whispers: a song card in any chat opens it too. */}
           <SongsScreen />
           {/* Consumes the same `clipModal` store field the desktop <ClipModal />
@@ -271,6 +272,8 @@ const MobileApp: React.FC = () => {
           {/* A held card's sheet: one for every card, so a card that moves or
               goes away after a press never takes the sheet with it. */}
           <ChannelHoldSheet />
+          {/* A badge tapped anywhere: rows, the +N fold, profiles. */}
+          <BadgeSheet />
         </>
       )}
 

@@ -1844,6 +1844,32 @@ export async function reconnectAllChannels(): Promise<void> {
  * automatic one within a minute of the last, or a window holding no Twitch room.
  */
 export async function rebuildTwitchChat(reason: string, force = false): Promise<boolean> {
+  const run = cycleTwitchChat(reason, force);
+  rebuildsInFlight.add(run);
+  // `rebuild_chat` has no deadline of its own: a join stops waiting on one
+  // that has not answered by then (an answer lost across a freeze), so a hung
+  // rebuild never holds every later join. The rebuild itself runs on.
+  const forget = setTimeout(() => rebuildsInFlight.delete(run), BRIDGE_CONNECT_TIMEOUT_MS);
+  try {
+    return await run;
+  } finally {
+    clearTimeout(forget);
+    rebuildsInFlight.delete(run);
+  }
+}
+
+/** Every rebuild from `rebuild_chat` to its reconnect, while it runs: a Twitch
+ *  join waits for them (see acquireChannel). Each is tracked on its own, so a
+ *  second ask that Rust declines at once (the stale watchdog and the return
+ *  both asking) never ends the wait for the one still running. */
+const rebuildsInFlight = new Set<Promise<boolean>>();
+
+/** The longest one round of that wait lasts, so a wedged connect or rebuild
+ *  never holds a join for good. As long as the connect's own deadman, so the
+ *  wait never gives up on a connect that is slow but still going. */
+const JOIN_WAIT_ROUND_MS = BRIDGE_CONNECT_TIMEOUT_MS;
+
+async function cycleTwitchChat(reason: string, force: boolean): Promise<boolean> {
   const twitchSlices = () =>
     Array.from(useChatConnectionStore.getState().channels.values()).filter((s) => s.provider === 'twitch');
   if (twitchSlices().length === 0) return false;
@@ -3720,6 +3746,18 @@ export async function acquireChannel(
     // since join_chat_channel would have nothing to join. The WS is already open
     // so it isn't reopened. (In an all-Twitch session another Twitch slice always
     // exists here, so this stays join_chat_channel: byte-identical to before.)
+    // A first room's connect, or a rebuild, still running (several chats
+    // joining at once, a tab opened on the return): both start the Twitch
+    // side fresh and sweep the window's claims, so a join that lands first is
+    // swept with them. Join after them, whatever they did, unless this room
+    // was let go meanwhile.
+    for (let waited = 0; (wsConnectPromise || rebuildsInFlight.size > 0) && waited < 3; waited += 1) {
+      await Promise.race([
+        Promise.allSettled([wsConnectPromise, ...rebuildsInFlight]),
+        new Promise<void>((done) => setTimeout(done, JOIN_WAIT_ROUND_MS)),
+      ]);
+    }
+    if (useChatConnectionStore.getState().channels.get(key) !== slice) return;
     const hasOtherTwitch = Array.from(
       useChatConnectionStore.getState().channels.values(),
     ).some((s) => s.channel !== key && s.provider === 'twitch');

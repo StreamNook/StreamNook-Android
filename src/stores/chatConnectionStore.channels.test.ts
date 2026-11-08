@@ -209,3 +209,119 @@ describe('a non-Twitch source released and taken back', () => {
     expect(useChatConnectionStore.getState().channels.has('youtube:ucsomeone')).toBe(false);
   });
 });
+
+describe('several Twitch chats joining at once', () => {
+  it("a join waits for the first room's connect, which sweeps the window's claims", async () => {
+    let finishStart: (port: number) => void = () => {};
+    answers.chat_bridge_port = () => 4242;
+    answers.start_chat = () => new Promise<number>((r) => (finishStart = r));
+    answers.join_chat_channel = () => undefined;
+    const { acquireChannel } = await import('./chatConnectionStore');
+
+    const first = acquireChannel('a', '1', 'twitch');
+    const second = acquireChannel('b', '2', 'twitch');
+    await settle();
+    expect(calls('join_chat_channel')).toHaveLength(0);
+
+    finishStart(4242);
+    await withClock(first);
+    await withClock(second);
+    expect(calls('join_chat_channel').map((c) => c[1])).toEqual([{ channel: 'b' }]);
+  });
+
+  it('a room let go while it waited is never joined', async () => {
+    let finishStart: (port: number) => void = () => {};
+    answers.chat_bridge_port = () => 4242;
+    answers.start_chat = () => new Promise<number>((r) => (finishStart = r));
+    answers.join_chat_channel = () => undefined;
+    answers.leave_chat_channel = () => undefined;
+    const { acquireChannel, releaseChannel } = await import('./chatConnectionStore');
+
+    const first = acquireChannel('a', '1', 'twitch');
+    const second = acquireChannel('b', '2', 'twitch');
+    await settle();
+    await releaseChannel('b', 'twitch');
+    finishStart(4242);
+    await withClock(first);
+    await withClock(second);
+    expect(calls('join_chat_channel')).toHaveLength(0);
+  });
+
+  it('a join waits for a rebuild in flight, which restarts the connection', async () => {
+    let finishRebuild: (port: number | null) => void = () => {};
+    answers.chat_bridge_port = () => 4242;
+    answers.start_chat = () => 4242;
+    answers.join_chat_channel = () => undefined;
+    answers.rebuild_chat = () => new Promise<number | null>((r) => (finishRebuild = r));
+    const { acquireChannel, rebuildTwitchChat } = await import('./chatConnectionStore');
+
+    await withClock(acquireChannel('a', '1', 'twitch'));
+    const rebuilding = rebuildTwitchChat('test');
+    const second = acquireChannel('b', '2', 'twitch');
+    await settle();
+    expect(calls('join_chat_channel')).toHaveLength(0);
+
+    finishRebuild(null);
+    await withClock(rebuilding);
+    await withClock(second);
+    expect(calls('join_chat_channel').map((c) => c[1])).toEqual([{ channel: 'b' }]);
+  });
+
+  it('a rebuild Rust declines at once never ends the wait for one still running', async () => {
+    let finishRebuild: (port: number | null) => void = () => {};
+    let asked = 0;
+    answers.chat_bridge_port = () => 4242;
+    answers.start_chat = () => 4242;
+    answers.join_chat_channel = () => undefined;
+    answers.rebuild_chat = () => {
+      asked += 1;
+      return asked === 1 ? new Promise<number | null>((r) => (finishRebuild = r)) : null;
+    };
+    const { acquireChannel, rebuildTwitchChat } = await import('./chatConnectionStore');
+
+    await withClock(acquireChannel('a', '1', 'twitch'));
+    const running = rebuildTwitchChat('watchdog');
+    expect(await withClock(rebuildTwitchChat('return'))).toBe(false);
+    const second = acquireChannel('b', '2', 'twitch');
+    await settle();
+    expect(calls('join_chat_channel')).toHaveLength(0);
+
+    finishRebuild(null);
+    await withClock(running);
+    await withClock(second);
+    expect(calls('join_chat_channel').map((c) => c[1])).toEqual([{ channel: 'b' }]);
+  });
+
+  it('a rebuild that never answers stops holding joins once its wait has passed', async () => {
+    answers.chat_bridge_port = () => 4242;
+    answers.start_chat = () => 4242;
+    answers.join_chat_channel = () => undefined;
+    answers.rebuild_chat = () => new Promise<number | null>(() => {});
+    const { acquireChannel, rebuildTwitchChat } = await import('./chatConnectionStore');
+
+    await withClock(acquireChannel('a', '1', 'twitch'));
+    void rebuildTwitchChat('lost');
+    await vi.advanceTimersByTimeAsync(46_000);
+    await withClock(acquireChannel('b', '2', 'twitch'));
+    expect(calls('join_chat_channel').map((c) => c[1])).toEqual([{ channel: 'b' }]);
+  });
+
+  it('a join waits out a first connect slower than one short round', async () => {
+    let finishStart: (port: number) => void = () => {};
+    answers.chat_bridge_port = () => 4242;
+    answers.start_chat = () => new Promise<number>((r) => (finishStart = r));
+    answers.join_chat_channel = () => undefined;
+    const { acquireChannel } = await import('./chatConnectionStore');
+
+    const first = acquireChannel('a', '1', 'twitch');
+    const second = acquireChannel('b', '2', 'twitch');
+    await settle();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(calls('join_chat_channel')).toHaveLength(0);
+
+    finishStart(4242);
+    await withClock(first);
+    await withClock(second);
+    expect(calls('join_chat_channel').map((c) => c[1])).toEqual([{ channel: 'b' }]);
+  });
+});

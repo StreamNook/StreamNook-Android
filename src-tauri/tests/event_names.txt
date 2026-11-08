@@ -56,10 +56,12 @@ eventsub://online
 eventsub://raid
 eventsub://subscription-failed
 eventsub://suspicious-user-update
+favorite-category-changed
 favorites-live-update
 gift-sub-received
 home-snapshot
 hype-train://update
+inbox-changed
 main-closed
 main-hiding-to-tray
 mass-unban-progress
@@ -79,6 +81,7 @@ multichat-popout-closed
 my-clips://changed
 new-favorite-drops
 notice-action-pending
+own-accolades-changed
 performance-state
 platform-account-changed
 platform-session-expired
@@ -131,6 +134,7 @@ twitch-reward-received
 unban-requests
 update://status
 user-history-message
+watch-drops://changed
 watch-session://offline
 watch-session://reconnecting
 watch-session://redirect
@@ -142,10 +146,8 @@ watch-session://went-live
 watched-chest-claimed
 webview-gpu-failed
 whisper-archive-changed
+whisper-arrived
 whisper-conversation-updated
-whisper-import-complete
-whisper-import-progress
 whisper-notify
-whisper-received
 window-visibility
 youtube-identity-changed

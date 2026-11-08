@@ -462,6 +462,18 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Chat',
+    section: 'Drops',
+    title: 'Drops',
+    description: 'Your progress toward drops on the channel you are watching, in chat. Drops bar, drop progress, rewards, claim.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Drops',
+    title: 'Drops progress',
+    description: 'A slim bar above the message box shows the next drop you are earning on this channel. Click it to see every reward you can earn here and claim the ones that are ready.'
+  },
+  {
+    tab: 'Chat',
     section: 'YouTube Chat',
     sectionId: 'settings-section-youtube-chat',
     title: 'Feed',
@@ -1437,6 +1449,26 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Chat',
     section: 'Emotes',
+    title: 'Emote words',
+    description: 'Show the word typed with each emote, under it, after it or in a chip, so emote-heavy chat reads as sentences. Emote names, emote labels, emote captions, readable chat.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Emotes',
+    title: 'Word size',
+    parent: 'Emote words',
+    description: 'How big the word beside each emote is, smaller or larger than its look draws it. Emote word text size, caption size.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Emotes',
+    title: 'Sentences only',
+    parent: 'Emote words',
+    description: 'Word only the emotes of messages that also have plain words; messages of nothing but emotes stay as they are. Emote spam.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Emotes',
     title: 'GIFs',
     description: 'Show Twitch GIFs posted by Tier 2 and Tier 3 subscribers, or swap each for a chip you click to reveal. Show GIFs in chat.'
   },
@@ -2365,6 +2397,12 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Overlay',
+    section: 'Filters',
+    title: 'Hide link-only messages',
+    description: 'Hides an overlay message that is just a link; a link sent with other words still shows. URL, link spam, bare links.'
+  },
+  {
+    tab: 'Overlay',
     section: 'Hidden Accounts',
     title: 'Hidden Accounts',
     description: 'Hide specific people on each overlay source, by username or display name. Block a user, ignore, bot by name.'
@@ -2536,6 +2574,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Interface',
+    section: 'Compact View',
+    sectionId: 'settings-section-compact',
+    title: 'Keep chat',
+    description: 'Compact View keeps chat where you dock it instead of hiding it; the window stays the size you picked and the picture makes room. Chat in Compact View, compact mode with chat.'
+  },
+  {
+    tab: 'Interface',
     section: 'Window',
     sectionId: 'settings-section-window',
     title: 'Centered settings',
@@ -2671,6 +2716,12 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Notify me about',
     title: 'Favorite channels live',
     description: 'When a channel you favorited goes live, even one you do not follow on Twitch. Favorites. Previously "Favorite channels".'
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
+    title: 'Favorite category changes',
+    description: 'When a live favorite switches to another category, saying what it switched from and to. Game change, category switch, stream changed game. Off until turned on.'
   },
   {
     tab: 'Notifications',

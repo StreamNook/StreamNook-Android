@@ -1446,6 +1446,28 @@ impl TwitchService {
         typed.into_error(refresh_failure_message(kind, &format!("{e:#}")))
     }
 
+    /// Renew the primary token from `refresh` and seal the result, in a task
+    /// of its own that keeps the slot until the write lands. Twitch's refresh
+    /// tokens are single use: once Twitch answers, the stored one is spent, so
+    /// a caller dropped between the answer and the write (chat's reload
+    /// aborting its supervisor, an outer timeout, the phone worker winding
+    /// down) lost the new pair and ended the sign-in at the next renewal. The
+    /// detached task finishes either way.
+    async fn renew_primary(slot: SlotGuard, refresh: String) -> Result<StorableToken> {
+        tauri::async_runtime::spawn(async move {
+            let new_token = Self::refresh_token(&refresh).await.map_err(Self::refresh_error)?;
+            if let Err(e) = Self::persist_primary_token(&slot, &new_token).await {
+                warn!("[GET_TOKEN] The renewed token could not be saved; the next renewal will be refused: {e:#}");
+            }
+            Ok(new_token)
+        })
+        .await
+        .map_err(|e| {
+            TokenError::Unreachable
+                .into_error(format!("Token refresh was interrupted ({e}); the sign-in is kept and tried again"))
+        })?
+    }
+
     pub async fn get_token() -> Result<String> {
         // Serialized end to end through the primary slot. Two callers landing
         // inside the 5-minute expiry buffer would otherwise BOTH refresh, and
@@ -1465,13 +1487,7 @@ impl TwitchService {
                     .into_error("Token expired and no refresh token available. Please log in again."));
             }
             debug!("[GET_TOKEN] Token expired or expiring soon, refreshing...");
-            match Self::refresh_token(&token.refresh_token).await {
-                Ok(new_token) => {
-                    token = new_token;
-                    let _ = Self::persist_primary_token(&slot, &token).await;
-                }
-                Err(e) => return Err(Self::refresh_error(e)),
-            }
+            token = Self::renew_primary(slot, token.refresh_token).await?;
         }
 
         Ok(token.access_token)
@@ -1480,7 +1496,6 @@ impl TwitchService {
     /// After a server refused `rejected`: the token now in the slot, refreshed
     /// first only if it is still that same token. Holds the slot throughout,
     /// so a sign-in or switch that landed meanwhile is never overwritten.
-    #[cfg_attr(not(mobile), allow(dead_code))]
     pub(crate) async fn get_token_after_reject(rejected: &str) -> Result<String> {
         let slot = Self::primary_slot().await;
         let token = Self::load_slot_token(&slot)?;
@@ -1490,13 +1505,7 @@ impl TwitchService {
         if token.refresh_token.is_empty() {
             return Err(TokenError::Refused.into_error("No refresh token available. Please log in again."));
         }
-        match Self::refresh_token(&token.refresh_token).await {
-            Ok(new_token) => {
-                Self::persist_primary_token(&slot, &new_token).await?;
-                Ok(new_token.access_token)
-            }
-            Err(e) => Err(Self::refresh_error(e)),
-        }
+        Ok(Self::renew_primary(slot, token.refresh_token).await?.access_token)
     }
 
     /// Verify the current token's health and return detailed status
@@ -1650,10 +1659,8 @@ impl TwitchService {
         }
 
         debug!("[Auth Debug] Force refreshing token...");
-        let new_token = Self::refresh_token(&token.refresh_token).await?;
-
-        // This is an explicit PRIMARY refresh, so persist it to the primary slot.
-        let _ = Self::persist_primary_token(&slot, &new_token).await;
+        // An explicit PRIMARY refresh, so it is sealed into the primary slot.
+        let new_token = Self::renew_primary(slot, token.refresh_token).await?;
 
         debug!("[Auth Debug] Token refreshed successfully!");
         Ok(new_token.access_token)
@@ -3740,46 +3747,46 @@ impl TwitchService {
         Ok(found)
     }
 
-    /// Send a whisper message to another user
-    /// Requires user:manage:whispers scope
-    pub async fn send_whisper(to_user_id: &str, message: &str) -> Result<()> {
-        let token = Self::get_token().await?;
+    /// Send a whisper from `from` with exactly this token (Helix, scope
+    /// `user:manage:whispers`). The caller has checked the token belongs to
+    /// `from`. A failure says whether anything may have reached Twitch: a
+    /// connect or name-lookup failure means nothing left; any other failure
+    /// without a status means it may have.
+    pub async fn send_whisper_with_token(
+        token: &str,
+        from: &str,
+        to: &str,
+        message: &str,
+    ) -> std::result::Result<(), crate::services::whisper_send::SendFail> {
+        use crate::services::whisper_send::SendFail;
         let client = crate::services::http::client().clone();
-
-        // Get the current user's ID
-        let user_info = Self::get_user_info().await?;
-
-        let response = client
-            .post(format!(
-                "https://api.twitch.tv/helix/whispers?from_user_id={}&to_user_id={}",
-                user_info.id, to_user_id
-            ))
-            .header(AUTHORIZATION, format!("Bearer {}", token))
+        let response = match client
+            .post(format!("https://api.twitch.tv/helix/whispers?from_user_id={from}&to_user_id={to}"))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
             .header("Client-Id", CLIENT_ID)
             .header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "message": message
-            }))
+            .json(&serde_json::json!({ "message": message }))
             .send()
             .await
-            .map_err(|e| {
+        {
+            Ok(r) => r,
+            Err(e) => {
                 log::warn!("[Whisper] send request failed: {e}");
-                anyhow::anyhow!(crate::services::whisper_inbox::send_failure_reason(None, ""))
-            })?;
-
+                return Err(if e.is_connect() || e.is_builder() {
+                    SendFail::BeforeConnect(e.to_string())
+                } else {
+                    SendFail::NoAnswer(e.to_string())
+                });
+            }
+        };
         let status = response.status();
         if status.is_success() {
-            Ok(())
-        } else {
-            // Twitch's reason, in the words every platform shows (the raw body
-            // stays in the log).
-            let error_text = response.text().await.unwrap_or_default();
-            log::warn!("[Whisper] Twitch refused a whisper ({status}): {error_text}");
-            Err(anyhow::anyhow!(crate::services::whisper_inbox::send_failure_reason(
-                Some(status.as_u16()),
-                &error_text
-            )))
+            return Ok(());
         }
+        // The raw body stays in the log; the shells show send_failure_reason's words.
+        let body = response.text().await.unwrap_or_default();
+        log::warn!("[Whisper] Twitch refused a whisper ({status}): {body}");
+        Err(SendFail::Status(status.as_u16(), body))
     }
 
     /// Get streams by game name (convenience method that resolves game name to ID)
@@ -5714,18 +5721,43 @@ impl TwitchService {
     pub async fn users_by_ids(
         ids: &[String],
     ) -> Result<std::collections::HashMap<String, (String, String, Option<String>)>, String> {
-        let mut out = std::collections::HashMap::new();
-        if ids.is_empty() {
+        let users = Self::helix_users("id", ids).await?;
+        Ok(users
+            .into_iter()
+            .map(|(id, login, display, avatar)| (id, (login, display, avatar)))
+            .collect())
+    }
+
+    /// `login -> (user id, display name, avatar)` for a batch of Twitch
+    /// logins (lowercase keys). Errors like `users_by_ids`.
+    pub async fn users_by_logins(
+        logins: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, String, Option<String>)>, String> {
+        let users = Self::helix_users("login", logins).await?;
+        Ok(users
+            .into_iter()
+            .map(|(id, login, display, avatar)| (login.to_lowercase(), (id, display, avatar)))
+            .collect())
+    }
+
+    /// Helix `users` by `field` (`id` or `login`), 100 a call:
+    /// `(id, login, display name, avatar)` per user found.
+    async fn helix_users(
+        field: &str,
+        values: &[String],
+    ) -> Result<Vec<(String, String, String, Option<String>)>, String> {
+        let mut out = Vec::new();
+        if values.is_empty() {
             return Ok(out);
         }
 
         let token = Self::get_token().await.map_err(|e| e.to_string())?;
         let client = crate::services::http::client().clone();
 
-        for chunk in ids.chunks(100) {
+        for chunk in values.chunks(100) {
             let query = chunk
                 .iter()
-                .map(|id| format!("id={}", id))
+                .map(|v| format!("{field}={}", urlencoding::encode(v)))
                 .collect::<Vec<_>>()
                 .join("&");
             let url = format!("https://api.twitch.tv/helix/users?{}", query);
@@ -5765,7 +5797,7 @@ impl TwitchService {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                out.insert(id.to_string(), (login, display, avatar));
+                out.push((id.to_string(), login, display, avatar));
             }
         }
 
@@ -8338,6 +8370,7 @@ mod slot_tests {
             "pub async fn get_token()",
             "pub(crate) async fn get_token_after_reject(",
             "pub async fn force_refresh_token()",
+            "async fn renew_primary(",
             "pub(crate) async fn persist_primary_token(",
         ] {
             assert!(!body(service, refresh).contains("bump_account_generation"), "{refresh} is a refresh");

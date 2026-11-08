@@ -109,8 +109,9 @@ import {
 } from '../utils/pausePark';
 import { followLiveAfterResync } from '../utils/liveResync';
 import { HLS_START_CONFIG, resumeLoadAfterRecover, startLoadOnManifest } from '../utils/hlsStartLoad';
-import { watchStalls } from '../utils/stallWatchdog';
+import { trackFragLoads, watchFirstMedia, watchStalls, watchWedge } from '../utils/stallWatchdog';
 import { createRecovery } from '../utils/recovery';
+import { IS_MAC } from '../utils/platform';
 import { attachPauseRoutes, releaseTypingFocus } from '../utils/pauseRoutes';
 import { recognizeNowPlaying, announceSong, isQuietResult } from '../utils/songId';
 import { SongsSplitButton } from './songs/SongsFlyout';
@@ -585,10 +586,10 @@ const VideoPlayer = () => {
   const [isRestarting, setIsRestarting] = useState(false);
 
   // Song identification: capture a few seconds of player audio and name the
-  // track. The note surfaces the result as a toast; the card also lands in
-  // the playing stream's chat, whose composer shows the listening strip
-  // meanwhile. The note's bars and its "Stop listening" come from the
-  // window's one listening state (SongsSplitButton reads it).
+  // track. The card lands in the playing stream's chat, whose composer shows
+  // the listening strip meanwhile and then the result. The note's bars and
+  // its "Stop listening" come from the window's one listening state
+  // (SongsSplitButton reads it).
   const handleIdentifySong = useCallback(async () => {
     const addToast = useAppStore.getState().addToast;
     // The room the answer goes to, as the listening starts: a viewer who
@@ -597,9 +598,11 @@ const VideoPlayer = () => {
     const result = await recognizeNowPlaying(videoRef.current, { room });
     // A canceled listening, or one asked for while one runs, says nothing.
     if (isQuietResult(result)) return;
-    // Also drop the clickable card into the playing stream's chat (where the
-    // links live); the toast below is just the quick on-player confirmation.
-    announceSong(result, room);
+    // The clickable card goes into the playing stream's chat (where the links
+    // live). Once it is there a toast would only repeat it: the answer just
+    // joins the island's history. With no chat to post in, the toast is the
+    // answer.
+    const islandOnly = announceSong(result, room);
     if (result.status === 'match') {
       const s = result.song;
       // The track's own link first; a search page says it is one.
@@ -616,12 +619,12 @@ const VideoPlayer = () => {
             }
           : undefined,
         // The island row shows the cover and opens the song in Your songs.
-        { avatarUrl: s.album_art ?? undefined, songKey: s.key ?? undefined },
+        { avatarUrl: s.album_art ?? undefined, songKey: s.key ?? undefined, islandOnly },
       );
     } else if (result.status === 'no-match') {
-      addToast("Couldn't identify the song. Try again when the music is clearer.", 'info');
+      addToast("Couldn't identify the song. Try again when the music is clearer.", 'info', undefined, { islandOnly });
     } else {
-      addToast(result.message, 'error');
+      addToast(result.message, 'error', undefined, { islandOnly });
     }
   }, []);
 
@@ -1530,13 +1533,41 @@ const VideoPlayer = () => {
           });
         },
       });
+      // Whether the main stream is downloading, for the macOS first-media wait
+      // at LEVEL_LOADED below. Tracked from here, ahead of every load: hls.js
+      // starts the first download inside its own LEVEL_LOADED handler, before
+      // that wait is armed.
+      const fragLoads = trackFragLoads();
+      if (IS_MAC && isLowLatencyChannel) {
+        hls.on(Hls.Events.FRAG_LOADING, (_e, data) => fragLoads.loading(data.frag));
+        hls.on(Hls.Events.FRAG_LOADED, (_e, data) => fragLoads.loaded(data.frag));
+      }
       if (isLowLatencyChannel) {
         let over = 0;
         let frozen = 0;
         let lastCt = -1;
         let lastRecover = 0;
+        const wedge = watchWedge();
         behindLiveWatchdogRef.current = setInterval(() => {
           const v = (hls.media as HTMLVideoElement | null) ?? video;
+          // WebKit only, checked before the seeking skip below: a wedged
+          // element's seeks never complete, so it would be skipped forever.
+          // Timed by the clock with a still playhead: an ordinary in-buffer
+          // seek, briefly at HAVE_METADATA, completes in well under a second.
+          // Reopening the stream is what gets it playing.
+          if (IS_MAC && v) {
+            const w = wedge(v, performance.now());
+            if (w.wedged) {
+              if (w.reload) {
+                recover(
+                  `[HLS] behind-live watchdog: element stuck at readyState ${v.readyState} at ${v.currentTime.toFixed(1)} with media buffered ahead; reloading the stream`,
+                  true,
+                  'wedge',
+                );
+              }
+              return;
+            }
+          }
           if (!v || v.paused || v.seeking) {
             over = 0;
             frozen = 0;
@@ -1816,25 +1847,87 @@ const VideoPlayer = () => {
             const cushion =
               typeof hls.config.liveSyncDuration === 'number' ? hls.config.liveSyncDuration : 2;
             const edge = data.details.edge;
-            const pos =
+            const loadedPos =
               hls.liveSyncPosition ?? (Number.isFinite(edge) ? Math.max(0, edge - cushion) : null);
-            if (pos != null && Number.isFinite(pos) && pos > 0) {
-              video.currentTime = pos;
-            }
-            Logger.debug(
-              `[HLS] Level loaded (LL) — starting playback at ${video.currentTime.toFixed(2)}`,
-            );
-            if (holdHeldPause()) return;
-            if (!currentSettings.autoplay) {
-              // Autoplay is off: nothing plays, and the wait arms the park so
-              // the downloads stop until the viewer presses play.
-              park?.paused();
+            const placeLL = () => {
+              if (hlsRef.current !== hls) return;
+              const pos = hls.liveSyncPosition ?? loadedPos;
+              if (pos != null && Number.isFinite(pos) && pos > 0) {
+                video.currentTime = pos;
+              }
+              Logger.debug(
+                `[HLS] Level loaded (LL) — starting playback at ${video.currentTime.toFixed(2)}`,
+              );
+            };
+            const playOrPark = () => {
+              if (hlsRef.current !== hls) return;
+              if (holdHeldPause()) return;
+              if (!currentSettings.autoplay) {
+                // Autoplay is off: nothing plays, and the wait arms the park so
+                // the downloads stop until the viewer presses play.
+                park?.paused();
+                return;
+              }
+              video.play().catch(() => {
+                video.muted = true;
+                video.play().catch(() => Logger.debug('[HLS] LL muted autoplay also failed'));
+              });
+            };
+            if (!IS_MAC) {
+              placeLL();
+              playOrPark();
               return;
             }
-            video.play().catch(() => {
-              video.muted = true;
-              video.play().catch(() => Logger.debug('[HLS] LL muted autoplay also failed'));
+            // On macOS, not before the first media lands: WebKit can wedge an
+            // element whose playhead was set while nothing was appended, at
+            // HAVE_METADATA for good with every later seek left pending.
+            const wantsPlay =
+              currentSettings.autoplay && !heldPause('main', liveKeyNow()) && !park?.loadStopped;
+            if (!wantsPlay) {
+              // Nothing plays yet: park or hold now, and place the playhead
+              // once media lands (after the viewer's play restarts the loads).
+              playOrPark();
+              hls.once(Hls.Events.FRAG_BUFFERED, placeLL);
+              return;
+            }
+            // A start that buffers nothing reloads instead of sitting black,
+            // and a slow first download still in flight is waited out.
+            const first = watchFirstMedia({
+              now: () => performance.now(),
+              inFlight: fragLoads.inFlight,
+              schedule: (fn, ms) => {
+                bufferGateTimeoutRef.current = setTimeout(fn, ms);
+              },
+              isCurrent: () => hlsRef.current === hls,
+              reload: (why) => {
+                // The viewer paused while it waited: nothing to recover. The
+                // held pause parks the downloads as on every other route, and
+                // the playhead is placed when media lands.
+                if (heldPause('main', liveKeyNow())) {
+                  playOrPark();
+                  hls.once(Hls.Events.FRAG_BUFFERED, placeLL);
+                  return true;
+                }
+                return recover(why, true, 'no-buffer');
+              },
+              finished: () => unhook(),
             });
+            const onProgress = () => first.progress();
+            const onMedia = () => {
+              if (!first.media()) return;
+              placeLL();
+              playOrPark();
+            };
+            const unhook = () => {
+              hls.off(Hls.Events.FRAG_LOADING, onProgress);
+              hls.off(Hls.Events.FRAG_LOADED, onProgress);
+              hls.off(Hls.Events.FRAG_PARSED, onProgress);
+              hls.off(Hls.Events.FRAG_BUFFERED, onMedia);
+            };
+            hls.on(Hls.Events.FRAG_LOADING, onProgress);
+            hls.on(Hls.Events.FRAG_LOADED, onProgress);
+            hls.on(Hls.Events.FRAG_PARSED, onProgress);
+            hls.on(Hls.Events.FRAG_BUFFERED, onMedia);
           });
         } else {
           // Non-LL: don't play here. The FRAG_BUFFERED gate below calls play() once

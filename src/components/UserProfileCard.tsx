@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo, useRef, useCallback, useSyncExternalStore } from 'react';
 import { ExternalAnchor } from './ui/ExternalAnchor';
-import { MessageCircle, UserPlus, UserMinus, Loader2, ChevronLeft, ChevronUp, Pencil, X, Share2, Link2, Check, EyeOff, History } from 'lucide-react';
+import { MessageCircle, UserPlus, UserMinus, Loader2, ChevronLeft, ChevronUp, Pencil, X, Share2, Check, EyeOff, History } from 'lucide-react';
 import { filterChannelKey, isHiddenInScope } from '../utils/chatFilters';
-import { shareLinkFor, buildProfileUrl } from '../utils/shareLink';
+import { shareLinkFor } from '../utils/shareLink';
 import { providerLabel, type ProviderId } from '../types/providers';
 import { motion, AnimatePresence, useScroll, useTransform, useReducedMotion, useMotionValue, animate } from 'framer-motion';
 import { setUserNickname, setUserColor } from '../utils/userChatOverrides';
@@ -437,6 +437,7 @@ const THIRD_PARTY_PROVIDER_GROUPS: { key: string; label: string }[] = [
   { key: 'moltorino', label: 'Moltorino' },
   { key: 'limerino', label: 'Limerino' },
   { key: 'jilchat', label: 'JilChat' },
+  { key: 'bchat', label: 'bChat' },
   { key: 'chatsen', label: 'Chatsen' },
   { key: 'chatty', label: 'Chatty' },
   { key: 'dankchat', label: 'DankChat' },
@@ -1004,8 +1005,6 @@ const UserProfileCard = ({
   const [followLoading, setFollowLoading] = useState(false);
   // Share confirmation (copies streamnook.app/w/<login>).
   const [shareCopied, setShareCopied] = useState(false);
-  // Profile-link confirmation (copies streamnook.app/u/<login>, members only).
-  const [profileLinkCopied, setProfileLinkCopied] = useState(false);
 
   // Get channel context
   const getChannelContext = useCallback(() => {
@@ -1162,15 +1161,18 @@ const UserProfileCard = ({
 
   // Resolve the BetterTTV Pro loyalty badge in parallel (non-blocking). Pops
   // into the BetterTTV badge group when/if it resolves; silent for non-Pro users.
+  // BetterTTV Pro belongs to a Twitch account, so the lookup uses the member's
+  // Twitch id (cardMemberId) and is skipped for a Kick or YouTube chatter nobody
+  // has claimed.
   useEffect(() => {
     let cancelled = false;
     setBttvProBadge(null);
-    if (!userId) return;
-    invoke<{ url: string; started_at: string | null; glow: boolean } | null>('get_bttv_pro_badge', { userId })
+    if (!cardMemberId) return;
+    invoke<{ url: string; started_at: string | null; glow: boolean } | null>('get_bttv_pro_badge', { userId: cardMemberId })
       .then((badge) => { if (!cancelled) setBttvProBadge(badge); })
       .catch((err) => Logger.debug('[UserProfileCard] BTTV Pro lookup failed:', err));
     return () => { cancelled = true; };
-  }, [userId]);
+  }, [cardMemberId]);
 
   // Lazily fetch the user's historical chat logs from Justlog the first time
   // the messages view is opened. We don't pre-fetch because most popup opens
@@ -1542,10 +1544,10 @@ const UserProfileCard = ({
   // default). Synchronous cache peek + version subscription so the card repaints
   // when the loadout lands or the member edits it; the effect kicks the fetch.
   useSyncExternalStore(subscribeIdentityVersion, getIdentityVersion, getIdentityVersion);
-  const identityLoadout = userId ? getIdentityFromMemoryCache(userId) : null;
+  const identityLoadout = cardMemberId ? getIdentityFromMemoryCache(cardMemberId) : null;
   useEffect(() => {
-    if (userId) void getIdentityWithCache(userId).catch(() => {});
-  }, [userId]);
+    if (cardMemberId) void getIdentityWithCache(cardMemberId).catch(() => {});
+  }, [cardMemberId]);
   const visibleThirdPartyBadges = useMemo(() => {
     if (!identityLoadout?.customized) return thirdPartyBadges;
     // A loadout picks WHICH badges show, never where they sit: the list keeps
@@ -1734,22 +1736,6 @@ const UserProfileCard = ({
       >
         {shareCopied ? <Check size={14} className="text-success" /> : <Share2 size={14} className="text-accent" />}
         {shareCopied ? 'Copied' : 'Share'}
-      </button>
-      {/* The member's public profile page on the web. */}
-      <button
-        onClick={async () => {
-          try {
-            await navigator.clipboard.writeText(buildProfileUrl(login));
-            setProfileLinkCopied(true);
-            window.setTimeout(() => setProfileLinkCopied(false), 1400);
-          } catch (err) {
-            Logger.error('[UserProfileCard] Failed to copy profile link:', err);
-          }
-        }}
-        className={`${memberActionBtn} ${profileLinkCopied ? 'text-success' : ''}`}
-      >
-        {profileLinkCopied ? <Check size={14} className="text-success" /> : <Link2 size={14} className="text-accent" />}
-        {profileLinkCopied ? 'Copied' : 'Profile link'}
       </button>
     </div>
   );
@@ -2063,9 +2049,7 @@ const UserProfileCard = ({
             className="absolute top-2.5 right-2.5 z-10 p-1.5 glass-button text-textSecondary hover:text-textPrimary rounded-full"
             aria-label="Close profile"
           >
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
+            <X size={16} strokeWidth={2.25} aria-hidden />
           </button>
         </div>
 

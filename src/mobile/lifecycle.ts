@@ -27,7 +27,8 @@
 //
 // Rust learns the same thing (set_app_foreground; PiP counts as seen), so its
 // pollers rest while the app is away. Going to the background also flushes
-// every debounced store there.
+// every debounced store there. It also learns whether the app can be read
+// (set_app_interactive; PiP does not count), for whisper conversations.
 import { invoke } from '@tauri-apps/api/core';
 import { refreshEntitlementRegistries, resumePresence, suspendPresence } from '../services/supabaseService';
 import { refreshFollowingIfStale } from './followRefresh';
@@ -47,18 +48,6 @@ let hiddenSince = 0;
 // a network round trip.
 const NOTIFY_KICK_MIN_GAP_MS = 5 * 60 * 1000;
 let lastNotifyKick = 0;
-
-// How long away before chat is assumed dead on return.
-//
-// Android freezes a backgrounded process, Twitch then drops the connection for
-// a missed keepalive, and the reconnect that follows runs before the network is
-// back, which ends the connection for good. A brief switch away to read a
-// notification does none of that, and rebuilding costs a reconnect and a
-// history load for every open room, so short absences are left alone and the
-// staleness watchdog picks up the rare miss. Anything longer is worth rebuilding on sight rather
-// than making someone stare at a dead room for the two minutes the watchdog
-// needs to be sure.
-const CHAT_REBUILD_AFTER_HIDDEN_MS = 90_000;
 
 // One run per transition. Two signals can report the same one: a lock with
 // audio playing raises sn:screen-off while the page may never turn hidden
@@ -88,7 +77,23 @@ function reportForeground(foreground: boolean): void {
   });
 }
 
+// Whether the app can be read right now: on screen with the screen on, and not
+// shrunk into the system PiP window. Rust counts an open whisper conversation
+// as being read only then, so a whisper landing while the stream plays in PiP
+// or the phone is locked still notifies and stays unread. Unlike
+// set_app_foreground, PiP does not count.
+let lastInteractive: boolean | null = null;
+function reportInteractive(override?: boolean): void {
+  const interactive = override ?? (document.visibilityState === 'visible' && !inPictureInPicture());
+  if (interactive === lastInteractive) return;
+  lastInteractive = interactive;
+  void invoke('set_app_interactive', { interactive }).catch((err) => {
+    Logger.debug('[Lifecycle] set_app_interactive failed:', err);
+  });
+}
+
 async function onHidden(): Promise<void> {
+  reportInteractive(false);
   if (inPictureInPicture()) {
     pipAway = true;
     return;
@@ -107,6 +112,7 @@ async function onHidden(): Promise<void> {
 }
 
 async function onVisible(): Promise<void> {
+  reportInteractive();
   if (!hiddenNow && !pipAway) return;
   hiddenNow = false;
   pipAway = false;
@@ -135,16 +141,15 @@ async function onVisible(): Promise<void> {
   // report that itself: the frontend reads a local bridge that stays up whether
   // or not the connection behind it is alive, so a dead room looks connected
   // forever. Rebuild it rather than trust it. Re-joining refetches recent
-  // history, so the room comes back populated instead of blank.
+  // history, so the room comes back populated instead of blank. The saved
+  // chats join again first (see chatResume), so the rebuild sees every room.
   const awayFor = hiddenSince ? Date.now() - hiddenSince : 0;
   hiddenSince = 0;
-  if (awayFor >= CHAT_REBUILD_AFTER_HIDDEN_MS) {
-    try {
-      const { hardCycleChat } = await import('./chat/chatRecovery');
-      await hardCycleChat(`away for ${Math.round(awayFor / 1000)}s`);
-    } catch (err) {
-      Logger.warn('[Lifecycle] chat resume failed:', err);
-    }
+  try {
+    const { resumeChats } = await import('./chat/chatResume');
+    await resumeChats(awayFor);
+  } catch (err) {
+    Logger.warn('[Lifecycle] chat resume failed:', err);
   }
 }
 
@@ -166,22 +171,29 @@ export function installLifecycle(): () => void {
   // and locked with audio is the main background case, so the screen itself
   // counts. PiP with the screen off is still PiP.
   const onScreenOff = () => {
+    reportInteractive(false);
     if (isInPip() !== true) void onHidden();
   };
   const onScreenOn = () => {
     if (document.visibilityState === 'visible') void onVisible();
+    else reportInteractive();
   };
+  // Entering or leaving PiP can happen while the page stays visible.
+  const onPip = () => reportInteractive();
   hiddenNow = document.visibilityState === 'hidden';
   document.addEventListener('visibilitychange', handler);
   window.addEventListener('sn:pip-closed', onPipClosed);
   window.addEventListener('sn:screen-off', onScreenOff);
   window.addEventListener('sn:screen-on', onScreenOn);
+  window.addEventListener('sn:pip', onPip);
   reportForeground(document.visibilityState === 'visible');
+  reportInteractive();
   return () => {
     document.removeEventListener('visibilitychange', handler);
     window.removeEventListener('sn:pip-closed', onPipClosed);
     window.removeEventListener('sn:screen-off', onScreenOff);
     window.removeEventListener('sn:screen-on', onScreenOn);
+    window.removeEventListener('sn:pip', onPip);
     installed = false;
   };
 }

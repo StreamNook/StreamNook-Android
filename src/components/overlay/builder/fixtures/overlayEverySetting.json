@@ -49,6 +49,7 @@
       "tiktok:gift"
     ],
     "superchatCurrency": "EUR",
+    "hideLinkOnly": true,
     "hideCommands": true,
     "commandFilters": [
       {
@@ -76,6 +77,10 @@
       "ffz",
       "homies-custom",
       "dankchat"
+    ],
+    "shownBadgeProviders": [
+      "jilchat",
+      "bchat"
     ],
     "badgeLimit": 0,
     "hiddenTwitchBadgeCategories": [
@@ -230,6 +235,7 @@
       "commandFilters": [],
       "hidePhrases": [],
       "hiddenBadgeProviders": [],
+      "shownBadgeProviders": [],
       "hiddenTwitchBadgeCategories": [],
       "eventTemplates": {}
     }

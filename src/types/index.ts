@@ -246,6 +246,10 @@ export interface ChatDesignSettings {
   // Twitch chat GIFs (Tier 2/3 subscribers). Off swaps each for a chip that
   // reveals on click. Typed in Rust too (ChatDesignSettings). Default true.
   show_chat_gifs?: boolean;
+  // Drops progress in chat for the channel this account is earning on: the
+  // bar above the message box on desktop, the drop card on Android. Typed in
+  // Rust too (ChatDesignSettings). Default true.
+  show_drops_in_chat?: boolean;
   // Chat GIF size multiplier on the 80px default, 0.5 to 2. Typed and clamped
   // in Rust (ChatDesignSettings.gif_scale). Default 1.
   gif_scale?: number;
@@ -270,6 +274,16 @@ export interface ChatDesignSettings {
   // Use compact emote tooltips (just the name) instead of the upscaled
   // emote preview. Default false (preview tooltip is the current behavior).
   compact_emote_tooltips?: boolean;
+  // The typed word beside each emote, so a sentence of emotes still reads:
+  // a small caption under it, the word after it, or a pill of a small emote
+  // and the word. Default 'off'. Typed in Rust too (ChatDesignSettings).
+  emote_words?: 'off' | 'under' | 'after' | 'chips';
+  // Word only the emotes of a message that also has plain words (Rust's
+  // metadata.has_words), so emote-only messages stay bare. Default true.
+  emote_words_sentences_only?: boolean;
+  // Size of the emote's word against its look's own size, 0.6 to 1.4. Typed
+  // and held to that range in Rust (ChatDesignSettings). Default 1.
+  emote_words_scale?: number;
   // Apply FrankerFaceZ modifier effects (ffzW wide, ffzX/Y flips, ffzRainbow,
   // ...) to the preceding emote, like FFZ's own client. Default true. Off
   // renders modifier emotes as plain overlay emotes instead.
@@ -366,11 +380,13 @@ export interface ChatDesignSettings {
   show_third_party_badges?: boolean;
   // Add-on badge providers to leave out (lowercase ids: 'streamnook', '7tv',
   // 'ffz', 'bttv', 'chatterino', 'homies', 'moltorino', 'chatsen', 'chatty',
-  // 'dankchat', 'limerino', 'jilchat'). Default none.
+  // 'dankchat', 'limerino', 'jilchat', 'bchat'). Default none.
   hidden_badge_providers?: string[];
   // How many badges a chat row shows before folding the rest into a "+N"
-  // chip that unfolds on hover (tap on phones). 0 shows all. Default 3.
+  // chip that unfolds on hover (tap on phones). 0 shows all. Default 0.
   badge_fold_limit?: number;
+  // Set once Rust moved an install from the old default 3 to Show all.
+  badge_fold_show_all_adopted?: boolean;
   // StreamNook atmospheres (and the Cologne event look) behind members' chat
   // rows. Off keeps every row plain; profiles still show them. Default true.
   show_chat_atmospheres?: boolean;
@@ -420,6 +436,9 @@ export interface ChatDesignSettings {
   // step laid out on a rail over the message) or 'capsule' (the message
   // slides aside for a capsule that names the step).
   mod_slider_style?: 'preview' | 'rail' | 'capsule';
+  // The phones' swipes the other way round: left moderates (the slider
+  // mirrored) and right replies. Default false.
+  mod_slider_flipped?: boolean;
   // Line buttons: one-click action buttons at the start of every line a
   // moderator can act on. They take the left edge, so the slider grip is not
   // drawn while they are on. Default false.
@@ -718,6 +737,9 @@ export interface MentionEntry {
   /** The message as the chat drew it, words and emotes in order. Absent on
    *  older entries and on a message with no emote: show `text`. */
   parts?: MentionPart[];
+  /** It arrived while its chat was on screen; the desktop island leaves it
+   *  out (`get_mention_inbox` with `unseenOnly`). */
+  seen_live?: boolean;
 }
 
 /** One piece of a filed message (mention_inbox.rs `MentionPart`). */
@@ -726,27 +748,6 @@ export type MentionPart = { type: 'text'; text: string } | { type: 'emote'; name
 /** The phones' inbox chips (mention_inbox.rs `InboxFilter`; `whispers` once
  *  the whisper store joins the view). */
 export type InboxFilterId = 'all' | 'mentions' | 'highlights' | 'whispers';
-
-/** One row of `get_inbox_view`: the newest of a run of identical messages. */
-export interface InboxRowView {
-  entry: MentionEntry;
-  /** The older identical messages, newest first. */
-  folded: { id: string; at_ms: number; read: boolean }[];
-  /** Any message in the row is unread. */
-  unread: boolean;
-  /** The sender's picture, once Rust has it. */
-  avatar: string | null;
-}
-
-/** `get_inbox_view` (commands/mention_inbox.rs `InboxView`). */
-export interface InboxView {
-  rows: InboxRowView[];
-  has_more: boolean;
-  /** The `beforeMs` that asks for the next page. */
-  before_ms: number | null;
-  unread_total: number;
-  chips: { id: InboxFilterId; unread: number }[];
-}
 
 /** `mention-arrived`: a live entry just filed unread, for the card over the
  *  message bar. */
@@ -962,6 +963,8 @@ export interface LiveNotificationSettings {
   // Separate from show_live_notifications so a long favorites list can be
   // silenced without losing notifications for the channels you follow.
   show_favorite_live_notifications?: boolean;
+  // A live FAVORITED channel switches category. Off until turned on.
+  show_favorite_category_notifications?: boolean;
   show_whisper_notifications?: boolean;
   show_update_notifications?: boolean;
   show_drops_notifications?: boolean;
@@ -1548,6 +1551,11 @@ export interface Settings {
   // purpose: a full-size window glued in front of everything is overbearing.
   // Only the frontend reads it, so it rides Rust's `extra` catch-all.
   keep_on_top_in_compact?: boolean;
+  // Compact View keeps chat where it is docked instead of hiding it; the
+  // preset's window makes room for it (utils/compactView.ts). Off by default.
+  // Only the frontend reads it, so it rides Rust's `extra` catch-all like
+  // keep_on_top_in_compact above.
+  keep_chat_in_compact?: boolean;
   // Full screen (F11) while watching tucks the title bar and sidebar away so
   // only the stream and chat show; each comes back when the cursor reaches its
   // edge. Frontend-only, so it rides Rust's `extra` catch-all. Default ON,
@@ -2790,6 +2798,9 @@ export interface LiveNotificationData {
   /** Each platform's channel this entry stands for, as Rust names it, so the
    *  row's "Turn off alerts" mutes every one. Absent on older entries. */
   channels?: AlertChannel[];
+  /** Set on a category change of a live favorite: the category it switched
+   *  from (`game_name` is the one it switched to). */
+  previous_game_name?: string;
 }
 
 /** One platform's channel in a go-live, as Rust's `AlertChannel`. */
@@ -2953,6 +2964,191 @@ export interface WhisperList {
   conversations: WhisperListRow[];
   unread_total: number;
 }
+
+/** Where one of our own sends stands (services/whisper_store.rs `Delivery`). */
+export type WhisperDelivery = 'sending' | 'sent' | 'unknown' | 'delivered' | 'not_delivered';
+
+/** Where a stored whisper came from (services/whisper_store.rs `Origin`). */
+export type WhisperOrigin = 'twitch' | 'local_sent' | 'scraped';
+
+/** A Twitch badge shown beside a whisper partner's name. */
+export interface TwitchWhisperBadge {
+  set_id: string;
+  version: string;
+  title: string;
+  image_url: string;
+}
+
+/** One stored whisper (services/whisper_store.rs `StoredWhisper`). */
+export interface StoredWhisperMessage {
+  id: string;
+  from_user_id: string;
+  from_user_login: string;
+  from_user_name: string;
+  to_user_id: string;
+  to_user_login: string;
+  to_user_name: string;
+  message: string;
+  timestamp: number;
+  is_sent: boolean;
+  parts: MentionPart[];
+  deleted: boolean;
+  edited_ms: number | null;
+  origin: WhisperOrigin;
+  delivery: WhisperDelivery | null;
+  failure: string | null;
+  cut_to: number | null;
+}
+
+/** A whisper partner's live broadcast (whisper_live.rs `LiveNow`). */
+export interface WhisperLiveNow {
+  title: string;
+  category: string;
+  viewers: number;
+}
+
+/** What every surface draws for a conversation (whisper_inbox.rs `RowMeta`). */
+export interface WhisperRowMeta {
+  key: string;
+  user_id: string;
+  user_login: string;
+  user_name: string;
+  profile_image_url: string | null;
+  color: string | null;
+  badges: TwitchWhisperBadge[];
+  last_message_timestamp: number;
+  last_text: string;
+  last_parts: MentionPart[];
+  last_is_sent: boolean;
+  unread_count: number;
+  archived: boolean;
+  muted: boolean;
+  /** The iPhone's pinned-sender view; desktop and Android use `useChatterLook`. */
+  sender_view?: unknown | null;
+  /** Live right now, as far as StreamNook knows; absent or null while offline. */
+  live?: WhisperLiveNow | null;
+}
+
+/** One conversation's change (`whisper-conversation-updated`). */
+export interface WhisperUpdatePayload {
+  owner_id: string;
+  key: string;
+  replaced_key: string | null;
+  meta: WhisperRowMeta;
+  message: StoredWhisperMessage | null;
+  removed_message_id: string | null;
+  loading: boolean | null;
+  error: string | null;
+}
+
+/** Rust's `whisper_list` once the new store lands. */
+export interface WhisperListPayload {
+  owner_id: string;
+  conversations: WhisperRowMeta[];
+  unread_total: number;
+  syncing: boolean;
+  signed_in: boolean;
+  session_problem: string | null;
+}
+
+/** Rust's `whisper_page`: one conversation's row and a page of its messages, oldest first. */
+export interface WhisperPagePayload {
+  meta: WhisperRowMeta | null;
+  messages: StoredWhisperMessage[];
+  cursor: string | null;
+  has_more_local: boolean;
+  older_on_twitch: boolean;
+}
+
+/** The inbox counts every badge reads (`inbox-changed`, services/inbox_counts.rs). */
+export interface InboxCounts {
+  unread_total: number;
+  mentions: number;
+  whispers: number;
+  island: number;
+  /** MultiChat's Mentions badge: every unread mention and the whispers after its Clear. */
+  multichat?: number;
+  rev: number;
+}
+
+/** Which surface asks for the inbox view (mention_inbox.rs `Surface`). */
+export type InboxSurface = 'phone' | 'island' | 'multichat';
+
+// The inbox view, the archive event, the arrival and the sync answer: one
+// place for the desktop and Android.
+
+/** A mention row of `get_inbox_view` (mention_inbox.rs `InboxItem::Mention`):
+ *  the newest of a run of identical messages. */
+export interface InboxMentionItem {
+  kind: 'mention';
+  /** Unique within a view: the entry's id. */
+  row_id: string;
+  entry: MentionEntry;
+  /** The older identical messages, newest first. */
+  folded: { id: string; at_ms: number; read: boolean }[];
+  /** Any message in the row is unread. */
+  unread: boolean;
+  /** The sender's picture, once Rust has it. */
+  avatar: string | null;
+}
+
+/** A whisper conversation row of `get_inbox_view` (`InboxItem::Whisper`), at
+ *  its newest message. `row_id` is `w:<key>`. */
+export interface InboxWhisperItem {
+  kind: 'whisper';
+  row_id: string;
+  whisper: WhisperRowMeta;
+}
+
+/** One row of `get_inbox_view`, tagged by `kind`. */
+export type InboxItem = InboxMentionItem | InboxWhisperItem;
+
+/** `get_inbox_view` (commands/mention_inbox.rs `InboxView`). */
+export interface InboxViewPayload {
+  rows: InboxItem[];
+  has_more: boolean;
+  /** Opaque: what asks for the next page. */
+  cursor: string | null;
+  unread_total: number;
+  chips: { id: InboxFilterId; unread: number }[];
+  /** The revision of the counts; a shell keeps the highest it has seen. */
+  counts_rev: number;
+  /** The island's count from the same snapshot. */
+  island_unread: number;
+  /** The whole snapshot those counts come from (seeds every badge at mount). */
+  counts: InboxCounts;
+}
+
+/** `whisper-archive-changed`: many conversations changed, or a sync started or ended. */
+export interface WhisperArchiveChangedPayload {
+  owner_id: string;
+  /** A sync is running. */
+  syncing: boolean;
+}
+
+/** `whisper-arrived`: a live whisper filed unread, for the card over the message bar. */
+export interface WhisperArrivedPayload {
+  update: WhisperUpdatePayload;
+}
+
+/** `whisper_status`: what the inbox says about whispers beyond its rows. */
+export interface WhisperStatusPayload {
+  signed_in: boolean;
+  syncing: boolean;
+  /** Why whispers cannot load (the twitch.tv session is someone else's), or null. */
+  session_problem: string | null;
+  unread_total: number;
+}
+
+/** `whisper_sync_now` (whisper_sync.rs `SyncOutcome`, tagged by `outcome`). */
+export type WhisperSyncOutcome =
+  | { outcome: 'done'; added: number }
+  | { outcome: 'partial'; added: number }
+  | { outcome: 'superseded' }
+  | { outcome: 'no_session' }
+  | { outcome: 'wrong_session' }
+  | { outcome: 'still_running' }
+  | { outcome: 'failed'; reason: string };
 
 // Hype Train Types
 export interface HypeTrainContributor {

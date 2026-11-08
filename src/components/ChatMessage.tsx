@@ -1,4 +1,5 @@
-import React, { useMemo, useState, useEffect, memo, useSyncExternalStore, type JSX } from 'react';
+import React, { useMemo, useState, useEffect, memo, useSyncExternalStore, useContext, type JSX } from 'react';
+import { PreviewChattersContext } from './chat/previewChatters';
 import { Gift } from 'lucide-react';
 import { parseBadges } from '../services/twitchBadges';
 import { Tooltip, type TooltipChildProps } from './ui/Tooltip';
@@ -8,6 +9,7 @@ import { isDiskCopyUrl } from '../utils/cacheFileUrl';
 import { getCachedEmojiUrl, parseEmojisSync } from '../services/emojiService';
 import { calculateHalfPadding } from '../utils/chatLayoutUtils';
 import { mentionHoldBackground } from './chat/mentionHold';
+import { withEmoteWord } from './chat/emoteWords';
 import { deletedBodyStyle, deletedRowDimmed, DEFAULT_DELETED_STYLE } from './chat/deletedMessage';
 import { ModerationTag } from './chat/ModerationTag';
 import { eventCardClass as eventCardClassFor, eventCardStyle as eventCardStyleFor } from './chat/eventCard';
@@ -539,7 +541,7 @@ import { isThemeDark } from '../themes';
 
 import { Logger } from '../utils/logger';
 import { moderateWithToast, type ModRequest } from '../services/moderation';
-import { Copy, PushPin, PushPinSlash } from 'phosphor-react';
+import { ArrowBendUpLeft, ChatDots, Copy, PushPin, PushPinSlash } from 'phosphor-react';
 import { ModSlider } from './chat/ModSlider';
 import { HoverModButtons } from './chat/HoverModButtons';
 import { ModLineButtons } from './chat/ModLineButtons';
@@ -1110,7 +1112,10 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // `tags.get('user-id')`, which Kick and YouTube do not stamp at all, so every
   // non-Twitch row was classified as a non-member no matter who sent it.
   const senderMemberId = memberIdFor(cosmeticsKey);
-  const isSNSender = isStreamNookUser(senderMemberId);
+  // A settings preview's made-up chatters (chat/previewChatters); null in chat.
+  const previewChatters = useContext(PreviewChattersContext);
+  const previewChatter = cosmeticsKey ? previewChatters?.get(cosmeticsKey) : undefined;
+  const isSNSender = previewChatter?.streamNookMember ?? isStreamNookUser(senderMemberId);
 
   // Provider-aware ban/timeout. Twitch -> Helix `ban_user` (duration in SECONDS,
   // null = permanent ban). Kick -> `kick_ban_user` (duration in MINUTES, null =
@@ -1268,7 +1273,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     cologne,
   } = useChatUserStore(
     useShallow((s) => {
-      const u = cosmeticsKey ? s.users.get(cosmeticsKey) : undefined;
+      const u = cosmeticsKey ? (previewChatter ?? s.users.get(cosmeticsKey)) : undefined;
       // A member can keep their theme on their profile but off their chat rows.
       const themeInChat = atmospheresInChat && !u?.themeHiddenInChat;
       return {
@@ -2137,6 +2142,23 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const memberContributes = (seg: EmoteSegment) =>
     ((seg.modifierFlags ?? 0) & MOD_PREFIX) !== 0 || ffzEffectsOn;
 
+  // Emote words: the typed word beside each emote so a sentence of emotes
+  // reads. Whether the body has plain words is Rust's stamp
+  // (metadata.has_words); an unstamped local row words its emotes.
+  const emoteWords = chatDesign?.emote_words ?? 'off';
+  const wordsHere =
+    emoteWords !== 'off' &&
+    (chatDesign?.emote_words_sentences_only === false || !stamped || parsed.metadata?.has_words === true);
+  // The word a group's target gets: a drawn emote, not an overlay standing
+  // alone or a personal emote already shown as its text.
+  const wordFor = (seg: EmoteSegment): string | null =>
+    wordsHere &&
+    seg.type === 'emote' &&
+    !seg.isZeroWidth &&
+    !(seg.isPersonal && chatDesign?.show_personal_emotes === false)
+      ? seg.content
+      : null;
+
   const renderGroup = (
     group: EmoteSegment | EmoteSegment[],
     index: number,
@@ -2196,10 +2218,13 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           })}
         </span>
       );
-      if (!effectBits) return gridSpan;
-      return wrapWithEmoteEffects(gridSpan, effectBits, `group-${index}`, index > 0);
+      const drawn = effectBits ? wrapWithEmoteEffects(gridSpan, effectBits, `group-${index}`, index > 0) : gridSpan;
+      const word = giant ? null : wordFor(group[0]);
+      return word ? withEmoteWord(emoteWords, drawn, word, `word-${index}`) : drawn;
     }
-    return renderSegment(group, index.toString(), false, false, undefined, giant);
+    const drawn = renderSegment(group, index.toString(), false, false, undefined, giant);
+    const word = giant ? null : wordFor(group);
+    return word ? withEmoteWord(emoteWords, drawn, word, `word-${index}`) : drawn;
   };
 
   // The body is a chatter's own text, so it is a bidi island (<bdi>): Arabic
@@ -2794,9 +2819,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         {/* Shared chat indicator */}
         {isFromDifferentChannel && (
           <div className="flex items-center gap-1.5 mb-2 pb-2 border-b border-borderSubtle">
-            <svg className="w-3.5 h-3.5 text-accent flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-            </svg>
+            <ChatDots size={14} weight="bold" aria-hidden className="text-accent flex-shrink-0" />
             <span className="text-xs text-accent font-semibold">From Shared Chat</span>
             {fetchedChannelName && (
               <>
@@ -3151,9 +3174,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
         {/* Shared chat indicator */}
         {isFromDifferentChannel && (
           <div className="flex items-center gap-1.5 mb-2 pb-2 border-b border-borderSubtle">
-            <svg className="w-3.5 h-3.5 text-accent flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
-            </svg>
+            <ChatDots size={14} weight="bold" aria-hidden className="text-accent flex-shrink-0" />
             <span className="text-xs text-accent font-semibold">From Shared Chat</span>
             {fetchedChannelName && (
               <>
@@ -3472,6 +3493,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // that handled the click itself keeps it (the name; an emote, which goes
   // into the composer), links and buttons keep the plain no-menu default, and
   // a text selection touching this row falls through to the Copy menu.
+  // The hover dock's Reply starts the same reply a right click does.
+  const canReply = !!onUsernameRightClick && !!parsed.tags.get('id');
   const handleRowContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.defaultPrevented || !onUsernameRightClick) return;
     const messageId = parsed.tags.get('id');
@@ -3624,9 +3647,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               // old text-xs at the default 14px) instead of a fixed size.
               style={{ fontSize: `${Math.round((chatDesign?.font_size ?? 14) * 0.85)}px` }}
             >
-              <svg className="flex-shrink-0" style={{ width: '1.1em', height: '1.1em' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
-              </svg>
+              <ArrowBendUpLeft size="1.1em" weight="bold" aria-hidden className="flex-shrink-0" />
               <span className="font-semibold"><bdi>{getDisplayedName(overrideKey(parsed.replyInfo.parentUserId, parsed.provider ?? 'twitch'), parsed.replyInfo.parentShownName || parsed.replyInfo.parentDisplayName, userOverrides)}</bdi></span>
               <span className="truncate flex-1">
                 <bdi>{replyPreviewSegments
@@ -3938,7 +3959,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           lengths open on a click, in place, and their close button lands on
           the chevron's own spot, so a double click only toggles. data-no-drag
           so nothing here starts a mod drag. */}
-      {hoverArmed && (onMessageCopy || (showInlinePin && !!broadcasterId) || dockOffered) && (
+      {hoverArmed && (onMessageCopy || canReply || (showInlinePin && !!broadcasterId) || dockOffered) && (
         <div
           data-no-drag="true"
           data-row-dock="true"
@@ -3968,7 +3989,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               }}
             />
           )}
-          {dockOffered && (onMessageCopy || showInlinePin) && <div className="mx-0.5 h-4 w-px bg-white/10" />}
+          {dockOffered && (onMessageCopy || canReply || showInlinePin) && <div className="mx-0.5 h-4 w-px bg-textPrimary/15" />}
           {showInlinePin && broadcasterId && thisMessageId && parsed.provider === 'twitch' && (
             <Tooltip content={isThisPinned ? 'Unpin message' : 'Pin message'} side="top" requirePointerMove>
               <button
@@ -3990,7 +4011,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                     useAppStore.getState().addToast(isThisPinned ? "Couldn't unpin that message" : "Couldn't pin that message", 'error');
                   });
                 }}
-                className={`p-1 rounded-md transition-colors ${isThisPinned ? 'text-accent hover:text-error hover:bg-error/15' : 'text-white/50 hover:text-accent hover:bg-accent/15'}`}
+                className={`p-1 rounded-md transition-colors ${isThisPinned ? 'text-accent hover:text-error hover:bg-error/15' : 'text-textSecondary hover:text-accent hover:bg-accent/15'}`}
               >
                 {isThisPinned ? <PushPinSlash size={14} weight="bold" /> : <PushPin size={14} weight="bold" />}
               </button>
@@ -4001,9 +4022,26 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               <button
                 aria-label="Copy message"
                 onClick={(e) => { e.preventDefault(); onMessageCopy(parsed.content); }}
-                className="p-1 rounded-md text-white/50 hover:text-white hover:bg-surface-hover transition-colors"
+                className="p-1 rounded-md text-textSecondary hover:text-textPrimary hover:bg-surface-hover transition-colors"
               >
                 <Copy size={14} weight="bold" />
+              </button>
+            </Tooltip>
+          )}
+          {/* The same reply a right click on the name starts, for those who
+              would rather click. */}
+          {canReply && (
+            <Tooltip content="Reply" side="top" requirePointerMove>
+              <button
+                aria-label="Reply"
+                onClick={(e) => {
+                  e.preventDefault();
+                  const messageId = parsed.tags.get('id');
+                  if (messageId) onUsernameRightClick?.(messageId, parsed.username);
+                }}
+                className="p-1 rounded-md text-textSecondary hover:text-textPrimary hover:bg-surface-hover transition-colors"
+              >
+                <ArrowBendUpLeft size={14} weight="bold" />
               </button>
             </Tooltip>
           )}
