@@ -5,8 +5,7 @@
 // whose switch `live_notifications.notice_<id>` is off does not show. Errors
 // and warnings never carry one, so they can never be hidden.
 import { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { Logger } from './logger';
+import { invokeList } from './invokeList';
 import type { LiveNotificationSettings } from '../types';
 
 /** Every notice id; the list in notice_types.json is tested to match. */
@@ -41,19 +40,15 @@ export function noticeHidden(prefs: Partial<LiveNotificationSettings> | undefine
 let cached: NoticeType[] | null = null;
 let pending: Promise<NoticeType[]> | null = null;
 
-/** The notices this build shows, read once per run. An empty list when the read fails. */
+/** The notices this build shows, read once per run, retried while Rust does
+ *  not answer (`invokeList`); the next caller tries again after a total miss. */
 export function loadNoticeTypes(): Promise<NoticeType[]> {
   if (cached) return Promise.resolve(cached);
-  pending ??= invoke<NoticeType[]>('get_notice_types')
-    .then((list) => {
-      cached = list;
-      return list;
-    })
-    .catch((err) => {
-      Logger.warn('[notices] get_notice_types failed:', err);
-      pending = null;
-      return [];
-    });
+  pending ??= invokeList<NoticeType>('get_notice_types').then((list) => {
+    if (list.length > 0) cached = list;
+    else pending = null;
+    return list;
+  });
   return pending;
 }
 
