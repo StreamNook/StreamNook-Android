@@ -606,6 +606,10 @@ pub struct ChatDesignSettings {
     /// /me messages slant (absent = true, as Twitch shows them); false keeps them upright.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_italic: Option<bool>,
+    /// /me message text wears the chatter's 7TV paint (absent = false: the text takes their
+    /// Twitch name colour and only the name keeps its paint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_action_text: Option<bool>,
     /// @mention shape: plain (coloured text, the default) | pill (tinted capsule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mention_style: Option<String>,
@@ -837,6 +841,7 @@ impl Default for ChatDesignSettings {
             mention_weight: None,
             mention_italic: None,
             action_italic: None,
+            paint_action_text: None,
             mention_style: None,
             mention_text_color: None,
             chat_dock_switcher: None,

@@ -665,6 +665,12 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Chat',
+    section: 'Message Layout',
+    title: 'Paint /me messages',
+    description: "A /me message's text wears the chatter's 7TV paint too. Off writes it in their Twitch name color, and only the name keeps its paint. /me, action, 7tv paint, name color."
+  },
+  {
+    tab: 'Chat',
     section: 'Mentions & Replies',
     title: 'Flash',
     parent: 'Highlight',

@@ -235,6 +235,7 @@ const BY_TITLE: Record<string, LucideIcon> = {
   'Activity feed size': ALargeSmall,
   'Text weight': Bold,
   'Italic /me messages': Italic,
+  'Paint /me messages': Paintbrush,
   'Message animation': WandSparkles,
   'History opacity': Blend,
   Timestamps: Clock,

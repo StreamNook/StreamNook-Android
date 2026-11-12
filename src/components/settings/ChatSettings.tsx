@@ -627,6 +627,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     mention_weight: stored?.mention_weight,
     mention_italic: stored?.mention_italic,
     action_italic: stored?.action_italic,
+    paint_action_text: stored?.paint_action_text,
     mention_style: stored?.mention_style,
     mention_text_color: stored?.mention_text_color,
     chat_dock_switcher: stored?.chat_dock_switcher,
@@ -1596,6 +1597,18 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
             <Toggle
               enabled={cd.action_italic ?? true}
               onChange={() => setDesign({ action_italic: !(cd.action_italic ?? true) })}
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Paint /me messages"
+          onReset={resetFor(['chat_design.paint_action_text', false])}
+          description="A /me message's text wears the chatter's 7TV paint too. Off writes it in their Twitch name color, and only the name keeps its paint."
+          control={
+            <Toggle
+              enabled={cd.paint_action_text ?? false}
+              onChange={() => setDesign({ paint_action_text: !(cd.paint_action_text ?? false) })}
             />
           }
         />

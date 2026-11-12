@@ -855,6 +855,23 @@
   {
    "page": "chat",
    "section": "Message Layout",
+   "title": "Paint /me messages",
+   "paths": [
+    "chat_design.paint_action_text"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "A /me message's text wears the chatter's 7TV paint too. Off writes it in their Twitch name color, and only the name keeps its paint.",
+   "aliases": [
+    "/me",
+    "action",
+    "7tv paint",
+    "name color"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Message Layout",
    "title": "Message animation",
    "paths": [
     "chat_design.message_entrance"

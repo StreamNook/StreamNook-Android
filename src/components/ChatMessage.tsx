@@ -1509,6 +1509,14 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     // Use the new computePaintStyle function
     return computePaintStyle(seventvPaint, effectiveColor, paintShadowMode, stillEmotes);
   }, [youtubeOwnerPill, seventvPaint, effectiveColor, paintShadowMode, stillEmotes]);
+  // A /me message's text: painted like the name only with Paint /me messages
+  // on (SN-272); otherwise the plain name color. The same object as
+  // usernameStyle when they match, so the name inside need not repeat it.
+  const paintActionText = chatDesign?.paint_action_text === true;
+  const actionTextStyle = useMemo(
+    () => (paintActionText || !seventvPaint || youtubeOwnerPill ? usernameStyle : { color: effectiveColor }),
+    [paintActionText, seventvPaint, youtubeOwnerPill, usernameStyle, effectiveColor],
+  );
 
   // Username prefix styling (normal messages only; action/"/me" stay plain).
   // The separator glyph sits between the name and the message; the name style
@@ -3840,15 +3848,17 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           >
             {isAction ? (
               // ACTION messages: entire content in username color, slanted
-              // unless Italic /me messages is off.
+              // unless Italic /me messages is off. The text wears the 7TV
+              // paint only with Paint /me messages on; otherwise it is the
+              // plain name color and the name alone keeps its paint (SN-272).
               <span
-                style={{ ...usernameStyle, fontWeight: chatBodyWeight(chatDesign?.font_weight) }}
+                style={{ ...actionTextStyle, fontWeight: chatBodyWeight(chatDesign?.font_weight) }}
                 className={`break-words ${chatDesign?.action_italic === false ? '' : 'italic'}`}
               >
                 {/* No hover tooltip: a right click anywhere on the message
                     replies, as the row's Reply button says (SN-264). */}
                 <span
-                    style={{ fontWeight: 700 }}
+                    style={{ ...(actionTextStyle === usernameStyle ? null : usernameStyle), fontWeight: 700 }}
                     className="cursor-pointer hover:underline inline-block"
                     onClick={(e) => {
                       const userId = clickUserId;

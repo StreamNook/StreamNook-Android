@@ -354,6 +354,8 @@ export interface ChatDesignSettings {
   mention_italic?: 'inherit' | 'never' | 'always';
   /** /me messages slant (default true); false keeps them upright. */
   action_italic?: boolean;
+  /** /me message text wears the chatter's 7TV paint (default false: their Twitch name color, the name keeps its paint). */
+  paint_action_text?: boolean;
   /** @mention shape: plain coloured text (default) or a tinted pill. */
   mention_style?: 'plain' | 'pill';
   /** @mention colour. Absent follows the mentioned user's name colour. */

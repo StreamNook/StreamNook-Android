@@ -111,6 +111,7 @@ pub fn frontend_owned_defaults() -> Value {
             "mention_weight": "medium",
             "mention_italic": "inherit",
             "action_italic": true,
+            "paint_action_text": false,
             "mention_style": "plain",
             "chat_dock_switcher": "menu",
         },
