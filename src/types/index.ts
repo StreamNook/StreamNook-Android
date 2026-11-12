@@ -1832,6 +1832,23 @@ export type ChangelogNode =
       items: ChangelogItem[];
     };
 
+/** Mirrors `services::app_links::AppPage`: a page an app link opens. */
+export type AppLinkPage =
+  | 'drops'
+  | 'whispers'
+  | 'badges'
+  | 'emote_sets'
+  | 'multichat'
+  | 'songs'
+  | 'profile'
+  | 'home';
+
+/** Mirrors `services::app_links::AppLink`: where a `streamnook://` link in the
+ *  update notes goes, as Rust read it. */
+export type AppLink =
+  | { kind: 'settings'; tab: string; row: string | null }
+  | { kind: 'open'; page: AppLinkPage };
+
 export interface ChangelogRelease {
   /** Without a leading "v". */
   version: string;

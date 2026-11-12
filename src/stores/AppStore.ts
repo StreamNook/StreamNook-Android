@@ -437,6 +437,9 @@ export interface AppState {
   // DOM id of a settings section to scroll to when the dialog opens (e.g. from a
   // right-click shortcut). Consumed by SettingsDialog, cleared on close.
   settingsInitialSection: string | null;
+  // Title of a settings row to land on when the dialog opens (a link in the
+  // update notes). Consumed by SettingsDialog, cleared on close.
+  settingsInitialRow: string | null;
   // Twitch user_id of the member whose public StreamNook profile is open in
   // the draggable viewer overlay, or null when closed.
   profileViewerUserId: string | null;
@@ -686,7 +689,7 @@ export interface AppState {
   /** Follow Rust's link governor for the solo player: show the rendition
    *  "Auto" plays, and reload when the relay restarted on another one. */
   applyLinkAdapt: (adapt: PlaybackAdapt) => void;
-  openSettings: (initialTab?: SettingsTab, initialSection?: string) => void;
+  openSettings: (initialTab?: SettingsTab, initialSection?: string, initialRow?: string) => void;
   closeSettings: () => void;
   closeProfileViewer: () => void;
   // Open the viewer in LIVE-PREVIEW mode for the current user's own profile,
@@ -1897,6 +1900,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   isSettingsOpen: false,
   settingsInitialTab: null,
   settingsInitialSection: null,
+  settingsInitialRow: null,
   profileViewerUserId: null,
   profileViewerPreview: null,
   isCommandPaletteOpen: false,
@@ -3713,12 +3717,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       currentStream: cs ? { ...cs, title: room?.last_title || '', game_name: room?.last_category || '', started_at: '' } : cs,
     });
   },
-  openSettings: (initialTab?: SettingsTab, initialSection?: string) => {
+  openSettings: (initialTab?: SettingsTab, initialSection?: string, initialRow?: string) => {
     trackActivity('Opened Settings' + (initialTab ? ` (${initialTab})` : ''));
     set({
       isSettingsOpen: true,
       settingsInitialTab: initialTab || null,
       settingsInitialSection: initialSection || null,
+      settingsInitialRow: initialRow || null,
       // A deep-link into Settings (e.g. a plugin card pointing at the tab where
       // its real panel lives) must land visibly, so close the Marketplace
       // overlay that would otherwise stay on top covering the dialog.
@@ -3727,7 +3732,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
   closeSettings: () => {
     trackActivity('Closed Settings');
-    set({ isSettingsOpen: false, settingsInitialTab: null, settingsInitialSection: null });
+    set({ isSettingsOpen: false, settingsInitialTab: null, settingsInitialSection: null, settingsInitialRow: null });
   },
   closeProfileViewer: () => {
     set({ profileViewerUserId: null, profileViewerPreview: null });

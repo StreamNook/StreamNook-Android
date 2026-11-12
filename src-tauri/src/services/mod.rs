@@ -326,6 +326,7 @@ pub mod whisper_gql;
 pub mod watch_session;
 pub mod watch_start;
 pub mod app_presence;
+pub mod app_links;
 pub mod earning_gate;
 pub mod whisper_inbox;
 pub mod whisper_live;

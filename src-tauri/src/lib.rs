@@ -106,6 +106,13 @@ fn watch_link_key(url: String) -> Option<String> {
     tauri::Url::parse(&url).ok().as_ref().and_then(parse_watch_link)
 }
 
+/// Where a `streamnook://settings/...` or `streamnook://open/...` link in the
+/// update notes goes; None for any other link (`services::app_links`).
+#[tauri::command]
+fn app_link_target(url: String) -> Option<services::app_links::AppLink> {
+    services::app_links::parse(&url)
+}
+
 /// The link a share button copies for a stream. `channel` is the row's
 /// `user_login`; `stream_id` its platform stream id, which names the live video
 /// for a YouTube stream started from a channel.
@@ -1857,6 +1864,7 @@ pub fn run() {
             get_window_size,
             take_pending_watch_link,
             watch_link_key,
+            app_link_target,
             share_link,
             #[cfg(target_os = "android")]
             twitch_login_plugin::open_mobile_login,

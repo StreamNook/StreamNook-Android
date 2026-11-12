@@ -102,6 +102,7 @@ const SettingsDialog = () => {
     isSettingsOpen,
     settingsInitialTab,
     settingsInitialSection,
+    settingsInitialRow,
     isAuthenticated,
     currentUser,
     settings,
@@ -110,6 +111,7 @@ const SettingsDialog = () => {
       isSettingsOpen: s.isSettingsOpen,
       settingsInitialTab: s.settingsInitialTab,
       settingsInitialSection: s.settingsInitialSection,
+      settingsInitialRow: s.settingsInitialRow,
       isAuthenticated: s.isAuthenticated,
       currentUser: s.currentUser,
       settings: s.settings,
@@ -256,6 +258,23 @@ const SettingsDialog = () => {
     }
     scrollToSection(entry.sectionId ?? '', entry);
   };
+
+  // A link in the update notes names a row: land on it the way a search hit
+  // does. The index loads with the search results, so it is fetched here too.
+  useEffect(() => {
+    if (!isSettingsOpen || !settingsInitialRow) return;
+    let live = true;
+    void import('./settings/searchIndex').then(({ SETTINGS_INDEX }) => {
+      const entry = SETTINGS_INDEX.find(
+        (e) => e.title === settingsInitialRow && (!settingsInitialTab || e.tab === settingsInitialTab),
+      );
+      if (live && entry) handleResultSelect(entry);
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isSettingsOpen, settingsInitialRow, settingsInitialTab]);
 
   return (
     <AnimatePresence>

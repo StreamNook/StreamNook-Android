@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useState, type MouseEvent, type ReactNode } from 'react';
 import {
   Bug,
   CircleArrowUp,
@@ -13,8 +13,10 @@ import {
 } from 'lucide-react';
 import { Globe } from 'phosphor-react';
 import { parseInlineMarkdown } from '../../services/markdownService';
+import { appLinkTarget } from '../../utils/appLinks';
 import { AndroidMark, AppleMark, WindowsMark } from './PlatformMarks';
 import type {
+  AppLink,
   ChangelogItem as Item,
   ChangelogNode as Node,
   ChangelogPlatform,
@@ -196,9 +198,26 @@ const renderNode = (node: Node, key: number): ReactNode => {
   }
 };
 
-export const ReleaseNotes = ({ nodes }: { nodes: Node[] }) => {
+// A `streamnook://` link in the notes opens a place in the app. Rust says where
+// it goes; one it does not know does nothing rather than leave the app.
+const onNotesClick = (onAppLink: ((link: AppLink) => void) | undefined) => (e: MouseEvent<HTMLDivElement>) => {
+  const anchor = (e.target as HTMLElement).closest('a');
+  const href = anchor?.getAttribute('href') ?? '';
+  if (!href.toLowerCase().startsWith('streamnook:')) return;
+  e.preventDefault();
+  if (!onAppLink) return;
+  void appLinkTarget(href).then((link) => {
+    if (link) onAppLink(link);
+  });
+};
+
+export const ReleaseNotes = ({ nodes, onAppLink }: { nodes: Node[]; onAppLink?: (link: AppLink) => void }) => {
   if (nodes.length === 0) {
     return <p className="px-1 text-[13px] italic text-textMuted">No release notes.</p>;
   }
-  return <div className="flex flex-col gap-6 text-left">{nodes.map(renderNode)}</div>;
+  return (
+    <div className="flex flex-col gap-6 text-left" onClick={onNotesClick(onAppLink)}>
+      {nodes.map(renderNode)}
+    </div>
+  );
 };
