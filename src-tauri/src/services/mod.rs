@@ -24,8 +24,10 @@ pub mod account_store;
 pub mod activity_history_service;
 // Phones only: ad-free live playback. Desktop keeps the ad-neutral core and
 // its `playback.resolve` plugin seam; a phone can't host a plugin (it is a
-// spawned native process), so the same work happens in-core there.
-#[cfg(mobile)]
+// spawned native process), so the same work happens in-core there. Its rules
+// (the splice, the filter, the vertical view's stand-down) are tested on
+// desktop; every call site stays `#[cfg(mobile)]`.
+#[cfg(any(mobile, test))]
 pub mod ad_bypass;
 pub mod ad_detect;
 pub mod app_paths;
@@ -174,7 +176,10 @@ pub mod theme_palette;
 pub mod settings_backups;
 pub mod install_marker;
 pub mod settings_catalog;
+pub mod search_relevance;
+pub mod suggest_platforms;
 pub mod alert_types;
+pub mod notice_types;
 // Phones only: go-live push registration. Its rules are tested on desktop.
 #[cfg(any(mobile, test))]
 pub mod push_alerts;
@@ -266,6 +271,7 @@ pub mod twitch_integrity;
 pub mod bits;
 pub mod count_text;
 pub mod twitch_resolver;
+pub mod twitch_view;
 pub mod twitch_limits;
 pub mod token_vault;
 #[cfg(target_os = "android")]
@@ -320,6 +326,7 @@ pub mod whisper_gql;
 pub mod watch_session;
 pub mod watch_start;
 pub mod app_presence;
+pub mod app_links;
 pub mod earning_gate;
 pub mod whisper_inbox;
 pub mod whisper_live;

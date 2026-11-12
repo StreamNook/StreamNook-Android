@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useState, type MouseEvent, type ReactNode } from 'react';
 import {
   Bug,
   CircleArrowUp,
@@ -11,10 +11,15 @@ import {
   Zap,
   type LucideIcon,
 } from 'lucide-react';
+import { Globe } from 'phosphor-react';
 import { parseInlineMarkdown } from '../../services/markdownService';
+import { appLinkTarget } from '../../utils/appLinks';
+import { AndroidMark, AppleMark, WindowsMark } from './PlatformMarks';
 import type {
+  AppLink,
   ChangelogItem as Item,
   ChangelogNode as Node,
+  ChangelogPlatform,
   ChangelogSectionKind,
 } from '../../types';
 
@@ -38,6 +43,38 @@ const SECTION_ICONS: Record<ChangelogSectionKind, LucideIcon> = {
 const sectionIcon = (kind: ChangelogSectionKind): ReactNode => {
   const Icon = SECTION_ICONS[kind] ?? Info;
   return <Icon size={14} className="text-accent shrink-0" />;
+};
+
+// Each platform's official mark, sized by eye: the solid Windows panes read
+// larger than Apple's outline and the short Android head reads smaller, so each
+// gets the size that makes the three look even. macOS and iPhone share Apple's.
+type MarkSpec = { Mark: typeof AppleMark; size: number };
+const WINDOWS: MarkSpec = { Mark: WindowsMark, size: 12 };
+const APPLE: MarkSpec = { Mark: AppleMark, size: 14 };
+const ANDROID: MarkSpec = { Mark: AndroidMark, size: 16 };
+const PLATFORM_MARKS: Record<ChangelogPlatform, MarkSpec> = {
+  windows: WINDOWS,
+  macos: APPLE,
+  android: ANDROID,
+  iphone: APPLE,
+};
+
+// A heading that names platforms: their marks, then its words. "Everywhere"
+// (no platforms) gets the globe. A mark two platforms share is drawn once.
+const PlatformHeading = ({ label, platforms }: { label: string; platforms: ChangelogPlatform[] }) => {
+  const marks = [...new Set(platforms.map((p) => PLATFORM_MARKS[p]))];
+  return (
+    <div className="flex items-center gap-2 px-1 mt-2 -mb-3 text-[15px] font-semibold text-textPrimary">
+      <span className="flex items-center gap-1.5 text-textSecondary shrink-0" aria-hidden="true">
+        {marks.length > 0 ? (
+          marks.map(({ Mark, size }, i) => <Mark key={i} width={size} height={size} />)
+        ) : (
+          <Globe size={16} weight="fill" />
+        )}
+      </span>
+      <span>{parseInlineMarkdown(label)}</span>
+    </div>
+  );
 };
 
 const SectionLabel = ({ label, kind }: { label: string; kind: ChangelogSectionKind }) => (
@@ -154,14 +191,33 @@ const renderNode = (node: Node, key: number): ReactNode => {
           {parseInlineMarkdown(node.desc)}
         </p>
       );
+    case 'platform':
+      return <PlatformHeading key={key} label={node.label} platforms={node.platforms} />;
     case 'section':
       return <Section key={key} node={node} />;
   }
 };
 
-export const ReleaseNotes = ({ nodes }: { nodes: Node[] }) => {
+// A `streamnook://` link in the notes opens a place in the app. Rust says where
+// it goes; one it does not know does nothing rather than leave the app.
+const onNotesClick = (onAppLink: ((link: AppLink) => void) | undefined) => (e: MouseEvent<HTMLDivElement>) => {
+  const anchor = (e.target as HTMLElement).closest('a');
+  const href = anchor?.getAttribute('href') ?? '';
+  if (!href.toLowerCase().startsWith('streamnook:')) return;
+  e.preventDefault();
+  if (!onAppLink) return;
+  void appLinkTarget(href).then((link) => {
+    if (link) onAppLink(link);
+  });
+};
+
+export const ReleaseNotes = ({ nodes, onAppLink }: { nodes: Node[]; onAppLink?: (link: AppLink) => void }) => {
   if (nodes.length === 0) {
     return <p className="px-1 text-[13px] italic text-textMuted">No release notes.</p>;
   }
-  return <div className="flex flex-col gap-6 text-left">{nodes.map(renderNode)}</div>;
+  return (
+    <div className="flex flex-col gap-6 text-left" onClick={onNotesClick(onAppLink)}>
+      {nodes.map(renderNode)}
+    </div>
+  );
 };

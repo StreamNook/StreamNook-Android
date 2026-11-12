@@ -121,23 +121,16 @@ export const MobileStreamCard: React.FC<{
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-live opacity-60" />
             <span className="relative inline-flex w-2 h-2 rounded-full bg-live ring-1 ring-black/40" />
           </span>
-          {/* Drops matter as much in list mode as in card mode, and the row had
-              no way to say so. Icon only: no space for the DROPS wordmark the
-              card carries. */}
+          {/* Drops sits on the preview's top-right corner as a small glyph chip,
+              as the iPhone row and the big card show it, so the text column
+              keeps to the stream itself. */}
           {hasDrops && (
             <CardChip
               kind="drops"
-              style={{
-                position: 'absolute',
-                top: 4,
-                right: 4,
-                fontSize: 8,
-                padding: '2px 3px',
-                gap: 0,
-              }}
               aria-label="Drops enabled"
+              style={{ position: 'absolute', top: 4, right: 4, padding: '2px 4px' }}
             >
-              <Package size={10} />
+              <Package size={9} weight="bold" aria-hidden />
             </CardChip>
           )}
           {hypeTrain && (
@@ -203,9 +196,8 @@ export const MobileStreamCard: React.FC<{
             )}
           </div>
           {showCategory && stream.game_name && (
-            <div className="flex items-center gap-1 text-textMuted text-[12.5px] leading-[15px]">
-              <span className="truncate">{stream.game_name}</span>
-              {/* The DROPS badge over the thumbnail already says this. */}
+            <div className="flex items-center min-w-0 text-textMuted text-[12.5px] leading-[15px]">
+              <span className="truncate min-w-0">{stream.game_name}</span>
             </div>
           )}
           {/* The streak rides the viewers line as amber words: as a dark chip it

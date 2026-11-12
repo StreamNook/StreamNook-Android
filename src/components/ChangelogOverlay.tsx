@@ -7,6 +7,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { ReleaseNotes } from './changelog/ReleaseNotes';
 import { useUpdateCheck } from './changelog/useUpdateCheck';
 import { Logger } from '../utils/logger';
+import { followAppLink } from '../utils/appLinks';
 
 // Compare versions ignoring a leading "v" (tags and props mix both forms).
 const normalizeTag = (t: string) => t.replace(/^v/i, '').trim();
@@ -339,7 +340,13 @@ const ChangelogOverlay = ({ version, onClose }: ChangelogOverlayProps) => {
               <p className="text-sm text-textSecondary">{error}</p>
             </div>
           ) : notes ? (
-            <ReleaseNotes nodes={notes} />
+            <ReleaseNotes
+              nodes={notes}
+              onAppLink={(link) => {
+                onClose();
+                followAppLink(link);
+              }}
+            />
           ) : (
             <div className="text-center py-10">
               <p className="text-sm text-textSecondary">No release notes available</p>

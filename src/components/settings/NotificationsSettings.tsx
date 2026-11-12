@@ -26,6 +26,7 @@ import { RESTLESS_ACCOLADE_ID, bumpTestNotificationClicks } from '../../utils/no
 import { restlessReached } from '../../utils/clientAccolades';
 import { earnClientAccolade } from '../../utils/earnAccolade';
 import { alertKey, loadAlertTypes, useAlertTypes } from '../../mobile/alertTypes';
+import { loadNoticeTypes, noticeHidden, noticeKey, useNoticeTypes } from '../../utils/notices';
 import { openSystemNotifySettings, useSystemNotifyPermission } from '../../utils/systemNotifyPermission';
 
 import { Logger } from '../../utils/logger';
@@ -41,9 +42,15 @@ import { LiveAlertChannelsModal } from './LiveAlertChannelsModal';
 // draws whole on its first frame rather than growing a section under the
 // reader.
 void loadAlertTypes();
+void loadNoticeTypes();
 
 // The operating system's name for its own notifications.
 const SYSTEM_NAME = IS_MAC ? 'macOS' : IS_LINUX ? 'desktop' : 'Windows';
+
+// How long the page waits for that list before it draws without it. The list
+// normally answers in a frame; a page that waited on it with no limit stayed
+// empty when it never came. Late rows then join "Notify me about" in place.
+const ALERT_TYPES_WAIT_MS = 1200;
 const IS_WINDOWS_DESKTOP = !IS_MAC && !IS_LINUX;
 
 // What each type's notification does on desktop beyond its one-line detail,
@@ -167,6 +174,13 @@ const NotificationsSettings = () => {
   const { settings, updateSettings, addToast } = useAppStore();
   const resetFor = useSettingReset();
   const alertTypes = useAlertTypes();
+  const noticeTypes = useNoticeTypes();
+  const [stopWaiting, setStopWaiting] = useState(false);
+  useEffect(() => {
+    if (alertTypes !== null) return;
+    const timer = setTimeout(() => setStopWaiting(true), ALERT_TYPES_WAIT_MS);
+    return () => clearTimeout(timer);
+  }, [alertTypes]);
   // macOS asks before StreamNook's first system notification; elsewhere this
   // is granted and never read.
   const { permission, ask } = useSystemNotifyPermission();
@@ -322,8 +336,9 @@ const NotificationsSettings = () => {
 
   // The list is read once a run, started when this code loaded; until it
   // answers (a moment, the first time) the page waits rather than drawing
-  // without its types and then pushing everything under them down.
-  if (alertTypes === null) return null;
+  // without its types and then pushing everything under them down, but only
+  // for ALERT_TYPES_WAIT_MS.
+  if (alertTypes === null && !stopWaiting) return null;
 
   return (
     <div className="space-y-8">
@@ -462,7 +477,7 @@ const NotificationsSettings = () => {
             label="Notify me about"
             description="Pick which events are worth a notification."
           >
-            {alertTypes.map((type) => {
+            {(alertTypes ?? []).map((type) => {
               const key = alertKey(type);
               if (!key) return null;
               const saved = liveNotifications[key];
@@ -505,6 +520,22 @@ const NotificationsSettings = () => {
                               Choose
                             </button>
                           </div>
+                        }
+                      />
+                      {/* Desktop reads it in Rust's go-live door; on a phone the
+                          push registration carries it and the push server
+                          writes the alert to match. */}
+                      <SubControl
+                        title="Streamer's message"
+                        control={
+                          <Toggle
+                            enabled={liveNotifications.streamer_go_live_text ?? false}
+                            onChange={() =>
+                              updateLiveNotifications({
+                                streamer_go_live_text: !(liveNotifications.streamer_go_live_text ?? false),
+                              })
+                            }
+                          />
                         }
                       />
                     </SubControls>
@@ -570,6 +601,33 @@ const NotificationsSettings = () => {
               );
             })}
           </SettingsSection>
+
+          {noticeTypes && noticeTypes.length > 0 && (
+            <SettingsSection
+              label="Small notices"
+              description="Short confirmations you can do without. Errors always show."
+            >
+              {noticeTypes.map((notice) => {
+                const on = !noticeHidden(liveNotifications, notice.id);
+                return (
+                  <SettingsRow
+                    key={notice.id}
+                    title={notice.title}
+                    onReset={resetFor(notice.setting)}
+                    description={notice.detail}
+                    control={
+                      <Toggle
+                        enabled={on}
+                        onChange={() =>
+                          updateLiveNotifications({ [noticeKey(notice.id)]: !on } as Partial<LiveNotificationSettings>)
+                        }
+                      />
+                    }
+                  />
+                );
+              })}
+            </SettingsSection>
+          )}
 
           <SettingsSection
             label="Sound"

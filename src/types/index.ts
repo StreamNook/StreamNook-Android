@@ -77,6 +77,14 @@ export interface VideoPlayerSettings {
    *  top and bottom (never its sides, at most 1.5x). Set by a pinch on the
    *  video or the Player switch. Default false. Typed in Rust. */
   zoom_to_fill?: boolean;
+  /** Phones only (SN-269): on its side, a vertical swipe on the video sets
+   *  brightness (left half) or volume (right half). Default true. Typed in Rust. */
+  swipe_dials?: boolean;
+  /** Phones only (SN-40): a dual-format Twitch stream opens in its vertical
+   *  view. Default false. Typed in Rust and backend-owned: only the core's
+   *  `change_stream_view` writes it and only the core reads it, so no shell
+   *  patches or reads this field. */
+  vertical_view?: boolean;
   /** Scroll over the player to adjust volume. Default true. */
   scroll_volume?: boolean;
   /** Scroll down over the player to open the channel About drawer. Default
@@ -327,6 +335,9 @@ export interface ChatDesignSettings {
   // Live polls open collapsed to their header instead of expanded. Independent
   // of `show_polls`, which hides the card entirely. Default false (polls open).
   polls_start_collapsed?: boolean;
+  // Live predictions open collapsed to their strip. A prediction already closed
+  // and waiting for its result starts collapsed either way. Default false.
+  predictions_start_collapsed?: boolean;
   /** Sound when a live message mentions you: a built-in tone id or `file:<id>`. Absent or empty: no sound. */
   mention_sound?: string;
   /** Mention sound volume, percent of the sound's own level (0-200, default 100). */
@@ -341,6 +352,10 @@ export interface ChatDesignSettings {
   mention_weight?: 'regular' | 'medium' | 'bold';
   /** @mention slant: inherit (italic inside /me messages, the default), never, or always. */
   mention_italic?: 'inherit' | 'never' | 'always';
+  /** /me messages slant (default true); false keeps them upright. */
+  action_italic?: boolean;
+  /** /me message text wears the chatter's 7TV paint (default false: their Twitch name color, the name keeps its paint). */
+  paint_action_text?: boolean;
   /** @mention shape: plain coloured text (default) or a tinted pill. */
   mention_style?: 'plain' | 'pill';
   /** @mention colour. Absent follows the mentioned user's name colour. */
@@ -382,6 +397,10 @@ export interface ChatDesignSettings {
   // 'ffz', 'bttv', 'chatterino', 'homies', 'moltorino', 'chatsen', 'chatty',
   // 'dankchat', 'limerino', 'jilchat', 'bchat'). Default none.
   hidden_badge_providers?: string[];
+  // Your own StreamNook badge beside your name on this screen (chat rows,
+  // profile headers). False leaves it out here only, for clean screenshots;
+  // others still see it. Default true.
+  show_own_streamnook_badge?: boolean;
   // How many badges a chat row shows before folding the rest into a "+N"
   // chip that unfolds on hover (tap on phones). 0 shows all. Default 0.
   badge_fold_limit?: number;
@@ -965,6 +984,9 @@ export interface LiveNotificationSettings {
   show_favorite_live_notifications?: boolean;
   // A live FAVORITED channel switches category. Off until turned on.
   show_favorite_category_notifications?: boolean;
+  // A Twitch go-live shows the streamer's own go-live message instead of the
+  // stream title, when they set one. Off by default.
+  streamer_go_live_text?: boolean;
   show_whisper_notifications?: boolean;
   show_update_notifications?: boolean;
   show_drops_notifications?: boolean;
@@ -1013,6 +1035,14 @@ export interface LiveNotificationSettings {
   // Channel logins excluded from live alerts. Empty means everything you follow
   // notifies, so an upgrade changes nothing until a channel is opted out.
   muted_live_channels?: string[];
+  // Small notices, each on its own switch (src/utils/notices.ts, Rust
+  // services/notice_types.json). Absent means on.
+  notice_welcome_back?: boolean;
+  notice_drop_claimed?: boolean;
+  notice_copied?: boolean;
+  notice_quality_changed?: boolean;
+  notice_stream_restarted?: boolean;
+  notice_vod_resumed?: boolean;
 }
 
 export type AutoSwitchMode = 'same_category' | 'followed_streams';
@@ -1151,6 +1181,10 @@ export interface MultiNookSlot {
   channelName?: string;   // The capitalization-correct display name
   volume: number;         // 0.0 to 1.0
   muted: boolean;         // Mute state
+  /** Muted by you on the tile itself (its player), not by focus. Focus,
+   *  promote, maximize, dock and undock never unmute it; your own unmute on
+   *  the tile clears it. Saved with the grid (Rust `held_muted`). */
+  heldMuted?: boolean;
   isFocused: boolean;     // Whether this stream has focus (unmuted while all others are muted)
   streamUrl?: string;     // The local proxy URL (ephemeral, not saved)
   isMinimized?: boolean;  // Whether the stream is tucked into the tray to save grid space
@@ -1398,6 +1432,9 @@ export interface FullscreenChatSettings {
   // phone_layout), as the person last left it. Default true: chat beside the
   // stream until they choose otherwise.
   landscape_open?: boolean;
+  // Phone only (SN-40). Whether a tall stream on an upright phone opens with
+  // the lower-third chat shown, as the person last left it. Default true.
+  vertical_open?: boolean;
 }
 
 /** How the Discord status looks. Mirrors Rust `DiscordPresenceSettings`
@@ -1772,6 +1809,9 @@ export type ChangelogSectionKind =
   | 'features'
   | 'other';
 
+/** Mirrors `services::changelog::Platform`: a platform drawn as its logo. */
+export type ChangelogPlatform = 'windows' | 'macos' | 'android' | 'iphone';
+
 export interface ChangelogItem {
   title: string;
   desc: string;
@@ -1784,6 +1824,8 @@ export type ChangelogNode =
   | { t: 'hero'; title: string; desc: string }
   | { t: 'image'; url: string; alt: string }
   | { t: 'note'; desc: string }
+  /** A heading naming platforms; an empty list is every platform. */
+  | { t: 'platform'; label: string; platforms: ChangelogPlatform[] }
   | {
       t: 'section';
       label: string | null;
@@ -1791,6 +1833,23 @@ export type ChangelogNode =
       intro: string[];
       items: ChangelogItem[];
     };
+
+/** Mirrors `services::app_links::AppPage`: a page an app link opens. */
+export type AppLinkPage =
+  | 'drops'
+  | 'whispers'
+  | 'badges'
+  | 'emote_sets'
+  | 'multichat'
+  | 'songs'
+  | 'profile'
+  | 'home';
+
+/** Mirrors `services::app_links::AppLink`: where a `streamnook://` link in the
+ *  update notes goes, as Rust read it. */
+export type AppLink =
+  | { kind: 'settings'; tab: string; row: string | null }
+  | { kind: 'open'; page: AppLinkPage };
 
 export interface ChangelogRelease {
   /** Without a leading "v". */
@@ -2444,6 +2503,9 @@ export interface DropsOverview {
   earned_badge_titles: string[];
   /** Earned plus Twitch's global catalog, lowercased. */
   known_badge_titles: string[];
+  /** Rewards this account cannot earn yet (an evolution stage whose earlier
+   *  form is not held), by drop id: "Needs the Gastly badge first". */
+  locked_drops: Record<string, string>;
 }
 
 // Drops inventory types

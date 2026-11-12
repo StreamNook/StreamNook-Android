@@ -5,8 +5,7 @@
 // build cannot send is simply not in the list. Desktop's Settings and setup
 // read it from here too.
 import { useEffect, useState } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { Logger } from '../utils/logger';
+import { invokeList } from '../utils/invokeList';
 import type { LiveNotificationSettings } from '../types';
 
 /** Mirrors Rust `alert_types::AlertType`. */
@@ -26,19 +25,16 @@ export interface AlertType {
 let cached: AlertType[] | null = null;
 let pending: Promise<AlertType[]> | null = null;
 
-/** The list, read once per run (it is fixed for a build). An empty list when the read fails. */
+/** The list, read once per run (it is fixed for a build). Retried while Rust
+ *  does not answer (`invokeList`); an empty list only when every try failed,
+ *  and the next caller then tries again. */
 export function loadAlertTypes(): Promise<AlertType[]> {
   if (cached) return Promise.resolve(cached);
-  pending ??= invoke<AlertType[]>('get_alert_types')
-    .then((list) => {
-      cached = list;
-      return list;
-    })
-    .catch((err) => {
-      Logger.warn('[alertTypes] get_alert_types failed:', err);
-      pending = null;
-      return [];
-    });
+  pending ??= invokeList<AlertType>('get_alert_types').then((list) => {
+    if (list.length > 0) cached = list;
+    else pending = null;
+    return list;
+  });
   return pending;
 }
 

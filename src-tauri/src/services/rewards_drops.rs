@@ -105,6 +105,9 @@ pub struct DropRow {
     pub detail: Option<String>,
     /// Bar fill 0 to 100; None for a drop watch time does not earn.
     pub bar: Option<f32>,
+    /// Not earnable yet (it needs an earlier reward first): drawn out of
+    /// reach, dimmed and after the rest, with `detail` saying what it needs.
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -162,16 +165,52 @@ pub async fn get(
         if let Err(e) = &campaigns {
             log::warn!("[Rewards] campaign list read failed: {e}");
         }
-        let source = Source { inventory: inventory.ok(), campaigns: campaigns.unwrap_or_default() };
+        let mut inventory = inventory.ok();
+        if let Some(inv) = inventory.as_mut() {
+            crate::services::drops_service::fill_account_links(&mut inv.items);
+        }
+        let source = Source { inventory, campaigns: campaigns.unwrap_or_default() };
         if let Ok(mut last) = LAST.lock() {
             *last = Some(source);
         }
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let last = LAST.lock().ok();
-    match last.as_ref().and_then(|l| l.as_ref()) {
-        Some(source) => build(source.inventory.as_ref(), &source.campaigns, query, now),
-        None => build(None, &[], query, now),
+    let mut view = {
+        let last = LAST.lock().ok();
+        match last.as_ref().and_then(|l| l.as_ref()) {
+            Some(source) => build(source.inventory.as_ref(), &source.campaigns, query, now),
+            None => build(None, &[], query, now),
+        }
+    };
+    apply_locked(&mut view, &crate::services::watch_drops::locked());
+    view
+}
+
+/// Rewards watching cannot earn yet (an evolution stage whose earlier form is
+/// not held) read like a reward out of reach: no status, what they need as the
+/// detail, no bar, and after every reward still earnable. Pure.
+fn apply_locked(view: &mut RewardsDrops, locked: &std::collections::HashMap<String, String>) {
+    if locked.is_empty() {
+        return;
+    }
+    let cards = view
+        .in_progress
+        .iter_mut()
+        .chain(view.available.iter_mut())
+        .flat_map(|g| g.campaigns.iter_mut());
+    for card in cards {
+        for row in card.drops.iter_mut() {
+            if row.claimed || row.done {
+                continue;
+            }
+            if let Some(needs) = locked.get(&row.id) {
+                row.locked = true;
+                row.status = String::new();
+                row.detail = Some(crate::services::evolution::locked_words(needs));
+                row.bar = None;
+            }
+        }
+        card.drops.sort_by_key(|r| r.locked);
     }
 }
 
@@ -274,6 +313,7 @@ fn drop_row(drop: &TimeBasedDrop, now_ms: i64) -> DropRow {
         status,
         detail,
         bar,
+        locked: false,
     }
 }
 
@@ -518,6 +558,24 @@ mod tests {
         assert_eq!(view.available[0].art, "https://x/ttv-boxart/Valorant-144x192.jpg");
         assert_eq!(view.earned.len(), 10);
         assert_eq!(view.earned[0].game, None);
+    }
+
+    #[test]
+    fn a_stage_that_needs_an_earlier_form_reads_out_of_reach_and_last() {
+        let started = campaign("1", "Pokemon", 20, vec![drop("gengar", 60, Some(30), false), drop("x", 60, Some(30), false)]);
+        let inventory = inv(vec![item(started.clone(), CampaignStatus::Active, 1)], 0);
+        let mut view = build(Some(&inventory), &[started], "", now());
+        let locked = std::collections::HashMap::from([("gengar".to_string(), "Haunter".to_string())]);
+        apply_locked(&mut view, &locked);
+        let rows = &view.in_progress[0].campaigns[0].drops;
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["x", "gengar"]);
+        let gengar = &rows[1];
+        assert!(gengar.locked);
+        assert_eq!(gengar.status, "");
+        assert_eq!(gengar.detail.as_deref(), Some("Needs the Haunter badge first"));
+        assert_eq!(gengar.bar, None);
+        assert!(!rows[0].locked && !rows[0].status.is_empty());
     }
 
     #[test]

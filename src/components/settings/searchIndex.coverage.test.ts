@@ -55,7 +55,7 @@ const UNINDEXED: Record<
     titles: ['Vibration', 'Keep screen on', 'Inbox button', 'Only after a colon'],
     nested: [{ title: 'Matching', parent: 'Chatter names' }],
   },
-  Player: { sections: ['Discover'], titles: ['Background play', 'Zoom to fill'] },
+  Player: { sections: ['Discover'], titles: ['Background play', 'Zoom to fill', 'Brightness and volume swipes'] },
   Support: { sections: ['Devices'], titles: ['Log export'] },
   Notifications: { titles: ['Gift sub preview', 'Reward preview'] },
   Moderation: { sections: ['Moderating Messages'] },
@@ -98,10 +98,19 @@ interface Rendered {
 const alertTypes = JSON.parse(
   readFileSync(new URL('../../../src-tauri/src/services/alert_types.json', import.meta.url), 'utf8'),
 ) as { types: { title: string; platforms: string[] }[] };
+// And its "Small notices" rows are Rust's notice list (notice_types.json).
+const noticeTypes = JSON.parse(
+  readFileSync(new URL('../../../src-tauri/src/services/notice_types.json', import.meta.url), 'utf8'),
+) as { notices: { title: string; platforms: string[] }[] };
 const LISTED_ROWS: Record<string, Rendered[]> = {
-  Notifications: alertTypes.types
-    .filter((t) => t.platforms.includes('desktop'))
-    .map((t) => ({ section: 'Notify me about', title: t.title })),
+  Notifications: [
+    ...alertTypes.types
+      .filter((t) => t.platforms.includes('desktop'))
+      .map((t) => ({ section: 'Notify me about', title: t.title })),
+    ...noticeTypes.notices
+      .filter((t) => t.platforms.includes('desktop'))
+      .map((t) => ({ section: 'Small notices', title: t.title })),
+  ],
 };
 
 /** A row title as search matches it: a title that shows its value

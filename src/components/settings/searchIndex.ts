@@ -659,6 +659,18 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Chat',
+    section: 'Message Layout',
+    title: 'Italic /me messages',
+    description: "A /me message is written in the chatter's name color and slants, as on Twitch. Off keeps it upright. /me, action, italics, slanted, upright."
+  },
+  {
+    tab: 'Chat',
+    section: 'Message Layout',
+    title: 'Paint /me messages',
+    description: "A /me message's text wears the chatter's 7TV paint too. Off writes it in their Twitch name color, and only the name keeps its paint. /me, action, 7tv paint, name color."
+  },
+  {
+    tab: 'Chat',
     section: 'Mentions & Replies',
     title: 'Flash',
     parent: 'Highlight',
@@ -1312,6 +1324,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Chat',
+    section: 'Polls & Predictions',
+    title: 'Collapsed',
+    parent: 'Predictions',
+    description: 'Opens live predictions as their header bar instead of expanded. A prediction already closed and waiting for the result opens collapsed either way. Predictions start collapsed, minimize prediction.'
+  },
+  {
+    tab: 'Chat',
     section: 'Chat Events',
     sectionId: 'settings-section-chat-events',
     title: 'Style',
@@ -1400,7 +1419,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Mentions & Replies',
     title: 'Italic',
     parent: '@name style',
-    description: 'Whether an @name slants: like the message, never, or always. @name italic, /me.'
+    description: 'Whether an @name slants: like the message, never, or always. @name italic.'
   },
   {
     tab: 'Chat',
@@ -1616,6 +1635,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     title: 'Services',
     parent: 'Add-on badges',
     description: 'Turn individual badge services off: 7TV, FFZ, Chatterino, Homies, Homies custom badges and the rest. Badge services, badge providers.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Names & Badges',
+    title: 'My badge',
+    parent: 'Add-on badges',
+    description: 'Your StreamNook badge beside your own name on your screen, in chat and on your profile. Turn it off for clean screenshots. Hide my badge, unequip StreamNook badge.'
   },
   {
     tab: 'Chat',
@@ -2714,6 +2740,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   {
     tab: 'Notifications',
     section: 'Notify me about',
+    title: "Streamer's message",
+    parent: 'Live channels',
+    description: "A Twitch go-live alert shows the message the streamer wrote for their followers' notifications instead of the stream title, when they wrote one. Go live notification text, custom go-live message."
+  },
+  {
+    tab: 'Notifications',
+    section: 'Notify me about',
     title: 'Favorite channels live',
     description: 'When a channel you favorited goes live, even one you do not follow on Twitch. Favorites. Previously "Favorite channels".'
   },
@@ -2818,6 +2851,20 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     title: 'Update straight from the toast',
     description: 'Clicking the update toast starts installing right away instead of opening the Updates page first.'
   },
+  // "Small notices" rows are drawn from Rust's notice list
+  // (src-tauri/src/services/notice_types.json, the desktop ones).
+  {
+    tab: 'Notifications',
+    section: 'Small notices',
+    title: 'Small notices',
+    description: 'Switch off single confirmations you can do without, one by one: Welcome back, Drop claimed, Copied, quality changes, stream restarted, resumed video. Errors always show.'
+  },
+  { tab: 'Notifications', section: 'Small notices', title: 'Welcome back', description: 'The "Welcome back" greeting toast when StreamNook opens signed in.' },
+  { tab: 'Notifications', section: 'Small notices', title: 'Drop claimed', description: 'The Drop claimed notice, toast, island entry and system notification, when a drop reward is claimed by you or for you.' },
+  { tab: 'Notifications', section: 'Small notices', title: 'Copied', description: 'The Copied toast when a link, emote or name is copied to the clipboard.' },
+  { tab: 'Notifications', section: 'Small notices', title: 'Quality changes', description: 'The "Quality changed to" toast when the stream quality switches.' },
+  { tab: 'Notifications', section: 'Small notices', title: 'Stream restarted', description: 'The "Stream restarted with new settings" toast when a player setting restarts the stream.' },
+  { tab: 'Notifications', section: 'Small notices', title: 'Resumed video', description: 'The "Resumed from" toast when a VOD picks up where you left off.' },
   {
     tab: 'Notifications',
     section: 'Sound',

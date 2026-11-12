@@ -52,6 +52,9 @@ fn build_has(need: &str) -> bool {
     if let Some(alert) = need.strip_prefix("alert:") {
         return crate::services::alert_types::works(alert);
     }
+    if let Some(notice) = need.strip_prefix("notice:") {
+        return crate::services::notice_types::shows(notice);
+    }
     crate::services::client_capabilities::has(need)
 }
 
@@ -313,6 +316,26 @@ mod tests {
     }
 
     #[test]
+    fn brightness_and_volume_swipes_row_on_both_phones_and_on_by_default() {
+        for ios in [false, true] {
+            let hit = search_on("brightness", 3, ios, &nothing);
+            assert!(titles(&hit).contains(&"Brightness and volume swipes"), "ios {ios}");
+            let changed = changed_rows_on(&["video_player.swipe_dials".to_string()], ios, &nothing);
+            assert!(titles(&changed).contains(&"Brightness and volume swipes"), "ios {ios}");
+        }
+        let fresh = serde_json::to_value(crate::models::settings::Settings::default()).unwrap();
+        assert_eq!(
+            crate::commands::settings_fields::get_path(&fresh, "video_player.swipe_dials"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        // A settings file from before the switch keeps the swipes.
+        let mut v = serde_json::to_value(crate::models::settings::VideoPlayerSettings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("swipe_dials");
+        let old: crate::models::settings::VideoPlayerSettings = serde_json::from_value(v).unwrap();
+        assert!(old.swipe_dials);
+    }
+
+    #[test]
     fn timestamp_position_defaults_inline_and_sits_under_timestamps() {
         let fresh = serde_json::to_value(crate::models::settings::Settings::default()).unwrap();
         assert_eq!(
@@ -359,8 +382,10 @@ mod tests {
         for row in rows() {
             for need in row.needs.iter().flat_map(|n| n.split('|')) {
                 let alert = need.strip_prefix("alert:").is_some_and(|id| crate::services::alert_types::ids().contains(&id));
+                let notice = need.strip_prefix("notice:").is_some_and(|id| crate::services::notice_types::ids().contains(&id));
                 let ok = known.contains(&need)
                     || alert
+                    || notice
                     || matches!(need, "watch:youtube" | "watch:tiktok" | "watch:twitch" | "watch:kick");
                 assert!(ok, "{} needs an unknown capability {need}", row.title);
             }
@@ -396,6 +421,25 @@ mod tests {
                 assert_eq!(row.needs.as_deref(), Some(format!("alert:{}", alert.id).as_str()));
             }
         }
+    }
+
+    #[test]
+    fn notice_rows_follow_the_notice_list() {
+        for platform in ["desktop", "android"] {
+            for notice in crate::services::notice_types::for_platform(platform) {
+                let row = rows().iter().find(|r| r.paths.contains(&notice.setting)).unwrap_or_else(|| panic!("no row for {}", notice.id));
+                assert_eq!((row.page.as_str(), row.section.as_str(), row.title.as_str()), ("notifications", "Small notices", notice.title.as_str()));
+                assert_eq!(row.detail, notice.detail, "{} words differ", notice.id);
+                assert_eq!(row.needs.as_deref(), Some(format!("notice:{}", notice.id).as_str()));
+            }
+        }
+        // Android searches find the two it shows and none of the desktop-only ones.
+        let android = |n: &str| match n.strip_prefix("notice:") {
+            Some(id) => crate::services::notice_types::shows_on(id, "android"),
+            None => true,
+        };
+        assert!(titles(&search_on("copied", 5, false, &android)).contains(&"Copied"));
+        assert!(!titles(&search_on("welcome back", 5, false, &android)).contains(&"Welcome back"));
     }
 
     #[test]

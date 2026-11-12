@@ -21,6 +21,7 @@ import { shareLinkFor } from '../utils/shareLink';
 import { playerOverlayButtonOn } from '../utils/playerOverlayButtons';
 import { usemultiNookStore } from '../stores/multiNookStore';
 import { useChannelSocial } from '../hooks/useChannelSocial';
+import { ARMED_DANGER_CLASS } from '../hooks/useConfirmPress';
 import StreamTitleWithEmojis from './StreamTitleWithEmojis';
 import PlayerStatsOverlay from './PlayerStatsOverlay';
 import OfflineRoomScreen, { OfflineRoomLivePill } from './OfflineRoomScreen';
@@ -567,6 +568,8 @@ const VideoPlayer = () => {
     checkingFollowStatus,
     heartDropAnimation,
     handleFollowClick,
+    unfollowArmed,
+    disarmUnfollow,
     isSubscribed,
     hasSubHistory,
     cumulativeMonths,
@@ -3298,7 +3301,7 @@ const VideoPlayer = () => {
     if (!at || at < 1) return;
     if (resumeToastedRef.current === vodPlayback.video_id) return;
     resumeToastedRef.current = vodPlayback.video_id;
-    useAppStore.getState().addToast(`Resumed from ${formatVodTime(at)}`, 'info');
+    useAppStore.getState().addToast(`Resumed from ${formatVodTime(at)}`, 'info', undefined, { notice: 'vod_resumed' });
   }, [vodPlayback]);
   const rewindLive = useAppStore((s) => s.rewindLive);
   const returnToLive = useAppStore((s) => s.returnToLive);
@@ -3914,16 +3917,20 @@ const VideoPlayer = () => {
                 ? 'Checking follow status...'
                 : followLoading
                   ? 'Processing...'
-                  : isFollowing
-                    ? `${terms.unfollow} ${currentStream.user_name}`
-                    : `${terms.follow} ${currentStream.user_name}`} side="bottom">
+                  : unfollowArmed
+                    ? `Press again to ${terms.unfollow.toLowerCase()} ${currentStream.user_name}`
+                    : isFollowing
+                      ? `${terms.unfollow} ${currentStream.user_name}`
+                      : `${terms.follow} ${currentStream.user_name}`} side="bottom">
           <button
             onClick={handleFollowClick}
+            onMouseLeave={disarmUnfollow}
             disabled={followLoading || checkingFollowStatus}
+            aria-pressed={unfollowArmed || undefined}
             className={`flex items-center justify-center p-2 aspect-square chrome-glaze chrome-glaze--control chrome-glaze--frosted ${followLoading || checkingFollowStatus
               ? 'opacity-60 cursor-wait'
               : ''
-              }`}
+              } ${unfollowArmed ? ARMED_DANGER_CLASS : ''}`}
           >
             {followLoading || checkingFollowStatus ? (
               <Loader2 className="w-4 h-4 animate-spin text-textSecondary" />

@@ -13,7 +13,9 @@ import { motion, LayoutGroup, AnimatePresence } from 'framer-motion';
 import { usemultiNookStore } from '../stores/multiNookStore';
 
 import { invoke } from '@tauri-apps/api/core';
-import { searchPlatforms } from '../services/platformSearch';
+import { mergeSearchBatches, searchPlatforms, type SearchBatch } from '../services/platformSearch';
+import { PlatformStackPicker } from './PlatformStackPicker';
+import { currentSuggestOff, suggestOn } from '../utils/suggestPlatforms';
 import type { TwitchStream, TwitchCategory, CategoryInfo, TwitchClip, TwitchVideo } from '../types';
 import LoadingWidget from './LoadingWidget';
 import StreamTitleWithEmojis from './StreamTitleWithEmojis';
@@ -60,6 +62,7 @@ import { AutomationPulse } from './ui/AutomationPulse';
 import { TogetherChip } from './SharedViewers';
 import { groupFor } from '../utils/sharedViewers';
 import { signInReasonText, useTwitchSignInReason } from '../utils/twitchSignIn';
+import { ARMED_DANGER_CLASS, useConfirmPress } from '../hooks/useConfirmPress';
 // Types for drops data
 interface DropCampaign {
     id: string;
@@ -1291,6 +1294,19 @@ const Home = () => {
     // text and `mode` forces streamer- or category-search regardless of the tab
     // it's launched from. Called with no args from the input (Enter), it keeps
     // the original tab-driven behavior.
+    // A press in the search bar's platform picker: a platform turned off leaves
+    // the results on screen at once, one turned back on searches again.
+    const onSuggestPlatformsChange = (off: ProviderId[], turnedOn: ProviderId | null) => {
+        if (turnedOn) {
+            if (activeTab === 'search' && searchMode === 'streamers' && searchQuery.trim()) void handleSearch();
+            return;
+        }
+        setSearchResults((rows) => {
+            const kept = rows.filter((s) => !off.includes(streamProvider(s)));
+            return kept.length === rows.length ? rows : kept;
+        });
+    };
+
     const handleSearch = async (opts?: { query?: string; mode?: SearchMode }) => {
         const q = (opts?.query ?? searchQuery).trim();
         if (!q) return;
@@ -1354,20 +1370,21 @@ const Home = () => {
                 // same way unified Discover merges directories. Rust searches them
                 // all at once and hands back each platform's rows as it answers,
                 // so a slow or failing platform never holds back the others.
-                const platforms: ProviderId[] = [
-                    'twitch',
-                    ...(isUnifiedView
-                        ? WATCHABLE_PROVIDERS.filter((pv) => pv !== 'twitch' && PROVIDER_WATCH[pv].search)
-                        : []),
-                ];
-                const found = new Map<ProviderId, TwitchStream[]>();
+                // On All, only the platforms the picker has on (read now, so a
+                // search started by the press that turned one on includes it).
+                const platforms: ProviderId[] = isUnifiedView
+                    ? suggestOn(currentSuggestOff()).filter((pv) => pv === 'twitch' || PROVIDER_WATCH[pv].search)
+                    : ['twitch'];
+                const found = new Map<ProviderId, SearchBatch>();
                 setCategorySearchResults([]);
                 await searchPlatforms(q, platforms, (batch) => {
                     if (seq !== searchSeqRef.current) return;
                     if (batch.error) Logger.warn(`${batch.provider} search failed:`, batch.error);
-                    found.set(batch.provider, batch.streams);
-                    // In a fixed order, whatever order the platforms answer in.
-                    setSearchResults(platforms.flatMap((pv) => found.get(pv) ?? []));
+                    found.set(batch.provider, batch);
+                    // Rust drops the rows that do not name the query and ranks
+                    // the rest on one scale, so the channel itself leads
+                    // whichever platform answers first.
+                    setSearchResults(mergeSearchBatches(platforms, found));
                 });
             }
             setRecentSearches(addRecentSearch(searchScope, q, usedMode));
@@ -1446,6 +1463,10 @@ const Home = () => {
         );
     };
 
+    const { armedKey: armedUnfollowKey, press: pressUnfollow, disarm: disarmUnfollow } = useConfirmPress();
+    const unfollowArmedFor = (stream: TwitchStream) =>
+        armedUnfollowKey === `${streamProvider(stream)}:${followIdentifier(stream)}`;
+
     const handleProviderFollowClick = (e: React.MouseEvent, stream: TwitchStream) => {
         e.stopPropagation();
         const provider = streamProvider(stream);
@@ -1460,6 +1481,8 @@ const Home = () => {
                 ? stream.user_id
                 : null;
         if (follows.isFollowed(provider, target) || (legacyKickId && follows.isFollowed(provider, legacyKickId))) {
+            // A second press on this row unfollows (SN-264).
+            if (!pressUnfollow(`${provider}:${target}`)) return;
             void follows.unfollow(provider, target);
             // Also remove the numeric-keyed legacy form, or the entry the old
             // bug wrote would survive the unfollow and re-read as followed.
@@ -2126,10 +2149,12 @@ const Home = () => {
                                                                                 exactly like Twitch's. Plus (not a heart) so it never reads
                                                                                 as the favourite control. */}
                                                                             {isProviderView && activeTab !== 'following' && (
-                                                                                <Tooltip content={isProviderFollowed(stream) ? `Unfollow on ${providerLabel(streamProvider(stream))}` : `Follow on ${providerLabel(streamProvider(stream))}`} side="top">
+                                                                                <Tooltip content={unfollowArmedFor(stream) ? `Press again to unfollow on ${providerLabel(streamProvider(stream))}` : isProviderFollowed(stream) ? `Unfollow on ${providerLabel(streamProvider(stream))}` : `Follow on ${providerLabel(streamProvider(stream))}`} side="top">
                                                                                 <button
                                                                                     onClick={(e) => handleProviderFollowClick(e, stream)}
-                                                                                    className="p-1 flex items-center justify-center bg-transparent transition-transform duration-300 hover:scale-110 active:scale-95"
+                                                                                    onMouseLeave={disarmUnfollow}
+                                                                                    aria-pressed={unfollowArmedFor(stream) || undefined}
+                                                                                    className={`p-1 flex items-center justify-center rounded-md bg-transparent transition-transform duration-300 hover:scale-110 active:scale-95 ${unfollowArmedFor(stream) ? ARMED_DANGER_CLASS : ''}`}
                                                                                 >
                                                                                     {isProviderFollowed(stream) ? (
                                                                                         <Check size={16} className="text-accent" strokeWidth={2.5} />
@@ -2829,6 +2854,12 @@ const Home = () => {
                             className="absolute -inset-[1px] flex items-center glass-input !rounded-xl z-20"
                             style={{ pointerEvents: isSearchExpanded ? 'auto' : 'none' }}
                         >
+                            {/* Which platforms All searches and suggests from. */}
+                            {isUnifiedView && (
+                                <div className="absolute inset-y-0 left-1.5 z-10 flex items-center">
+                                    <PlatformStackPicker onChange={onSuggestPlatformsChange} />
+                                </div>
+                            )}
                             <input
                                 ref={searchInputRef}
                                 type="text"
@@ -2844,7 +2875,7 @@ const Home = () => {
                                         setIsSearchExpanded(false);
                                     }
                                 }}
-                                className="flex-1 bg-transparent text-center text-white text-sm px-10 py-1.5 focus:outline-none h-full w-full"
+                                className={`flex-1 bg-transparent text-center text-white text-sm ${isUnifiedView ? 'px-24' : 'px-10'} py-1.5 focus:outline-none h-full w-full`}
                             />
 
                             {/* Close button - ONLY visible when text exists */}

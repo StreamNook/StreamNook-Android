@@ -36,12 +36,12 @@
 //! regardless of the experimental setting. The two cannot both own the
 //! playlist, so `LlOrigin::start` returns inactive while `active()` is true.
 
-// Phone builds only (Android and iPhone). The unit tests run against the
-// Android target too (built with `cargo test --target aarch64-linux-android`
-// and executed on the device), so there is no reason to let this compile into
-// a desktop test build and every reason not to: a desktop `cargo test` is the
-// one place a supposedly frozen build could still break.
-#![cfg(mobile)]
+// Phone builds only (Android and iPhone), plus the desktop's test build: the
+// relay's rules (the splice, the filter, the vertical view's stand-down) are
+// tested in the shared desktop `cargo test` like `push_alerts` and
+// `live_poll`. Nothing in a desktop app build reaches it; every call site is
+// `#[cfg(mobile)]`.
+#![cfg(any(mobile, test))]
 
 pub mod filter;
 pub mod master;
@@ -239,6 +239,53 @@ pub(crate) async fn resolve_through_relay(
 fn stand_down() {
     ACTIVE.store(false, Ordering::Relaxed);
     pivot::disarm();
+}
+
+/// A vertical view start (SN-40) plays the portrait ladder straight from
+/// Twitch, skipping `resolve_master`, so the relay session the previous
+/// landscape start armed stands down here: no relay in use (`ACTIVE` false,
+/// so the low-latency origin may run), the pivot disarmed (its generation
+/// moves, so an escalation in flight discards itself instead of swapping a
+/// landscape relay picture in under the tall layout), and ad stripping off
+/// for this session, so Twitch's ads play as the notice says rather than a
+/// stripped all-ad window freezing the picture. The next landscape start sets
+/// all three again from the settings.
+pub fn decline_for_vertical() {
+    ENABLED.store(false, Ordering::Relaxed);
+    stand_down();
+    info!("[AdBypass] vertical view plays straight from Twitch; the relay and ad stripping stand down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_vertical_start_stands_the_relay_session_down() {
+        // A landscape start was relayed: relay in use, pivot armed, stripping on.
+        ENABLED.store(true, Ordering::Relaxed);
+        ACTIVE.store(true, Ordering::Relaxed);
+        pivot::arm_for_test("test-vertical");
+        assert!(pivot::armed());
+        let before = pivot::generation();
+
+        decline_for_vertical();
+
+        assert!(!active(), "no relay in use, so the low-latency origin may run");
+        assert!(!enabled(), "ad stripping is off for this session");
+        assert!(!pivot::armed());
+        assert!(pivot::generation() > before, "an escalation in flight discards itself");
+        // Past the debounce nothing escalates: a spawn here would panic, as
+        // this test runs on no async runtime.
+        for _ in 0..5 {
+            pivot::maybe_trigger(true);
+        }
+        assert!(!pivot::armed());
+        // An all-ad playlist passes through untouched.
+        let all_ads = "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:10\n\
+#EXTINF:2.0,Amazon|1\nhttps://cdn/ad0.ts\n#EXTINF:2.0,Amazon|2\nhttps://cdn/ad1.ts\n";
+        assert_eq!(filter_and_escalate(all_ads), all_ads);
+    }
 }
 
 /// Strip leaked ad segments out of a served media playlist, and escalate to a

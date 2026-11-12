@@ -167,6 +167,11 @@ pub struct PlaybackStatus {
     pub proxy_base: Option<String>,
     /// Region label the plugin reported for that base, best-effort.
     pub proxy_region: Option<String>,
+    /// Why ad-free playback is not in use on a stream it would otherwise
+    /// cover: "vertical" when a phone's vertical view declined the relay
+    /// (SN-40). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 static STATUS: OnceCell<Mutex<HashMap<String, PlaybackStatus>>> = OnceCell::new();
@@ -183,11 +188,93 @@ pub fn get_status(channel: &str) -> Option<PlaybackStatus> {
     map.get(channel).cloned()
 }
 
+/// The usher query every live master fetch sends, with this playback token.
+fn usher_query(sig: &str, token: &str) -> String {
+    format!(
+        "platform=web&player_type=embed&allow_source=true&allow_audio_only=true\
+         &playlist_include_framerate=true&supported_codecs=av1,h264,h265&fast_bread=true\
+         &include_unavailable=true&sig={sig}&token={tok}",
+        sig = sig,
+        tok = urlencoding::encode(token),
+    )
+}
+
+/// The v1 live master: the landscape ladder every start plays today. v1
+/// ignores `multigroup_video`, so it never carries a portrait ladder.
+fn v1_usher_url(channel: &str, sig: &str, token: &str) -> String {
+    format!("https://usher.ttvnw.net/api/channel/hls/{}.m3u8?{}", channel, usher_query(sig, token))
+}
+
+/// The v2 live master with every ladder (SN-40): a dual-format broadcast's
+/// portrait ladder appears only here. Same query, same signature and token.
+fn v2_usher_url(channel: &str, sig: &str, token: &str) -> String {
+    format!(
+        "https://usher.ttvnw.net/api/v2/channel/hls/{}.m3u8?{}&multigroup_video=true",
+        channel,
+        usher_query(sig, token)
+    )
+}
+
+/// A v2 master fetch running beside the v1 one (the phones' vertical view,
+/// SN-40). It answers the master, or None when it failed or was no playlist:
+/// a v2 problem is never the start's error. The fetch is bounded by the web
+/// client's 8 s deadline.
+pub(crate) struct DualFetch {
+    pub handle: tokio::task::JoinHandle<Option<String>>,
+    /// When the v2 request went out, for the wait rule's deadline.
+    pub started: Instant,
+}
+
+impl DualFetch {
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+/// Start the v2 fetch of `url` on its own task.
+pub(crate) fn spawn_v2(url: String, label: String) -> DualFetch {
+    let started = Instant::now();
+    let handle = tokio::spawn(async move {
+        let resp = match web_client()
+            .get(&url)
+            .header("Referer", "https://player.twitch.tv")
+            .header("Origin", "https://player.twitch.tv")
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::debug!("[AuthProxy] {label} v2 master failed: {e}");
+                return None;
+            }
+        };
+        if !resp.status().is_success() {
+            log::debug!("[AuthProxy] {label} v2 master returned {}", resp.status());
+            return None;
+        }
+        let text = resp.text().await.ok()?;
+        text.contains("#EXT-X-STREAM-INF").then_some(text)
+    });
+    DualFetch { handle, started }
+}
+
 /// Direct Twitch fetch: GQL playbackAccessToken then usher master. Sends the
 /// viewer's own credential when present (entitled accounts get their ad-free
 /// master this way); works anonymously otherwise, same as the logged-out web
 /// player. Returns the master playlist body.
 pub(crate) async fn fetch_auth_master(channel: &str, oauth_token: Option<&str>) -> Result<String> {
+    fetch_auth_masters(channel, oauth_token, false).await.map(|(master, _)| master)
+}
+
+/// `fetch_auth_master`, and with `want_dual` also the v2 master (all ladders)
+/// on the same token, fetched alongside v1 rather than after it. Only a
+/// phone's solo start asks: tiles, Cast, the ad pivot, the soaks and the
+/// desktop never fetch v2. The v1 master is byte-identical either way.
+pub(crate) async fn fetch_auth_masters(
+    channel: &str,
+    oauth_token: Option<&str>,
+    want_dual: bool,
+) -> Result<(String, Option<DualFetch>)> {
     // Dev switch: drop the viewer credential so the playback token carries no
     // entitlement. Lets an ad-free account (Turbo/sub) reproduce what un-
     // entitled viewers receive — server-side ad splices in particular — which
@@ -253,27 +340,31 @@ pub(crate) async fn fetch_auth_master(channel: &str, oauth_token: Option<&str>) 
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("no token value"))?;
 
-    let usher = format!(
-        "https://usher.ttvnw.net/api/channel/hls/{ch}.m3u8\
-         ?platform=web&player_type=embed&allow_source=true&allow_audio_only=true\
-         &playlist_include_framerate=true&supported_codecs=av1,h264,h265&fast_bread=true\
-         &include_unavailable=true&sig={sig}&token={tok}",
-        ch = channel,
-        sig = sig,
-        tok = urlencoding::encode(value),
-    );
-
-    let resp = client
-        .get(&usher)
-        .header("Referer", "https://player.twitch.tv")
-        .header("Origin", "https://player.twitch.tv")
-        .send()
-        .await
-        .context("usher request failed")?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("usher returned {}", resp.status()));
-    }
-    let master = resp.text().await?;
+    let usher = v1_usher_url(channel, sig, value);
+    // v2 goes out now, beside v1, on the same token. A v1 failure ends it.
+    let dual = want_dual.then(|| spawn_v2(v2_usher_url(channel, sig, value), channel.to_string()));
+    let v1 = async {
+        let resp = client
+            .get(&usher)
+            .header("Referer", "https://player.twitch.tv")
+            .header("Origin", "https://player.twitch.tv")
+            .send()
+            .await
+            .context("usher request failed")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("usher returned {}", resp.status()));
+        }
+        Ok::<String, anyhow::Error>(resp.text().await?)
+    };
+    let master = match v1.await {
+        Ok(master) => master,
+        Err(e) => {
+            if let Some(dual) = &dual {
+                dual.abort();
+            }
+            return Err(e);
+        }
+    };
 
     // Region unlock: when logged in but geo-blocked from a high tier (1440p/2160p,
     // flagged AUTHZ_GEO in the include_unavailable blob), fetch a region master
@@ -288,12 +379,12 @@ pub(crate) async fn fetch_auth_master(channel: &str, oauth_token: Option<&str>) 
         // region-unlocked tiers on. authenticated == oauth_token.is_some().
         let oauth = oauth_token.expect("authenticated implies an oauth token");
         match recover_geo_blocked_master(channel, oauth).await {
-            Some(relay_master) => return Ok(splice_missing_tiers(&master, &relay_master)),
+            Some(relay_master) => return Ok((splice_missing_tiers(&master, &relay_master), dual)),
             None => log::debug!("[auth_proxy] {channel}: geo-unlock relay recover failed"),
         }
     }
 
-    Ok(master)
+    Ok((master, dual))
 }
 
 /// The streamnook.app relay that re-fetches a usher master from an allowed region,
@@ -495,4 +586,65 @@ pub(crate) fn extract_attr(line: &str, key: &str) -> Option<String> {
     let rest = &line[pos + needle.len()..];
     let end = rest.find(',').unwrap_or(rest.len());
     Some(rest[..end].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::twitch_resolver as tr;
+
+    /// A geo-blocked viewer's own master: the 1440p source is hidden, so its
+    /// 1080p tier is a transcode.
+    const VIEWER: &str = "#EXTM3U\n\
+#EXT-X-STREAM-INF:BANDWIDTH=160000,CODECS=\"mp4a.40.2\",IVS-NAME=\"audio_only\",IVS-VARIANT-SOURCE=\"transcode\"\n\
+https://v/audio.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.4D402A,mp4a.40.2\",FRAME-RATE=60.000,IVS-NAME=\"1080p60\",IVS-VARIANT-SOURCE=\"transcode\"\n\
+https://v/1080.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=3400000,RESOLUTION=1280x720,CODECS=\"avc1.4D401F,mp4a.40.2\",FRAME-RATE=60.000,IVS-NAME=\"720p60\",IVS-VARIANT-SOURCE=\"transcode\"\n\
+https://v/720.m3u8\n";
+
+    /// The region relay's master for the same channel.
+    const REGION: &str = "#EXTM3U\n\
+#EXT-X-STREAM-INF:BANDWIDTH=9000000,RESOLUTION=2560x1440,CODECS=\"hev1.1.6.L150.90,mp4a.40.2\",FRAME-RATE=60.000,IVS-NAME=\"1440p60\",IVS-VARIANT-SOURCE=\"source\"\n\
+https://r/1440.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS=\"avc1.4D402A,mp4a.40.2\",FRAME-RATE=60.000,IVS-NAME=\"1080p60\",IVS-VARIANT-SOURCE=\"transcode\"\n\
+https://r/1080.m3u8\n";
+
+    #[test]
+    fn the_v1_url_is_unchanged_and_v2_adds_every_ladder_on_the_same_token() {
+        let v1 = v1_usher_url("zerator", "SIG", "{\"a\":1}");
+        assert_eq!(
+            v1,
+            "https://usher.ttvnw.net/api/channel/hls/zerator.m3u8?platform=web&player_type=embed\
+             &allow_source=true&allow_audio_only=true&playlist_include_framerate=true\
+             &supported_codecs=av1,h264,h265&fast_bread=true&include_unavailable=true\
+             &sig=SIG&token=%7B%22a%22%3A1%7D"
+        );
+        assert!(!v1.contains("multigroup_video"), "v1 stays byte-identical");
+        let v2 = v2_usher_url("zerator", "SIG", "{\"a\":1}");
+        assert!(v2.starts_with("https://usher.ttvnw.net/api/v2/channel/hls/zerator.m3u8?"), "{v2}");
+        assert!(v2.ends_with("&multigroup_video=true"), "{v2}");
+        assert!(v2.contains("&sig=SIG&token=%7B%22a%22%3A1%7D"), "same signature and token: {v2}");
+    }
+
+    /// Landscape golden (SN-40): the geo-spliced master keeps choosing what
+    /// it chose before the vertical view (one source tier, the grafted one).
+    #[test]
+    fn landscape_golden_geo_spliced() {
+        let spliced = splice_missing_tiers(VIEWER, REGION);
+        let graft = format!("{}?region=weur&u={}", QUALITY_MEDIA_URL, "https%3A%2F%2Fr%2F1440.m3u8");
+        assert!(spliced.ends_with(&format!("{graft}\n")), "{spliced}");
+        let v = tr::parse_master(&spliced);
+        assert_eq!(v.len(), 4);
+        let url = |q: &str| tr::select_variant(&v, q).map(|(i, l)| format!("{l}={}", v[i].url));
+        assert_eq!(url("best"), Some(format!("best={graft}")));
+        assert_eq!(url("worst").as_deref(), Some("worst=https://v/720.m3u8"));
+        assert_eq!(url("1080p60").as_deref(), Some("1080p60=https://v/1080.m3u8"));
+        assert_eq!(url("1440p60"), Some(format!("1440p60={graft}")));
+        let mut menu = vec!["1440p60", "1080p60", "720p60", "best", "audio_only", "worst"];
+        if !cfg!(mobile) {
+            menu.insert(0, "auto");
+        }
+        assert_eq!(tr::quality_names(&v), menu);
+    }
 }

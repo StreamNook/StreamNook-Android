@@ -7,7 +7,8 @@
 // subscription per tab, so every open room stays connected and switching tabs is
 // a re-render rather than a reconnect. This pane renders whichever tab is active
 // via `useChannelChat`.
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { acceptsComposerEvent, type PaneEventDetail } from '../../components/chat/managerStore';
 import { HandPointing, X } from 'phosphor-react';
 import ChatMessageList from '../../components/ChatMessageList';
 import {
@@ -22,7 +23,7 @@ import { parseMessage } from '../../services/twitchChat';
 import type { BackendChatMessage } from '../../services/twitchChat';
 import { Logger } from '../../utils/logger';
 import { moderateWithToast } from '../../services/moderation';
-import { MobileChatInput, type ChatGating } from './MobileChatInput';
+import { MobileChatInput, type ChatGating, type ComposerFold } from './MobileChatInput';
 import { MobileDropsLip } from './MobileDropsLip';
 import { UserProfileSheet, type SheetUser } from '../profile/UserProfileSheet';
 import { EmoteSheet } from './EmoteSheet';
@@ -50,7 +51,7 @@ import { useAutomodStore } from '../../stores/automodStore';
 import { heldRowMessage, heldRows, isHeldRowId, mergeHeld } from './heldRows';
 import { SwipeModerator } from './SwipeModerator';
 import { messageReach, reachCanDelete, reachCanTimeout, type MessageReach, type SwipeTarget, type TouchSlider } from './swipeSteps';
-import { REPLY_PROVIDERS, canReplyTo, composerTakesText, replyAfterSend, replyHintWords, replyRowOf, type ComposerState, type ReplyTarget } from './replySwipe';
+import { REPLY_PROVIDERS, canReplyTo, composerTakesText, notSentYet, replyAfterSend, replyHintWords, replyRowOf, type ComposerState, type ReplyTarget } from './replySwipe';
 import { learnReplyHint, replyHintOnPause, useReplyHintLearned } from './replyHint';
 import { measureText } from './placeholderFit';
 import { usePlatformAccountStore } from '../../stores/platformAccountStore';
@@ -62,6 +63,9 @@ import { PausedOverlay } from './ResumeLiveButton';
 import { useComposerRiserLift } from './pausedOverlay';
 import { openBadgeInfo } from '../../stores/badgeSpotlightStore';
 import { twitchRowBadgeRef, type TwitchRowBadgeInfo } from '../../utils/badgeSpotlight';
+import { CHAT_BUTTON_SLOT, type VerticalChatState } from '../watch/verticalView';
+import { OVER_VIDEO_CLASS, useOverVideoStyle, useThemeDark } from './overVideo';
+import { NameColorToneContext } from '../../hooks/useNameColor';
 
 /** A tapped badge in a row opens the phone's badge sheet (BadgeSheet, mounted in MobileApp).
  *  Module scope, so the rows' memo never sees a new callback. */
@@ -129,11 +133,49 @@ export const MobileChatPane: React.FC<{
    *  still and catches up in one render when seen again. */
   idle?: boolean;
   top?: React.ReactNode;
-  surface?: InboxSurface;
+  /** A chat's own surface; `home` (browsing) has no chat. */
+  surface?: Exclude<InboxSurface, 'home'>;
   /** The watch chat is not on screen (mini player, landscape with chat off): sheets that belong
    *  to its rows close. The app going to the background is not this. */
   hidden?: boolean;
-}> = ({ readOnly = false, strip = true, paused = false, idle = false, top, surface = 'watch', hidden = false }) => {
+  /** The tall layout's chat (SN-40): `lower` (and `cleared`, out of sight) is the lower third
+   *  over the picture, its rows inert and each on its own backing, live, with no row swipes,
+   *  hold or fan; `expanded` is the full chat grown up the screen. Absent everywhere else. */
+  vertical?: VerticalChatState;
+  /** The lower third's own touch area over the rows (the watch layer's: a tap or a drag up grows
+   *  the chat, sideways clears it, down shrinks the player). */
+  lowerTouch?: React.ReactNode;
+  /** The side chat beside the video is too narrow for a message bar (SN-268): the bar folds to a
+   *  button, and the host widens the column while it is open. */
+  composerFold?: ComposerFold;
+}> = ({
+  readOnly = false,
+  strip = true,
+  paused = false,
+  idle = false,
+  top,
+  surface = 'watch',
+  hidden = false,
+  vertical,
+  lowerTouch,
+  composerFold,
+}) => {
+  // The lower third (or cleared, which keeps its rules while out of sight): rows held at the
+  // newest, inert, every gesture on them the watch layer's.
+  const folded = vertical === 'lower' || vertical === 'cleared';
+  // Chat straight over the video (the lower third, the landscape overlay, which is the only
+  // read-only pane) takes dark ink in a light theme (overVideo.ts): the lower third's list
+  // carries the variables here, the overlay's whole column carries them in the watch screen.
+  // Its names are adjusted for the dark backing; `null` leaves every other pane on the theme.
+  // The names follow a beat behind, in a render React can interrupt, so growing, folding or
+  // turning the phone never waits on every row rendering again.
+  const themeDark = useThemeDark();
+  const overVideo = folded || readOnly;
+  const nameTone = useDeferredValue(overVideo && !themeDark ? true : null);
+  const lowerInk = useOverVideoStyle(folded);
+  // This pane's own name, so a slash command's page action (/clearmessages,
+  // /poll) reaches only the pane it was typed in.
+  const paneSource = useId();
   const currentUser = useAppStore((s) => s.currentUser);
   const addToast = useAppStore((s) => s.addToast);
 
@@ -260,7 +302,8 @@ export const MobileChatPane: React.FC<{
     [noSend, gating.blocked, gating.warning, activeProvider, kickConnected],
   );
   // The room's own platform threads replies (YouTube and TikTok send a reply as a plain line).
-  const replyEnabled = REPLY_PROVIDERS.includes(activeProvider) && composerTakesText(composer);
+  // Never on the lower third's inert rows (SN-40).
+  const replyEnabled = REPLY_PROVIDERS.includes(activeProvider) && composerTakesText(composer) && !folded;
   // Moderator tools are ON wherever you have the badge. A mod opening their own
   // channel expects their tools, and making them hunt for a toggle every time is
   // the wrong default. The destructive actions are protected by the fan's
@@ -536,6 +579,12 @@ export const MobileChatPane: React.FC<{
     listScrollToBottomRef.current?.();
   }, [pause]);
 
+  // The lower third is always live (SN-40): a list held paused never sits behind the picture,
+  // where nothing could scroll it back.
+  useEffect(() => {
+    if (folded && isPaused) resumeLive();
+  }, [folded, isPaused, resumeLive]);
+
   // Tapping the "replying to" line jumps to the message being replied to.
   //
   // Everything except this handler already existed: ChatMessage has carried the
@@ -627,8 +676,10 @@ export const MobileChatPane: React.FC<{
       if (!isTwitchRoom || !d?.userId || !d.username) return;
       setSheetUser({ userId: d.userId, username: d.username, displayName: d.displayName ?? d.username, color: '' });
     };
-    const clearRows = () => {
+    const clearRows = (e: Event) => {
       if (!activeChannel) return;
+      // The pane's own box typed it; the room is whichever this pane shows.
+      if (!acceptsComposerEvent((e as CustomEvent<PaneEventDetail>).detail, paneSource, null)) return;
       const ids = new Set<string>();
       for (const message of messages) {
         const id = getMessageId(message);
@@ -642,7 +693,7 @@ export const MobileChatPane: React.FC<{
       window.removeEventListener('streamnook-open-user-card', openCard);
       window.removeEventListener('streamnook-clear-local-chat', clearRows);
     };
-  }, [isTwitchRoom, activeChannel, messages, getMessageId]);
+  }, [isTwitchRoom, activeChannel, messages, getMessageId, paneSource]);
   // Messages AutoMod held, inline where they arrived, for a moderator of this
   // room: Allow and Deny on the row, which folds once someone decides it.
   const heldKey = isModerator && activeChannel ? activeChannel.toLowerCase() : '';
@@ -693,7 +744,7 @@ export const MobileChatPane: React.FC<{
   // Left-handed swipes: left moderates, right replies.
   const swipeFlipped = useAppStore((s) => s.settings.chat_design?.mod_slider_flipped ?? false);
   const holdModButtons = useAppStore((s) => s.settings.chat_design?.mod_hold_buttons ?? true);
-  const swipeOn = swipeSetting && modToolsArmed && !!broadcasterId && !noSend;
+  const swipeOn = swipeSetting && modToolsArmed && !!broadcasterId && !noSend && !folded;
   // Rows take sideways swipes: right for a moderator's slider, left for a reply.
   const rowSwipeOn = swipeOn || replyEnabled;
   const press = useLongPressDrag({
@@ -770,7 +821,8 @@ export const MobileChatPane: React.FC<{
    *  Delete alone on the viewer's own message, nothing on the broadcaster's. */
   const reachOf = useCallback(
     (messageId: string): { target: SwipeTarget; reach: MessageReach } | null => {
-      if (isHeldRowId(messageId)) return null;
+      // A line Twitch has not echoed yet has only a local id, which no delete can name.
+      if (isHeldRowId(messageId) || notSentYet(messageId)) return null;
       for (const message of messages) {
         if (getMessageId(message) !== messageId) continue;
         try {
@@ -796,7 +848,9 @@ export const MobileChatPane: React.FC<{
       if (found && found.reach !== 'nothing') return found.target;
       // Why a press starts no swipe, for the app log (the iPhone logs the same).
       const why = !found
-        ? 'no chatter on this row'
+        ? notSentYet(messageId)
+          ? 'Twitch has not echoed this line yet, so it has no id to delete'
+          : 'no chatter on this row'
         : `Twitch allows nothing on it (own ${found.target.userId === currentUser?.user_id}, role ${viewerRole ?? 'viewer'}, sender badges ${found.target.badges.join(',') || 'none'})`;
       Logger.warn('[Swipe]', `down on ${messageId}: not swipeable: ${why}`);
       return null;
@@ -1064,7 +1118,13 @@ export const MobileChatPane: React.FC<{
       <div className="flex-1 min-h-0 relative flex flex-col">
       <div
         ref={listRef}
-        style={listMask ? { WebkitMaskImage: listMask, maskImage: listMask } : undefined}
+        // The lower third's rows take dark ink in every theme (overVideo.ts); the composer
+        // under them keeps the theme.
+        style={
+          listMask || lowerInk
+            ? { ...lowerInk, ...(listMask ? { WebkitMaskImage: listMask, maskImage: listMask } : null) }
+            : undefined
+        }
         data-chat-list=""
         // `select-none` is load-bearing, not tidiness: Android WebView answers a
         // long-press on text by starting its OWN text selection, which wins the
@@ -1074,21 +1134,24 @@ export const MobileChatPane: React.FC<{
         // `sn-row-swipe` gives the rows themselves `touch-action: pan-y`. On this wrapper it would do
         // nothing, since the browser reads touch-action only from the touched element up to its
         // scroll container.
-        className={`flex-1 min-h-0 relative select-none [-webkit-touch-callout:none] ${strip || listMask ? '' : 'sn-fade-top'} ${rowSwipeOn ? 'sn-row-swipe' : ''}`}
+        // The lower third (SN-40): every row on its own soft backing and inert, and no hold, fan
+        // or row swipe; the watch layer's touch area over the rows owns every touch there.
+        className={`flex-1 min-h-0 relative select-none [-webkit-touch-callout:none] ${strip || listMask ? '' : 'sn-fade-top'} ${rowSwipeOn ? 'sn-row-swipe' : ''}${folded ? ` sn-chat-vertical ${OVER_VIDEO_CLASS}` : ''}`}
         onContextMenu={onListContextMenu}
-        onPointerDown={press.onPointerDown}
-        onPointerMove={press.onPointerMove}
-        onPointerUp={press.onPointerUp}
-        onPointerCancel={press.onPointerCancel}
+        onPointerDown={folded ? undefined : press.onPointerDown}
+        onPointerMove={folded ? undefined : press.onPointerMove}
+        onPointerUp={folded ? undefined : press.onPointerUp}
+        onPointerCancel={folded ? undefined : press.onPointerCancel}
       >
         <HoldWhile hold={idle}>
+          <NameColorToneContext.Provider value={nameTone}>
           <ChatMessageList
             scrollToBottomRef={listScrollToBottomRef}
             messages={shownMessages}
             emptyNote={replayOn ? replayError : historyLoaded ? 'No recent messages' : null}
             renderToken={renderToken}
             isPaused={isPaused}
-            onPauseIntent={() => pause(true)}
+            onPauseIntent={folded ? undefined : () => pause(true)}
             onScroll={onScroll}
             touchPauseRatio={rowSwipeOn ? touchPauseRatio : undefined}
             onUsernameClick={onUsernameClick}
@@ -1106,6 +1169,7 @@ export const MobileChatPane: React.FC<{
             homeProvider={activeProvider}
             getMessageId={getMessageId}
           />
+          </NameColorToneContext.Provider>
         </HoldWhile>
         {swipeOn && !hintLearned && (
           <div className="pointer-events-none absolute left-0 right-0 top-2 z-10 flex justify-center">
@@ -1127,13 +1191,15 @@ export const MobileChatPane: React.FC<{
           lift={overlayLift}
           onResume={resumeLive}
         />
+        {folded && lowerTouch}
       </div>
       {/* Outside the list, so a press in them never reaches its gestures. */}
       {onScreen && !readOnly && <InboxArrival side={inboxSide} surface={surface} />}
       <InboxSheet surface={surface} />
       </div>
-      {/* The landscape overlay has no room for it and shows whichever is chosen. */}
-      {vodHere && !readOnly && (
+      {/* The landscape overlay and the lower third have no room for it and show whichever is
+          chosen; the grown chat shows it. */}
+      {vodHere && !readOnly && !folded && (
         <div
           className="px-2.5 pt-1.5"
           // With no composer under it, the switch clears the gesture bar itself.
@@ -1155,6 +1221,9 @@ export const MobileChatPane: React.FC<{
       )}
       {!noSend && (
         <MobileChatInput
+          // The tall layout's chat button sits beside the message box (SN-40).
+          trailingSlot={vertical ? CHAT_BUTTON_SLOT : 0}
+          fold={composerFold}
           inboxSurface={surface}
           channel={activeTab?.login ?? null}
           provider={activeProvider}
@@ -1173,6 +1242,8 @@ export const MobileChatPane: React.FC<{
           onAddChat={handleAddChat}
           onReload={handleReload}
           onCloseChat={handleCloseChat}
+          paused={paused}
+          source={paneSource}
         />
       )}
       {/* Channel context matters: Twitch badges like sub tiers and moderator are

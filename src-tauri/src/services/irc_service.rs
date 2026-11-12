@@ -19,7 +19,6 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::{broadcast, Mutex};
@@ -33,6 +32,10 @@ static WS_SERVER_HANDLE: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = 
 // restoring N channels at boot) don't each spin up a separate server + broadcaster,
 // which leaves the frontend attached to a dead or message-less socket.
 static BRIDGE_BRINGUP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+/// The close generation the serving bridge was built at. A full stop that lands
+/// after a bridge came up moves the generation past it, and that server then
+/// closes every socket the moment it opens: it must be rebuilt, never reused.
+static WS_SERVER_BORN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CURRENT_CHANNELS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static MESSAGE_BROADCASTER: OnceLock<Mutex<Option<Arc<broadcast::Sender<BridgeFrame>>>>> =
     OnceLock::new();
@@ -5823,6 +5826,12 @@ impl IrcService {
 
     pub async fn stop() -> Result<()> {
         debug!("[IRC Chat] Stopping chat service");
+        // Held to the end: a bring-up running beside the teardown was born before
+        // the generation moved at the end, so it served a port that closed every
+        // socket at once (an iPhone opening a stream beside a saved room sat on its
+        // join history for good). Now a start waits for the stop, or comes first
+        // and is torn down with it.
+        let _bringup = get_bridge_bringup_lock().lock().await;
 
         // Stop IRC connection + its keepalive children (ping / heartbeat),
         // which aborting the parent alone would orphan.
@@ -5944,8 +5953,17 @@ impl IrcService {
             // through to a fresh bring-up.
             let ws_alive = {
                 let mut handle = get_ws_server_handle().lock().await;
+                let current = WS_SERVER_BORN.load(std::sync::atomic::Ordering::SeqCst) == bridge_generation();
                 match handle.as_ref() {
-                    Some(h) if !h.is_finished() => true,
+                    Some(h) if !h.is_finished() && current => true,
+                    Some(h) if !h.is_finished() => {
+                        // Built before the last full stop: it closes every socket
+                        // at once, so the shell would sit on a dead port.
+                        record_lifecycle("WS bridge predates the last full stop; rebuilding bridge");
+                        h.abort();
+                        handle.take();
+                        false
+                    }
                     Some(_) => {
                         record_lifecycle("WS bridge task is dead; rebuilding bridge");
                         handle.take();
@@ -5977,28 +5995,24 @@ impl IrcService {
             let tx_clone = tx_for_warp.clone();
             ws.on_upgrade(move |socket| Self::handle_local_ws(socket, tx_clone, born))
         });
-        // Pick a free port via an ephemeral probe bind, then hand it to warp. (warp 0.4
-        // exposes no ephemeral bind that returns the port, and a fixed random port in a
-        // small range can collide; an OS-allocated port + the bring-up lock above make a
-        // collision negligible.) The old random-port path could return a port whose
-        // server silently failed to bind, leaving callers to hit "refused".
-        let probe = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        // Bind an OS-allocated port and hand that very listener to warp. Probing a
+        // port, letting it go and having warp bind it again left a gap another
+        // bind could take: warp then panicked on the bind and the caller held a
+        // port nothing served ("refused" for good).
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .map_err(|e| anyhow::anyhow!("WS bridge port probe failed: {}", e))?;
-        let port = probe
+            .map_err(|e| anyhow::anyhow!("WS bridge bind failed: {}", e))?;
+        let port = listener
             .local_addr()
             .map_err(|e| anyhow::anyhow!("WS bridge local_addr failed: {}", e))?
             .port();
-        drop(probe);
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let handle = tokio::spawn(async move {
-            warp::serve(local_ws).run(addr).await;
+            warp::serve(local_ws).incoming(listener).run().await;
         });
-        // Let warp re-bind the freed port before callers connect (frontend also retries).
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
 
         // Only now (bind succeeded) publish the live socket so providers/the frontend
         // attach to a server that is actually listening.
+        WS_SERVER_BORN.store(born, std::sync::atomic::Ordering::SeqCst);
         *get_message_broadcaster().lock().await = Some(tx);
         *get_ws_server_handle().lock().await = Some(handle);
         *get_ws_port().lock().await = Some(port);
@@ -6033,20 +6047,19 @@ impl IrcService {
             let tx_clone = tx_for_warp.clone();
             ws.on_upgrade(move |socket| Self::handle_local_ws(socket, tx_clone, born))
         });
-        let probe = match previous {
+        // The listener warp serves is the one bound here (no probe-and-rebind gap).
+        let listener = match previous {
             Some(p) => match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
                 Ok(listener) => listener,
                 Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
             },
             None => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
         };
-        let port = probe.local_addr()?.port();
-        drop(probe);
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let port = listener.local_addr()?.port();
         let handle = tokio::spawn(async move {
-            warp::serve(local_ws).run(addr).await;
+            warp::serve(local_ws).incoming(listener).run().await;
         });
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        WS_SERVER_BORN.store(born, std::sync::atomic::Ordering::SeqCst);
         *get_ws_server_handle().lock().await = Some(handle);
         *get_ws_port().lock().await = Some(port);
         record_lifecycle("WS bridge listener re-bound after a resume");
@@ -8262,10 +8275,21 @@ mod bridge_close_tests {
         None
     }
 
+    /// Both tests move the process-wide close generation; one at a time.
+    static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    fn serial() -> &'static tokio::sync::Mutex<()> {
+        SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     // Drives the same close `IrcService::stop` ends with, without the rest of
     // its teardown: that clears process-wide caches other tests here read.
     #[tokio::test]
     async fn a_full_stop_closes_the_page_socket_it_left_open() {
+        let _serial = serial().lock().await;
+        // Each test has its own runtime, and the other test's bridge dies with its
+        // runtime just after that test lets go of the lock. Outdate it first, so the
+        // bridge this test talks to is built on this test's runtime.
+        close_page_sockets();
         let port = IrcService::ensure_local_ws_bridge().await.expect("bridge up");
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/"))
             .await
@@ -8279,5 +8303,24 @@ mod bridge_close_tests {
             .await
             .expect("the page socket closes within five seconds");
         assert_eq!(code, Some(1012), "a service-restart close, so the page reconnects");
+    }
+
+    // A full stop whose close lands after a bridge came up (a start racing the
+    // stop) leaves that bridge closing every socket the moment it opens. The next
+    // ask for the bridge must build a fresh one whose sockets stay open, not hand
+    // back the dead port.
+    #[tokio::test]
+    async fn a_bridge_older_than_the_last_close_is_rebuilt_not_reused() {
+        let _serial = serial().lock().await;
+        let stale = IrcService::ensure_local_ws_bridge().await.expect("bridge up");
+        close_page_sockets();
+
+        let port = IrcService::ensure_local_ws_bridge().await.expect("bridge rebuilt");
+        assert_ne!(port, stale, "a fresh bridge, not the one the close outdated");
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("page socket connects");
+        let closed = tokio::time::timeout(Duration::from_millis(800), close_code(&mut socket)).await;
+        assert!(closed.is_err(), "the socket stays open, got {closed:?}");
     }
 }

@@ -45,6 +45,7 @@ use commands::image_upload::{
 };
 use commands::stream_manager::{
     check_stream_info, get_reward_queue, get_stream_manager, search_raid_targets, stream_manager_act,
+    stream_manager_watch,
 };
 use commands::{
     accounts::*, activity_history::*, announcements::*, app::*, badge_metadata::*, badge_service::*,
@@ -103,6 +104,13 @@ fn parse_watch_link(url: &tauri::Url) -> Option<String> {
 #[tauri::command]
 fn watch_link_key(url: String) -> Option<String> {
     tauri::Url::parse(&url).ok().as_ref().and_then(parse_watch_link)
+}
+
+/// Where a `streamnook://settings/...` or `streamnook://open/...` link in the
+/// update notes goes; None for any other link (`services::app_links`).
+#[tauri::command]
+fn app_link_target(url: String) -> Option<services::app_links::AppLink> {
+    services::app_links::parse(&url)
 }
 
 /// The link a share button copies for a stream. `channel` is the row's
@@ -1038,6 +1046,11 @@ pub fn run() {
         // relay sessions, and nothing in the new page knows their ids, so the
         // sessions are released as it starts loading. The first load finds none.
         .on_page_load(|webview, payload| {
+            // A new page shows no Stream manager until it says so, on every
+            // platform: the old page's surfaces would keep Rust reading.
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                services::stream_manager::clear_label(webview.label());
+            }
             // A reload drops the old page's open dialogs: its wrapper never got
             // to say they closed, so Performance mode would read the window as
             // in front until it closed.
@@ -1851,6 +1864,7 @@ pub fn run() {
             get_window_size,
             take_pending_watch_link,
             watch_link_key,
+            app_link_target,
             share_link,
             #[cfg(target_os = "android")]
             twitch_login_plugin::open_mobile_login,
@@ -2107,6 +2121,7 @@ pub fn run() {
             stop_ll_diag,
             get_stream_qualities,
             change_stream_quality,
+            change_stream_view,
             rewind_live_stream,
             get_live_rewind_info,
             // VOD watch position
@@ -2315,6 +2330,7 @@ pub fn run() {
             get_stream_manager,
             check_stream_info,
             stream_manager_act,
+            stream_manager_watch,
             get_reward_queue,
             search_raid_targets,
             // Discord Rich Presence (desktop only)
@@ -2334,6 +2350,7 @@ pub fn run() {
             complete_setup,
             set_chat_user_hidden,
             set_favorite_category,
+            set_suggest_platforms,
             set_favorite_channel,
             set_channel_hidden,
             set_hidden_channel_blocked,
@@ -2357,6 +2374,7 @@ pub fn run() {
             search_settings,
             get_changed_settings,
             get_alert_types,
+            get_notice_types,
             services::client_capabilities::get_client_capabilities,
             list_settings_backups,
             restore_settings_backup,
@@ -2940,6 +2958,7 @@ pub fn run() {
                 services::app_exit::note_window_destroyed(&label);
                 services::performance_mode::note_window_destroyed(&label);
                 services::whisper_claims::forget_window(&label);
+                services::stream_manager::clear_label(&label);
                 // A destroyed webview never runs its React cleanup, so any
                 // chat consumer claims it still holds would pin those channels
                 // JOINed (and their IRC traffic flowing) forever. Sweep them;

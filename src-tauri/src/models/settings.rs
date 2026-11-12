@@ -240,6 +240,19 @@ pub struct VideoPlayerSettings {
     /// the Player settings switch sets it. The desktop player ignores it.
     #[serde(default)]
     pub zoom_to_fill: bool,
+    /// Phones only (SN-269). On its side, a swipe up or down on the left half
+    /// of the video sets the screen brightness, on the right half the volume.
+    /// Off leaves vertical swipes on the video alone. On by default.
+    #[serde(default = "default_true")]
+    pub swipe_dials: bool,
+    /// Phones only (SN-40). A dual-format Twitch stream (one that also
+    /// broadcasts a portrait picture) opens in its vertical view. Off by
+    /// default: landscape until the viewer picks Vertical on the player's view
+    /// pill, which remembers the last pick. Backend-owned: written only by
+    /// `commit_vertical_view` after a pick played (`adopt_backend_owned`
+    /// keeps it through every other save), read only by the core.
+    #[serde(default)]
+    pub vertical_view: bool,
 }
 
 fn default_background_mode() -> String {
@@ -286,6 +299,8 @@ impl Default for VideoPlayerSettings {
             sync_vod_progress: true,
             continue_watching_live: false,
             zoom_to_fill: false,
+            swipe_dials: true,
+            vertical_view: false,
         }
     }
 }
@@ -512,6 +527,11 @@ pub struct ChatDesignSettings {
     pub show_third_party_badges: bool,
     #[serde(default)]
     pub hidden_badge_providers: Vec<String>,
+    /// Your own StreamNook badge beside your name on this screen (chat rows,
+    /// your profile header). Off leaves it out here only, for clean screenshots;
+    /// nothing is written anywhere else (`chat_row_view::own_badge_hidden`).
+    #[serde(default = "default_true")]
+    pub show_own_streamnook_badge: bool,
     /// How many badges a chat row shows before folding the rest into a "+N"
     /// chip (`services::badge_fold`). 0 shows them all. Default 0.
     #[serde(default = "default_badge_fold_limit")]
@@ -555,6 +575,9 @@ pub struct ChatDesignSettings {
     pub pinned_start_collapsed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub polls_start_collapsed: Option<bool>,
+    /// Live predictions open collapsed to their strip (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predictions_start_collapsed: Option<bool>,
     /// Sound played when a live message mentions you: a built-in tone id or
     /// `file:<id>` from the custom sounds. Absent or empty means no sound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -580,6 +603,13 @@ pub struct ChatDesignSettings {
     /// @mention slant: inherit (italic inside /me messages) | never | always.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mention_italic: Option<String>,
+    /// /me messages slant (absent = true, as Twitch shows them); false keeps them upright.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_italic: Option<bool>,
+    /// /me message text wears the chatter's 7TV paint (absent = false: the text takes their
+    /// Twitch name colour and only the name keeps its paint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paint_action_text: Option<bool>,
     /// @mention shape: plain (coloured text, the default) | pill (tinted capsule).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mention_style: Option<String>,
@@ -785,6 +815,7 @@ impl Default for ChatDesignSettings {
             ffz_custom_role_badges: true,
             show_third_party_badges: true,
             hidden_badge_providers: Vec::new(),
+            show_own_streamnook_badge: true,
             badge_fold_limit: default_badge_fold_limit(),
             badge_fold_show_all_adopted: true,
             show_chat_atmospheres: true,
@@ -801,6 +832,7 @@ impl Default for ChatDesignSettings {
             username_colon: None,
             pinned_start_collapsed: None,
             polls_start_collapsed: None,
+            predictions_start_collapsed: None,
             mention_sound: None,
             mention_sound_volume: None,
             mention_sound_replies: None,
@@ -808,6 +840,8 @@ impl Default for ChatDesignSettings {
             reply_sound_volume: None,
             mention_weight: None,
             mention_italic: None,
+            action_italic: None,
+            paint_action_text: None,
             mention_style: None,
             mention_text_color: None,
             chat_dock_switcher: None,
@@ -874,6 +908,11 @@ pub struct LiveNotificationSettings {
     /// the moment this arrives in an update.
     #[serde(default)]
     pub show_favorite_category_notifications: bool,
+    /// A Twitch go-live shows the streamer's own go-live message (the text they
+    /// set for their followers' notifications) instead of the stream title,
+    /// when they set one. Off by default.
+    #[serde(default)]
+    pub streamer_go_live_text: bool,
     #[serde(default = "default_true")]
     pub show_whisper_notifications: bool,
     #[serde(default = "default_true")]
@@ -951,6 +990,20 @@ pub struct LiveNotificationSettings {
     // upgrade changes nothing until someone opts a channel out.
     #[serde(default)]
     pub muted_live_channels: Vec<String>,
+    // Small notices, each switched on its own (services/notice_types.json
+    // lists them; the frontend passes the id to addToast as `notice`).
+    #[serde(default = "default_true")]
+    pub notice_welcome_back: bool,
+    #[serde(default = "default_true")]
+    pub notice_drop_claimed: bool,
+    #[serde(default = "default_true")]
+    pub notice_copied: bool,
+    #[serde(default = "default_true")]
+    pub notice_quality_changed: bool,
+    #[serde(default = "default_true")]
+    pub notice_stream_restarted: bool,
+    #[serde(default = "default_true")]
+    pub notice_vod_resumed: bool,
 }
 
 fn default_true() -> bool {
@@ -980,6 +1033,7 @@ impl Default for LiveNotificationSettings {
             show_live_notifications: true,
             show_favorite_live_notifications: true,
             show_favorite_category_notifications: false,
+            streamer_go_live_text: false,
             show_whisper_notifications: true,
             show_update_notifications: true,
             show_drops_notifications: true,
@@ -1003,6 +1057,12 @@ impl Default for LiveNotificationSettings {
             background_interval_minutes: 15,
             push_notifications: true,
             muted_live_channels: Vec::new(),
+            notice_welcome_back: true,
+            notice_drop_claimed: true,
+            notice_copied: true,
+            notice_quality_changed: true,
+            notice_stream_restarted: true,
+            notice_vod_resumed: true,
         }
     }
 }
@@ -1145,6 +1205,11 @@ pub struct MultiNookSlot {
     pub channel_name: Option<String>,
     pub volume: f32,
     pub muted: bool,
+    /// Muted by the viewer on the tile itself, not by focus: focus, promote,
+    /// maximize, dock and undock leave it muted. Named here because this
+    /// struct is typed (a field it does not name is dropped on save).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_muted: Option<bool>,
     pub is_focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_url: Option<String>,
@@ -2128,6 +2193,9 @@ impl Settings {
         // identity fill; a window's copy of them is never written back.
         self.favorite_streamers = authoritative.favorite_streamers.clone();
         self.favorite_channels = authoritative.favorite_channels.clone();
+        // The vertical view pick changes only through `commit_vertical_view`
+        // (SN-40): a window's `video_player` group never carries it back.
+        self.video_player.vertical_view = authoritative.video_player.vertical_view;
     }
 
     /// One-time move of an existing install onto the first-run chat look,
@@ -2791,6 +2859,26 @@ mod backup_persistence_tests {
     }
 
     #[test]
+    fn vertical_view_defaults_off_round_trips_and_survives_a_stale_save() {
+        assert!(!Settings::default().video_player.vertical_view);
+        let mut value = serde_json::to_value(Settings::default()).expect("serialize");
+        value["video_player"]["vertical_view"] = serde_json::Value::Bool(true);
+        let parsed: Settings = serde_json::from_value(value).expect("parse");
+        assert!(parsed.video_player.vertical_view);
+        let saved = serde_json::to_value(&parsed).expect("serialize");
+        assert_eq!(saved["video_player"]["vertical_view"], serde_json::Value::Bool(true));
+        // An older file without the key loads with it off.
+        let mut older = serde_json::to_value(Settings::default()).expect("serialize");
+        older["video_player"].as_object_mut().unwrap().remove("vertical_view");
+        let older: Settings = serde_json::from_value(older).expect("an older file parses");
+        assert!(!older.video_player.vertical_view);
+        // A window's stale group never writes it back.
+        let mut incoming = Settings::default();
+        incoming.adopt_backend_owned(&parsed);
+        assert!(incoming.video_player.vertical_view);
+    }
+
+    #[test]
     fn first_run_chat_look_reaches_only_a_fresh_install() {
         let fresh = Settings::default().chat_design;
         assert_eq!(fresh.message_entrance, "slide");
@@ -3068,6 +3156,7 @@ mod backup_persistence_tests {
         design.insert("username_colon".into(), serde_json::json!(true));
         design.insert("pinned_start_collapsed".into(), serde_json::json!(true));
         design.insert("polls_start_collapsed".into(), serde_json::json!(false));
+        design.insert("predictions_start_collapsed".into(), serde_json::json!(true));
 
         let parsed: Settings = serde_json::from_value(value).expect("deserialize");
         assert_eq!(parsed.chat_design.name_color_adjustment, "off");
@@ -3075,6 +3164,7 @@ mod backup_persistence_tests {
         assert_eq!(parsed.chat_design.username_colon, Some(true));
         assert_eq!(parsed.chat_design.pinned_start_collapsed, Some(true));
         assert_eq!(parsed.chat_design.polls_start_collapsed, Some(false));
+        assert_eq!(parsed.chat_design.predictions_start_collapsed, Some(true));
 
         let again = serde_json::to_value(&parsed).expect("re-serialize");
         assert_eq!(again["chat_design"]["activity_font_size"], serde_json::json!(16));

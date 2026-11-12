@@ -38,6 +38,7 @@ import { useUserColor } from '../services/userColorCache';
 import { memberIdFor } from '../utils/memberIdentity';
 import { isStreamNookUser, getStreamNookUserNumber, subscribeStreamNookRegistryVersion, getStreamNookRegistryVersion } from '../services/supabaseService';
 import { MemberReveal, MEMBER_REVEAL_CARD_CLASS } from './StreamNookBadge';
+import { PaintNameTip } from './chat/PaintNameTip';
 import { EmoteCreditLine } from './chat/EmoteCreditLine';
 import { canCredit } from '../services/emoteCredit';
 import { openEmoteCard, useEmoteCardStore, type EmoteCardTarget } from '../stores/emoteCardStore';
@@ -61,7 +62,7 @@ import { isHomeRow, rowProvider } from '../utils/chatAuthority';
 import { ProviderLogo } from './ProviderLogo';
 import { getDisplayedName, getColorOverride } from '../utils/userChatOverrides';
 import { overrideKey, rowOverrideKey, rowSenderNames, rowShownName, stripLeadingName, withShownSender } from '../utils/chatterName';
-import { useNameColorAdjust } from '../hooks/useNameColor';
+import { NameColorToneContext, useNameColorAdjust } from '../hooks/useNameColor';
 import { vendorEmojiUrl } from '../services/emojiService';
 import { categoryOf, chatEventTemplateContext } from '../utils/chatEvents';
 import { renderEventTemplate } from './overlay/overlayConfig';
@@ -206,6 +207,23 @@ const SubGiftIcon = () => {
   ) : (
     <Gift size={20} className="text-accent" />
   );
+};
+
+/** The hover bar's Reply tooltip, which also teaches the right click. */
+const REPLY_TIP = (
+  <span>
+    Reply<span className="text-textSecondary"> · or right-click the message</span>
+  </span>
+);
+
+/** A YouTube channel owner's name: dark text in YouTube's gold pill (the values
+ *  the overlay reads off YouTube's own chat, `OverlayChat.tsx`). */
+const YOUTUBE_OWNER_PILL: React.CSSProperties = {
+  color: '#111111',
+  backgroundColor: '#ffd600',
+  padding: '0.13em 0.27em',
+  borderRadius: '0.13em',
+  textShadow: 'none',
 };
 
 const GIANT_EMOTE_HEIGHT = 'calc(8em * var(--sn-emote-scale, 1))';
@@ -1477,14 +1495,28 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // base color; the 7TV paint (if present) renders on top of it.
   const paintShadowMode = useAppStore((s) => s.settings.cosmetics?.paint_shadows) ?? 'all';
 
+  // YouTube's channel owner has no badge: the name sits in a gold pill, as on
+  // YouTube and in the overlay. Rust tags the row (`youtube-owner`). The pill is
+  // the owner's role mark, so it follows Show badges.
+  const youtubeOwnerPill =
+    parsed.provider === 'youtube' && parsed.tags.get('youtube-owner') === '1' && chatDesign?.show_badges !== false;
   const usernameStyle = useMemo(() => {
+    if (youtubeOwnerPill) return YOUTUBE_OWNER_PILL;
     if (!seventvPaint) {
       return { color: effectiveColor };
     }
 
     // Use the new computePaintStyle function
     return computePaintStyle(seventvPaint, effectiveColor, paintShadowMode, stillEmotes);
-  }, [seventvPaint, effectiveColor, paintShadowMode, stillEmotes]);
+  }, [youtubeOwnerPill, seventvPaint, effectiveColor, paintShadowMode, stillEmotes]);
+  // A /me message's text: painted like the name only with Paint /me messages
+  // on (SN-272); otherwise the plain name color. The same object as
+  // usernameStyle when they match, so the name inside need not repeat it.
+  const paintActionText = chatDesign?.paint_action_text === true;
+  const actionTextStyle = useMemo(
+    () => (paintActionText || !seventvPaint || youtubeOwnerPill ? usernameStyle : { color: effectiveColor }),
+    [paintActionText, seventvPaint, youtubeOwnerPill, usernameStyle, effectiveColor],
+  );
 
   // Username prefix styling (normal messages only; action/"/me" stay plain).
   // The separator glyph sits between the name and the message; the name style
@@ -2453,6 +2485,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const isOwnMessage =
     parsed.metadata?.is_own === true ||
     (!!currentUser?.user_id && parsed.tags.get('user-id') === currentUser.user_id);
+  // Your own StreamNook badge stays off your own rows while you turned it off
+  // (clean screenshots); only this screen changes.
+  const snBadgeShown = snBadgeOn && !(isOwnMessage && chatDesign?.show_own_streamnook_badge === false);
   const isRaidNotice = parsed.tags.get('msg-id') === 'raid';
 
   // Resolve which built-in event (if any) should drive the row's tint. Order
@@ -2517,7 +2552,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // (hooks before any conditional return). Read from the shared cache during
   // render, so a row that mounts after the first never flashes in unmarked;
   // only a room not known yet asks, and its answer lands here.
-  const sourceDark = isThemeDark();
+  // What the row sits on: the phones' chat over video is dark in every theme (SN-40).
+  const sourceDark = useContext(NameColorToneContext) ?? isThemeDark();
   const sourceKey = isFromSharedChat && sourceRoomId ? sharedSourceKey(sourceRoomId, sourceDark) : null;
   const [askedSource, setAskedSource] = useState<{ key: string; source: SharedSource } | null>(null);
   const sharedSource = sourceKey
@@ -2629,7 +2665,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             twitchBadges={visibleBadges}
             seventvBadge={seventvBadge}
             thirdPartyBadges={thirdPartyBadges}
-            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            streamNookMemberId={isSN && snBadgeShown ? senderUserId : null}
             onBadgeClick={onBadgeClick}
             foldLimit={foldLimit}
             keyPrefix="ev0"
@@ -2802,7 +2838,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             twitchBadges={visibleBadges}
             seventvBadge={seventvBadge}
             thirdPartyBadges={thirdPartyBadges}
-            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            streamNookMemberId={isSN && snBadgeShown ? senderUserId : null}
             onBadgeClick={onBadgeClick}
             foldLimit={foldLimit}
             keyPrefix="ev1"
@@ -2947,7 +2983,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             twitchBadges={visibleBadges}
             seventvBadge={seventvBadge}
             thirdPartyBadges={thirdPartyBadges}
-            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            streamNookMemberId={isSN && snBadgeShown ? senderUserId : null}
             onBadgeClick={onBadgeClick}
             foldLimit={foldLimit}
             keyPrefix="ev2"
@@ -3033,7 +3069,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             twitchBadges={visibleBadges}
             seventvBadge={seventvBadge}
             thirdPartyBadges={thirdPartyBadges}
-            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            streamNookMemberId={isSN && snBadgeShown ? senderUserId : null}
             onBadgeClick={onBadgeClick}
             foldLimit={foldLimit}
             keyPrefix="ev3"
@@ -3275,7 +3311,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             twitchBadges={visibleBadges}
             seventvBadge={seventvBadge}
             thirdPartyBadges={thirdPartyBadges}
-            streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+            streamNookMemberId={isSN && snBadgeShown ? senderUserId : null}
             onBadgeClick={onBadgeClick}
             foldLimit={foldLimit}
             keyPrefix="ev4"
@@ -3488,6 +3524,21 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   const lineButtonsOn = chatDesign?.mod_line_buttons === true;
   const showModLine = canActOnChatter && lineButtonsOn && !!modLine?.length && !!thisMessageId;
   const showModSlider = canActOnChatter && !lineButtonsOn && chatDesign?.mod_slider !== false;
+  // A moderator's own Twitch message: the slider with Delete alone, the one
+  // thing Twitch lets a moderator do to their own line. Not the channel
+  // owner's own messages, which Twitch refuses to delete at all.
+  const showOwnDeleteSlider =
+    canModerateThisRow &&
+    isOwnMessage &&
+    !viewerOwnsChannel &&
+    (!parsed.provider || parsed.provider === 'twitch') &&
+    !!broadcasterId &&
+    // A line just sent shows under a local id until Twitch's echo gives it the
+    // real one (irc_service), and only the real one can be deleted.
+    !!thisMessageId &&
+    !thisMessageId.startsWith('local-') &&
+    !lineButtonsOn &&
+    chatDesign?.mod_slider !== false;
 
   // Right-click anywhere on a message replies to it, as on the name. A part
   // that handled the click itself keeps it (the name; an emote, which goes
@@ -3592,6 +3643,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
           is hovered, so idle rows carry none of it. */}
       {hoverArmed && showModSlider && (
         <ModSlider provider={parsed.provider ?? 'twitch'} target={modTarget()} messageId={thisMessageId} />
+      )}
+      {hoverArmed && showOwnDeleteSlider && (
+        <ModSlider provider="twitch" target={modTarget()} messageId={thisMessageId} deleteOnly />
       )}
 
       {/* Built-in event label (first-time chatter, returning, self, raid) */}
@@ -3776,7 +3830,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                 twitchBadges={visibleBadges}
                 seventvBadge={seventvBadge}
                 thirdPartyBadges={thirdPartyBadges}
-                streamNookMemberId={isSN && snBadgeOn ? senderUserId : null}
+                streamNookMemberId={isSN && snBadgeShown ? senderUserId : null}
                 onBadgeClick={onBadgeClick}
                 foldLimit={foldLimit}
                 keyPrefix="badge"
@@ -3793,11 +3847,18 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             }}
           >
             {isAction ? (
-              // ACTION messages: entire content in username color
-              <span style={{ ...usernameStyle, fontWeight: chatBodyWeight(chatDesign?.font_weight) }} className="break-words italic">
-                <Tooltip content="Right-click to reply" side="top">
-                  <span
-                    style={{ fontWeight: 700 }}
+              // ACTION messages: entire content in username color, slanted
+              // unless Italic /me messages is off. The text wears the 7TV
+              // paint only with Paint /me messages on; otherwise it is the
+              // plain name color and the name alone keeps its paint (SN-272).
+              <span
+                style={{ ...actionTextStyle, fontWeight: chatBodyWeight(chatDesign?.font_weight) }}
+                className={`break-words ${chatDesign?.action_italic === false ? '' : 'italic'}`}
+              >
+                {/* No hover tooltip: a right click anywhere on the message
+                    replies, as the row's Reply button says (SN-264). */}
+                <span
+                    style={{ ...(actionTextStyle === usernameStyle ? null : usernameStyle), fontWeight: 700 }}
                     className="cursor-pointer hover:underline inline-block"
                     onClick={(e) => {
                       const userId = clickUserId;
@@ -3833,8 +3894,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                         <path fillRule="evenodd" d="M12.5 3.5 8 2 3.5 3.5 2 8l1.5 4.5L8 14l4.5-1.5L14 8l-1.5-4.5ZM7 11l4.5-4.5L10 5 7 8 5.5 6.5 4 8l3 3Z" clipRule="evenodd"></path>
                       </svg>
                     )}
-                  </span>
-                </Tooltip>
+                </span>
                 {' '}{replyMentionNode}{giantPluck ? giantPluck.inline : renderContent(contentWithEmotes)}
               </span>
             ) : (
@@ -3882,9 +3942,17 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   tooltip={
                     senderMemberNumber !== null ? (
                       <MemberReveal userId={senderMemberId} chatKey={cosmeticsKey} userNumber={senderMemberNumber} />
+                    ) : seventvPaint?.name ? (
+                      // The paint they wear, by name (SN-264). No paint, no card.
+                      <PaintNameTip
+                        paint={seventvPaint}
+                        color={effectiveColor ?? ''}
+                        shadowMode={paintShadowMode}
+                        still={stillEmotes}
+                      />
                     ) : undefined
                   }
-                  tooltipClassName={MEMBER_REVEAL_CARD_CLASS}
+                  tooltipClassName={senderMemberNumber !== null ? MEMBER_REVEAL_CARD_CLASS : undefined}
                 />
                 <span style={{ fontWeight: chatBodyWeight(chatDesign?.font_weight) }} className="text-textPrimary break-words">
                   {/* data-mod-body: the text the slider's Preview style strikes through. */}
@@ -4028,10 +4096,11 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
               </button>
             </Tooltip>
           )}
-          {/* The same reply a right click on the name starts, for those who
-              would rather click. */}
+          {/* The same reply a right click anywhere on the message starts, for
+              those who would rather click. Its tooltip is where the shortcut is
+              taught, in place of a tooltip over every name (SN-264). */}
           {canReply && (
-            <Tooltip content="Reply" side="top" requirePointerMove>
+            <Tooltip content={REPLY_TIP} side="top" requirePointerMove>
               <button
                 aria-label="Reply"
                 onClick={(e) => {

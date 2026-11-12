@@ -29,6 +29,7 @@ import { SettingsSection, SettingsRow, SegmentedSelect, SwitchList } from './_pr
 import { useSettingReset } from './settingReset';
 import { Toggle } from '../ui/Toggle';
 import { usePhonePrefs } from '../../mobile/phonePrefs';
+import { sideChatMin } from '../../mobile/watch/sideChat';
 import { useNameColorAdjust } from '../../hooks/useNameColor';
 import { CURRENCY_OPTIONS } from '../../services/currencyService';
 import { EVENT_CATEGORIES, EVENT_TEMPLATE_EXAMPLES, PROVIDER_CATEGORY_LABELS, PROVIDER_EVENT_CATEGORIES } from '../overlay/overlayConfig';
@@ -596,6 +597,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     pinned_collapsed_style: stored?.pinned_collapsed_style ?? 'bar',
     pinned_start_collapsed: stored?.pinned_start_collapsed ?? true,
     polls_start_collapsed: stored?.polls_start_collapsed ?? false,
+    predictions_start_collapsed: stored?.predictions_start_collapsed ?? false,
     name_color_adjustment: (stored?.name_color_adjustment ?? 'hsl_loop') as 'off' | 'hsl_loop',
     show_badges: stored?.show_badges ?? true,
     badge_scale: stored?.badge_scale ?? 1,
@@ -603,6 +605,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     ffz_custom_role_badges: stored?.ffz_custom_role_badges ?? true,
     show_third_party_badges: stored?.show_third_party_badges ?? true,
     hidden_badge_providers: stored?.hidden_badge_providers ?? [],
+    show_own_streamnook_badge: stored?.show_own_streamnook_badge ?? true,
     show_chat_atmospheres: stored?.show_chat_atmospheres ?? true,
     message_entrance: (stored?.message_entrance ?? ENTRANCE_FALLBACK) as 'none' | 'fade' | 'slide' | 'rise',
     emoji_style: (stored?.emoji_style ?? 'apple') as 'system' | 'apple' | 'google' | 'twitter' | 'facebook',
@@ -623,6 +626,8 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
     reply_sound_volume: stored?.reply_sound_volume,
     mention_weight: stored?.mention_weight,
     mention_italic: stored?.mention_italic,
+    action_italic: stored?.action_italic,
+    paint_action_text: stored?.paint_action_text,
     mention_style: stored?.mention_style,
     mention_text_color: stored?.mention_text_color,
     chat_dock_switcher: stored?.chat_dock_switcher,
@@ -848,8 +853,9 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           description="How wide the chat column is over the video."
           control={
             <InlineSlider
-              value={Math.max(240, Math.min(640, settings.fullscreen_chat?.width ?? 340))}
-              min={240}
+              // A phone's side column goes narrower than the desktop overlay (SN-268).
+              value={Math.max(sideChatMin(IS_MOBILE), Math.min(640, settings.fullscreen_chat?.width ?? 340))}
+              min={sideChatMin(IS_MOBILE)}
               max={640}
               step={20}
               label="Full screen chat width"
@@ -1149,7 +1155,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           title="Predictions"
           onReset={resetFor(['show_predictions', true])}
           description="A live prediction card with the outcomes and how points are stacking up."
-          help="Top card picks which one sits on top when a poll and a prediction run at the same time. Both cards show either way, stacked."
+          help="Collapsed opens a prediction as its header bar; tap the header to expand it. A prediction that is already closed and waiting for the result opens collapsed either way. Top card picks which one sits on top when a poll and a prediction run at the same time. Both cards show either way, stacked."
           control={
             <Toggle
               enabled={settings.show_predictions ?? true}
@@ -1159,8 +1165,21 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
             />
           }
         >
-          {(settings.show_polls ?? true) && (settings.show_predictions ?? true) && (
+          {(settings.show_predictions ?? true) && (
             <SubControls>
+              <SubControl
+                title="Collapsed"
+                onReset={resetFor(['chat_design.predictions_start_collapsed', false])}
+                control={
+                  <Toggle
+                    enabled={cd.predictions_start_collapsed ?? false}
+                    onChange={() =>
+                      setDesign({ predictions_start_collapsed: !(cd.predictions_start_collapsed ?? false) })
+                    }
+                  />
+                }
+              />
+              {(settings.show_polls ?? true) && (
               <SubControl
                 title="Top card"
                 onReset={resetFor(['chat_overlay_order', 'prediction-first'])}
@@ -1175,6 +1194,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
                   />
                 }
               />
+              )}
             </SubControls>
           )}
         </SettingsRow>
@@ -1570,6 +1590,30 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
         </SettingsRow>
 
         <SettingsRow
+          title="Italic /me messages"
+          onReset={resetFor(['chat_design.action_italic', true])}
+          description="A /me message is written in the chatter's name color and slants, as on Twitch. Off keeps it upright."
+          control={
+            <Toggle
+              enabled={cd.action_italic ?? true}
+              onChange={() => setDesign({ action_italic: !(cd.action_italic ?? true) })}
+            />
+          }
+        />
+
+        <SettingsRow
+          title="Paint /me messages"
+          onReset={resetFor(['chat_design.paint_action_text', false])}
+          description="A /me message's text wears the chatter's 7TV paint too. Off writes it in their Twitch name color, and only the name keeps its paint."
+          control={
+            <Toggle
+              enabled={cd.paint_action_text ?? false}
+              onChange={() => setDesign({ paint_action_text: !(cd.paint_action_text ?? false) })}
+            />
+          }
+        />
+
+        <SettingsRow
           title="Message animation"
           onReset={resetFor(['chat_design.message_entrance', ENTRANCE_FALLBACK])}
           description="How a new message arrives: a short fade or slide as each one lands. History loaded on join never animates, and it is skipped when motion is reduced."
@@ -1856,7 +1900,7 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
           title="Add-on badges"
           onReset={resetFor(['chat_design.show_third_party_badges', true])}
           description="Badges from 7TV, FFZ, Chatterino, Homies, Limerino, JilChat and the other badge services, plus StreamNook membership badges."
-          help="Services turns individual badge services off."
+          help="Services turns individual badge services off. My badge takes your StreamNook badge off your own name on your screen, for clean screenshots."
           control={
             <Toggle
               enabled={cd.show_third_party_badges}
@@ -1875,6 +1919,16 @@ const ChatSettings = ({ hidePlacement = false }: { hidePlacement?: boolean } = {
                     items={BADGE_PROVIDERS.map((p) => ({ id: p.id, label: p.label, mark: <ServiceMark id={p.id} size={14} /> }))}
                     isOn={(id) => !badgeProviderHidden(id)}
                     onToggle={toggleBadgeProvider}
+                  />
+                }
+              />
+              <SubControl
+                title="My badge"
+                onReset={resetFor(['chat_design.show_own_streamnook_badge', true])}
+                control={
+                  <Toggle
+                    enabled={cd.show_own_streamnook_badge}
+                    onChange={() => setDesign({ show_own_streamnook_badge: !cd.show_own_streamnook_badge })}
                   />
                 }
               />
