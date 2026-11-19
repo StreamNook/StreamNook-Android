@@ -70,9 +70,30 @@ function artCopy(url: string): string | null {
     : null;
 }
 
+/**
+ * The disk copy of a piece of StreamNook art, or null when Rust has none yet.
+ * A pure read: it never asks for a copy, so a caller that must not draw the
+ * CDN URL itself can decide on its own when to request one.
+ */
+export function streamnookArtCopyOf(url: string): string | null {
+  return isStreamnookArtUrl(url) ? artCopy(url) : null;
+}
+
 /** Ask Rust for a disk copy of a piece of art (repeats are dropped). */
 export function requestStreamnookArt(url: string): void {
   if (isStreamnookArtUrl(url) && !artCopy(url)) requestAssetCaching('streamnook', url, url);
+}
+
+/**
+ * Tell Rust a disk copy would not decode, so it forgets that copy and the next
+ * session downloads the art again. This window's map is left as it is: the
+ * caller stops drawing that copy for the session on its own.
+ */
+export function forgetStreamnookArtCopy(url: string): void {
+  if (!isStreamnookArtUrl(url)) return;
+  invoke<boolean>('forget_streamnook_art_copy', { url }).catch((e) =>
+    Logger.debug('[StreamNookArt] could not forget a broken copy:', e),
+  );
 }
 
 /**

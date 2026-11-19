@@ -226,6 +226,72 @@ async fn chatters_emoteinfo_and_openurl_show_the_real_failure() {
 }
 
 #[tokio::test]
+async fn afk_sets_away_here_and_back_clears_it() {
+    let fake = Fake::new();
+    fake.answer(|cmd, args| match cmd {
+        "automations_set_away" if !args["message"].is_null() => Ok(json!({ "message": "brb", "since_ms": 1 })),
+        _ => Ok(Value::Null),
+    });
+    let o = run(&fake, "/afk brb").await;
+    assert_eq!(toast(&o, ToastKind::Success), ["You're away: brb"]);
+    assert_eq!(fake.calls("automations_set_away"), vec![json!({ "message": "brb" })]);
+    let o = run(&fake, "/back").await;
+    assert_eq!(toast(&o, ToastKind::Success), ["You're back"]);
+    assert_eq!(fake.calls("automations_set_away")[1], json!({ "message": null }));
+    // In a Kick room too: away needs no Twitch API.
+    let o = run_in(&fake, "kick:somebody", "/back").await;
+    assert!(o.handled);
+}
+
+#[tokio::test]
+async fn automations_sets_the_run_state_or_says_it() {
+    let fake = Fake::new();
+    run(&fake, "/automations on").await;
+    run(&fake, "/automations test").await;
+    run(&fake, "/automations off").await;
+    assert_eq!(
+        fake.calls("automations_set_run"),
+        vec![json!({ "state": "on" }), json!({ "state": "test" }), json!({ "state": "off" })]
+    );
+    fake.answer(|cmd, _| match cmd {
+        "automations_status" => Ok(json!({ "run": "test", "away": { "message": "lunch", "since_ms": 1 }, "chats_kept": ["a", "b"] })),
+        _ => Ok(Value::Null),
+    });
+    let o = run(&fake, "/automations").await;
+    assert_eq!(o.notices, ["Automations are in Test: rules show what they would do. You're away: lunch. They keep 2 chats open"]);
+    let o = run(&fake, "/automations sideways").await;
+    assert!(o.handled && toast(&o, ToastKind::Info)[0].starts_with("Usage:"));
+}
+
+#[tokio::test]
+async fn disconnect_says_how_many_chats_the_automations_keep() {
+    let fake = Fake::new();
+    fake.answer(|cmd, _| match cmd {
+        "stop_chat" => Ok(json!(true)),
+        "automations_status" => Ok(json!({ "run": "on", "away": null, "chats_kept": ["a", "b", "c"] })),
+        _ => Ok(Value::Null),
+    });
+    assert_eq!(toast(&run(&fake, "/disconnect").await, ToastKind::Info), ["Disconnected from chat. Automations keep 3 chats open"]);
+    fake.answer(|cmd, _| if cmd == "stop_chat" { Ok(json!(true)) } else { Ok(Value::Null) });
+    assert_eq!(toast(&run(&fake, "/disconnect").await, ToastKind::Info), ["Disconnected from chat"]);
+}
+
+#[tokio::test]
+async fn a_saved_custom_afk_sets_away_then_posts_its_text() {
+    let fake = Fake::new();
+    *fake.settings.lock().unwrap() = json!({ "chat_commands": { "user_commands": [
+        { "trigger": "afk", "expansion": "I'm off for a bit", "enabled": true }
+    ] } });
+    let o = run(&fake, "/afk").await;
+    assert_eq!(o.send.as_deref(), Some("I'm off for a bit"));
+    assert_eq!(fake.calls("automations_set_away"), vec![json!({ "message": "" })]);
+    // Without a custom command the built-in arm answers.
+    let fake = Fake::new();
+    let o = run(&fake, "/afk").await;
+    assert!(o.send.is_none() && o.handled);
+}
+
+#[tokio::test]
 async fn a_failed_disconnect_is_shown() {
     let fake = Fake::new();
     fake.answer(|cmd, _| if cmd == "stop_chat" { Err("socket busy".into()) } else { Ok(Value::Null) });
@@ -1014,6 +1080,21 @@ fn templates_expand_in_one_pass() {
 }
 
 #[test]
+fn expand_with_reads_names_through_the_lookup() {
+    let args = vec!["a".to_string(), "b".to_string()];
+    let lookup = |name: &str| match name {
+        "user" => Some("Me".to_string()),
+        "away" => Some(String::new()),
+        _ => None,
+    };
+    let ex = expand_with("{user} said {1}, {away} {missing} {{x}}", &args, lookup);
+    assert_eq!(ex.text, "Me said a, {missing} {x}");
+    assert_eq!(expand_with("{3} {2+}", &args, lookup).missing_args, vec![3]);
+    // A value is never read again as a placeholder.
+    assert_eq!(expand_with("{user}", &[], |_| Some("{1}".to_string())).text, "{1}");
+}
+
+#[test]
 fn uptime_reads_hours_and_minutes() {
     let start = "2001-09-09T01:46:40Z"; // 1_000_000_000_000 ms
     assert_eq!(format_uptime(Some(start), 1_000_000_000_000 + 2 * 3_600_000 + 14 * 60_000), "2h 14m");
@@ -1487,4 +1568,31 @@ async fn mods_and_vips_read_the_signed_in_role_list() {
     assert!(serde_json::to_string(&o).unwrap().contains("role mods"));
     run(&fake, "/vips").await;
     assert_eq!(fake.calls("slash_role_list")[1]["role"], json!("vips"));
+}
+
+#[test]
+fn the_extracted_parsers_give_what_the_arms_always_gave() {
+    // /slow: bare = 30, "60" = 60, "abc" = 30, "-5" = -5 (Twitch refuses it), "7s" = 7.
+    assert_eq!(slow_seconds(None), 30);
+    assert_eq!(slow_seconds(Some("60")), 60);
+    assert_eq!(slow_seconds(Some("abc")), 30);
+    assert_eq!(slow_seconds(Some("7s")), 7);
+    // /followers: bare = 0, "10m" = 10, "2h" = 120, "1d" = 1440, "1w", "1mo", "m" = None (null duration).
+    assert_eq!(followers_setting(""), Some(0));
+    assert_eq!(followers_setting("10m"), Some(10));
+    assert_eq!(followers_setting("2h"), Some(120));
+    assert_eq!(followers_setting("1d"), Some(1440));
+    assert_eq!(followers_setting("1w"), Some(10080));
+    assert_eq!(followers_setting("1mo"), Some(43200));
+    assert_eq!(followers_setting("m"), None);
+    assert_eq!(marker_description(""), None);
+    assert_eq!(marker_description("great play"), Some("great play".into()));
+    assert_eq!(title_or_query("  Chill  "), "Chill");
+}
+
+#[test]
+fn the_engines_title_limit_is_the_stream_managers() {
+    // The engine modules may not name stream_manager (source pin), so the
+    // equality is asserted here, where both are in reach.
+    assert_eq!(crate::services::account_automations::command::TITLE_MAX, crate::services::stream_manager::TITLE_MAX);
 }

@@ -35,7 +35,25 @@ interface SettingsSectionProps {
   accessory?: ReactNode;
   /** On the section element, for a host that shows one section at a time. */
   className?: string;
+  /** How many items the section lists, as a chip after its name. */
+  count?: number;
+  /** Buttons on the heading's line, at its right edge, on every platform (the
+   *  phone draws them where `accessory` goes). */
+  actions?: ReactNode;
+  /** Set the rows on the glaze (the chrome's lit glass) instead of the flat
+   *  settings card. Desktop; the phone keeps its grouped card. */
+  glaze?: boolean;
+  /** A small icon before the heading, in the accent, for a page whose sections
+   *  each carry one. */
+  icon?: ReactNode;
 }
+
+/** The count chip after a section's name. */
+const SectionCount = ({ count }: { count: number }) => (
+  <span className="inline-flex items-center rounded-full bg-textPrimary/[0.07] px-2 py-px text-[11px] font-semibold normal-case tracking-normal tabular-nums text-textSecondary">
+    {count}
+  </span>
+);
 
 export { sectionIdFromLabel, SETTINGS_REVEAL_EVENT };
 
@@ -50,19 +68,24 @@ const PhoneSettingsSection = ({
   bare = false,
   logo,
   shownLabel,
-  accessory,
+  accessory: accessoryProp,
   className,
-}: SettingsSectionProps) => (
+  count,
+  actions,
+}: SettingsSectionProps) => {
+  const accessory = accessoryProp ?? actions;
+  return (
   <section id={id ?? sectionIdFromLabel(label)} data-settings-section={label} className={className}>
     {/* An accessory sits on the heading's line, centered on it. */}
     <div className={accessory ? 'flex items-center justify-between gap-3 pr-2' : undefined}>
       <GroupLabel
         as="h3"
-        className={`px-4 ${accessory ? '' : 'pb-2'} ${logo ? 'flex items-center gap-1.5' : ''}`}
+        className={`px-4 ${accessory ? '' : 'pb-2'} ${logo || count !== undefined ? 'flex items-center gap-1.5' : ''}`}
         aria-label={shownLabel ? label : undefined}
       >
         {logo}
         {shownLabel ?? label}
+        {count !== undefined && <SectionCount count={count} />}
       </GroupLabel>
       {accessory}
     </div>
@@ -72,7 +95,8 @@ const PhoneSettingsSection = ({
     </SectionNameContext.Provider>
     {description && <GroupFooter className="px-4 pt-2">{description}</GroupFooter>}
   </section>
-);
+  );
+};
 
 export const SettingsSection = (props: SettingsSectionProps) =>
   IS_MOBILE ? <PhoneSettingsSection {...props} /> : <DesktopSettingsSection {...props} />;
@@ -86,16 +110,29 @@ const DesktopSettingsSection = ({
   logo,
   shownLabel,
   className,
+  count,
+  actions,
+  glaze = false,
+  icon,
 }: SettingsSectionProps) => (
   <section id={id ?? sectionIdFromLabel(label)} data-settings-section={label} className={className}>
     <div className="px-1 pb-2.5">
-      <h3
-        className={`text-[12px] font-semibold uppercase tracking-[0.14em] text-textPrimary ${logo ? 'flex items-center gap-1.5' : ''}`}
-        aria-label={shownLabel ? label : undefined}
-      >
-        {logo}
-        {shownLabel ?? label}
-      </h3>
+      <div className={actions ? 'flex min-h-8 items-center justify-between gap-3' : undefined}>
+        <h3
+          className={`text-[12px] font-semibold uppercase tracking-[0.14em] text-textPrimary ${logo || icon || count !== undefined ? 'flex items-center gap-1.5' : ''}`}
+          aria-label={shownLabel ? label : undefined}
+        >
+          {icon && (
+            <span className="-ml-px mr-0.5 inline-flex text-accent-on-surface" aria-hidden>
+              {icon}
+            </span>
+          )}
+          {logo}
+          {shownLabel ?? label}
+          {count !== undefined && <SectionCount count={count} />}
+        </h3>
+        {actions && <div className="flex shrink-0 items-center gap-1.5">{actions}</div>}
+      </div>
       {description && (
         <p className="mt-1 text-[12px] leading-relaxed text-textMuted">
           {description}
@@ -105,7 +142,7 @@ const DesktopSettingsSection = ({
     {bare ? (
       <div className="space-y-3">{children}</div>
     ) : (
-      <div className="settings-card px-4">{children}</div>
+      <div className={glaze ? 'chrome-glaze settings-glaze px-4' : 'settings-card px-4'}>{children}</div>
     )}
   </section>
 );

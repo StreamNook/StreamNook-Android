@@ -58,6 +58,23 @@ export interface MissingBadge {
   category: string | null;
 }
 
+/** When a badge was added and where it sits in Newest First (Rust `AddedDate`, services/badge_standing.rs). */
+export interface AddedDate {
+  ms: number | null;
+  precision: 'minute' | 'day' | 'month' | null;
+  /** "13 November 2026" or "March 2017", in UTC; a surface writes "Added " before it. */
+  label: string | null;
+  /** 0 is the newest. Every catalogue badge has one, dated or not. */
+  order: number;
+}
+
+/** A badge's sharp art from the index (Rust `BadgeArt`): `a` names Penrose's two
+ *  files made from the Twitch image `i`, and is drawn only beside that image. */
+export interface BadgeArt {
+  i: string;
+  a: string;
+}
+
 export interface BadgeStanding {
   login: string | null;
   collection: CollectionState;
@@ -67,6 +84,10 @@ export interface BadgeStanding {
   catalogue_ready: boolean;
   owned: string[];
   windows: Record<string, WindowRun[]>;
+  /** Every catalogue badge's date and place in Newest First, keyed `set_id/version`. */
+  added: Record<string, AddedDate>;
+  /** The sharp art of every catalogue badge the index carries one for, keyed `set_id/version`. */
+  art: Record<string, BadgeArt>;
   missing_now: MissingBadge[];
   next_change_ms: number | null;
   /** Twitch's own art for earn chips, by step kind (`subscribe`: the gift, `cheer`: the gem). */
@@ -91,9 +112,27 @@ export interface CatchUp {
   estimated: boolean;
 }
 
+/** The last standing Rust answered this run. A surface opened later starts from it instead of an empty one. */
+let lastStanding: BadgeStanding | null = null;
+// Requests are numbered so an older answer that lands after a newer one never
+// replaces it: the next surface would otherwise open on the older order.
+let requestSeq = 0;
+let storedSeq = 0;
+
+export function getLastStanding(): BadgeStanding | null {
+  return lastStanding;
+}
+
 /** Rust answers from its cache at once; a due refresh follows as `badge-standing-changed`. */
 export function getBadgeStanding(force = false): Promise<BadgeStanding> {
-  return invoke<BadgeStanding>('get_badge_standing', { force });
+  const seq = ++requestSeq;
+  return invoke<BadgeStanding>('get_badge_standing', { force }).then((standing) => {
+    if (seq > storedSeq) {
+      storedSeq = seq;
+      lastStanding = standing;
+    }
+    return standing;
+  });
 }
 
 export function getBadgeWindow(setId: string, version: string): Promise<WindowRun[] | null> {

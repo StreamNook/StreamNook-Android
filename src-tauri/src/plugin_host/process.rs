@@ -109,6 +109,9 @@ pub async fn run_supervisor(host: Arc<HostInner>, plugin_id: String) {
 
         let outcome = run_once(&host, &record).await;
         host.running.write().await.remove(&plugin_id);
+        // Whatever status this provider last sent no longer holds.
+        #[cfg(desktop)]
+        crate::services::background_mode::note_provider_stopped(&plugin_id);
 
         match outcome {
             RunOutcome::CleanShutdown => break,
@@ -134,6 +137,8 @@ pub async fn run_supervisor(host: Arc<HostInner>, plugin_id: String) {
         }
     }
     host.running.write().await.remove(&plugin_id);
+    #[cfg(desktop)]
+    crate::services::background_mode::note_provider_stopped(&plugin_id);
     debug!("[PluginHost] supervisor for {} ended", plugin_id);
 }
 
@@ -215,6 +220,7 @@ async fn run_once(host: &Arc<HostInner>, record: &InstalledPlugin) -> RunOutcome
         "data_dir": super::registry::plugin_data_dir(&record.id)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default(),
+        "host_session": super::host_session_id(),
         "log_dir": super::registry::plugin_state_dir(&record.id)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default(),
@@ -249,6 +255,7 @@ async fn run_once(host: &Arc<HostInner>, record: &InstalledPlugin) -> RunOutcome
 
     // Register as running.
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SupCmd>();
+    let own_tx = cmd_tx.clone();
     {
         let mut running = host.running.write().await;
         running.insert(
@@ -275,7 +282,26 @@ async fn run_once(host: &Arc<HostInner>, record: &InstalledPlugin) -> RunOutcome
     // plugin's channel and is served by the loop below.
     if record.granted.actions.iter().any(|a| a == super::DROPS_CONFIGURE_ACTION) {
         let host = host.clone();
-        tokio::spawn(async move { host.push_drops_settings().await });
+        let plugin_id = record.id.clone();
+        tokio::spawn(async move {
+            host.push_drops_settings().await;
+            // While it runs, the evolution lines this account can't start are
+            // re-checked every few minutes, so a plugin mining with nothing
+            // playing in the app hears of them (watch_drops only checks while
+            // a stream earns in the app). Ends with this run of the plugin.
+            let mut every = tokio::time::interval(Duration::from_secs(super::LOCKS_LIST_MAX_AGE_SECS));
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            every.tick().await;
+            loop {
+                every.tick().await;
+                let current = !host.shutting_down.load(Ordering::SeqCst)
+                    && host.running.read().await.get(&plugin_id).is_some_and(|h| h.cmd_tx.same_channel(&own_tx));
+                if !current {
+                    break;
+                }
+                host.refresh_evolution_locks().await;
+            }
+        });
     }
 
     // Serve until shutdown, crash, or unresponsiveness.

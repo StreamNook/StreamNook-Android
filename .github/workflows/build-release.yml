@@ -61,6 +61,10 @@ jobs:
         with:
           ref: main
 
+      # The shell steps below match text with ripgrep.
+      - name: Install ripgrep
+        run: command -v rg >/dev/null || brew install ripgrep
+
       # Release-exists guard, the macOS twin of the Windows job's check. This
       # workflow fires on ANY `dev` push that touches Cargo.toml, release or
       # not, and every upload below is `--clobber`. Without this guard a
@@ -76,7 +80,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          version=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          version=$(rg -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "VERSION=$version" >> "$GITHUB_OUTPUT"
           if gh release view "v$version" >/dev/null 2>&1; then
             echo "RELEASE_EXISTS=true" >> "$GITHUB_OUTPUT"
@@ -132,7 +136,7 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          version=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          version=$(rg -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           app_dir="src-tauri/target/universal-apple-darwin/release/bundle/macos"
           test -d "$app_dir/StreamNook.app" || { echo "no .app at $app_dir"; exit 1; }
           bundle="StreamNook.app.tar.gz"
@@ -251,6 +255,10 @@ jobs:
         with:
           ref: main
 
+      # The shell steps below match text with ripgrep.
+      - name: Install ripgrep
+        run: command -v rg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep; }
+
       # Release-exists guard, the Linux twin of the macOS and Windows checks.
       # Same reasoning: every upload below is --clobber, and this workflow fires
       # on ANY dev push touching Cargo.toml, so without the guard a dependency
@@ -263,7 +271,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          version=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          version=$(rg -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "VERSION=$version" >> "$GITHUB_OUTPUT"
           if gh release view "v$version" >/dev/null 2>&1; then
             echo "RELEASE_EXISTS=true" >> "$GITHUB_OUTPUT"
@@ -430,7 +438,7 @@ jobs:
           # The decoders must survive; without them the player dies with
           # "HLS is not supported in this browser".
           for keep in libgstlibav.so libgstopenh264.so; do
-            find "$appdir" -name "$keep" | grep -q . || { echo "$keep went missing"; exit 1; }
+            find "$appdir" -name "$keep" | rg -q . || { echo "$keep went missing"; exit 1; }
           done
 
           # The GTK plugin's AppRun hook forces X11 on every Wayland desktop and
@@ -468,7 +476,7 @@ jobs:
         id: pack
         run: |
           set -euo pipefail
-          version=$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          version=$(rg -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           src_dir="src-tauri/target/release/bundle/appimage"
           # The bundler names it StreamNook_<version>_amd64.AppImage. The client
           # asks for the STABLE name (default_bundle_name() returns
@@ -678,10 +686,27 @@ jobs:
       #   src-tauri/target/release/bundle/nsis/StreamNook_<ver>_x64-setup.exe
       # Its updater signature is made by "Sign the installer" below, not by
       # tauri build.
+      #
+      # Releases link with MSVC link.exe, as every release always has.
+      # src-tauri/.cargo/config.toml sets rust-lld for Windows to speed up local
+      # test builds; for a release that saves seconds of a two-hour run, so it
+      # is not worth a different linker in the .exe everyone installs. An env
+      # var outranks the config file. The path is the toolset rustc itself
+      # would pick (the Build Tools' default version file), never a bare
+      # link.exe that Git's coreutils link.exe on PATH could shadow.
       - name: Build Tauri app
         if: steps.check_release.outputs.RELEASE_EXISTS == 'false'
         shell: pwsh
-        run: npm run tauri build
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "No Visual Studio with the MSVC x64 tools on this runner" }
+          $toolset = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt" -Raw).Trim()
+          $link = "$vs\VC\Tools\MSVC\$toolset\bin\Hostx64\x64\link.exe"
+          if (-not (Test-Path -LiteralPath $link)) { throw "MSVC link.exe not found at $link" }
+          $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $link
+          "Windows release linker: $link" >> $env:GITHUB_STEP_SUMMARY
+          npm run tauri build
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}

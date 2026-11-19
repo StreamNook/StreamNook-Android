@@ -261,6 +261,7 @@ const BY_TITLE: Record<string, LucideIcon> = {
   'Short links': Link2,
   Underline: Underline,
   'Emoji style': Smile,
+  'Smiley style': Smile,
   'Personal emotes': SmilePlus,
   'Emote words': Captions,
   'Sentences only': WholeWord,
@@ -379,6 +380,13 @@ const BY_TITLE: Record<string, LucideIcon> = {
 /** Short names that mean different things in different sections ("Style",
  *  "Spacing", "Color"): the section's own entry wins over the title table. */
 const BY_SECTION: Record<string, Record<string, LucideIcon>> = {
+  Limits: {
+    'Messages a minute': Gauge,
+    'Post in other channels': Globe,
+    'Chat notes': NotebookPen,
+    'New people to whisper a day': MessageCircle,
+    "This device's name": Signature,
+  },
   'Chat Placement': { Position: PanelLeft },
   'Chat Events': { Style: Brush, Platforms: Layers },
   'Pinned Messages': { Collapsed: Pin },

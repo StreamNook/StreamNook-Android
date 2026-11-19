@@ -8,6 +8,7 @@ pub mod badge_feed;
 pub mod badge_polling_service;
 pub mod badge_earn;
 pub mod badge_fold;
+pub mod badge_index;
 pub mod badge_service;
 pub mod browse_languages;
 pub mod badge_standing;
@@ -20,6 +21,7 @@ pub mod own_accolades;
 pub mod watch_places;
 pub mod chat_preview;
 
+pub mod account_automations;
 pub mod account_store;
 pub mod activity_history_service;
 // Phones only: ad-free live playback. Desktop keeps the ad-neutral core and
@@ -31,6 +33,13 @@ pub mod activity_history_service;
 pub mod ad_bypass;
 pub mod ad_detect;
 pub mod app_paths;
+// Desktop-only: Autopilot's Missing badges mode keeps StreamNook running in
+// the tray (background_mode) and owns the login entry that starts it there
+// (autostart).
+#[cfg(desktop)]
+pub mod autostart;
+#[cfg(desktop)]
+pub mod background_mode;
 pub mod asset_scope;
 #[cfg(target_os = "ios")]
 pub mod ios_sheet;
@@ -45,6 +54,7 @@ pub mod channel_media;
 pub mod channel_avatars;
 pub mod ll_diagnostics;
 pub mod channel_points_websocket_service;
+pub mod chat_room_redemptions;
 pub mod chat_logger_service;
 pub mod automod_queue;
 pub mod chat_bridge_route;
@@ -123,6 +133,7 @@ pub mod spellcheck;
 pub mod asset_cache_queue;
 pub mod emote_credit;
 pub mod emote_match;
+pub mod emote_moment;
 pub mod emote_picker;
 pub mod emote_prefetch_service;
 #[cfg(test)]
@@ -130,6 +141,8 @@ mod emote_golden;
 pub mod emote_restamp;
 pub mod emote_service;
 pub mod emote_set_cache;
+pub mod twitch_smilies;
+pub mod twitch_smiley_style;
 pub mod eventsub_budget;
 pub mod eventsub_moderation;
 pub mod eventsub_service;
@@ -168,6 +181,7 @@ pub mod membership_gifts;
 pub mod membership_status;
 pub mod provider_categories;
 pub mod provider_live_service;
+pub mod provider_pace;
 pub mod link_adapt;
 pub mod ll_origin;
 pub mod page_watchdog;
@@ -304,6 +318,12 @@ pub mod shared_chat_source;
 // The Custom interface font's files on the phones.
 pub mod custom_font;
 pub mod share_link;
+// streamnook:///badge/<set>[/<version>] deep links to a badge's detail.
+pub mod badge_link;
+// streamnook:///category/<id> links: parse, build, and what Twitch says the id is.
+pub mod category_link;
+// The one inbound-link type, its route, and the slot that holds one for the page.
+pub mod inbound_link;
 pub mod slash_commands;
 pub mod chat_top_stack;
 pub mod poll_view;
@@ -330,6 +350,7 @@ pub mod app_links;
 pub mod earning_gate;
 pub mod whisper_inbox;
 pub mod whisper_live;
+pub mod whisper_recipients;
 pub mod whisper_service;
 pub mod whisper_store;
 pub mod whisper_sync;

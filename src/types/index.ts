@@ -179,6 +179,10 @@ export interface DropsSettings {
   prefer_favorites?: boolean; // Collect your live favorited channels instead of the priority list (default: false)
   prefer_missing_badges?: boolean; // Work first on campaigns that award a badge you're missing (default: true)
   auto_pick_evolution?: boolean; // Equip a Pokémon line to evolve when none is equipped (default: true)
+  collect_missing_badges?: boolean; // Collect every watch-based badge you're missing (default: false)
+  keep_running_when_closed?: boolean; // With Missing badges on, closing keeps StreamNook in the tray (default: true)
+  start_at_login?: boolean; // With both on, start in the tray at sign-in (default: false; this machine only)
+  told_keep_running?: boolean; // Rust-owned: the one-time tray notice was shown
   // Recovery settings
   recovery_settings?: RecoverySettings;
 }
@@ -693,6 +697,244 @@ export interface CosmeticsSettings {
   // When a 7TV picture moves: 'always', 'hover' (focal surfaces move, lists
   // on hover) or 'never'. Default 'always'. Separate from motion_mode.
   profile_picture_animation?: 'always' | 'hover' | 'never';
+}
+
+// Account automations. Mirrored in models/automations.rs. Rust owns every
+// write through the automations commands; a settings page never patches
+// `automations` (it is backend-owned), and writes `automation_prefs` field by
+// field.
+export type AutomationRunState = 'off' | 'test' | 'on';
+
+export interface AutomationAway {
+  message: string;
+  since_ms: number;
+}
+
+export interface Automations {
+  version: number;
+  run: AutomationRunState;
+  /** What Resume returns to; never 'off'. */
+  last_active: AutomationRunState;
+  /** This device's away; null when clear. */
+  away: AutomationAway | null;
+  last_away_message: string;
+  /** Stored rules, raw. Read them typed (AutomationRule) through the automations commands. */
+  rules: unknown[];
+  converted_reminders: string[];
+}
+
+export interface AutomationPrefs {
+  /** 1 to 20. Default 10. */
+  sends_per_minute: number;
+  /** Default false. */
+  other_channels: boolean;
+  /** 10 to 600. Default 30. */
+  other_channel_gap_seconds: number;
+  /** Default true. */
+  chat_notes: boolean;
+  /** 1 to 30. Default 20. */
+  whisper_people_per_day: number;
+}
+
+export interface AutomationAccountRef {
+  provider: string;
+  id: string;
+  login: string;
+  name: string;
+}
+
+export type AutomationMatchMode = 'any_word' | 'all_words' | 'phrase' | 'contains' | 'starts_with' | 'exact' | 'regex';
+
+export interface AutomationTextMatch {
+  mode: AutomationMatchMode;
+  pattern: string;
+  case_sensitive: boolean;
+}
+
+/** A chat platform a rule listens on (Rust `Platform`). A rule that posts names exactly one, and only Twitch and Kick can be posted to. */
+export type AutomationPlatform = 'twitch' | 'kick' | 'youtube' | 'tiktok';
+
+export type AutomationEventKind =
+  | 'sub'
+  | 'resub'
+  | 'gift'
+  | 'gift_bomb'
+  | 'raid'
+  | 'cheer'
+  | 'announcement'
+  | 'super_chat'
+  | 'super_sticker'
+  | 'membership'
+  | 'member_gift'
+  | 'tiktok_gift'
+  | 'tiktok_follow'
+  | 'tiktok_share';
+
+export type AutomationBadgeLeg = 'announced' | 'earnable' | 'both';
+
+export interface AutomationBadgeLink {
+  preset: 'streamnook' | 'streamdatabase' | 'custom' | 'none';
+  custom: string;
+  if_not_ready: 'streamnook' | 'no_link';
+}
+
+export type AutomationTrigger =
+  | { kind: 'message'; text: AutomationTextMatch }
+  | { kind: 'mention'; replies_too: boolean }
+  | { kind: 'first_message' }
+  | {
+      kind: 'channel_event';
+      events: AutomationEventKind[];
+      min_months: number;
+      min_gifts: number;
+      min_viewers: number;
+      min_bits: number;
+    }
+  | { kind: 'badge_drop'; on: AutomationBadgeLeg; link: AutomationBadgeLink; batch_text: string }
+  | { kind: 'whisper'; text: AutomationTextMatch | null }
+  | { kind: 'timer'; every_seconds: number; min_messages: number }
+  | { kind: 'clock'; at: string; days: AutomationWeekday[] }
+  | { kind: 'uptime'; seconds: number; late_ok: boolean }
+  | { kind: 'delay'; seconds: number }
+  | { kind: 'follow' }
+  | { kind: 'reward_redeemed'; reward_id: string | null }
+  | { kind: 'poll_started' }
+  | { kind: 'prediction_started' }
+  | { kind: 'live_change'; online: boolean };
+
+export interface AutomationChannelRef {
+  id: string;
+  /** Built in Rust: `twitch:login`. */
+  key: string;
+  room_id: string;
+  name: string;
+}
+
+export type AutomationChannelScope =
+  | { kind: 'own' }
+  | { kind: 'these'; list: AutomationChannelRef[] }
+  | { kind: 'any_open' }
+  | { kind: 'watching' };
+
+export type AutomationSenderRole = 'broadcaster' | 'moderator' | 'vip' | 'subscriber' | 'viewer';
+
+export type AutomationWeekday = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';
+
+export interface AutomationHours {
+  /** "HH:MM", local. */
+  from: string;
+  to: string;
+  /** Empty means every day. */
+  days: AutomationWeekday[];
+}
+
+export interface AutomationConditions {
+  /** The platforms the rule listens on; `['twitch']` by default. */
+  platforms: AutomationPlatform[];
+  channels: AutomationChannelScope;
+  roles: AutomationSenderRole[];
+  skip_users: string[];
+  only_users: string[];
+  only_live: boolean;
+  only_away: boolean;
+  shared_chat: boolean;
+  hours: AutomationHours | null;
+  /** Post only in a chat a window holds; offered for every rule, set by "Make it a rule". Optional here: Rust always writes it. */
+  only_while_open?: boolean;
+  /** Set by "Make it a rule" for a "mods" keyword; backend-owned, kept by every save. */
+  lead_moderator_excluded?: boolean;
+  /** Set by "Make it a rule" for a pinned uptime reminder; backend-owned, kept by every save. */
+  only_while_watching?: boolean;
+  /** The saved-filter language, chat rows only. */
+  expression: string | null;
+}
+
+export interface AutomationWhisperTarget {
+  user_id: string;
+  login: string;
+  name: string;
+}
+
+export type AutomationAnnounceColor = 'primary' | 'blue' | 'green' | 'orange' | 'purple';
+
+export interface AutomationLine {
+  id: string;
+  text: string;
+}
+
+export type AutomationPick = 'random' | 'shuffle' | 'in_order';
+
+export type AutomationAction =
+  | { kind: 'reply'; id: string; texts: AutomationLine[]; pick: AutomationPick; thread: boolean }
+  | { kind: 'send'; id: string; to: AutomationChannelRef | null; texts: AutomationLine[]; pick: AutomationPick }
+  | {
+      kind: 'notify';
+      id: string;
+      title: string;
+      body: string;
+      toast: boolean;
+      system: boolean;
+      sound: string | null;
+      /** 0 to 1. */
+      volume: number;
+    }
+  | { kind: 'command'; id: string; line: string }
+  | { kind: 'whisper'; id: string; to: AutomationWhisperTarget | null; texts: AutomationLine[]; pick: AutomationPick }
+  | { kind: 'timeout'; id: string; seconds: number; reason: string }
+  | { kind: 'delete'; id: string }
+  | { kind: 'pin'; id: string; seconds: number | null }
+  | { kind: 'announce'; id: string; text: string; color: AutomationAnnounceColor }
+  | { kind: 'shoutout'; id: string }
+  | { kind: 'join_chat'; id: string; channel: AutomationChannelRef }
+  | { kind: 'leave_chat'; id: string; channel: AutomationChannelRef }
+  | { kind: 'wait'; id: string; seconds: number }
+  | { kind: 'log'; id: string; to_file: boolean }
+  | { kind: 'speak'; id: string; text: string; on_stream: boolean }
+  | { kind: 'highlight'; id: string; color: string };
+
+export interface AutomationLimits {
+  rule_cooldown_seconds: number;
+  user_cooldown_seconds: number;
+  max_per_hour: number;
+  max_wait_seconds: number;
+}
+
+/** What "Make it a rule" stores so the rule claims as its reminder does. Backend-owned: no editor writes it. */
+export interface AutomationClaimAs {
+  account_id: string;
+  kind: 'interval' | 'delay' | 'clock' | 'uptime' | 'keyword';
+  family_hash: string;
+  seconds: number;
+  cooldown_s: number;
+  trigger_kind: string;
+  scope_kind: string;
+  scope_key: string;
+  send_to: string | null;
+}
+
+export interface AutomationRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  /** false = Test. */
+  live: boolean;
+  owner: AutomationAccountRef;
+  send_as: AutomationAccountRef;
+  when: AutomationTrigger;
+  only_if: AutomationConditions;
+  actions: AutomationAction[];
+  limits: AutomationLimits;
+  vary: boolean;
+  origin: string | null;
+  /** Set only by "Make it a rule"; Rust keeps it across saves while it still applies. Optional here: no client writes it. */
+  claim_as?: AutomationClaimAs | null;
+  created_ms: number;
+  updated_ms: number;
+}
+
+export interface AutomationFieldError {
+  path: string;
+  message: string;
 }
 
 // /spam and /pyramid. Mirrored in models/settings.rs (ChatBurstSettings).
@@ -1521,6 +1763,10 @@ export interface Settings {
   cosmetics?: CosmeticsSettings;
   chat_burst?: ChatBurstSettings;
   mentions?: MentionSettings;
+  /** Account automations. Backend-owned (models/automations.rs): changed only through the automations commands, never a settings patch. */
+  automations?: Automations;
+  /** Automation preferences, written field by field. */
+  automation_prefs?: AutomationPrefs;
   /** The phones' Chats screen keeps the screen on while in front, until 30 min pass with no touch. Default on. */
   chats_keep_screen_on?: boolean;
   live_notifications?: LiveNotificationSettings;
@@ -2385,6 +2631,9 @@ export interface LiveRewindInfo {
    *  timeline's "you left here" mark. Absent when there is nothing to go
    *  back to. */
   left_off_secs?: number;
+  /** Why rewind is off when it is not "no recording": a channel that limits
+   *  its recordings and a viewer it leaves out. Rust's words. */
+  reason?: string;
 }
 
 export interface TwitchUser {
@@ -2411,11 +2660,15 @@ export interface SevenTVBadge {
   name: string;
   tooltip: string;
   urls: Array<[string, string]>;
+  /** False when 7TV keeps it for the account but won't let it be worn now. */
+  accessible?: boolean;
 }
 
 export interface SevenTVPaint {
   id: string;
   name: string;
+  /** False when 7TV keeps it for the account but won't let it be worn now. */
+  accessible?: boolean;
   function: 'LINEAR_GRADIENT' | 'RADIAL_GRADIENT' | 'URL';
   color?: number;
   stops?: Array<{ at: number; color: number }>;
@@ -2506,6 +2759,9 @@ export interface DropsOverview {
   /** Rewards this account cannot earn yet (an evolution stage whose earlier
    *  form is not held), by drop id: "Needs the Gastly badge first". */
   locked_drops: Record<string, string>;
+  /** The favourite games when it was built: the grid's favourites-first sort
+   *  before the page's own settings read lands. */
+  favorite_games?: string[];
 }
 
 // Drops inventory types
@@ -2563,6 +2819,25 @@ export interface TimeBasedDrop {
   random_of?: number | null;
   /** A draw with one reward left unheld: what it will give (Twitch never repeats one). */
   next_reward?: DropBenefit | null;
+  /** Twitch holds it until the campaign's other rewards are earned (the Golden Iguana): never ready or claimed. Rust lists it in `locked_drops`. */
+  needs_earlier?: boolean;
+  /** Every reward a draw can give, named, with whether the account holds it (Rust, second list only). */
+  pool_rewards?: PoolReward[];
+  /** A subscription tier that only gets a container another tier opens (a Special Great Ball): not a reward of its own. */
+  obtains_container?: boolean;
+  /** Drops of the same campaign that must be claimed first (Twitch's `preconditionDrops`); Rust lists an unmet chain in `locked_drops`. */
+  precondition_drops?: string[];
+}
+
+/** One reward a draw can give: a pool member. */
+export interface PoolReward {
+  id: string;
+  name: string;
+  image_url: string;
+  /** "badge", "emote" or "item". */
+  kind: string;
+  /** The account already holds it; Twitch never gives it again. */
+  held: boolean;
 }
 
 export interface AllowedChannel {

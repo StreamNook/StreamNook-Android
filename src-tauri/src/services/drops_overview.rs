@@ -24,6 +24,46 @@ const KNOWN_TITLES_TTL: Duration = Duration::from_secs(10 * 60);
 
 static BADGE_TITLES: Mutex<Option<(Instant, BadgeTitles)>> = Mutex::new(None);
 
+/// The last overview built, with the Drops token epoch it was built under. The
+/// Drops page draws it the moment it opens and reads Twitch again behind it,
+/// instead of a spinner for the whole read. A new or removed Drops token (a
+/// sign-out, another account) changes the epoch, so another account's drops
+/// are never shown.
+static LAST: Mutex<Option<(u64, u64, DropsOverview)>> = Mutex::new(None);
+
+/// Numbers each build as it starts, so a slow build can't replace the model a
+/// later one (a claim's rebuild) already kept.
+static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The number for a build starting now; pass it to `remember`.
+pub fn next_build() -> u64 {
+    BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// Keep `overview` as the one the Drops page opens on. `epoch` is the token
+/// epoch read when its build STARTED, so a build that straddles a sign-out is
+/// filed under the old token and never shown for the new one. A build that
+/// started before the kept one (same token) is older news and is dropped.
+pub fn remember(epoch: u64, build: u64, overview: &DropsOverview) {
+    if let Ok(mut slot) = LAST.lock() {
+        if slot.as_ref().is_some_and(|(e, b, _)| *e == epoch && *b > build) {
+            return;
+        }
+        *slot = Some((epoch, build, overview.clone()));
+    }
+}
+
+/// The last overview built for the current Drops token, at any age. No lock on
+/// the drops service and no network, so it answers at once.
+pub fn last() -> Option<DropsOverview> {
+    let epoch = crate::services::drops_auth_service::DropsAuthService::token_epoch();
+    LAST.lock()
+        .ok()?
+        .as_ref()
+        .filter(|(at, _, _)| *at == epoch)
+        .map(|(_, _, overview)| overview.clone())
+}
+
 /// Badge titles, lowercased: the ones this account has earned, and those plus
 /// Twitch's global catalog.
 #[derive(Debug, Clone, Default)]
@@ -68,6 +108,10 @@ pub struct DropsOverview {
     /// form is not held), by drop id, with what they need first ("Needs the
     /// Gastly badge first"). They count as neither in progress nor ready.
     pub locked_drops: HashMap<String, String>,
+    /// The favourite games when this was built, so a page drawn from the kept
+    /// model sorts favourites first before its settings read lands (the grid
+    /// would otherwise reshuffle a moment after opening).
+    pub favorite_games: Vec<String>,
 }
 
 fn normalize(name: &str) -> String {
@@ -568,17 +612,16 @@ pub fn overview(
     if let Some(inv) = inventory.as_mut() {
         crate::services::drops_service::fill_account_links(&mut inv.items);
     }
+    // Chained drops whose earlier drops are not claimed yet are out of reach too.
+    let claimed: HashSet<String> = progress.iter().filter(|p| p.is_claimed).map(|p| p.drop_id.clone()).collect();
+    let locked = &crate::services::evolution::with_chains(locked.clone(), campaigns, &claimed);
     let games = build_with_locked(campaigns, &progress, inventory.as_ref(), &titles.known, locked);
     // Only rewards the page lists, each with the words it shows.
     let locked_drops = games
         .iter()
         .flat_map(|g| &g.active_campaigns)
         .flat_map(|c| &c.time_based_drops)
-        .filter_map(|d| {
-            locked
-                .get(&d.id)
-                .map(|needs| (d.id.clone(), crate::services::evolution::locked_words(needs)))
-        })
+        .filter_map(|d| locked.get(&d.id).map(|words| (d.id.clone(), words.clone())))
         .collect();
     let (inventory_items, completed_drops) = inventory
         .map(|inv| (inv.items, inv.completed_drops))
@@ -597,6 +640,7 @@ pub fn overview(
         earned_badge_titles: sorted(titles.earned),
         known_badge_titles: sorted(titles.known),
         locked_drops,
+        favorite_games: Vec::new(),
     }
 }
 
@@ -636,6 +680,10 @@ mod tests {
             required_days: 0,
             random_of: None,
             next_reward: None,
+            needs_earlier: false,
+            pool_rewards: Vec::new(),
+            obtains_container: false,
+            precondition_drops: Vec::new(),
         }
     }
 
@@ -718,6 +766,28 @@ mod tests {
     }
 
     #[test]
+    fn the_kept_model_is_the_latest_build_for_this_drops_sign_in_only() {
+        let named = |title: &str| {
+            let mut o = overview(&[], vec![], None, None, BadgeTitles::default(), &HashMap::new());
+            o.earned_badge_titles = vec![title.to_string()];
+            o
+        };
+        let shown = || last().map(|o| o.earned_badge_titles[0].clone());
+        let epoch = crate::services::drops_auth_service::DropsAuthService::token_epoch();
+        let (slow, claim) = (next_build(), next_build());
+
+        remember(epoch, claim, &named("after claim"));
+        remember(epoch, slow, &named("slow refresh"));
+        assert_eq!(shown().as_deref(), Some("after claim"), "a build that started earlier never replaces a later one");
+
+        remember(epoch, next_build(), &named("next open"));
+        assert_eq!(shown().as_deref(), Some("next open"));
+
+        remember(epoch + 1, next_build(), &named("other account"));
+        assert_eq!(shown(), None, "a model built under another Drops token is never shown");
+    }
+
+    #[test]
     fn groups_campaigns_by_game_and_merges_live_progress() {
         let campaigns = vec![
             campaign("1", "Rust", 1, vec![drop("d1", 60, "hat"), drop("d2", 120, "cape")]),
@@ -744,13 +814,46 @@ mod tests {
     }
 
     #[test]
+    fn a_chained_drop_is_out_of_reach_until_the_one_before_is_claimed() {
+        // Twitch's preconditionDrops: the second reward counts only once the
+        // first is claimed, so its minutes in the campaign clock mean nothing.
+        let mut second = drop("b", 60, "Gold Chain");
+        second.precondition_drops = vec!["a".to_string()];
+        let campaigns = vec![campaign("1", "Game", 1, vec![drop("a", 60, "Silver Chain"), second])];
+        let live = vec![progress("a", 60, 60, false), progress("b", 60, 60, false)];
+        let o = overview(&campaigns, live, None, None, BadgeTitles::default(), &HashMap::new());
+        assert_eq!(
+            o.locked_drops,
+            HashMap::from([("b".to_string(), "Needs Silver Chain first".to_string())])
+        );
+        // The first one claimed: the second is earnable like any drop.
+        let live = vec![progress("a", 60, 60, true), progress("b", 0, 60, false)];
+        let o = overview(&campaigns, live, None, None, BadgeTitles::default(), &HashMap::new());
+        assert!(o.locked_drops.is_empty());
+        // A precondition the campaign does not list is left to Twitch.
+        let mut orphan = drop("c", 60, "Bronze Chain");
+        orphan.precondition_drops = vec!["elsewhere".to_string()];
+        let lone = vec![campaign("2", "Game", 1, vec![orphan])];
+        let o = overview(&lone, vec![], None, None, BadgeTitles::default(), &HashMap::new());
+        assert!(o.locked_drops.is_empty());
+    }
+
+    #[test]
+    fn two_unclaimed_preconditions_read_as_the_earlier_rewards() {
+        assert_eq!(
+            crate::services::evolution::needs_first_words(&["A".to_string(), "B".to_string()]),
+            "Needs the earlier rewards first"
+        );
+    }
+
+    #[test]
     fn the_overview_carries_locked_stages_and_counts_them_nowhere() {
         // Twitch reports Gengar in progress and fully watched, but Gastly is not held.
         let campaigns = vec![campaign("1", "Pokemon", 1, vec![drop("ball", 60, "Poke Ball"), drop("gengar", 60, "Gengar")])];
         let live = vec![progress("ball", 10, 60, false), progress("gengar", 60, 60, false)];
         let locked = HashMap::from([
-            ("gengar".to_string(), "Gastly".to_string()),
-            ("elsewhere".to_string(), "Ralts".to_string()),
+            ("gengar".to_string(), "Needs the Gastly badge first".to_string()),
+            ("elsewhere".to_string(), "Needs the Ralts badge first".to_string()),
         ]);
         let o = overview(&campaigns, live, None, None, BadgeTitles::default(), &locked);
         assert_eq!(

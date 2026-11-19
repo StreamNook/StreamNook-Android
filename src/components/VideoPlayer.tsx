@@ -43,6 +43,7 @@ import { LiveAlertBell } from './LiveAlertBell';
 import { TwitchVerifiedMark } from './ui/TwitchGlyph';
 import { registerPlayerControls, type PlayerControls } from '../keybindings';
 import { qualitiesEquivalent, qualityLabel } from '../utils/quality';
+import { prepareSettingsMenu } from '../utils/plyrSettingsMenu';
 import { createStallReporter, reportSegment } from '../utils/linkAdapt';
 import { SEAM_MAX_SECS, learnedLLCushion, rememberLLCushion } from '../utils/llCushion';
 
@@ -63,6 +64,10 @@ import {
 } from '../utils/audioBoost';
 import type { AudioBoostSettings, MutedRange, VodChapter } from '../types';
 import { AudioBoostControls } from './AudioBoostFaders';
+import { missingCodecsWords, missingTwitchCodecs } from '../utils/codecPreference';
+
+/** Whether this run already checked the video engine for Twitch's decoders. */
+let codecsWarned = false;
 
 /** A backward scrub on a live stream smaller than this is treated as a
  *  nudge, not a rewind request. */
@@ -739,7 +744,8 @@ const VideoPlayer = () => {
       const settingsHome = settingsMenu.querySelector('[role="menu"]');
       if (settingsHome) {
         const qualityMenuItem = document.createElement('button');
-        qualityMenuItem.className = 'plyr__control';
+        // --forward: the same chevron Speed's row has, since both open a list.
+        qualityMenuItem.className = 'plyr__control plyr__control--forward';
         qualityMenuItem.setAttribute('data-plyr', 'quality');
         qualityMenuItem.setAttribute('type', 'button');
         qualityMenuItem.setAttribute('role', 'menuitem');
@@ -1162,6 +1168,16 @@ const VideoPlayer = () => {
       // could go stale. Same pattern as the provider check above.
       const playbackProvider = streamProvider(useAppStore.getState().currentStream);
       const isTwitchPlayback = playbackProvider === 'twitch';
+      // A video engine with no H.264 or AAC (a Linux build against the prebuilt
+      // CEF) plays every stream black and silent; say why once per run instead.
+      if (!codecsWarned) {
+        codecsWarned = true;
+        const missing = missingTwitchCodecs();
+        if (missing.length) {
+          Logger.error(`[Player] video engine lacks ${missing.join(', ')}`);
+          useAppStore.getState().addToast(missingCodecsWords(missing), 'error', undefined, { sticky: true });
+        }
+      }
       // Provider cushions are learned per channel exactly like Twitch's. Tracked
       // here so the LEVEL_LOADED correction and the stall ramp share one base.
       let providerCushionBase = PROVIDER_LIVE_SYNC_FALLBACK;
@@ -2468,7 +2484,10 @@ const VideoPlayer = () => {
           // Nothing to rewind into: keep the live position and say why, once
           // per scrub, instead of silently snapping back to the edge.
           video.currentTime = from;
-          store.addToast(`${store.currentStream?.user_name || 'This channel'} has VODs turned off, so the broadcast can't be rewound`, 'info');
+          store.addToast(
+            store.liveRewindReason ?? `${store.currentStream?.user_name || 'This channel'} has VODs turned off, so the broadcast can't be rewound`,
+            'info',
+          );
           return;
         }
         Logger.debug(`[player] live scrub back ${behind.toFixed(0)}s past the live window; rewinding into the recording`);
@@ -3406,14 +3425,25 @@ const VideoPlayer = () => {
       setShowOverlay(false);
     };
 
+    // The gear opens on its main list on the glaze every time (SN-277). Capture
+    // runs before Plyr's own click handler opens the menu.
+    const handleSettingsOpen = (e: MouseEvent) => {
+      const gear = (e.target as Element | null)?.closest?.('[data-plyr="settings"]');
+      if (!gear || gear.getAttribute('aria-expanded') === 'true') return;
+      const menu = gear.parentElement?.querySelector('.plyr__menu__container');
+      if (menu) prepareSettingsMenu(menu);
+    };
+
     container.addEventListener('mousemove', handleMouseMove);
     container.addEventListener('mouseenter', handleMouseEnter);
     container.addEventListener('mouseleave', handleMouseLeave);
+    container.addEventListener('click', handleSettingsOpen, true);
 
     return () => {
       container.removeEventListener('mousemove', handleMouseMove);
       container.removeEventListener('mouseenter', handleMouseEnter);
       container.removeEventListener('mouseleave', handleMouseLeave);
+      container.removeEventListener('click', handleSettingsOpen, true);
       if (overlayTimerRef.current) {
         clearTimeout(overlayTimerRef.current);
         overlayTimerRef.current = null;
@@ -3668,7 +3698,7 @@ const VideoPlayer = () => {
                 </Tooltip>
               ) : currentMediaType === 'clip' || currentMediaType === 'video' ? (
                 // Clips/VODs: always show back arrow — stop playback and return to category
-                <Tooltip content={streamOriginCategory ? `Back to ${streamOriginCategory.name}` : 'Back'} side="bottom" delay={200}>
+                <Tooltip content={streamOriginCategory ? (streamOriginCategory.name ? `Back to ${streamOriginCategory.name}` : 'Back to category') : 'Back'} side="bottom" delay={200}>
                   <button
                     onClick={async () => {
                       if (streamOriginCategory) {

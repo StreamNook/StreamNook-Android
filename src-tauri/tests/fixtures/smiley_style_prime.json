@@ -1,0 +1,79 @@
+{
+  "data": {
+    "currentUser": {
+      "id": "42",
+      "hasPrime": true,
+      "hasTurbo": false,
+      "primeSettings": {
+        "id": "ps-42",
+        "primeEmoticons": {
+          "currentSetName": "PURPLE",
+          "emoticonSets": [
+            {
+              "id": "ROBOTS",
+              "emotes": [
+                { "id": "1", "text": ":)" },
+                { "id": "2", "text": ":(" },
+                { "id": "3", "text": ":D" },
+                { "id": "4", "text": ">(" },
+                { "id": "5", "text": ":|" },
+                { "id": "6", "text": "O_o" },
+                { "id": "7", "text": "B)" },
+                { "id": "8", "text": ":O" },
+                { "id": "9", "text": "<3" },
+                { "id": "10", "text": ":/" },
+                { "id": "11", "text": ";)" },
+                { "id": "12", "text": ":P" },
+                { "id": "13", "text": ";P" },
+                { "id": "14", "text": "R)" }
+              ]
+            },
+            {
+              "id": "PURPLE",
+              "emotes": [
+                { "id": "432", "text": ">(" },
+                { "id": "439", "text": ";)" },
+                { "id": "440", "text": ":)" },
+                { "id": "441", "text": "B)" },
+                { "id": "442", "text": ";P" },
+                { "id": "443", "text": ":D" },
+                { "id": "444", "text": ":|" },
+                { "id": "445", "text": "<3" },
+                { "id": "438", "text": ":P" },
+                { "id": "436", "text": ":O" },
+                { "id": "435", "text": "R)" },
+                { "id": "434", "text": ":(" },
+                { "id": "433", "text": ":/" },
+                { "id": "437", "text": "O_o" }
+              ]
+            },
+            {
+              "id": "MONKEYS",
+              "emotes": [
+                { "id": "497", "text": "O_o" },
+                { "id": "493", "text": ":/" },
+                { "id": "487", "text": "<]" },
+                { "id": "485", "text": "#/" },
+                { "id": "501", "text": ";)" },
+                { "id": "500", "text": "B)" },
+                { "id": "499", "text": ":)" },
+                { "id": "498", "text": ">(" },
+                { "id": "496", "text": ":D" },
+                { "id": "495", "text": ":s" },
+                { "id": "494", "text": ":|" },
+                { "id": "492", "text": ":O" },
+                { "id": "491", "text": ";P" },
+                { "id": "490", "text": ":P" },
+                { "id": "489", "text": ":(" },
+                { "id": "488", "text": ":7" },
+                { "id": "486", "text": ":>" },
+                { "id": "484", "text": "R)" },
+                { "id": "483", "text": "<3" }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

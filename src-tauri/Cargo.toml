@@ -1,15 +1,24 @@
 [package]
 name = "StreamNook"
-version = "8.9.1"
+version = "8.9.3"
 description = "StreamNook"
 authors = ["Brandon Winters"]
 license = "PolyForm-Noncommercial-1.0.0"
 repository = "github.com/winters27/streamnook"
 edition = "2021"
+# tests/ holds source-text checks that never call the library. Built as integration
+# tests they made `cargo test` compile this whole crate a second time (as a plain rlib)
+# just to link them, about doubling every test build. src/source_pins.rs runs them in
+# the library's own test binary instead; a test there fails when a tests/ file is not
+# listed.
+autotests = false
 
 [[bin]]
 name = "StreamNook"
 path = "src/main.rs"
+# main.rs only calls streamnook_lib::run() and holds no tests; testing it would link
+# the exe (which a running dev app holds) for nothing.
+test = false
 
 # Library target required by Tauri mobile: `tauri android`/`ios` build the app
 # as a shared library that the generated Android/iOS project loads and calls
@@ -19,6 +28,9 @@ path = "src/main.rs"
 [lib]
 name = "streamnook_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+# There are no doctests (0 ran), and running them needs one more full build of the
+# crate as an rlib.
+doctest = false
 
 [build-dependencies]
 tauri-build = { version = "2.5.2", features = [] }
@@ -59,6 +71,9 @@ regex = "1.12.2"
 # Cutting a notification's quoted line between characters as people count
 # them, never through an emoji; already in the lock.
 unicode-segmentation = "1.13.2"
+# NFC for automation claim families, so one pattern typed two ways makes one
+# family on every device; already in the lock via url (idna_adapter).
+icu_normalizer = { version = "2.1", default-features = false, features = ["compiled_data"] }
 uuid = { version = "1.19.0", features = ["v4"] }
 urlencoding = "2.1.3"
 chrono = { version = "0.4.42", features = ["serde"] }
@@ -254,6 +269,9 @@ reqwest = { version = "0.12.24", features = ["json", "gzip", "cookies", "multipa
 # 0.21 line tauri and wry already resolve to, so the tree carries one copy.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+# boot_ms() (services/inbound_link.rs) reads CLOCK_BOOTTIME through it, its
+# only user. Already in the tree under tauri, so the lock gains no new copy.
+libc = "0.2"
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 # Chat's second route, raw IRC over TLS (services/irc_transport.rs), on the
 # same rustls + bundled roots the WebSocket uses. Both already in the tree
@@ -388,6 +406,9 @@ objc2-web-kit = { version = "0.3", default-features = false, features = [
     "WKHTTPCookieStore",
 ] }
 
+[dev-dependencies]
+tokio = { version = "1.48.0", features = ["test-util"] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol", "sn-tauri-headless/custom-protocol"]
@@ -429,3 +450,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# The test build keeps file and line numbers (panics and backtraces still point at
+# the line) but drops the full variable and type info only a debugger reads.
+# Measured 2026-11-14: the lib test crate compiles in 5.7 min instead of 7.7 and
+# peaks 1 GB lower. Only this crate; dependencies keep their builds.
+[profile.test.package.StreamNook]
+debug = "line-tables-only"

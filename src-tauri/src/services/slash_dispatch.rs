@@ -428,6 +428,32 @@ pub fn followers_minutes(raw: &str) -> Option<i64> {
     }
 }
 
+/// `/slow [seconds]`: 30 with no argument or an unreadable one.
+pub fn slow_seconds(first_arg: Option<&str>) -> i64 {
+    match first_arg {
+        None => 30,
+        Some(arg) => js_parse_int(arg).unwrap_or(30),
+    }
+}
+
+/// `/followers [duration]` in minutes: no argument is 0 (anyone who follows);
+/// None where a unit came with no number (`/followers m`), which the manual
+/// command sends as a null duration and an automation refuses.
+pub fn followers_setting(first_arg: &str) -> Option<i64> {
+    followers_minutes(if first_arg.is_empty() { "0" } else { first_arg })
+}
+
+/// `/marker [description]`: None for none, as the manual command sends it.
+pub fn marker_description(text: &str) -> Option<String> {
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// `/settitle` and `/setgame`: the text after the command, trimmed. Empty is
+/// the usage line.
+pub fn title_or_query(text: &str) -> String {
+    text.trim().to_string()
+}
+
 /// A `/setting set` value: JSON when it reads as JSON, text otherwise.
 pub fn parse_setting_value(raw: &str) -> Value {
     let t = raw.trim();
@@ -616,6 +642,16 @@ fn dotted(key: &str, ctx: &TemplateContext) -> Option<String> {
 /// An unknown `{name}` stays as typed. Runs of spaces left by empty values
 /// collapse to one and the ends are trimmed.
 pub fn expand_user_command(template: &str, ctx: &TemplateContext) -> Expansion {
+    expand_with(template, &ctx.args, |name| dotted(name, ctx))
+}
+
+/// The custom-command grammar over any set of names: `{N}`, `{N+}` and
+/// `{*}` read `args`, `{{` and `}}` are literal braces, and `{name}` reads
+/// `lookup(name)` (the name as typed); a name `lookup` does not know stays
+/// as typed. One pass, so an inserted value is never read as a placeholder.
+/// Runs of spaces left by empty values collapse to one and the ends are
+/// trimmed. Automations expand their variables through this.
+pub fn expand_with(template: &str, args: &[String], lookup: impl Fn(&str) -> Option<String>) -> Expansion {
     let mut out = String::with_capacity(template.len());
     let mut missing: Vec<u64> = Vec::new();
     let b = template.as_bytes();
@@ -640,10 +676,10 @@ pub fn expand_user_command(template: &str, ctx: &TemplateContext) -> Expansion {
                 // {N+}
                 if digits_end > 0 && &inner[digits_end..] == "+" {
                     let start: u64 = inner[..digits_end].parse().unwrap_or(u64::MAX);
-                    if start < 1 || start > ctx.args.len() as u64 {
+                    if start < 1 || start > args.len() as u64 {
                         missing.push(start);
                     } else {
-                        out.push_str(&ctx.args[(start - 1) as usize..].join(" "));
+                        out.push_str(&args[(start - 1) as usize..].join(" "));
                     }
                     i += close + 1;
                     continue;
@@ -651,7 +687,7 @@ pub fn expand_user_command(template: &str, ctx: &TemplateContext) -> Expansion {
                 // {N}
                 if digits_end > 0 && digits_end == inner.len() {
                     let n: u64 = inner.parse().unwrap_or(u64::MAX);
-                    match n.checked_sub(1).and_then(|k| ctx.args.get(k as usize)).filter(|v| !v.is_empty()) {
+                    match n.checked_sub(1).and_then(|k| args.get(k as usize)).filter(|v| !v.is_empty()) {
                         Some(v) => out.push_str(v),
                         None => missing.push(n),
                     }
@@ -659,14 +695,14 @@ pub fn expand_user_command(template: &str, ctx: &TemplateContext) -> Expansion {
                     continue;
                 }
                 if inner == "*" {
-                    out.push_str(&ctx.args.join(" "));
+                    out.push_str(&args.join(" "));
                     i += close + 1;
                     continue;
                 }
                 let is_name = inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
                     && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
                 if is_name {
-                    match dotted(inner, ctx) {
+                    match lookup(inner) {
                         Some(v) => out.push_str(&v),
                         None => out.push_str(&rest[..=close]),
                     }
@@ -1045,6 +1081,12 @@ fn dispatch_with(ctx: Ctx, text: String, depth: u32, allow_custom: bool) -> BoxF
         // Saved custom commands, where they win the name.
         if allow_custom && custom_command_wins(&typed) {
             if let Some(uc) = find_user_command(&typed, &user_commands(&settings), true) {
+                // A saved custom /afk or /back still does what the built-in
+                // does: the away change first, then the custom expansion.
+                if typed == "afk" || typed == "back" {
+                    let message = (typed == "afk").then(|| args.join(" "));
+                    let _ = ctx.b.invoke("automations_set_away", json!({ "message": message })).await;
+                }
                 let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
                 let tctx = template_context(&*ctx.b, &ctx.channel, &ctx.broadcaster_id, a, &uc.expansion).await;
                 let ex = expand_user_command(&uc.expansion, &tctx);
@@ -1412,7 +1454,7 @@ async fn core(c: &Call<'_>, o: &mut Outcome) -> Result<Flow, String> {
             o.ok("Chat cleared");
         }
         "slow" => {
-            let secs = (if c.args.is_empty() { Some(30) } else { js_parse_int(c.arg(0)) }).unwrap_or(30);
+            let secs = slow_seconds(if c.args.is_empty() { None } else { Some(c.arg(0)) });
             b.invoke("update_chat_settings", modes(json!({ "slow_mode": true, "slow_mode_wait_time": secs }))).await?;
             o.ok(format!("Slow mode enabled ({secs}s)"));
             manager_changed(c).await;
@@ -1423,8 +1465,7 @@ async fn core(c: &Call<'_>, o: &mut Outcome) -> Result<Flow, String> {
             manager_changed(c).await;
         }
         "followers" => {
-            let raw = if c.arg(0).is_empty() { "0" } else { c.arg(0) };
-            let minutes = followers_minutes(raw).map(Value::from).unwrap_or(Value::Null);
+            let minutes = followers_setting(c.arg(0)).map(Value::from).unwrap_or(Value::Null);
             b.invoke("update_chat_settings", modes(json!({ "follower_mode": true, "follower_mode_duration": minutes }))).await?;
             o.ok("Followers-only mode enabled");
             manager_changed(c).await;
@@ -1515,7 +1556,7 @@ async fn core(c: &Call<'_>, o: &mut Outcome) -> Result<Flow, String> {
             manager_act(c, o, json!({ "kind": "cancel_raid" })).await?;
         }
         "marker" => {
-            b.invoke("create_stream_marker", json!({ "userId": id, "description": opt(&c.from(0)) })).await?;
+            b.invoke("create_stream_marker", json!({ "userId": id, "description": marker_description(&c.from(0)) })).await?;
             o.ok("Stream marker created");
         }
         "color" => {
@@ -1554,11 +1595,17 @@ async fn core(c: &Call<'_>, o: &mut Outcome) -> Result<Flow, String> {
             }
         }
         "disconnect" => match b.invoke("stop_chat", json!({})).await {
-            Ok(v) => o.info(if v.as_bool().unwrap_or(false) {
-                "Disconnected from chat"
-            } else {
-                "Chat stayed connected because another chat window is still using it"
-            }),
+            Ok(v) => {
+                let mut text = String::from(if v.as_bool().unwrap_or(false) {
+                    "Disconnected from chat"
+                } else {
+                    "Chat stayed connected because another chat window is still using it"
+                });
+                if let Some(kept) = automations_kept(b).await {
+                    text.push_str(&format!(". Automations keep {kept} chat{} open", if kept == 1 { "" } else { "s" }));
+                }
+                o.info(text);
+            }
             Err(e) => {
                 log::warn!("[Command Handler] Disconnect failed: {e}");
                 o.err(format!("Couldn't disconnect from chat: {e}"));
@@ -1699,7 +1746,7 @@ async fn core(c: &Call<'_>, o: &mut Outcome) -> Result<Flow, String> {
             o.say(format!("Hiding {target} everywhere. Undo in Settings > Chat > Hidden Messages."));
         }
         "settitle" | "setgame" => {
-            let value = c.from(0).trim().to_string();
+            let value = title_or_query(&c.from(0));
             let title = c.command == "settitle";
             if value.is_empty() || id.is_empty() {
                 o.info(if title { "Usage: /settitle <title>" } else { "Usage: /setgame <category>" });
@@ -2085,10 +2132,57 @@ pub const PLATFORM_NEUTRAL: &[&str] = &[
     "help", "copy", "echo", "say", "tts", "shrug", "lurk", "squishy", "barrelroll", "party", "exporttext", "openfile",
     "proc", "screenshot", "setting", "timer", "chain", "foreach", "debug-env", "debug-chat", "debug-eventsub",
     "debug-logs", "debug-logging", "openstreamhighlights", "song", "songs", "favorite", "unfavorite",
+    "automations", "afk", "back",
 ];
 
 const SQUISHY: &str =
     "notsquishY WHEN YOU NEED HIM notsquishY IN A JIFFY notsquishY USE THIS EMOTE notsquishY TO SUMMON SQUISHY notsquishY";
+
+/// How many chats the automations keep joined, when any (None otherwise or
+/// when the status cannot be read).
+async fn automations_kept(b: &dyn Backend) -> Option<usize> {
+    let status = b.invoke("automations_status", json!({})).await.ok()?;
+    let kept = status["chats_kept"].as_array()?.len();
+    (kept > 0).then_some(kept)
+}
+
+/// The words for `/automations` with no argument.
+fn automations_status_line(status: &Value) -> String {
+    let run = match status["run"].as_str() {
+        Some("on") => "Automations are on",
+        Some("test") => "Automations are in Test: rules show what they would do",
+        _ => "Automations are off",
+    };
+    let mut line = run.to_string();
+    if let Some(message) = status["away"]["message"].as_str() {
+        line.push_str(&format!(". You're away: {message}"));
+    }
+    if let Some(kept) = status["chats_kept"].as_array().filter(|k| !k.is_empty()) {
+        line.push_str(&format!(". They keep {} chat{} open", kept.len(), if kept.len() == 1 { "" } else { "s" }));
+    }
+    line
+}
+
+/// `/automations [off|test|on]`.
+async fn automations_command(c: &Call<'_>, o: &mut Outcome) -> Result<(), String> {
+    let b = c.b();
+    match c.arg(0).to_lowercase().as_str() {
+        "" => {
+            let status = b.invoke("automations_status", json!({})).await?;
+            o.say(automations_status_line(&status));
+        }
+        word @ ("off" | "test" | "on") => {
+            b.invoke("automations_set_run", json!({ "state": word })).await?;
+            o.ok(match word {
+                "off" => "Automations are off",
+                "test" => "Automations are in Test: rules show what they would do",
+                _ => "Automations are on",
+            });
+        }
+        _ => ext_usage(o, "automations", "/automations [off|test|on]"),
+    }
+    Ok(())
+}
 
 /// The table's usage line for an extended command.
 fn ext_usage(o: &mut Outcome, command: &str, fallback: &str) {
@@ -2600,7 +2694,7 @@ async fn extended(c: &Call<'_>, o: &mut Outcome) -> Result<bool, String> {
             let bud = b.invoke("chat_send_budget", json!({ "channel": login })).await?;
             let slow = bud["slow_seconds"].as_u64().unwrap_or(0);
             o.say(format!(
-                "You are a {} here: {} messages per {}s ({} used), at least {} ms apart{}.",
+                "You are a {} here: {} messages per {}s ({} used; automation sends counted for 35 s), at least {} ms apart{}.",
                 bud["role"].as_str().unwrap_or("viewer"),
                 bud["per_window"],
                 bud["window_seconds"],
@@ -2631,6 +2725,18 @@ async fn extended(c: &Call<'_>, o: &mut Outcome) -> Result<bool, String> {
             b.invoke("slash_open_export", json!({ "file": opt(c.arg(0)) })).await?;
         }
         "timer" => timer(c, o),
+        "automations" => automations_command(c, o).await?,
+        "afk" => {
+            let away = b.invoke("automations_set_away", json!({ "message": c.rest })).await?;
+            o.ok(match away["message"].as_str().filter(|m| !m.is_empty()) {
+                Some(m) => format!("You're away: {m}"),
+                None => "You're away".to_string(),
+            });
+        }
+        "back" => {
+            b.invoke("automations_set_away", json!({ "message": Value::Null })).await?;
+            o.ok("You're back");
+        }
         "runin" => {
             let who = clean_login(c.arg(0));
             let line = c.from(1).trim().to_string();

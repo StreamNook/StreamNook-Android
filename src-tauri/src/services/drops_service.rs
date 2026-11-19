@@ -84,6 +84,16 @@ fn claim_outcome_from_status(status: Option<&str>) -> Option<ClaimOutcome> {
     }
 }
 
+/// The drops a standard drop needs claimed first (`preconditionDrops`), by id.
+fn precondition_ids(drop_json: &serde_json::Value) -> Vec<String> {
+    drop_json["preconditionDrops"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| d["id"].as_str().map(str::to_string))
+        .collect()
+}
+
 /// Whether a drop is earned and waiting to be claimed: Twitch says so outright
 /// for multi-day and subscription rewards (no minutes to compare), otherwise
 /// the watched minutes reached a non-zero requirement.
@@ -938,6 +948,10 @@ impl DropsService {
                         required_days: 0,
                         random_of: None,
                         next_reward: None,
+                        needs_earlier: false,
+                        pool_rewards: Vec::new(),
+                        obtains_container: false,
+                        precondition_drops: precondition_ids(drop_json),
                     });
                 }
             }
@@ -1241,6 +1255,9 @@ impl DropsService {
                         name
                         requiredMinutesWatched
                         requiredSubs
+                        preconditionDrops {
+                            id
+                        }
                         benefitEdges {
                             benefit {
                                 id
@@ -1479,6 +1496,10 @@ impl DropsService {
                             required_days: 0,
                             random_of: None,
                             next_reward: None,
+                            needs_earlier: false,
+                            pool_rewards: Vec::new(),
+                            obtains_container: false,
+                            precondition_drops: precondition_ids(drop_json),
                         });
                     }
                 }
@@ -2264,7 +2285,24 @@ impl DropsService {
                             match Self::fetch_active_campaigns(&client, &device_id, &session_id)
                                 .await
                             {
-                                Ok(campaigns) => Some(Self::progress_from_campaigns(&campaigns)),
+                                Ok(campaigns) => {
+                                    // The list just read is the newest there is: keep it
+                                    // for the drops lip too, and wake it when a campaign
+                                    // opened since, so a new badge for this channel shows
+                                    // within this read instead of the lip's own 15 minutes.
+                                    let opened = {
+                                        let mut cache = cached_campaigns.write().await;
+                                        let opened = cache.as_ref().is_some_and(|(old, _)| {
+                                            campaigns.iter().any(|c| !old.iter().any(|o| o.id == c.id))
+                                        });
+                                        *cache = Some((campaigns.clone(), Utc::now()));
+                                        opened
+                                    };
+                                    if opened {
+                                        crate::services::watch_drops::poke();
+                                    }
+                                    Some(Self::progress_from_campaigns(&campaigns))
+                                }
                                 Err(e) => {
                                     debug!("Watched-channel drop progress refresh failed: {}", e);
                                     None
@@ -2681,6 +2719,10 @@ impl DropsService {
                         required_days: 0,
                         random_of: None,
                         next_reward: None,
+                        needs_earlier: false,
+                        pool_rewards: Vec::new(),
+                        obtains_container: false,
+                        precondition_drops: Vec::new(),
                     }
                 })
                 .collect();

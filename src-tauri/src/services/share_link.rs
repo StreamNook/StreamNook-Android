@@ -304,6 +304,15 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_badge_host_is_still_a_watch_link() {
+        // Released apps read it as channel "badge"; the badge router only
+        // takes it when a set follows (`badge_link`).
+        assert_eq!(parse_str("streamnook://badge"), link("twitch", "badge"));
+        // The host-less badge link names no channel.
+        assert_eq!(parse_str("streamnook:///badge/clover"), None);
+    }
+
+    #[test]
     fn junk_links_open_nothing() {
         for junk in [
             "streamnook://",
@@ -367,5 +376,16 @@ mod tests {
     fn platforms_without_a_share_link_build_none() {
         assert_eq!(share_url("rumble", "someone", "1014"), None);
         assert_eq!(deep_link("x", "someone"), None);
+    }
+
+    #[test]
+    fn category_links_stay_as_a_released_app_reads_them() {
+        // The host-less category link names no channel, the host form is a channel called
+        // "category", and a /c/ web link is not a stream link. `inbound_link::route` checks
+        // for a category first; this is what an app without it does.
+        assert_eq!(parse_str("streamnook:///category/509658"), None);
+        assert_eq!(parse_str("streamnook://category"), link("twitch", "category"));
+        assert_eq!(parse_str("streamnook://category/509658"), link("twitch", "category"));
+        assert_eq!(parse_str("https://streamnook.app/c/509658/just-chatting?d=1114"), None);
     }
 }

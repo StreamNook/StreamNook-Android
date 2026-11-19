@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { ChevronRight, SearchX } from 'lucide-react';
 import { searchSettings, type SettingsIndexEntry } from './searchIndex';
+import { useSettingNeedsVersion } from '../../utils/settingNeeds';
 
 interface SettingsSearchResultsProps {
   query: string;
@@ -43,7 +44,13 @@ const SettingsSearchResults = ({
   onSelect,
   results: provided,
 }: SettingsSearchResultsProps) => {
-  const results = useMemo(() => provided ?? searchSettings(query), [provided, query]);
+  const needsVersion = useSettingNeedsVersion();
+  const results = useMemo(() => {
+    // The search drops an entry whose need is unmet, so a need that flips has
+    // to run it again.
+    void needsVersion;
+    return provided ?? searchSettings(query);
+  }, [provided, query, needsVersion]);
 
   if (results.length === 0) {
     return (
@@ -58,12 +65,14 @@ const SettingsSearchResults = ({
   }
 
   return (
-    <div className="space-y-1.5">
+    // One card, one row per result: the row hairlines separate results, so the
+    // list reads as one group instead of a stack of boxes.
+    <div className="settings-card">
       {results.map((entry, i) => (
         <button
           key={`${entry.tab}-${entry.section}-${entry.parent ?? ''}-${entry.title}-${i}`}
           onClick={() => onSelect(entry)}
-          className="settings-card group flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-white/[0.03]"
+          className="settings-row group flex w-full items-center gap-3 px-4 py-3 text-left"
         >
           <div className="min-w-0 flex-1">
             <div className="mb-1 flex items-center gap-1.5 text-[11px] uppercase tracking-[0.08em] text-textMuted">

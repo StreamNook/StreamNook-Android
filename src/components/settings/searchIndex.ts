@@ -1,4 +1,5 @@
 import { IS_MOBILE } from '../../utils/platform';
+import { settingNeedMet } from '../../utils/settingNeeds';
 export interface SettingsIndexEntry {
   tab: string;
   section: string;
@@ -8,6 +9,10 @@ export interface SettingsIndexEntry {
    *  SubControl. Search shows it in the trail and lands inside that row. */
   parent?: string;
   description?: string;
+  /** A need (utils/settingNeeds.ts) this window must meet before the setting is
+   *  offered: a row drawn only for some accounts. Search and the update-notes
+   *  links skip the entry while the need is unmet. */
+  needs?: string;
 }
 
 const tokenize = (s: string): string[] =>
@@ -27,6 +32,7 @@ export const searchSettings = (
 
   for (const entry of SETTINGS_INDEX) {
     if (allowTabs && !allowTabs.includes(entry.tab)) continue;
+    if (entry.needs && !settingNeedMet(entry.needs)) continue;
     const title = entry.title.toLowerCase();
     const description = entry.description?.toLowerCase() ?? '';
     const section = entry.section.toLowerCase();
@@ -55,6 +61,13 @@ export const searchSettings = (
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit).map((s) => s.entry);
 };
+
+/** The entry a link names (by row title, on its tab when one is given), skipping
+ *  a setting this window cannot show right now. */
+export const findSettingsEntry = (title: string, tab?: string | null): SettingsIndexEntry | undefined =>
+  SETTINGS_INDEX.find(
+    (e) => e.title === title && (!tab || e.tab === tab) && (!e.needs || settingNeedMet(e.needs)),
+  );
 
 // Manual index for the in-Settings search box. Mirrors the rendered
 // <SettingsSection>/<SettingsRow> tree in src/components/settings/. `sectionId`
@@ -844,7 +857,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Chat',
     section: 'Chat Input',
     title: 'Hide emote button',
-    description: 'Remove the smiley from inside the message box, and with it the menu of emotes, GIFs and commands (the command list moved into that menu; "Hide command button" is gone). Tab completion, : search and typing / still work. Previously "Hide the emote button".'
+    description: 'Remove the emote button (the smiley, or the emote chat is using most) from inside the message box, and with it the menu of emotes, GIFs and commands (the command list moved into that menu; "Hide command button" is gone). Tab completion, : search and typing / still work. Previously "Hide the emote button".'
   },
   {
     tab: 'Chat',
@@ -1458,6 +1471,13 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Emotes',
     title: 'Emoji style',
     description: 'Which set draws the emoji in messages: Apple, Google, Twitter, Facebook, or your system emoji.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Emotes',
+    title: 'Smiley style',
+    needs: 'smiley_style',
+    description: 'Which art your text faces :) ;) <3 are drawn in: Robots, Purple or Monkeys (Purple and Monkeys come with Twitch Prime or Turbo). Changes your Twitch account. Smilies, smiley, faces, emoticons, robots, purple, monkeys, prime, turbo.'
   },
   {
     tab: 'Chat',
@@ -2947,6 +2967,74 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'About',
     title: 'About',
     description: 'About notifications and how to use them.'
+  },
+  // === Automations ===
+  {
+    tab: 'Automations',
+    section: 'Status',
+    title: 'Status',
+    description: 'Automations on, off or in Test: rules that reply, alert and moderate for you through your own accounts (away replies, welcomes, raid and sub thanks, badge news). Test writes what rules would do to Activity and sends nothing. Auto reply, autoresponder, bot, pause, resume.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Status',
+    title: 'Away',
+    description: 'Set or clear away on this device, the same as /afk and /back. Rules set to answer only while you are away use it.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Limits',
+    title: 'Messages a minute',
+    description: 'The most messages your rules send in a minute, across all your devices. Pace, rate, messages per minute, limit.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Limits',
+    title: 'Post in other channels',
+    description: "Rules may post in chats that aren't yours, at most once per chat in each gap."
+  },
+  {
+    tab: 'Automations',
+    section: 'Limits',
+    title: 'Gap',
+    parent: 'Post in other channels',
+    description: "How long rules wait between messages in one chat that isn't yours."
+  },
+  {
+    tab: 'Automations',
+    section: 'Limits',
+    title: 'Chat notes',
+    description: 'A line only you see in chat when a rule acts, or would act in Test.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Limits',
+    title: 'New people to whisper a day',
+    description: 'The most new people your rules may whisper in a day, across all your devices.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Limits',
+    title: "This device's name",
+    description: 'The name your other devices show when this one answers first. Device name.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Rules',
+    title: 'Rules',
+    description: 'Your rules: when something happens in chat, check the conditions, then reply, post or notify you. Add a rule, or start from a template: away reply, welcome first-timers, raid thanks, sub and gift thanks, badge news.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Reminders',
+    title: 'Reminders',
+    description: 'Your reminders in one list, each with its own switch. Make a reminder into a rule to give it conditions, Test and Activity, and turn it back on later. Timer, repeat, keyword.'
+  },
+  {
+    tab: 'Automations',
+    section: 'Activity',
+    title: 'Activity',
+    description: 'What your rules did, would have done in Test, and skipped, today and earlier. Try a message: a sample message, sender or event against your rules, to see which would act and what they would post. Log, history, test, preview.'
   },
   // === Cache ===
   {

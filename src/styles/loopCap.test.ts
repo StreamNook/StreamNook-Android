@@ -215,6 +215,7 @@ const CSS_ROWS: Record<string, Row> = {
 // tailwind.config.js `theme.extend.animation`.
 const TAILWIND_ROWS: Record<string, Row> = {
   'fade-in': { d: 'instant-ok' },
+  'enter-fade': { d: 'instant-ok' },
   'scale-in': { d: 'instant-ok' },
   shimmer: { d: 'rests-ok' },
   droplet: { d: 'rests-ok' },
@@ -233,6 +234,7 @@ const OFF_EXEMPT = ['.animate-spin', '.animate-penrose-rotate', '.sn-loader', '.
 const PULSE_LOADER_FILES = new Set([
   'components/badge/EvolutionPicker.tsx',
   'components/badge/MissingNowStrip.tsx',
+  'components/BadgeDetailOverlay.tsx',
   'components/ChannelPointsMenu.tsx',
   'components/Home.tsx',
   'components/modroom/ModRoomPane.tsx',
@@ -241,7 +243,9 @@ const PULSE_LOADER_FILES = new Set([
   'components/UserProfileCard.tsx',
   'mobile/rewards/MobileEvolution.tsx',
   'mobile/rewards/MobileMissingNow.tsx',
+  'mobile/screens/CategoryStreamsScreen.tsx',
   'mobile/screens/MobileWhatsNew.tsx',
+  'mobile/screens/RewardsScreen.tsx',
   'mobile/ui/SkeletonCards.tsx',
 ]);
 

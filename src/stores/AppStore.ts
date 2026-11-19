@@ -14,7 +14,7 @@ import { reportCodecPreference } from '../utils/codecPreference';
 import { setInlineEmoteScale } from '../services/emoteService';
 import { updatePresence } from '../services/supabaseService';
 import { patchSettings, settingsDiff } from '../utils/settingsBroadcast';
-import { IS_MOBILE } from '../utils/platform';
+import { IS_MOBILE, isMainWindow } from '../utils/platform';
 import { makeKey, parseKey } from '../utils/providerKey';
 import { clearPauseIntent, forgetOwnChannel, holdOwnChannel } from '../utils/pausePark';
 import { favoritesDiffer, RUST_ONLY_KEYS, settlePending, type FavoritePending } from '../utils/favoriteLabel';
@@ -26,10 +26,19 @@ import type { PlaybackAdapt } from '../utils/linkAdapt';
 import { WATCHABLE_PROVIDERS, type ProviderId, type ProviderCategory } from '../types/providers';
 import { takePreloadedSettings } from '../bootPreload';
 import { settleFirstSettings } from '../utils/settingsOnceLoaded';
-import { setWindowFullscreen } from '../utils/windowFullscreen';
+import { exitPlayerFullscreen, setWindowFullscreen } from '../utils/windowFullscreen';
 import { useAccountRosterStore } from './accountRosterStore';
 import { twitchSignInReason } from '../utils/twitchSignIn';
 import { authFailureOutcome, HELD_SESSION_RECHECK_MS, isNetworkAuthError, readProfile } from '../utils/authErrors';
+import { isAutomatic, noteBootAction, runAsAutomatic } from '../utils/noticeReport';
+import {
+  categoryAnswerOutcome,
+  forgetFailedLinkedCategory,
+  getLinkedCategory,
+  onLateLinkedCategory,
+  type LinkedCategory,
+} from '../utils/linkedCategory';
+import { useBadgeSpotlightStore } from './badgeSpotlightStore';
 import {
   availableAfter,
   holdsLate,
@@ -149,7 +158,7 @@ export interface Toast {
   createdAt: number;
 }
 
-export type SettingsTab = 'Profile' | 'Interface' | 'Player' | 'Chat' | 'Moderation' | 'Overlay' | 'Theme' | 'Integrations' | 'Plugins' | 'Notifications' | 'Cache' | 'Command Palette' | 'Keybindings' | 'Backup' | 'Support' | 'Analytics';
+export type SettingsTab = 'Profile' | 'Interface' | 'Player' | 'Chat' | 'Moderation' | 'Overlay' | 'Theme' | 'Integrations' | 'Plugins' | 'Notifications' | 'Automations' | 'Cache' | 'Command Palette' | 'Keybindings' | 'Backup' | 'Support' | 'Analytics';
 
 export type HomeTab = 'following' | 'recommended' | 'browse' | 'search' | 'category';
 
@@ -346,6 +355,9 @@ export interface AppState {
   /** Where the viewer left this broadcast before this playback (recording
    *  seconds), for the timeline's "you left here" mark. Rust decides it. */
   liveLeftOffSecs: number | null;
+  /** Why rewind is off when it is not "VODs turned off" (Rust's words), e.g.
+   *  a channel that limits its recordings to a viewer it leaves out. */
+  liveRewindReason: string | null;
   /** Rewind the live broadcast into its recording VOD at an absolute
    *  broadcast position, or `behindSecs` behind now (null = from the start).
    *  No-op unless a Twitch live stream is playing. */
@@ -714,6 +726,7 @@ export interface AppState {
   openBadgesWithBadge: (badgeId: string) => void;
   openBadgesOnStreamNook: (slug?: string) => void;
   openBadgesWithTarget: (target: { tab: string; query?: string }) => void;
+  openTwitchBadge: (setId: string, version: string) => void;
   setShowEmoteSetsOverlay: (show: boolean) => void;
   openEmoteSets: (opts?: { twitchId?: string; tab?: 'emotes' | 'sets' | 'editors' }) => void;
   openEmoteSpotlight: (emoteId: string, name: string) => void;
@@ -755,6 +768,14 @@ export interface AppState {
   setHomeProviderCategory: (category: ProviderCategory | null) => void;
   /** Open what a stream's category label points at (utils/streamCategory). */
   openStreamCategory: (target: StreamCategoryTarget) => void;
+  /** A category link: open the category's screen at once by id, with no name (Home asks for it). */
+  openCategoryFromLink: (id: string) => void;
+  /** An answer named a category: give every nameless copy of that id the name and art. */
+  fillLinkedCategory: (id: string, category: TwitchCategory) => void;
+  /** Close each layer drawn above Home that this store holds, through that layer's own closer. */
+  closeLayersOverHome: () => void;
+  /** Home's own tab choice. Not a person's action, so the boot watch ignores it. */
+  autoSelectHomeTab: (tab: HomeTab) => void;
   setSearchReturnTab: (tab: HomeTab) => void;
   setHomeCategoryTab: (tab: 'live' | 'clips' | 'videos') => void;
   setHomeCategoryTags: (key: string, tags: string[]) => void;
@@ -1507,6 +1528,8 @@ async function startProviderStream(
   /** Same escape hatch as `startStream`: a relay that is already serving. */
   preResolved?: StreamStartResult,
 ): Promise<void> {
+  // While booting, a start the person made drops the link that is still waiting.
+  if (get().isBooting && isMainWindow()) noteBootAction(invoke);
   const key = makeKey(provider, channel);
   // Claim the ticket BEFORE the teardown, so a start that begins while this one
   // is still awaiting immediately invalidates everything below.
@@ -1878,6 +1901,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   liveRewindAvailable: null,
   liveRewindAnchor: null,
   liveLeftOffSecs: null,
+  liveRewindReason: null,
   streamView: null,
   verticalAvailable: false,
   streamPortrait: null,
@@ -2348,7 +2372,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       savedPlatform &&
       (savedPlatform === 'all' || WATCHABLE_PROVIDERS.includes(savedPlatform))
     ) {
-      set({ activePlatform: savedPlatform });
+      // Restoring the saved scope is not the person choosing a page, so the boot
+      // watch must not count it as one.
+      runAsAutomatic(() => set({ activePlatform: savedPlatform }));
     }
     // The retired second OLED theme moves to OLED in Rust when settings load
     // (Settings::retire_oled_v2), so every shell gets it.
@@ -2559,6 +2585,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     get().openClipEditor({ vodId: vodId as string, offsetSeconds: vodOffset, channelName });
   },
   playMedia: async (type: 'clip' | 'video', url: string, info: MediaInfo) => {
+    // While booting, a start the person made drops the link that is still waiting.
+    if (get().isBooting && isMainWindow()) noteBootAction(invoke);
     await settleStop();
     set({ isLoading: true });
     trackActivity(`Started watching ${type}: ${info?.title || info?.id}`);
@@ -2685,7 +2713,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } catch (e: unknown) {
       Logger.error(`Failed to start ${type}:`, e);
       get().addToast(`Failed to load ${type}: ${String(e)}`, 'error');
-      set({ isHomeActive: true, currentMediaType: null, currentStream: null, streamUrl: null, activeQuality: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false });
+      set({ isHomeActive: true, currentMediaType: null, currentStream: null, streamUrl: null, activeQuality: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, liveRewindReason: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false });
     } finally {
       set({ isLoading: false });
     }
@@ -2879,7 +2907,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     } finally {
       // Whatever failed above: a half-closed stream (no URL, its row still set)
       // would keep its chat tab pinned for good.
-      set({ streamUrl: null, activeQuality: null, availableQualities: [], adSource: null, playbackKind: null, currentStream: null, currentMediaType: null, currentHypeTrain: null, streamOriginCategory: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false });
+      set({ streamUrl: null, activeQuality: null, availableQualities: [], adSource: null, playbackKind: null, currentStream: null, currentMediaType: null, currentHypeTrain: null, streamOriginCategory: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, liveRewindReason: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false });
       resetViewSession(set);
       finishStop();
       if (stopInFlight === stopping) stopInFlight = null;
@@ -3403,6 +3431,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ streamMeasuredUrl: url, streamMeasuredPortrait: portrait });
   },
   startStream: async (channel, providedStreamInfo?, skipChatRefresh = false, preResolved?: StreamStartResult) => {
+    // A restore's automatic flag lasts only through this synchronous prefix, so the
+    // starts this one hands over to after waiting carry it by hand (keepAutomatic).
+    const automatic = isAutomatic();
+    // While booting, a start the person made drops the link that is still waiting.
+    if (get().isBooting && isMainWindow()) noteBootAction(invoke);
     // A close still running (Home shows before it ends) finishes first.
     await settleStop();
     // A live start ends any VOD/clip chat replay, on every provider. This is the
@@ -3424,7 +3457,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // assumption it is a Twitch login. That destroys a case-sensitive YouTube
       // video id, so use the caller's string as given.
       const target = channel.includes(':') ? parsed.channel : channel;
-      return startProviderStream(provider, target, providedStreamInfo, set, get, preResolved);
+      return keepAutomatic(automatic, () => startProviderStream(provider, target, providedStreamInfo, set, get, preResolved));
     }
     channel = parsed.channel;
 
@@ -3525,14 +3558,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         forgetOwnChannel();
       }
 
-      set({ streamUrl: result.url, activeQuality: result.quality, adSource: adSourceFrom(result), availableQualities: result.available ?? [], playbackKind: 'hls', currentStream: info, currentMediaType: 'live', originalMediaUrl: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false, isHomeActive: false });
+      set({ streamUrl: result.url, activeQuality: result.quality, adSource: adSourceFrom(result), availableQualities: result.available ?? [], playbackKind: 'hls', currentStream: info, currentMediaType: 'live', originalMediaUrl: null, vodPlayback: null, liveRewind: null, liveRewindAvailable: null, liveRewindAnchor: null, liveLeftOffSecs: null, liveRewindReason: null, offlineRoom: null, offlineRoomLive: null, offlineRoomJoining: false, isHomeActive: false });
 
       // Can this broadcast be rewound? One cached Rust lookup per live start;
       // the player disables Rewind (with the reason) on a channel that keeps
       // no VODs instead of letting the viewer find out from a failure.
       void invoke<LiveRewindInfo>('get_live_rewind_info', { channel })
         .then((r) => {
-          if (!superseded()) set({ liveRewindAvailable: r.available, liveRewindAnchor: r.recorded_at ?? null, liveLeftOffSecs: r.left_off_secs ?? null });
+          if (!superseded()) set({ liveRewindAvailable: r.available, liveRewindAnchor: r.recorded_at ?? null, liveLeftOffSecs: r.left_off_secs ?? null, liveRewindReason: r.reason ?? null });
         })
         .catch(() => {});
     } catch (e) {
@@ -3557,7 +3590,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Offline needs no toast: the room's own screen says so.
       if (live) get().addToast("Couldn't play this stream, showing chat only", 'error');
       try {
-        await get().startOfflineChat(channel, providedStreamInfo, { chatOnly: live });
+        await keepAutomatic(automatic, () => get().startOfflineChat(channel, providedStreamInfo, { chatOnly: live }));
       } catch (fallbackErr) {
         Logger.error('[Stream] Chat-only fallback failed:', fallbackErr);
       }
@@ -3568,6 +3601,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
   startOfflineChat: async (channel, providedStreamInfo?, opts?) => {
+    // See startStream: the automatic flag is carried to the starts this one hands over to.
+    const automatic = isAutomatic();
+    // While booting, a start the person made drops the link that is still waiting.
+    if (get().isBooting && isMainWindow()) noteBootAction(invoke);
     // A close still running (Home shows before it ends) finishes first.
     await settleStop();
     // Shares the Twitch start sequence: a newer stream start or room open wins,
@@ -3600,7 +3637,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const room = opened.room ?? null;
 
       if (opened.live) {
-        await get().startStream(login, opened.live);
+        await keepAutomatic(automatic, () => get().startStream(login, opened.live));
         return;
       }
 
@@ -3643,7 +3680,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (superseded()) return;
 
       if (opts?.playVod && !superseded()) {
-        await get().playOfflineRoomVod();
+        await keepAutomatic(automatic, () => get().playOfflineRoomVod());
       }
     } catch (e) {
       Logger.error('[Offline room] Failed to open:', e);
@@ -3656,6 +3693,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const room = get().offlineRoom;
     const vod = room?.latest_vod;
     if (!room || !vod || get().currentMediaType !== 'offline_chat') return;
+    // A call with nothing to play opened nothing, so only a real start drops the waiting link.
+    if (get().isBooting && isMainWindow()) noteBootAction(invoke);
     const url = `https://twitch.tv/videos/${vod.id}`;
     set({ isLoading: true });
     try {
@@ -3809,6 +3848,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   openBadgesWithTarget: (target: { tab: string; query?: string }) => {
     trackActivity('Opened Badges with Target');
     set({ showBadgesOverlay: true, badgesOverlayInitialTarget: target, badgesOverlayInitialPaintId: null, badgesOverlayInitialBadgeId: null, badgesOverlayInitialStreamNook: false });
+  },
+  openTwitchBadge: (setId: string, version: string) => {
+    trackActivity(`Opened Badges with Twitch Badge: ${setId}/${version}`);
+    set({
+      showBadgesOverlay: true,
+      badgesOverlayInitialTarget: { tab: 'twitch-badges' },
+      badgesOverlayInitialPaintId: null,
+      badgesOverlayInitialBadgeId: null,
+      badgesOverlayInitialStreamNook: false,
+    });
   },
   setShowEmoteSetsOverlay: (show: boolean) => {
     if (show) trackActivity('Opened Emote Sets');
@@ -4371,6 +4420,12 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ homeActiveTab: tab });
   },
 
+  autoSelectHomeTab: (tab: HomeTab) => {
+    // Home picks a tab by itself once sign-in resolves, during boot. That is not a
+    // page the person chose, so the boot watch must not drop a waiting link for it.
+    runAsAutomatic(() => set({ homeActiveTab: tab }));
+  },
+
   setActivePlatform: (platform) => {
     if (get().activePlatform === platform) return;
     // Leaving a platform drops its drill-down state, so returning later opens
@@ -4405,9 +4460,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   openStreamCategory: (target) => {
-    trackActivity(`Opened category: ${target.category.name}`);
-    // Home sits under the player's full screen, so leave it first.
-    if (get().isPlayerFullscreen) getPlayerControls()?.toggleFullscreen();
+    trackActivity(`Opened category: ${target.category.name || target.category.id}`);
+    // Home sits under the player's full screen, so leave it first, through the
+    // window's own exit: it also covers a MultiNook tile, and unlike a toggle it
+    // cannot re-enter full screen while the store flag is still catching up.
+    if (get().isPlayerFullscreen) exitPlayerFullscreen();
     // A category Rust already counted brings its art and viewer count along.
     const known = target.kind === 'provider'
       ? get().otherCategories.find((c) => c.provider === target.category.provider && c.id === target.category.id)
@@ -4416,6 +4473,62 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Switching platform drops the old drill-down and forward steps, so it goes first.
     if (platform) get().setActivePlatform(platform);
     set({ ...patch, isHomeActive: true, showBadgesOverlay: false, showDropsOverlay: false });
+  },
+
+  openCategoryFromLink: (id) => {
+    // Leave compact view the way exitStream does: the window is smaller there.
+    if (get().isTheaterMode) get().toggleTheaterMode();
+    get().closeLayersOverHome();
+    // A link is always a fresh attempt for an id whose last answer failed.
+    forgetFailedLinkedCategory(id);
+    const selected = get().homeSelectedCategory;
+    const bare: TwitchCategory = { id, name: '', box_art_url: '' };
+    // The category already shown keeps its name, and a stored answer names the
+    // copy at once; only an id nobody has answered for opens nameless.
+    const category =
+      selected && selected.id === id && selected.name !== ''
+        ? selected
+        : (categoryAnswerOutcome(bare, id, getLinkedCategory(id)) ?? bare);
+    get().openStreamCategory({ kind: 'twitch', category });
+  },
+
+  fillLinkedCategory: (id, category) => {
+    const s = get();
+    const answer: LinkedCategory = { state: 'found', category };
+    const selected = categoryAnswerOutcome(s.homeSelectedCategory, id, answer);
+    const exited = categoryAnswerOutcome(s.homeLastExitedCategory, id, answer);
+    const origin = categoryAnswerOutcome(s.streamOriginCategory, id, answer);
+    if (!selected && !exited && !origin) return;
+    // One write, and not through the Home selection setter: that one drops the
+    // forward step, which is one of the copies this fills.
+    set({
+      ...(selected ? { homeSelectedCategory: selected } : {}),
+      ...(exited ? { homeLastExitedCategory: exited } : {}),
+      ...(origin ? { streamOriginCategory: origin } : {}),
+    });
+  },
+
+  closeLayersOverHome: () => {
+    const s = get();
+    // Each layer through its own closer (some also record state), and only the
+    // ones that are open, so a link logs and notifies nothing for the rest.
+    if (s.isSettingsOpen) s.closeSettings();
+    if (s.showBadgesOverlay) s.setShowBadgesOverlay(false);
+    if (s.showWhispersOverlay) s.setShowWhispersOverlay(false);
+    if (s.showEmoteSetsOverlay) s.setShowEmoteSetsOverlay(false);
+    if (s.showDropsOverlay) s.setShowDropsOverlay(false);
+    if (s.showLiveStreamsOverlay) s.setShowLiveStreamsOverlay(false);
+    if (s.showMarketplaceOverlay) s.setShowMarketplaceOverlay(false);
+    if (s.showDashboardOverlay) s.setShowDashboardOverlay(false);
+    if (s.profileViewerUserId !== null) s.closeProfileViewer();
+    if (s.songsPanel !== null) s.closeSongs();
+    if (s.emoteSpotlight !== null) s.setEmoteSpotlight(null);
+    if (s.isCommandPaletteOpen) s.closeCommandPalette();
+    if (s.profileModalUser !== null) s.setProfileModalUser(null);
+    if (s.clipModal !== null) s.closeClipModal();
+    if (s.vodModal !== null) s.closeVodModal();
+    const spotlight = useBadgeSpotlightStore.getState();
+    if (spotlight.badge !== null) spotlight.close();
   },
 
   setSearchReturnTab: (tab: HomeTab) => {
@@ -4585,6 +4698,15 @@ export const useAppStore = create<AppState>((set, get) => ({
     return campaigns?.[0];
   },
 }));
+
+// A name can arrive after its link opened (a late answer replaces a failed one),
+// whether or not a screen shows the copy: fill the nameless copies the store holds.
+onLateLinkedCategory((id, category) => useAppStore.getState().fillLinkedCategory(id, category));
+
+/** Runs a hand-over start under the automatic flag when the start that hands over was automatic. */
+function keepAutomatic<T>(automatic: boolean, fn: () => T): T {
+  return automatic ? runAsAutomatic(fn) : fn();
+}
 
 /** The chat room the main view holds for the playing stream (a chat slice
  *  key): the provider room it acquired, or the Twitch channel's login. Null

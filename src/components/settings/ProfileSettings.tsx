@@ -17,7 +17,10 @@ import {
   pickPaintLayerImage,
   queueCosmeticForCaching,
   clearUserCache as clear7TVCache,
+  canWear,
+  wearLater,
 } from '../../services/seventvService';
+import { paintSwapStyle } from '../../services/paintStyle';
 import { FallbackImage } from '../FallbackImage';
 import { getCachedBadgeUrl } from '../../services/badgeImageCacheService';
 import { Tooltip } from '../ui/Tooltip';
@@ -70,7 +73,7 @@ import {
   pauseCardAnimations,
   type CaptureMode,
 } from '../../utils/shareProfile';
-import { clearCosmeticsMemoryCache, invalidateUserCosmetics, getCosmeticsWithFallback, applyLocalCosmeticSelection } from '../../services/cosmeticsCache';
+import { clearCosmeticsMemoryCache, applyLocalCosmeticSelection } from '../../services/cosmeticsCache';
 import { buildBttvProBadge, resolveBttvProUrl, withBttvPro } from '../../services/bttvProBadge';
 import { toggleLoadoutBadge, wearCategory, wearCategoryOfKey } from '../../utils/chatterBadges';
 import { invoke } from '@tauri-apps/api/core';
@@ -776,14 +779,9 @@ const ProfileSettings = () => {
         // clear7TVCache drops the lower-level 7TV-service entry so a later natural
         // fetch is fresh once 7TV is consistent (prevents stale resurrection).
         clear7TVCache();
-        if (currentUser?.user_id) {
-          const applied = applyLocalCosmeticSelection(currentUser.user_id, { paintId });
-          if (!applied) {
-            // Nothing cached to flip — fall back to a fresh fetch.
-            invalidateUserCosmetics(currentUser.user_id);
-            void getCosmeticsWithFallback(currentUser.user_id).catch(() => {});
-          }
-        }
+        // Hands over the definition: chat's cache holds only the old paint, so
+        // the new one is not in it. Re-reads on its own when it cannot flip.
+        if (currentUser?.user_id) applyLocalCosmeticSelection(currentUser.user_id, { paintId, paint });
       }
     } catch (e: unknown) {
       Logger.error('[ProfileSettings] Failed to update paint:', e);
@@ -811,13 +809,7 @@ const ProfileSettings = () => {
         // so re-fetching would re-cache the old badge. clear7TVCache keeps the
         // lower-level entry fresh for a later natural fetch.
         clear7TVCache();
-        if (currentUser?.user_id) {
-          const applied = applyLocalCosmeticSelection(currentUser.user_id, { badgeId });
-          if (!applied) {
-            invalidateUserCosmetics(currentUser.user_id);
-            void getCosmeticsWithFallback(currentUser.user_id).catch(() => {});
-          }
-        }
+        if (currentUser?.user_id) applyLocalCosmeticSelection(currentUser.user_id, { badgeId, badge });
         updateProfilePreview({ bumpBadges: true }); // re-resolve the preview's badge row
       }
     } catch (e: unknown) {
@@ -1351,7 +1343,7 @@ const ProfileSettings = () => {
               className={`${cardInColumn ? 'text-2xl' : 'text-3xl'} font-bold ${
                 freshOnCard.has(`paint-${seventvPaint?.id ?? 'none'}`) ? 'sn-cosmetic-swap sn-cosmetic-swap--name' : ''
               }`}
-              style={seventvPaint ? computePaintStyle(seventvPaint as any, '#9146FF') : { color: 'var(--text-primary)' }}
+              style={seventvPaint ? paintSwapStyle(computePaintStyle(seventvPaint as any, '#9146FF')) : { color: 'var(--text-primary)' }}
             >
               {currentUser.display_name || currentUser.login}
             </h3>
@@ -1860,16 +1852,22 @@ const ProfileSettings = () => {
                 {paintHits.map((paint) => {
                   const isSelected = seventvPaint?.id === paint.id;
                   const isUpdating = updatingSeventvPaintId === paint.id;
+                  const wearable = canWear(paint);
                   return (
-                    <Tooltip key={paint.id} content={seventvAuthConnected ? paint.name : `${paint.name} - Connect to edit`} side="top">
+                    <Tooltip
+                      key={paint.id}
+                      content={!wearable ? wearLater(paint.name) : seventvAuthConnected ? paint.name : `${paint.name} - Connect to edit`}
+                      side="top"
+                    >
                       <div
                         className={`
                           relative min-w-0 px-3 py-1.5 rounded-lg cursor-pointer transition-all text-sm font-bold
-                          ${isSelected ? 'glass-input border-[#29b6f6]/50 ring-1 ring-[#29b6f6]/30' : 'border border-transparent hover:bg-glass hover:border-borderLight'}
+                          ${isSelected ? 'glass-input border-[#29b6f6]/50 ring-1 ring-[#29b6f6]/30' : wearable ? 'border border-transparent hover:bg-glass hover:border-borderLight' : 'border border-transparent'}
                           ${isUpdating ? 'opacity-50' : ''}
-                          ${!seventvAuthConnected ? 'cursor-default' : ''}
+                          ${!wearable ? 'opacity-40' : ''}
+                          ${!seventvAuthConnected || !wearable ? 'cursor-default' : ''}
                         `}
-                        onClick={() => seventvAuthConnected && !isUpdating && handleSelectSeventvPaint(isSelected ? null : paint)}
+                        onClick={() => seventvAuthConnected && wearable && !isUpdating && handleSelectSeventvPaint(isSelected ? null : paint)}
                       >
                         <span className="block truncate" style={computePaintStyle(paint as any, '#29b6f6')}>{paint.name}</span>
                         {isSelected && <CheckChip tone="seventv" />}
@@ -1896,16 +1894,22 @@ const ProfileSettings = () => {
                   const urls = getBadgeImageUrls(badge as any);
                   const isSelected = (badge as any).selected;
                   const isUpdating = updatingSeventvBadgeId === badge.id;
+                  const wearable = canWear(badge);
                   return urls.url4x ? (
-                    <Tooltip key={`${badge.id}-${idx}`} content={badge.tooltip || badge.name} side="top">
+                    <Tooltip
+                      key={`${badge.id}-${idx}`}
+                      content={wearable ? badge.tooltip || badge.name : wearLater(badge.tooltip || badge.name)}
+                      side="top"
+                    >
                       <div
                         className={`
                           relative p-2 rounded-lg cursor-pointer transition-all
-                          ${isSelected ? 'glass-input border-[#29b6f6]/50 ring-1 ring-[#29b6f6]/30' : 'border border-transparent hover:bg-glass hover:border-borderLight'}
+                          ${isSelected ? 'glass-input border-[#29b6f6]/50 ring-1 ring-[#29b6f6]/30' : wearable ? 'border border-transparent hover:bg-glass hover:border-borderLight' : 'border border-transparent'}
                           ${isUpdating ? 'opacity-50' : ''}
-                          ${!seventvAuthConnected ? 'cursor-default' : ''}
+                          ${!wearable ? 'opacity-40' : ''}
+                          ${!seventvAuthConnected || !wearable ? 'cursor-default' : ''}
                         `}
-                        onClick={() => seventvAuthConnected && !isUpdating && handleSelectSeventvBadge(isSelected ? null : badge)}
+                        onClick={() => seventvAuthConnected && wearable && !isUpdating && handleSelectSeventvBadge(isSelected ? null : badge)}
                       >
                         <FallbackImage
                           src={urls.url4x}

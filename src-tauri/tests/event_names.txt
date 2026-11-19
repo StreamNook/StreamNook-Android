@@ -10,6 +10,11 @@ app-foregrounded
 app-presence
 asset-cache://cached
 asset-cache://cleared
+automations://activity
+automations://notify
+automations://speak
+automations://status
+background-state-changed
 badge-available
 badge-metadata-amended
 badge-notification
@@ -43,6 +48,7 @@ drop-ready
 drops-login-complete
 drops-login-error
 drops-settings-updated
+emote-moment
 emote-palette://insert
 emote-palette://target
 emote-prefetch-complete
@@ -120,7 +126,7 @@ stream-manager-state
 streamer-mode-changed
 streamer-went-live
 streamnook-settings-updated
-streamnook:watch
+streamnook:link
 titlebar-drag-ended
 tray-open-multichat
 tv-screen://state
@@ -131,6 +137,7 @@ twitch-overlay-close
 twitch-overlay-open
 twitch-overlay-url
 twitch-reward-received
+twitch://smilies-changed
 unban-requests
 update://status
 user-history-message

@@ -48,6 +48,10 @@ const PUSH_FRESH: Duration = Duration::from_secs(150);
 const SECOND_LIST_MAX_AGE: u64 = 60;
 /// The cached campaign list is fetched again past this age.
 const CAMPAIGNS_MAX_AGE_SECS: i64 = 900;
+/// The list is fetched again past this age while nothing in it counts on the
+/// watched channel. Just over the drops monitor's 2-minute read, which primes
+/// the cache, so watching shares that read instead of adding one.
+const UNCOVERED_MAX_AGE_SECS: i64 = 150;
 /// The campaign clock flat this long while playing is a stall.
 const STALL_AFTER: Duration = Duration::from_secs(240);
 /// A stall still flat this long after its episode began starts the next one.
@@ -590,14 +594,48 @@ fn rows<'a>(
         })
         .max()
         .unwrap_or(0);
+    // A reward Twitch counts only once earlier drops are claimed
+    // (`preconditionDrops`). The inventory copy may lack the list, so the
+    // campaign list's copy fills it in by id.
+    let listed = i.list.iter().find(|l| l.id == c.id);
+    let preconditions = |d: &TimeBasedDrop| -> Vec<String> {
+        if !d.precondition_drops.is_empty() {
+            return d.precondition_drops.clone();
+        }
+        listed
+            .and_then(|l| l.time_based_drops.iter().find(|x| x.id == d.id))
+            .map(|x| x.precondition_drops.clone())
+            .unwrap_or_default()
+    };
+    let claimed_here = |x: &TimeBasedDrop| {
+        tiers
+            .iter()
+            .zip(&base)
+            .find(|(t, _)| t.id == x.id)
+            .map_or(false, |(_, (_, own))| *own)
+            || x.progress.as_ref().is_some_and(|p| p.is_claimed)
+            || i.claims.get(&x.id) == Some(&ClaimState::Claimed)
+    };
+    // Per reward: whether it is chained, and the earlier rewards still unclaimed.
+    let chains: Vec<(bool, Vec<String>)> = tiers
+        .iter()
+        .map(|d| {
+            let pre = preconditions(d);
+            let unclaimed = crate::services::evolution::unclaimed_preconditions(c, &pre, &claimed_here);
+            (!pre.is_empty(), unclaimed)
+        })
+        .collect();
     let mut rows = tiers
         .iter()
         .zip(base)
-        .map(|(d, (have, own))| {
+        .zip(chains)
+        .map(|((d, (have, own)), (chained, unclaimed))| {
             let need = d.required_minutes_watched;
+            // A chained reward counts its own minutes from the moment the
+            // earlier one is claimed, never the campaign's running count.
             let shown = if own {
                 need
-            } else if per_drop {
+            } else if per_drop || chained {
                 have
             } else {
                 clock.min(need)
@@ -612,8 +650,9 @@ fn rows<'a>(
             let locked = i
                 .locked
                 .get(&d.id)
-                .filter(|_| !own && !pending && !twitch_ready)
-                .cloned();
+                .cloned()
+                .or_else(|| (!unclaimed.is_empty()).then(|| crate::services::evolution::needs_first_words(&unclaimed)))
+                .filter(|_| !own && !pending && !twitch_ready);
             let earned = locked.is_none() && started && (shown >= need || twitch_ready);
             let ungranted = i.ungranted.contains(&d.id);
             // Twitch will not grant it until the game account is linked: one
@@ -651,10 +690,9 @@ impl Row<'_> {
         self.ready || self.pending || self.connect || self.watched
     }
 
-    /// The lip's order, then minutes left: one to claim, then one still
-    /// earning, then one the lip only shows when nothing else is left (a
-    /// claim in flight, one waiting on a link, or not granted), so a finished
-    /// reward never parks the lip while another is making progress.
+    /// The drawer's campaign order, then minutes left: one to claim, then one
+    /// still earning, then a claim in flight, one waiting on a link, or one
+    /// not granted. The lip reads it over rewards still earning only.
     fn rank(&self) -> (u8, i32) {
         let kind = if self.ready {
             0
@@ -725,8 +763,8 @@ fn here_drop(r: &Row, i: &Inputs, started: bool, lead: bool) -> HereDrop {
         status,
         detail: if r.owned {
             None
-        } else if let Some(needs) = &r.locked {
-            Some(crate::services::evolution::locked_words(needs))
+        } else if let Some(words) = &r.locked {
+            Some(words.clone())
         } else {
             drop_words::progress_line(d, i.now_ms).or_else(|| drop_words::requirement_text(d))
         },
@@ -890,10 +928,15 @@ pub fn build(i: &Inputs) -> WatchDrops {
             b.c.name.to_lowercase(),
         ))
     });
-    // The lip's reward, by `Row::rank`: one to claim, else the one still
-    // earning closest to done, ties to the first in drawer order. The reward
-    // already on the lip keeps it while it is the same kind and within the
-    // slack of the closest, so rewards finishing together never trade places.
+    // The lip's reward: the one still earning closest to done, ties to the
+    // first in drawer order. A reward whose minutes are in (ready to claim,
+    // being claimed, waiting on a game account link, not granted) never leads:
+    // watching does nothing more for it, so the lip moves on to one still
+    // earning or goes away (SN-272: a finished drop parked on top of chat).
+    // The drawer and the Drops page still list it with its Claim or Connect.
+    // The reward already on the lip keeps it while it is within the slack of
+    // the closest, so rewards finishing together never trade places.
+    let earning = |r: &Row| !r.owned && r.locked.is_none() && !r.waits();
     let candidates: Vec<((usize, usize), (u8, i32))> = built
         .iter()
         .enumerate()
@@ -902,7 +945,7 @@ pub fn build(i: &Inputs) -> WatchDrops {
             b.rows
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| !r.owned && r.locked.is_none())
+                .filter(|(_, r)| earning(r))
                 .map(move |(ri, r)| ((bi, ri), r.rank()))
         })
         .collect();
@@ -925,7 +968,12 @@ pub fn build(i: &Inputs) -> WatchDrops {
         .map(|b| b.rows.iter().filter(|r| !r.owned && r.locked.is_none()).count() as u32)
         .sum();
     let locked = built.iter().any(|b| b.rows.iter().any(|r| !r.owned && r.locked.is_some()));
-    view.more = unowned.saturating_sub(view.lead.is_some() as u32);
+    // "+N" counts only what watching still earns, like the lead.
+    let still_earning: u32 = built
+        .iter()
+        .map(|b| b.rows.iter().filter(|r| earning(r)).count() as u32)
+        .sum();
+    view.more = still_earning.saturating_sub(view.lead.is_some() as u32);
     // Only what is left locked is not everything claimed.
     view.complete = !built.is_empty() && unowned == 0 && !locked;
     view.campaigns = built
@@ -976,12 +1024,14 @@ pub fn build(i: &Inputs) -> WatchDrops {
 }
 
 /// The bar's stacked pictures: the first two rewards still to earn here
-/// besides the lead, each with the picture its own drawer row shows.
+/// besides the lead, each with the picture its own drawer row shows. One whose
+/// minutes are in is not still to earn.
 fn more_art(campaigns: &[HereCampaign]) -> Vec<String> {
     campaigns
         .iter()
         .flat_map(|c| &c.drops)
         .filter(|d| !d.claimed && !d.lead && !d.locked && !d.image.is_empty())
+        .filter(|d| !(d.ready || d.pending || d.connect || d.watched))
         .map(|d| d.image.clone())
         .take(2)
         .collect()
@@ -1255,9 +1305,14 @@ pub fn set_lip_hidden(hidden: bool) {
 }
 
 /// Rewards watching cannot earn yet, as of the last look, for reads made
-/// outside the model (the phones' own bar read).
+/// outside the model (the phones' own bar read, the phones' Rewards rows).
+/// The tiers Twitch holds behind their campaign's other rewards come from
+/// the second list as last read, so they hold while nothing is watched too.
 pub fn locked() -> HashMap<String, String> {
-    with_state(|s| s.locked.clone())
+    crate::services::evolution::with_held_back(
+        with_state(|s| s.locked.clone()),
+        &crate::services::reward_drops::cached(),
+    )
 }
 
 /// The model now.
@@ -1672,14 +1727,27 @@ pub async fn answer_for(
 
 // ---- The watcher -------------------------------------------------------------
 
-/// The cached campaign list, fetched again when missing or older than
-/// `CAMPAIGNS_MAX_AGE_SECS`. Priming the cache never touches the live progress map.
-async fn campaigns(h: &Handles) -> Vec<DropCampaign> {
+/// Whether the cached campaign list is read again before the watched place
+/// is judged: when missing, past `CAMPAIGNS_MAX_AGE_SECS`, or past
+/// `UNCOVERED_MAX_AGE_SECS` while nothing in it counts on that channel. A
+/// campaign that opened after the list was read (a new badge for one
+/// streamer) is missing from it, and with only the long age the lip and the
+/// inventory reads stayed off for up to 15 minutes of watching it, which a
+/// short campaign does not outlast.
+fn list_stale(age_secs: Option<i64>, covers_place: bool) -> bool {
+    match age_secs {
+        None => true,
+        Some(age) => age >= CAMPAIGNS_MAX_AGE_SECS || (!covers_place && age >= UNCOVERED_MAX_AGE_SECS),
+    }
+}
+
+/// The cached campaign list, fetched again when `list_stale` says so.
+/// Priming the cache never touches the live progress map.
+async fn campaigns(h: &Handles, place: &Place, second: &[DropCampaign]) -> Vec<DropCampaign> {
     let cached = h.cached_campaigns.read().await.clone();
-    let young = cached
-        .as_ref()
-        .is_some_and(|(_, at)| (Utc::now() - *at).num_seconds() < CAMPAIGNS_MAX_AGE_SECS);
-    if young {
+    let age = cached.as_ref().map(|(_, at)| (Utc::now() - *at).num_seconds());
+    let covers = cached.as_ref().is_some_and(|(list, _)| gate_open(place, list, second));
+    if !list_stale(age, covers) {
         return cached.map(|(c, _)| c).unwrap_or_default();
     }
     match DropsService::fetch_active_campaigns(&h.client, &h.device_id, &h.session_id).await {
@@ -1742,10 +1810,13 @@ async fn step(app: &AppHandle, h: &Handles) -> Option<Duration> {
     let playing =
         state.watch_heartbeat.is_playing() && !crate::services::app_presence::phone_quiet(app);
     let solo = crate::services::watch_session::solo_earning(&place.channel_id);
-    let list = campaigns(h).await;
     let second = crate::services::reward_drops::cached();
+    let list = campaigns(h, &place, &second).await;
     let gate = gate_open(&place, &list, &second);
-    let locked = crate::services::evolution::locked_stages(app).await;
+    let locked = crate::services::evolution::with_held_back(
+        crate::services::evolution::stage_words(crate::services::evolution::locked_stages(app).await),
+        &second,
+    );
     let (out, due, locked_changed) = with_state(|s| {
         if playing && !s.playing {
             s.stall.play_edge(Instant::now());
@@ -1811,9 +1882,10 @@ async fn step(app: &AppHandle, h: &Handles) -> Option<Duration> {
         rebuild(s)
     });
     send(out);
-    // While a stream plays here the stall clock needs a look each minute.
+    // While a stream plays here the stall clock needs a look each minute, and
+    // with nothing to earn here yet, a campaign that just opened for it does.
     Some(with_state(|s| {
-        if s.gate_open && s.playing {
+        if s.playing {
             FAST
         } else {
             SLOW
@@ -2074,7 +2146,7 @@ mod tests {
             }
             let first: Vec<String> = rows
                 .iter()
-                .filter(|d| !d.claimed && !d.lead)
+                .filter(|d| !d.claimed && !d.lead && !(d.ready || d.pending || d.connect || d.watched))
                 .map(|d| d.image.clone())
                 .take(2)
                 .collect();
@@ -2263,6 +2335,31 @@ mod tests {
         assert!(!gate_open(&place, &[], &flat));
     }
 
+    /// Brandon 2026-11-13: the Jordan x Space Jam badge opened for one
+    /// streamer; watching samham earned (Twitch had minutes in by 2 minutes
+    /// in), but the lip showed nothing to earn until a restart, because it
+    /// judged the channel by a list read before the campaign opened and kept
+    /// that list for 15 minutes.
+    #[test]
+    fn a_list_with_nothing_for_the_watched_channel_is_read_again_within_minutes() {
+        let place = golden::place();
+        let covering = golden::cases()
+            .into_iter()
+            .find(|c| c.name == "a_campaign_in_list_and_inventory_is_listed_once")
+            .expect("golden case")
+            .list;
+        assert!(gate_open(&place, &covering, &[]));
+        assert!(!gate_open(&place, &[], &[]));
+        // Three minutes old, nothing in it for this channel: read again.
+        assert!(list_stale(Some(180), false));
+        // Inside the monitor's 2-minute read: that read primes it, so no extra.
+        assert!(!list_stale(Some(100), false));
+        // A list that already covers the channel keeps the long age.
+        assert!(!list_stale(Some(180), true));
+        assert!(list_stale(Some(CAMPAIGNS_MAX_AGE_SECS), true));
+        assert!(list_stale(None, true));
+    }
+
     fn one_tier(have: i32) -> (Vec<DropCampaign>, InventoryResponse) {
         let case = golden::cases()
             .into_iter()
@@ -2302,7 +2399,7 @@ mod tests {
         let (list, inv) = one_tier(20);
         let mut i = Inputs::bare(&place, &list, Some(&inv), now_ms());
         assert!(build(&i).lead.is_some());
-        let locked = HashMap::from([("t1".to_string(), "Gastly".to_string())]);
+        let locked = HashMap::from([("t1".to_string(), "Needs the Gastly badge first".to_string())]);
         i.locked = &locked;
         let view = build(&i);
         assert!(view.lead.is_none());
@@ -2313,6 +2410,70 @@ mod tests {
         assert_eq!(row.status, "");
         assert_eq!(row.detail.as_deref(), Some("Needs the Gastly badge first"));
         assert_eq!(row.bar, None);
+    }
+
+    #[test]
+    fn a_reward_held_behind_the_other_rewards_is_never_ready() {
+        // Brandon (2026-11-18): the Golden Iguana read as ready to claim, but
+        // Twitch gives it only once every other reward is earned. Its minutes
+        // are in; Twitch says the tier's preconditions are not met.
+        let place = golden::place();
+        let (list, mut inv) = one_tier(0);
+        let tier = &mut inv.items[0].campaign.time_based_drops[0];
+        let need = tier.required_minutes_watched;
+        tier.progress.as_mut().unwrap().current_minutes_watched = need;
+        let i = Inputs::bare(&place, &list, Some(&inv), now_ms());
+        assert!(build(&i).campaigns[0].drops[0].ready, "fully watched reads ready when nothing holds it");
+
+        inv.items[0].campaign.time_based_drops[0].needs_earlier = true;
+        let campaigns: Vec<DropCampaign> = inv.items.iter().map(|it| it.campaign.clone()).collect();
+        let locked = crate::services::evolution::with_held_back(HashMap::new(), &campaigns);
+        let view = build(&Inputs { locked: &locked, ..Inputs::bare(&place, &list, Some(&inv), now_ms()) });
+        let row = &view.campaigns[0].drops[0];
+        assert!(row.locked && !row.ready && !row.lead && !row.claimed);
+        assert!(view.lead.is_none());
+        assert_eq!((view.more, view.complete), (0, false));
+        assert_eq!(row.status, "");
+        assert_eq!(row.detail.as_deref(), Some("Needs the other rewards first"));
+        assert_eq!(row.bar, None);
+    }
+
+    #[test]
+    fn a_chained_drop_waits_for_the_one_before_and_counts_its_own_minutes() {
+        // Twitch's preconditionDrops: t2 counts only once t1 is claimed, and
+        // then from zero. The campaign's running count read it Ready at once.
+        fn row<'a>(v: &'a WatchDrops, id: &str) -> &'a HereDrop {
+            v.campaigns[0].drops.iter().find(|d| d.id == id).unwrap()
+        }
+        let place = golden::place();
+        let (list, mut inv) = one_tier(60);
+        let mut t2 = inv.items[0].campaign.time_based_drops[0].clone();
+        t2.id = "t2".to_string();
+        t2.benefit_edges[0].id = "bt2".to_string();
+        t2.benefit_edges[0].name = "Reward t2".to_string();
+        let p = t2.progress.as_mut().unwrap();
+        p.drop_id = "t2".to_string();
+        p.current_minutes_watched = 0;
+        p.drop_instance_id = None;
+        inv.items[0].campaign.time_based_drops.push(t2);
+        let before = build(&Inputs::bare(&place, &list, Some(&inv), now_ms()));
+        assert!(row(&before, "t2").ready, "unchained, the running count calls it ready");
+
+        inv.items[0].campaign.time_based_drops[1].precondition_drops = vec!["t1".to_string()];
+        let view = build(&Inputs::bare(&place, &list, Some(&inv), now_ms()));
+        let t2 = row(&view, "t2");
+        assert!(t2.locked && !t2.ready && !t2.lead);
+        assert_eq!(t2.status, "");
+        assert_eq!(t2.detail.as_deref(), Some("Needs Reward t1 first"));
+        assert_eq!(t2.bar, None);
+        assert_eq!(view.campaigns[0].drops.last().map(|d| d.id.as_str()), Some("t2"));
+
+        // t1 claimed: t2 opens and counts its own minutes from zero.
+        inv.items[0].campaign.time_based_drops[0].progress.as_mut().unwrap().is_claimed = true;
+        let view = build(&Inputs::bare(&place, &list, Some(&inv), now_ms()));
+        let t2 = row(&view, "t2");
+        assert!(!t2.locked && !t2.ready);
+        assert_eq!(t2.current_minutes, 0);
     }
 
     #[test]
@@ -2745,9 +2906,8 @@ mod tests {
         assert_eq!(pending.campaigns[0].drops[0].status, "Claiming");
         // The UI branches on the booleans: a claim in flight never offers Claim again.
         assert!(!pending.campaigns[0].drops[0].ready && pending.campaigns[0].drops[0].pending);
-        let lead = pending.lead.as_ref().expect("the tier still leads");
-        assert!(!lead.complete);
-        assert_eq!(lead.status, "Claiming");
+        // Its minutes are in: the lip lets it go (SN-272), the drawer keeps it.
+        assert!(pending.lead.is_none(), "a claim in flight never parks the lip");
         let mut ungranted = HashSet::new();
         ungranted.insert("t1".to_string());
         let mut j = Inputs::bare(&place, &list, Some(&inv), now_ms());
@@ -2755,15 +2915,49 @@ mod tests {
         let watched = build(&j);
         assert_eq!(watched.campaigns[0].drops[0].status, "Watched");
         assert!(!watched.campaigns[0].drops[0].ready && watched.campaigns[0].drops[0].watched);
-        // Nothing else is left, so the lip still shows it rather than vanish.
-        assert!(watched.lead.as_ref().is_some_and(|l| !l.complete && l.status == "Watched"));
+        // Nothing else is left to earn, so the lip goes away.
+        assert!(watched.lead.is_none());
+        assert_eq!(watched.more, 0);
+    }
+
+    #[test]
+    fn a_finished_drop_never_stays_on_top_of_chat() {
+        // SN-272 (zoox): a drop whose minutes are in sat on the lip with
+        // Connect because the game account was not linked. Ready, Connect and
+        // Watched all let the lip go; the drawer still offers the action.
+        let place = golden::place();
+        let (mut list, mut inv) = tiers(true, &[("a", 60, 60)]);
+        assert!(lead_of_opt(&list, &inv).is_none(), "Ready alone: no lip");
+        for c in list.iter_mut() {
+            c.account_link = Some("https://game.example/link".into());
+            c.is_account_connected = false;
+        }
+        inv.items[0].campaign.is_account_connected = false;
+        let view = build(&Inputs::bare(&place, &list, Some(&inv), now_ms()));
+        assert!(view.campaigns[0].drops[0].connect, "the drawer offers Connect");
+        assert!(view.lead.is_none(), "Connect alone: no lip");
+        assert!(!view.complete, "not claimed, so not complete");
+        // The phones' bar reads the same lead.
+        assert!(lead_for(&view).is_none());
+        // With another reward still earning, the lip shows that one, and the
+        // finished one is neither counted nor stacked.
+        let (list, inv) = tiers(true, &[("a", 60, 60), ("b", 120, 30)]);
+        let view = build(&Inputs::bare(&place, &list, Some(&inv), now_ms()));
+        assert_eq!(view.lead.as_ref().map(|l| l.drop_id.as_str()), Some("b"));
+        assert_eq!(view.more, 0);
+        assert!(view.more_art.is_empty());
+    }
+
+    fn lead_of_opt(list: &[DropCampaign], inv: &InventoryResponse) -> Option<String> {
+        let place = golden::place();
+        build(&Inputs::bare(&place, list, Some(inv), now_ms())).lead.map(|l| l.drop_id)
     }
 
     #[test]
     fn a_stuck_reward_never_parks_the_lip_while_another_is_earning() {
         let place = golden::place();
         let (list, inv) = tiers(true, &[("a", 60, 60), ("b", 120, 70), ("c", 240, 70)]);
-        assert_eq!(lead_of(&list, &inv, None), "a", "Ready leads");
+        assert_eq!(lead_of(&list, &inv, None), "b", "a finished one never leads");
         let mut claims = HashMap::new();
         claims.insert("a".to_string(), ClaimState::Pending);
         let mut i = Inputs::bare(&place, &list, Some(&inv), now_ms());
@@ -2833,7 +3027,7 @@ mod tests {
     fn the_lip_moves_to_the_next_reward_once_the_closest_is_claimed() {
         let place = golden::place();
         let (list, inv) = tiers(false, &[("t1", 30, 40), ("t2", 60, 40), ("t3", 90, 40)]);
-        assert_eq!(lead_of(&list, &inv, None), "t1", "the finished tier leads");
+        assert_eq!(lead_of(&list, &inv, None), "t2", "the finished tier hands the lip on");
         let mut claims = HashMap::new();
         claims.insert("t1".to_string(), ClaimState::Claimed);
         let mut i = Inputs::bare(&place, &list, Some(&inv), now_ms());
@@ -2864,7 +3058,7 @@ mod tests {
         assert!(tuck_holds(&t, &earning));
         // Minutes ticking up keep it tucked.
         assert!(tuck_holds(&t, &view_of(&[("a", 60, 45), ("b", 120, 45)], Some("a"))));
-        // Ready to claim brings it back.
+        // Ready to claim hands the lip to the next reward, which brings it back.
         assert!(!tuck_holds(&t, &view_of(&[("a", 60, 60), ("b", 120, 60)], Some("a"))));
         // The next reward starting brings it back.
         let mut claims = HashMap::new();
@@ -2895,13 +3089,12 @@ mod tests {
         // Truly further along: the lip follows it.
         let (list, inv) = tiers(true, &[("a", 60, 50), ("b", 60, 52)]);
         assert_eq!(lead_of(&list, &inv, Some("a")), "b");
-        // Both finish together: the first, or the one already shown.
+        // Both finish together: nothing is left to earn, so no lip.
         let (list, inv) = tiers(true, &[("a", 60, 60), ("b", 60, 60)]);
-        assert_eq!(lead_of(&list, &inv, None), "a");
-        assert_eq!(lead_of(&list, &inv, Some("b")), "b");
-        // A finished one always takes the lip from one still earning.
+        assert!(lead_of_opt(&list, &inv).is_none());
+        // A finished one never takes the lip from one still earning.
         let (list, inv) = tiers(true, &[("a", 60, 59), ("b", 60, 60)]);
-        assert_eq!(lead_of(&list, &inv, Some("a")), "b");
+        assert_eq!(lead_of(&list, &inv, Some("b")), "a");
         // One running count: equal tiers finish together, the first leads.
         let (list, inv) = tiers(false, &[("a", 60, 45), ("b", 60, 45), ("c", 120, 45)]);
         assert_eq!(lead_of(&list, &inv, None), "a");

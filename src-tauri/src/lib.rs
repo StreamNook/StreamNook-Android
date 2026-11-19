@@ -55,7 +55,7 @@ use commands::{
     link_preview::*, live_alerts::*, logs::*, media_glow::*, mod_log_storage::*, modroom::*, overlay_file::*, plugins::*,
     profile_cache::*, provider_browse::*,
     resub::*, session::*, settings::*, settings_fields::*, settings_lists::*, settings_extras::*, seventv::*, seventv_cosmetics::*,
-    seventv_cosmetics_fetch::*, sn_cosmetics::*, song_id::*, spellcheck::*, streamnook_api::*, streaming::*, subscriptions::*,
+    seventv_cosmetics_fetch::*, smiley_style::*, sn_cosmetics::*, song_id::*, spellcheck::*, streamnook_api::*, streaming::*, subscriptions::*,
     text_segments::*, twitch::*,
     universal_cache::*,
     user_profile::*, vod_progress::*, watch_session::*, watch_streak::*, whispers::*, mention_inbox::*, window_state::*,
@@ -69,6 +69,7 @@ use models::settings::{AppState, CloseToTrayMode, Settings};
 use services::background_service::BackgroundService;
 use services::cache_service;
 use services::drops_service::DropsService;
+use services::inbound_link::{self as inbound, PendingLink};
 use services::live_notification_service::LiveNotificationService;
 use services::whisper_service::WhisperService;
 use std::sync::{Arc, Mutex};
@@ -83,12 +84,6 @@ use tauri::{
 #[cfg(not(target_os = "ios"))]
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::sync::Mutex as TokioMutex;
-
-/// A `streamnook://` deep link that arrived before the frontend was listening
-/// (cold start). The webview drains it via `take_pending_watch_link` on mount.
-/// On mobile every link passes through here, warm ones included.
-#[derive(Default)]
-struct PendingWatchLink(Mutex<Option<String>>);
 
 /// Read a `streamnook://` (or streamnook.app) share link into the stream key the
 /// frontend's `startStream` takes: a bare login for Twitch, `provider:channel`
@@ -125,12 +120,60 @@ fn share_link(provider: Option<String>, channel: String, stream_id: Option<Strin
         .ok_or_else(|| format!("Nothing to share for {provider} channel {channel:?}"))
 }
 
-/// Drain a deep link the app was cold-started with, if any. The frontend calls
-/// this once on mount so a link that fired before its listener existed still
-/// opens the channel. Returns None when the app wasn't launched from a link.
+/// Take the link the app was opened with, or the newest one that arrived while
+/// no page was listening (returns and clears it). One slot holds every kind of
+/// link on every platform, so a link opened while the window was closed still
+/// reaches the window created for it.
 #[tauri::command]
-fn take_pending_watch_link(state: tauri::State<'_, PendingWatchLink>) -> Option<String> {
-    state.0.lock().ok().and_then(|mut guard| guard.take())
+fn take_pending_link(app: crate::rt::AppHandle) -> Option<inbound::TakenLink> {
+    let slot = app.try_state::<PendingLink>()?;
+    slot.take()
+}
+
+/// The stamp of the link waiting in the slot, without taking it. A page that
+/// mounts after a link arrived has no event it could have heard, so it asks here
+/// what it missed (see `link_superseded`).
+#[cfg(desktop)]
+#[tauri::command]
+fn peek_pending_link_stamp(app: crate::rt::AppHandle) -> Option<u64> {
+    let slot = app.try_state::<PendingLink>()?;
+    slot.peek_stamp()
+}
+
+/// The person acted while a link was waiting (the app is still starting): drop
+/// the waiting link when the page had already heard of it (`stamp <= seen`), so
+/// it does not open over what they just chose. A link stored after the action,
+/// one the page has not heard of, stays.
+#[cfg(desktop)]
+#[tauri::command]
+fn link_superseded(app: crate::rt::AppHandle, seen: u64) {
+    if let Some(slot) = app.try_state::<PendingLink>() {
+        slot.drop_if_older(seen.saturating_add(1));
+    }
+}
+
+/// What a Twitch category link names, asked once per id by the page that shows
+/// it. An id that is not a Twitch category id answers `unreachable` with no
+/// request.
+#[tauri::command]
+async fn resolve_category_link(id: String) -> services::category_link::CategoryAnswer {
+    services::category_link::resolve(&id).await
+}
+
+/// The link a Share button copies for a category. Refuses an id the share page
+/// would answer with a 404.
+#[tauri::command]
+fn category_share_link(id: String, name: String) -> Result<String, String> {
+    services::category_link::share_link_for(&id, &name, &services::share_link::day_tag())
+}
+
+/// What a `streamnook://` or streamnook.app link opens, read as the one door
+/// reads it: a channel, a badge or a category; None for any other link. The
+/// iPhone hands the links it is opened with here, since it has no deep-link
+/// plugin and so no slot and no event.
+#[tauri::command]
+fn inbound_link(url: String) -> Option<inbound::InboundLink> {
+    tauri::Url::parse(&url).ok().as_ref().and_then(inbound::route)
 }
 
 /// First-paint signal from the webview. The main window is created hidden
@@ -225,6 +268,9 @@ fn main_window_chrome(
 /// re-shows if the window was hidden to the tray on close.
 #[cfg(desktop)]
 pub(crate) fn show_main_window(app: &crate::rt::AppHandle) {
+    // A show is a new main lifetime: a teardown or fallback destroy that was
+    // armed for the window before it stands down.
+    services::background_mode::note_main_window_shown();
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -232,6 +278,7 @@ pub(crate) fn show_main_window(app: &crate::rt::AppHandle) {
         services::app_exit::note_main_shown();
         #[cfg(target_os = "linux")]
         commands::twitch::linux_overlays::show_with_main(app);
+        services::background_mode::refresh_tray(app);
         return;
     }
     // Main was fully closed (the streamer went live, which destroys it to free its
@@ -294,6 +341,7 @@ pub(crate) fn show_main_window(app: &crate::rt::AppHandle) {
             // skipping this here would silently leave the lock off for the rest
             // of the session on that platform.
             services::window_aspect::install(&win);
+            services::background_mode::refresh_tray(app);
         }
         Err(e) => error!("[Main] Failed to recreate main window: {e}"),
     }
@@ -386,6 +434,11 @@ mod platform;
 mod plugin_host;
 pub mod rt;
 mod services;
+// The source-text checks in tests/, run in this crate's own test binary (see the file).
+#[cfg(test)]
+mod source_pins;
+#[cfg(target_os = "android")]
+mod speech_plugin;
 #[cfg(target_os = "android")]
 mod twitch_login_plugin;
 mod utils;
@@ -686,6 +739,76 @@ mod webview_args_tests {
     }
 }
 
+/// This device's run state and whether it is away, as saved.
+#[cfg(desktop)]
+fn automations_state(app: &crate::rt::AppHandle) -> (models::automations::RunState, bool) {
+    app.try_state::<AppState>()
+        .and_then(|s| s.settings.lock().ok().map(|g| (g.automations.run, g.automations.away.is_some())))
+        .unwrap_or_default()
+}
+
+/// The tray's two automation rows, worded for what a click does now.
+#[cfg(desktop)]
+fn automations_tray_labels((run, away): (models::automations::RunState, bool)) -> (&'static str, &'static str) {
+    (
+        if run == models::automations::RunState::Off { "Resume automations" } else { "Pause automations" },
+        if away { "I'm back" } else { "Set away" },
+    )
+}
+
+/// What "Pause" or "Resume" sets: Off when running, else what it last ran as
+/// (never Off).
+#[cfg(desktop)]
+fn automations_next_run(run: models::automations::RunState, last_active: models::automations::RunState) -> models::automations::RunState {
+    use models::automations::RunState;
+    match run {
+        RunState::Off if last_active == RunState::Off => RunState::Test,
+        RunState::Off => last_active,
+        _ => RunState::Off,
+    }
+}
+
+/// A tray click on an automation row.
+#[cfg(desktop)]
+fn automations_tray_click(app: &crate::rt::AppHandle, id: &str) {
+    let Some((run, last_active, away)) = app
+        .try_state::<AppState>()
+        .and_then(|s| s.settings.lock().ok().map(|g| (g.automations.run, g.automations.last_active, g.automations.away.is_some())))
+    else {
+        return;
+    };
+    let answer = if id == "automations_run" {
+        commands::account_automations::automations_set_run(app.clone(), automations_next_run(run, last_active))
+    } else {
+        // Set uses the last message (else "Back soon"); clearing is "I'm back".
+        commands::account_automations::automations_set_away(app.clone(), if away { None } else { Some(String::new()) }).map(|_| ())
+    };
+    if let Err(e) = answer {
+        warn!("[Tray] automations click failed: {e}");
+    }
+}
+
+#[cfg(all(test, desktop))]
+mod automations_tray_tests {
+    use super::*;
+    use models::automations::RunState::{Off, On, Test};
+
+    #[test]
+    fn the_rows_say_what_a_click_does() {
+        assert_eq!(automations_tray_labels((Off, false)), ("Resume automations", "Set away"));
+        assert_eq!(automations_tray_labels((On, true)), ("Pause automations", "I'm back"));
+        assert_eq!(automations_tray_labels((Test, false)).0, "Pause automations");
+    }
+
+    #[test]
+    fn pause_and_resume_return_to_what_ran_before() {
+        assert_eq!(automations_next_run(On, Test), Off);
+        assert_eq!(automations_next_run(Test, On), Off);
+        assert_eq!(automations_next_run(Off, On), On);
+        assert_eq!(automations_next_run(Off, Off), Test, "last_active is never Off, but a damaged file must not stay off");
+    }
+}
+
 /// Flush every debounced store before the process dies; each is a no-op when
 /// nothing is dirty. The run loop's `Exit` arm calls it, and on iOS so does
 /// the move to the background, after which the app may be ended unseen.
@@ -701,6 +824,7 @@ pub(crate) fn flush_debounced_stores() {
     let _ = services::activity_history_service::flush_now();
     let _ = services::song_id::history::flush_now();
     let _ = services::chat_logger_service::ChatLoggerService::flush_all();
+    services::account_automations::flush();
 }
 
 /// Shared app entry point. Desktop's `main.rs` calls this directly; on mobile
@@ -947,7 +1071,11 @@ pub fn run() {
     // existing instance (via the deep-link feature) instead of spawning a
     // duplicate window. No multi-process/duplicate-window concept on mobile.
     #[cfg(all(desktop, not(target_os = "linux")))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        // The login entry fired while StreamNook already runs: nothing to show.
+        if services::background_mode::argv_is_background(&argv) {
+            return;
+        }
         show_main_window(app);
     }));
     // Linux: the plugin speaks D-Bus and panics at setup when the session bus
@@ -955,7 +1083,10 @@ pub fn run() {
     // launch over anyway (linux_cef logged why).
     #[cfg(target_os = "linux")]
     let builder = if linux_cef::session_bus_available() {
-        builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if services::background_mode::argv_is_background(&argv) {
+                return;
+            }
             show_main_window(app);
         }))
     } else {
@@ -1010,6 +1141,10 @@ pub fn run() {
     // services::cast_session.
     #[cfg(target_os = "android")]
     let builder = builder.plugin(cast_plugin::init());
+    // Android text to speech for automations' Speak action and /tts
+    // (`SpeechPlugin.kt`: no audio focus, queued until the engine is ready).
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(speech_plugin::init());
     // Android mention notifications, posted from Rust while the page sleeps.
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_notify::mention_plugin());
@@ -1097,8 +1232,14 @@ pub fn run() {
             // runtime cannot paint a transparent window (linux_window_frame).
             // Every property comes from the same config entry, and it happens
             // before anything below looks the window up.
+            // Linux: the tray host's owner is read once before main is built, so no
+            // close can see the unread value; a thread then follows it.
             #[cfg(target_os = "linux")]
-            {
+            services::background_mode::start_tray_host_watch();
+            // A `--background` launch builds no window here: the launch decision
+            // (after the registry load) shows one, or keeps the app in the tray.
+            #[cfg(target_os = "linux")]
+            if !services::background_mode::background_launch() {
                 let frame = linux_window_frame::frame();
                 info!("[LinuxFrame] frame={} transparent=false", frame.as_str());
                 let config = app
@@ -1182,6 +1323,9 @@ pub fn run() {
                 // transfer) run the setup again rather than skip it.
                 if let Ok(data) = services::cache_service::get_app_data_dir() {
                     if services::install_marker::reconcile(&data, &mut loaded) {
+                        // A restored file never brings rules back live, turns
+                        // automations on or brings back an old away.
+                        commands::account_automations::pause_restored(&mut loaded.automations);
                         if let Err(e) = commands::settings::write_settings_to_disk_sync(&loaded) {
                             log::warn!("[Setup] could not save the install's setup state: {e}");
                         }
@@ -1209,6 +1353,9 @@ pub fn run() {
                 if let Ok(mut s) = settings_arc.lock() {
                     *s = loaded;
                 }
+                // The real file is read now: rules recompile from it (a no-op
+                // until the engine starts; init then reads these settings).
+                services::account_automations::request_refresh();
                 let drops_service_reload = drops_service.clone();
                 tauri::async_runtime::spawn(async move {
                     drops_service_reload
@@ -1430,25 +1577,30 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             std::thread::spawn(|| info!("{}", linux_desktop_entry::install()));
 
-            // Resolve streamnook:// share links to a channel and hand it to the UI.
+            // Every streamnook:// link goes through one slot, whatever it opens (a
+            // channel, a badge or a category). It is stored before anything is
+            // shown or emitted, so a window that is created for the link, or a
+            // page that is not listening yet, takes it on mount; the
+            // `streamnook:link` event carries the stamp the store returned and
+            // only tells a mounted page that a link is waiting.
             //
             // Two arrival paths, both covered here:
             //  - Warm (app running): the single-instance plugin re-feeds the URL, the
-            //    deep-link plugin emits, on_open_url fires, we emit to the (mounted)
-            //    frontend.
+            //    deep-link plugin emits, on_open_url fires: store, show the main
+            //    window (desktop), emit.
             //  - Cold (app launched by the link): the plugin already emitted before this
-            //    listener (and the webview) existed, so we also drain get_current()
-            //    into PendingWatchLink, which the frontend pulls on mount.
+            //    listener (and the webview) existed, so we drain get_current() into
+            //    the slot; the window is still being created, so only the emit.
             //
             // Android delivers both through on_open_url, from the activity rather
             // than from argv: the cold link fires when the plugin loads into the
             // new webview, before any page script is listening, and a link that
-            // recreates the activity lands in a fresh page the same way. So on
-            // mobile every link is stashed first, and the event only tells a
-            // mounted shell to drain it; the one take decides who opens it.
+            // recreates the activity lands in a fresh page the same way. The one
+            // take decides who opens it.
             //
-            // iOS has no deep-link plugin; the Swift app receives the links.
-            app.manage(PendingWatchLink::default());
+            // iOS has no deep-link plugin; the Swift app receives the links and
+            // asks `inbound_link` what each one means.
+            app.manage(PendingLink::default());
             #[cfg(not(target_os = "ios"))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -1462,16 +1614,20 @@ pub fn run() {
                             commands::notification_mirror::on_notice_url(&watch_handle, &url);
                             continue;
                         }
-                        if let Some(channel) = parse_watch_link(&url) {
+                        // Android adds the moment it delivered the link as a
+                        // `#sn-at=` fragment; it is read off before routing.
+                        let at = inbound::arrival_ms(&url).unwrap_or_else(inbound::boot_ms);
+                        let url = inbound::without_stamp(&url);
+                        if let Some(link) = inbound::route(&url) {
+                            let Some(slot) = watch_handle.try_state::<PendingLink>() else {
+                                warn!("[DeepLink] no link slot; a link was dropped");
+                                continue;
+                            };
+                            let stamp = slot.store(link, at);
                             #[cfg(desktop)]
                             show_main_window(&watch_handle);
-                            #[cfg(mobile)]
-                            if let Some(pending) = watch_handle.try_state::<PendingWatchLink>() {
-                                if let Ok(mut guard) = pending.0.lock() {
-                                    *guard = Some(channel.clone());
-                                }
-                            }
-                            let _ = watch_handle.emit("streamnook:watch", channel);
+                            let _ = watch_handle.emit("streamnook:link", stamp);
+                            continue;
                         }
                     }
                 });
@@ -1485,13 +1641,18 @@ pub fn run() {
                             commands::notification_mirror::on_notice_url(&app_handle, &url);
                             continue;
                         }
-                        if let Some(channel) = parse_watch_link(&url) {
-                            if let Some(pending) = app.try_state::<PendingWatchLink>() {
-                                if let Ok(mut guard) = pending.0.lock() {
-                                    *guard = Some(channel.clone());
-                                }
-                            }
-                            let _ = app_handle.emit("streamnook:watch", channel);
+                        // Android adds the moment it delivered the link as a
+                        // `#sn-at=` fragment; it is read off before routing.
+                        let at = inbound::arrival_ms(&url).unwrap_or_else(inbound::boot_ms);
+                        let url = inbound::without_stamp(&url);
+                        if let Some(link) = inbound::route(&url) {
+                            let Some(slot) = app.try_state::<PendingLink>() else {
+                                warn!("[DeepLink] no link slot; a link was dropped");
+                                continue;
+                            };
+                            let stamp = slot.store(link, at);
+                            let _ = app_handle.emit("streamnook:link", stamp);
+                            continue;
                         }
                     }
                 }
@@ -1551,9 +1712,41 @@ pub fn run() {
             // Manage AppState directly, not wrapped in Arc
             app.manage(app_state);
 
+            // The plugin registry, loaded once and synchronously (seeded and
+            // migrated; its save path tells background mode), so the background
+            // launch below knows whether a plugin can run Missing badges before
+            // any window is shown. `startup` takes this value as it is. The phones
+            // have no background mode: `startup(None)` loads its own.
+            #[cfg(desktop)]
+            let loaded_registry = match plugin_host::load_prepared() {
+                Ok(registry) => Some(registry),
+                Err(e) => {
+                    error!("[PluginHost] registry load failed: {e}");
+                    None
+                }
+            };
+            #[cfg(not(desktop))]
+            let loaded_registry: Option<plugin_host::registry::Registry> = None;
+            #[cfg(desktop)]
+            {
+                services::background_mode::init(&app_handle);
+                // Again, now that the handle is stored: runs the login-entry
+                // worker and the first re-evaluation (a load error leaves the
+                // provider unknown, which never removes an entry or exits).
+                if let Some(registry) = &loaded_registry {
+                    services::background_mode::note_registry(registry);
+                }
+                services::background_mode::decide_launch(&app_handle);
+            }
+
             // Drops progress for the channel being earned on: one model for
             // every surface, and the app's one inventory reader.
             services::watch_drops::start(app_handle.clone());
+            // The Drops page's model, built once a little after start-up so
+            // the page's first open draws at once instead of on a spinner.
+            // Desktop only: the phones' Drops segment has its own model.
+            #[cfg(desktop)]
+            commands::drops::warm_drops_overview(app_handle.clone());
 
             // Discord Rich Presence reads the switch and the style from AppState.
             #[cfg(desktop)]
@@ -1627,7 +1820,7 @@ pub fn run() {
             // Start the plugin host: loads the registry and starts plugins
             // the user previously enabled. No-op with none installed.
             tauri::async_runtime::spawn(async move {
-                plugin_host.startup().await;
+                plugin_host.startup(loaded_registry).await;
             });
 
             // Start background service, then bring the user-global points socket
@@ -1684,9 +1877,17 @@ pub fn run() {
             #[cfg(desktop)]
             services::performance_mode::start(app_handle.clone());
             services::user_message_history_service::UserMessageHistoryService::set_app_handle(app_handle.clone());
+            // The badge date index: fetched after start and every six hours, so
+            // the gallery, the wall and the detail line order and date badges
+            // from the one copy.
+            services::badge_index::start(app_handle.clone());
             // Badge-drop feed socket, owned here so drops still arrive while the
             // main window is destroyed (live mode, tray). See services::badge_feed.
             services::badge_feed::start(app_handle.clone());
+            // Account automations: the watch channel and the engine exist
+            // before reconcile starts, and the feed's first network call is
+            // two seconds away, so nothing it reports is missed.
+            services::account_automations::init(&app_handle);
 
             // Badge-drop detection now lives server-side on the Penrose bot and
             // is delivered to the app over the badge WebSocket feed
@@ -1778,14 +1979,29 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
+            // Automations: pause or resume the rules, set or clear this
+            // device's away. The labels follow the state (see below).
+            let (run_label, away_label) = automations_tray_labels(
+                app.state::<AppState>().settings.lock().map(|s| (s.automations.run, s.automations.away.is_some())).unwrap_or_default(),
+            );
+            let automations_run_item = MenuItem::with_id(app, "automations_run", run_label, true, None::<&str>)?;
+            let automations_away_item = MenuItem::with_id(app, "automations_away", away_label, true, None::<&str>)?;
             let sep = PredefinedMenuItem::separator(app)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit StreamNook", true, None::<&str>)?;
             let tray_menu = Menu::with_items(
                 app,
-                &[&show_item, &open_multichat_item, &overlay_clickable_item, &sep, &quit_item],
+                &[
+                    &show_item,
+                    &open_multichat_item,
+                    &overlay_clickable_item,
+                    &automations_run_item,
+                    &automations_away_item,
+                    &sep,
+                    &quit_item,
+                ],
             )?;
 
-            let tray_builder = TrayIconBuilder::new()
+            let tray_builder = TrayIconBuilder::with_id(services::background_mode::TRAY_ID)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .tooltip("StreamNook");
@@ -1816,12 +2032,13 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             let tray_builder = tray_builder.icon_as_template(true);
 
-            let _tray = tray_builder
+            let tray_icon = tray_builder
                 .on_menu_event(|app_handle, event| match event.id.as_ref() {
                     "show" => show_main_window(app_handle),
                     "overlay_clickable" => {
                         commands::popout_window::make_chat_overlays_clickable(app_handle);
                     }
+                    id @ ("automations_run" | "automations_away") => automations_tray_click(app_handle, id),
                     "open_multichat" => {
                         // Recreate/show main first (going live may have CLOSED it),
                         // then defer to its JS helper, which owns popout spawning
@@ -1833,7 +2050,8 @@ pub fn run() {
                             let _ = main_win.emit("tray-open-multichat", ());
                         }
                     }
-                    "quit" => {
+                    "bg_open" => show_main_window(app_handle),
+                    "quit" | "bg_quit" => {
                         services::app_exit::exit(app_handle, 0, "tray menu Quit");
                     }
                     _ => {}
@@ -1849,6 +2067,22 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+            services::background_mode::install_tray(app.handle(), tray_icon, tray_menu)?;
+            // The rows' words follow the run state and away (each change emits
+            // the status event). Updated on a spawned task, never under an
+            // engine lock.
+            {
+                let (run_item, away_item) = (automations_run_item.clone(), automations_away_item.clone());
+                let label_app = app_handle.clone();
+                tauri::Listener::listen(&app_handle, "automations://status", move |_| {
+                    let (run_item, away_item, label_app) = (run_item.clone(), away_item.clone(), label_app.clone());
+                    tauri::async_runtime::spawn(async move {
+                        let (run_label, away_label) = automations_tray_labels(automations_state(&label_app));
+                        let _ = run_item.set_text(run_label);
+                        let _ = away_item.set_text(away_label);
+                    });
+                });
+            }
             }
 
             Ok(())
@@ -1862,10 +2096,17 @@ pub fn run() {
             get_app_authors,
             fetch_exchange_rates,
             get_window_size,
-            take_pending_watch_link,
             watch_link_key,
             app_link_target,
             share_link,
+            take_pending_link,
+            #[cfg(desktop)]
+            peek_pending_link_stamp,
+            #[cfg(desktop)]
+            link_superseded,
+            resolve_category_link,
+            category_share_link,
+            inbound_link,
             #[cfg(target_os = "android")]
             twitch_login_plugin::open_mobile_login,
             #[cfg(target_os = "android")]
@@ -1910,6 +2151,8 @@ pub fn run() {
             cast_plugin::tv_set_enabled,
             #[cfg(target_os = "android")]
             cast_plugin::tv_control,
+            #[cfg(target_os = "android")]
+            speech_plugin::speak_android,
             #[cfg(mobile)]
             flush_persistent_stores,
             #[cfg(mobile)]
@@ -1948,6 +2191,8 @@ pub fn run() {
             #[cfg(desktop)]
             commands::notification_mirror::take_notice_action,
             #[cfg(desktop)]
+            commands::notification_mirror::notice_opened,
+            #[cfg(desktop)]
             grow_popout_width,
             #[cfg(desktop)]
             fit_popout_on_screen,
@@ -1985,6 +2230,8 @@ pub fn run() {
             open_plugin_window,
             #[cfg(desktop)]
             close_main_window,
+            #[cfg(desktop)]
+            services::background_mode::get_background_state,
             calculate_aspect_ratio_size,
             calculate_aspect_ratio_size_preserve_video,
             set_window_aspect_constraint,
@@ -2301,6 +2548,9 @@ pub fn run() {
             update_twitch_display_name,
             upload_seventv_profile_picture,
             upload_twitch_profile_image,
+            get_smiley_style,
+            set_smiley_style,
+            get_own_smilies,
             get_user_chat_colors,
             block_user,
             unblock_user,
@@ -2462,6 +2712,7 @@ pub fn run() {
             asset_cache_enqueue,
             cache_file_server,
             asset_cache_set_burst,
+            forget_streamnook_art_copy,
             get_cached_file,
             get_cached_files,
             get_all_universal_cached_items,
@@ -2602,6 +2853,34 @@ pub fn run() {
             mention_watch_pull,
             mention_push_arrived,
             services::mention_ping::mention_ping_claim,
+            // Account automations
+            commands::account_automations::automations_status,
+            commands::account_automations::automations_save_rule,
+            commands::account_automations::automations_delete_rule,
+            commands::account_automations::automations_move_rule,
+            commands::account_automations::automations_set_rule_flags,
+            commands::account_automations::automations_set_run,
+            commands::account_automations::automations_set_away,
+            commands::account_automations::automations_test,
+            commands::account_automations::automations_badge_samples,
+            commands::account_automations::automations_templates,
+            commands::account_automations::automations_add_template,
+            commands::account_automations::automations_variables,
+            commands::account_automations::automations_activity,
+            commands::account_automations::automations_clear_activity,
+            commands::account_automations::automations_watch_activity,
+            commands::account_automations::automations_set_device_name,
+            commands::account_automations::automations_check_link,
+            commands::account_automations::automations_notify_claim,
+            commands::account_automations::automations_pip,
+            commands::account_automations::automations_set_reminders,
+            commands::account_automations::automations_convert_reminder,
+            commands::account_automations::automations_restore_reminder,
+            commands::account_automations::automations_own_rewards,
+            commands::account_automations_p2::automations_open_log_folder,
+            commands::account_automations_p2::automations_whisper_people,
+            #[cfg(mobile)]
+            commands::account_automations_p2::automations_share_log,
             // IVR account facts
             get_ivr_user_summary,
             get_ivr_subage_summary,
@@ -2634,6 +2913,7 @@ pub fn run() {
             get_client_config,
             // Drops page model
             get_drops_overview,
+            get_cached_drops_overview,
             // The phones' Rewards tab, Drops segment
             get_rewards_drops,
             // The phones' in-player drop bar
@@ -2668,6 +2948,7 @@ pub fn run() {
             get_emote_by_name,
             match_emote_tokens,
             mention_suggestions,
+            get_emote_moment,
             emote_credit,
             personal_emote_overrides,
             parse_text_segments,
@@ -2676,6 +2957,7 @@ pub fn run() {
             get_gif_picker_status,
             search_gifs,
             send_gif_message,
+            find_gif_link,
             // Bits: the insert menu's Bits section and a confirmed cheer
             get_bits_state,
             check_cheer,
@@ -2959,12 +3241,17 @@ pub fn run() {
                 services::performance_mode::note_window_destroyed(&label);
                 services::whisper_claims::forget_window(&label);
                 services::stream_manager::clear_label(&label);
+                // It stops hearing Activity and Notify claims.
+                services::account_automations::forget_window(&label);
                 // A destroyed webview never runs its React cleanup, so any
                 // chat consumer claims it still holds would pin those channels
                 // JOINed (and their IRC traffic flowing) forever. Sweep them;
                 // channels with no remaining consumers PART.
                 let gone = label.clone();
                 tauri::async_runtime::spawn(async move {
+                    // The engine keeps the rooms no other window holds first,
+                    // so a room never PARTs and joins again.
+                    services::account_automations::adopt_window_chats(&gone).await;
                     services::irc_service::IrcService::release_window_claims(&gone, None).await;
                     // Same sweep for the non-Twitch adapters. Their consumers are
                     // window labels too, so without this a closed popout leaves
@@ -2997,7 +3284,25 @@ pub fn run() {
                     let _ = app_handle.emit("main-closed", ());
                     #[cfg(target_os = "linux")]
                     commands::twitch::linux_overlays::close_with_main(&app_handle);
+                    // Always: the teardown stops the stream and the grid and, for a
+                    // keep-alive close, ends the watch session.
+                    services::background_mode::note_main_destroyed(&app_handle);
+                    // Then one decision when no user window remains. It is never made
+                    // twice: a stay the popout arm already recorded (main was hidden
+                    // in the tray, and this is the JS hide path or the 5 s fallback
+                    // destroying it) stands.
+                    let others = {
+                        let windows = app_handle.webview_windows();
+                        services::app_exit::other_user_windows(windows.keys().map(String::as_str), "main")
+                    };
+                    if others == 0 && !services::background_mode::staying_for_keep_alive() {
+                        if !services::background_mode::on_user_windows_gone(&app_handle, "main") {
+                            services::app_exit::exit(&app_handle, 0, "last window closed");
+                        }
+                    }
                 }
+                // The tray's menu and line follow the windows that are left.
+                services::background_mode::refresh_tray(&app_handle);
             }
 
             if label == "main" {
@@ -3023,11 +3328,10 @@ pub fn run() {
                         .try_state::<AppState>()
                         .and_then(|s| s.settings.lock().ok().map(|g| g.close_to_tray))
                         .unwrap_or_default();
-                    let hide_to_tray = match mode {
-                        CloseToTrayMode::Always => true,
-                        CloseToTrayMode::Never => false,
-                        CloseToTrayMode::WithPopouts => popouts_open,
-                    };
+                    // Missing badges: while keep-alive holds, a close always hides to
+                    // the tray (the JS hide path stops the stream and destroys main).
+                    let keep_alive = services::background_mode::keep_alive(&app_handle);
+                    let hide_to_tray = services::background_mode::close_hides(mode, popouts_open, keep_alive);
                     if hide_to_tray {
                         debug!(
                             "[Main] Close requested (mode {:?}, popouts_open {}) — hiding main to tray",
@@ -3035,38 +3339,61 @@ pub fn run() {
                         );
                         api.prevent_close();
                         if let Some(main_win) = app_handle.get_webview_window("main") {
-                            // Tell the JS side it's about to go background so
-                            // it can stop the active stream (Streamlink + video
-                            // + drops monitoring) before we hide. Chat stays
-                            // alive because the popouts still need it — the JS
-                            // handler is intentionally NOT a full stopStream
-                            // (which would tear down the IRC connection too).
-                            let _ = main_win.emit("main-hiding-to-tray", ());
-                            // A hidden owner does not hide its owned windows.
-                            commands::emote_palette::on_window_gone(&app_handle, "main");
-                            #[cfg(target_os = "linux")]
-                            commands::twitch::linux_overlays::hide_with_main(&app_handle);
-                            let _ = main_win.hide();
-                            services::app_exit::note_main_hidden_to_tray();
+                            // The page releases main's chats when it hears the
+                            // event below, so the engine adopts them first
+                            // (bounded at 3 s). Reopening main from the tray
+                            // meanwhile starts a new lifetime: this close then
+                            // stands down and touches nothing.
+                            let lifetime = services::background_mode::main_lifetime();
+                            let app_handle = app_handle.clone();
+                            tauri::async_runtime::spawn(async move {
+                                services::account_automations::adopt_main_chats().await;
+                                if services::background_mode::main_lifetime() != lifetime {
+                                    return;
+                                }
+                                if keep_alive {
+                                    services::background_mode::note_keep_alive_close(&app_handle);
+                                }
+                                // Tell the JS side it's about to go background so
+                                // it can stop the active stream (Streamlink + video
+                                // + drops monitoring) before we hide. Chat stays
+                                // alive because the popouts still need it — the JS
+                                // handler is intentionally NOT a full stopStream
+                                // (which would tear down the IRC connection too).
+                                let _ = main_win.emit("main-hiding-to-tray", ());
+                                // A hidden owner does not hide its owned windows.
+                                commands::emote_palette::on_window_gone(&app_handle, "main");
+                                #[cfg(target_os = "linux")]
+                                commands::twitch::linux_overlays::hide_with_main(&app_handle);
+                                let _ = main_win.hide();
+                                services::app_exit::note_main_hidden_to_tray();
+                                services::background_mode::refresh_tray(&app_handle);
+                            });
                         }
                     }
                 }
 
-            } else if label.starts_with("multichat-") || label.starts_with("overlay-") {
+            } else if services::app_exit::is_user_window(&label) && label != "main" {
                 if let WindowEvent::Destroyed = event {
                     // Tell the main window this popout is gone so it can
                     // drop the popout's channel set from its tracking and
                     // re-show its own ChatWidget if it was hiding because of
                     // those channels.
-                    if let Some(main_win) = app_handle.get_webview_window("main") {
-                        let _ = main_win.emit("multichat-popout-closed", &label);
+                    // Only a MultiChat or overlay popout has a channel set main
+                    // tracks: a profile card or plugin window closing must not
+                    // re-render those consumers.
+                    if label.starts_with("multichat-") || label.starts_with("overlay-") {
+                        if let Some(main_win) = app_handle.get_webview_window("main") {
+                            let _ = main_win.emit("multichat-popout-closed", &label);
+                        }
                     }
 
-                    let still_open = app_handle
-                        .webview_windows()
-                        .iter()
-                        .filter(|(l, _)| (l.starts_with("multichat-") || l.starts_with("overlay-")) && **l != label)
-                        .count();
+                    // Every other user window counts; main is judged below by
+                    // `exit_when_last_popout_closes` (a hidden main counts as gone).
+                    let still_open = {
+                        let windows = app_handle.webview_windows();
+                        services::app_exit::other_user_windows(windows.keys().map(String::as_str), &label)
+                    };
                     if still_open == 0 {
                         // Exit when the last popout closes and main is unavailable —
                         // either hidden to tray OR fully destroyed (going live closes
@@ -3108,13 +3435,17 @@ pub fn run() {
                             in_tray,
                             always_tray,
                         ) {
-                            services::app_exit::exit(
-                                &app_handle,
-                                0,
-                                &format!(
-                                    "last popout '{label}' closed while main was put away (main {main:?}, revealed={revealed}, in_tray={in_tray}, close_to_tray={close_mode:?})"
-                                ),
-                            );
+                            // One shared decision: keep-alive keeps the app with main
+                            // hidden in the tray and whatever helper is still open.
+                            if !services::background_mode::on_user_windows_gone(&app_handle, &label) {
+                                services::app_exit::exit(
+                                    &app_handle,
+                                    0,
+                                    &format!(
+                                        "last popout '{label}' closed while main was put away (main {main:?}, revealed={revealed}, in_tray={in_tray}, close_to_tray={close_mode:?})"
+                                    ),
+                                );
+                            }
                         } else if main != MainWindow::Visible {
                             info!(
                                 "[Main] last popout '{label}' closed; staying open (main {main:?}, revealed={revealed}, in_tray={in_tray}, close_to_tray={close_mode:?})"
@@ -3143,15 +3474,51 @@ pub fn run() {
                     .try_state::<AppState>()
                     .and_then(|s| s.settings.lock().ok().map(|g| g.close_to_tray))
                     .unwrap_or_default();
-                let prevented =
-                    cfg!(desktop) && code.is_none() && close_mode == CloseToTrayMode::Always;
+                #[cfg(desktop)]
+                let (prevented, reevaluate_now) = {
+                    use services::background_mode::{
+                        exit_requested_decision, keep_alive, stays_alive, staying_for_keep_alive, ExitVerdict,
+                    };
+                    let verdict = exit_requested_decision(
+                        *code,
+                        staying_for_keep_alive(),
+                        services::app_exit::take_close_decision,
+                        || stays_alive(close_mode, None, keep_alive(app_handle)),
+                    );
+                    (verdict != ExitVerdict::Proceed, verdict == ExitVerdict::StayAndReevaluate)
+                };
+                #[cfg(not(desktop))]
+                let (prevented, reevaluate_now) = (false, false);
                 if prevented {
-                    debug!("[Main] Last window closed under Always close mode — staying in the tray");
+                    debug!("[Main] Last window closed with the app kept running — staying in the tray");
                     api.prevent_exit();
+                } else {
+                    services::app_exit::begin_shutdown();
                 }
+                #[cfg(desktop)]
+                if prevented {
+                    if reevaluate_now {
+                        services::background_mode::reevaluate(app_handle);
+                    } else {
+                        // Decided from a recorded decision or computed here: store
+                        // the stay (flag, tray, one re-check).
+                        services::background_mode::record_stay(app_handle, close_mode != CloseToTrayMode::Always);
+                    }
+                }
+                #[cfg(not(desktop))]
+                let _ = reevaluate_now;
                 services::app_exit::on_exit_requested(*code, prevented, &format!("{close_mode:?}"));
             }
+            // macOS: a Dock click with no window on screen brings main back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = &event {
+                if !*has_visible_windows {
+                    show_main_window(app_handle);
+                }
+            }
             if let tauri::RunEvent::Exit = event {
+                // First: from here a late teardown or exit task does nothing.
+                services::app_exit::begin_shutdown();
                 services::app_exit::on_run_exit();
                 let shutdown_started = std::time::Instant::now();
                 // Quitting mid-stream is a close too: file where the viewer

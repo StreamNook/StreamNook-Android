@@ -118,6 +118,42 @@ pub struct TimeBasedDrop {
     /// will give. Twitch never repeats a reward, so it is certain.
     #[serde(default)]
     pub next_reward: Option<DropBenefit>,
+    /// Twitch holds this reward until the campaign's earlier rewards are
+    /// earned (`hasPreconditionsMet: false` on a second-list reward tier, the
+    /// GTAVI Golden Iguana): never ready, never claimed, out of reach.
+    #[serde(default)]
+    pub needs_earlier: bool,
+    /// Every reward a second-list draw can give (`random_of` > 1), each named
+    /// and marked when the account holds it, so a reward list shows the six
+    /// Chains instead of one mystery box. Empty for anything else.
+    #[serde(default)]
+    pub pool_rewards: Vec<PoolReward>,
+    /// A subscription tier that only gets a container (a Special Great Ball):
+    /// another tier draws from the same pool and opens it. Not a reward of its
+    /// own. A subscription tier that draws its reward itself (GTAVI's sub
+    /// emotes and badges) is not one.
+    #[serde(default)]
+    pub obtains_container: bool,
+    /// Drops of the same campaign that must be claimed before this one
+    /// counts (Twitch's `preconditionDrops` on a standard campaign). Twitch
+    /// starts its minutes only after they are claimed.
+    #[serde(default)]
+    pub precondition_drops: Vec<String>,
+}
+
+/// One reward a draw can give: a pool member.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolReward {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub image_url: String,
+    /// "badge", "emote" or "item", from Twitch's distribution type.
+    #[serde(default)]
+    pub kind: String,
+    /// The account already holds it; Twitch never gives it again.
+    #[serde(default)]
+    pub held: bool,
 }
 
 fn default_collectible() -> bool {
@@ -467,6 +503,23 @@ pub struct DropsSettings {
     /// A line the viewer picked is always followed.
     #[serde(default = "default_true")]
     pub auto_pick_evolution: bool,
+    /// The Missing badges switch: drops automation works through every
+    /// watch-based badge the account is missing, with or without a run the
+    /// viewer started. Off until the viewer turns it on.
+    #[serde(default)]
+    pub collect_missing_badges: bool,
+    /// With Missing badges on, closing StreamNook keeps it running in the
+    /// tray so badges are still collected. On by default.
+    #[serde(default = "default_true")]
+    pub keep_running_when_closed: bool,
+    /// With both of the above on, start in the tray when the viewer signs in
+    /// to the computer. This machine's choice: a settings import keeps it.
+    #[serde(default)]
+    pub start_at_login: bool,
+    /// The one-time "still running in the tray" notice was shown. Written by
+    /// Rust only; a settings import keeps this machine's value.
+    #[serde(default)]
+    pub told_keep_running: bool,
     // Recovery settings
     #[serde(default)]
     pub recovery_settings: RecoverySettings,
@@ -511,6 +564,11 @@ impl Default for DropsSettings {
             prefer_missing_badges: true,
             // Pick an evolution line when none is equipped, on by default
             auto_pick_evolution: true,
+            // Missing badges is opt-in; when on, it keeps running in the tray
+            collect_missing_badges: false,
+            keep_running_when_closed: true,
+            start_at_login: false,
+            told_keep_running: false,
             // Recovery defaults
             recovery_settings: RecoverySettings::default(),
         }
@@ -1023,5 +1081,32 @@ mod tests {
         let c = campaign("1", "Pokemon", false, &[], &["5", "6"]);
         assert!(c.counts_in("6", "Some Other Game"));
         assert!(!c.counts_in("7", "Some Other Game"));
+    }
+}
+
+#[cfg(test)]
+mod missing_badges_settings_tests {
+    use super::*;
+
+    /// A settings file from before these fields: each takes its own default.
+    #[test]
+    fn drops_settings_new_fields_default() {
+        let old: DropsSettings = serde_json::from_value(serde_json::json!({
+            "auto_claim_drops": true, "auto_claim_channel_points": true,
+            "notify_on_drop_available": true, "notify_on_drop_claimed": true,
+            "notify_on_points_claimed": false, "check_interval_seconds": 60,
+            "automation_enabled": false, "priority_games": [], "excluded_games": [],
+            "priority_mode": "PriorityOnly", "watch_interval_seconds": 20
+        }))
+        .unwrap();
+        assert!(!old.collect_missing_badges);
+        assert!(old.keep_running_when_closed);
+        assert!(!old.start_at_login);
+        assert!(!old.told_keep_running);
+        let fresh = DropsSettings::default();
+        assert!(!fresh.collect_missing_badges);
+        assert!(fresh.keep_running_when_closed);
+        assert!(!fresh.start_at_login);
+        assert!(!fresh.told_keep_running);
     }
 }

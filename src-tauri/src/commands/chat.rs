@@ -476,24 +476,32 @@ pub async fn kick_chat_history(
     crate::services::providers::kick::chat_history(&channel)
         .await
         .into_iter()
-        .filter_map(|mut m| {
-            let verdict = crate::services::chat_rules::ChatRules::evaluate(&mut m, &rules);
-            if verdict.drop {
-                None
-            } else {
-                // A mention from before you opened the chat still reaches the
-                // inbox (once: it dedupes by id), with no sound or notice.
-                if !m.id.starts_with(crate::services::providers::kick::KICK_LOCAL_ID) {
-                    crate::services::mention_inbox::on_backfill(&m, &verdict);
-                }
-                m.metadata.from_backfill = true;
-                crate::services::chat_row_view::stamp(&mut m);
-                // Patched in later if the channel's whole 7TV table is not in yet.
-                crate::services::providers::kick_emotes::hold_row(&m);
-                Some(m)
-            }
-        })
+        .filter_map(|m| kick_history_row(m, &rules))
         .collect()
+}
+
+/// One Kick backlog row through the rules, as history: `None` when the rules
+/// drop it.
+fn kick_history_row(
+    mut m: crate::models::chat_layout::ChatMessage,
+    rules: &crate::services::chat_rules::CompiledRules,
+) -> Option<crate::models::chat_layout::ChatMessage> {
+    // Marked before the rules see it, so what counts "right now" (the
+    // composer's emote of the moment) leaves history out.
+    m.metadata.from_backfill = true;
+    let verdict = crate::services::chat_rules::ChatRules::evaluate(&mut m, rules);
+    if verdict.drop {
+        return None;
+    }
+    // A mention from before you opened the chat still reaches the inbox
+    // (once: it dedupes by id), with no sound or notice.
+    if !m.id.starts_with(crate::services::providers::kick::KICK_LOCAL_ID) {
+        crate::services::mention_inbox::on_backfill(&m, &verdict);
+    }
+    crate::services::chat_row_view::stamp(&mut m);
+    // Patched in later if the channel's whole 7TV table is not in yet.
+    crate::services::providers::kick_emotes::hold_row(&m);
+    Some(m)
 }
 
 #[tauri::command]
@@ -921,6 +929,9 @@ const HISTORY_DEFAULT_LIMIT: u32 = 100;
 /// parsing. The seed is a cached broadcaster lookup plus a disk read.
 const HISTORY_EMOTE_SEED_WAIT: Duration = Duration::from_secs(3);
 const HISTORY_MAX_LIMIT: u32 = 800;
+/// How much longer a join Twitch's history already answered waits for the
+/// mirror's notices (it started at the same time, so usually it is in).
+const MIRROR_NOTICE_WAIT: Duration = Duration::from_millis(1500);
 const RECENT_MESSAGES_BASE: &str = "https://recent-messages.robotty.de/api/v2/recent-messages";
 
 static HISTORY_CACHE: OnceLock<Mutex<HashMap<String, (Instant, Vec<String>)>>> = OnceLock::new();
@@ -1010,7 +1021,9 @@ async fn fetch_recent_messages(
 /// recent chat when the viewer is signed in to twitch.tv
 /// (`twitch_chat_history`), else the recent messages mirror
 /// (recent-messages.robotty.de), as lines tagged `historical=1`, then the same
-/// parse the live path uses. A reconnect's windowed backfill always uses the
+/// parse the live path uses. Twitch's answer holds chat messages only, so the
+/// mirror's notices (announcements, subs, raids) are folded into it
+/// (`twitch_chat_history::with_notices`). A reconnect's windowed backfill always uses the
 /// mirror, since Twitch's answer has no time window. Until 2026-09-07 the page fetched the
 /// mirror itself, serially after the badge cache init, so history landed one
 /// to two seconds after the first live rows and visibly prepended; now the
@@ -1038,18 +1051,30 @@ pub async fn load_channel_history(
     let raw = match if windowed { None } else { cached_history(&key) } {
         Some(lines) => lines,
         None => {
-            let from_twitch = if windowed {
-                None
+            let lines = if windowed {
+                fetch_recent_messages(&key, limit.unwrap_or(HISTORY_DEFAULT_LIMIT), after_ms, before_ms).await
             } else {
-                crate::services::twitch_chat_history::fetch(&key, &state.twitch_auth)
+                // The mirror runs alongside Twitch's history: it is the
+                // fallback, and it holds the notices (announcements, subs,
+                // raids) Twitch's answer leaves out. A slow mirror delays a
+                // join that Twitch answered by at most MIRROR_NOTICE_WAIT.
+                let mirror = tokio::spawn({
+                    let key = key.clone();
+                    async move { fetch_recent_messages(&key, HISTORY_DEFAULT_LIMIT, None, None).await }
+                });
+                let from_twitch = crate::services::twitch_chat_history::fetch(&key, &state.twitch_auth)
                     .await
-                    .filter(|lines| !lines.is_empty())
-            };
-            let lines = match from_twitch {
-                Some(lines) => lines,
-                None => {
-                    fetch_recent_messages(&key, limit.unwrap_or(HISTORY_DEFAULT_LIMIT), after_ms, before_ms)
-                        .await
+                    .filter(|lines| !lines.is_empty());
+                match from_twitch {
+                    Some(lines) => {
+                        let notices = tokio::time::timeout(MIRROR_NOTICE_WAIT, mirror)
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or_default();
+                        crate::services::twitch_chat_history::with_notices(lines, notices)
+                    }
+                    None => mirror.await.unwrap_or_default(),
                 }
             };
             if !windowed {
@@ -1113,6 +1138,44 @@ pub async fn load_channel_history(
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[test]
+    fn kick_history_never_makes_the_emote_of_the_moment() {
+        let rules = crate::services::chat_rules::CompiledRules::default();
+        for (i, user) in ["a", "b", "c"].iter().enumerate() {
+            let mut m = crate::models::chat_layout::ChatMessage {
+                id: format!("kick-hist-moment-{i}"),
+                user_id: format!("70{i}"),
+                username: user.to_string(),
+                display_name: user.to_string(),
+                color: None,
+                badges: vec![],
+                // Kick's own time shape: RFC 3339 text.
+                timestamp: "2026-11-13T10:00:00Z".into(),
+                content: "catJAM".into(),
+                provider: "kick".into(),
+                channel: "kick:momenthist".into(),
+                received_at_ms: None,
+                emotes: vec![],
+                tags: std::collections::HashMap::new(),
+                layout: Default::default(),
+                segments: vec![],
+                metadata: Default::default(),
+            };
+            m.segments = vec![crate::models::chat_layout::MessageSegment::Emote {
+                content: "catJAM".into(),
+                emote_id: Some("1".into()),
+                emote_url: "https://cdn/catJAM.webp".into(),
+                is_zero_width: None,
+                modifier_flags: None,
+                is_personal: None,
+                local_path: None,
+            }];
+            let row = kick_history_row(m, &rules).expect("kept");
+            assert!(row.metadata.from_backfill);
+        }
+        assert_eq!(crate::services::emote_moment::get("kick", "momenthist").emote, None);
+    }
 
     #[test]
     fn historical_tag_lands_in_the_tag_block() {

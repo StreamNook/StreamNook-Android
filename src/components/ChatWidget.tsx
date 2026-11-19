@@ -85,6 +85,7 @@ import { CheerBar } from './chat/CheerBar';
 import { useCheerDraft } from '../stores/cheerPromptStore';
 import { channelToolSections } from '../utils/channelTools';
 import ResubNotificationBanner, { ResubNotification } from './ResubNotificationBanner';
+import { onOwnSubSettled } from '../utils/ownSubWatch';
 import WatchStreakBanner, { WatchStreakMilestone } from './WatchStreakBanner';
 import { EmoteSet, queueChannelEmotesForCaching, setEmoteCacheBurst, youTubeChannelEmojiRows, type YouTubeChannelEmoji } from '../services/emoteService';
 import { useEmotePalette, type PaletteChannel } from '../hooks/useEmotePalette';
@@ -131,6 +132,8 @@ import { getRemindFlowSuggestions, tokenizeRemindOverlay } from '../utils/remind
 import { BackendChatMessage } from '../services/twitchChat';
 import { registerChatModController, getChatModController, type ChatModController } from '../keybindings';
 import { Tooltip } from './ui/Tooltip';
+import { AutomationDot } from './chat/AutomationDot';
+import { useAutomationDot } from '../hooks/useAutomationStatus';
 import { RoomModeIndicator } from './chat/RoomModeIndicator';
 import {
   composerInputLook,
@@ -138,7 +141,9 @@ import {
   composerPaddingLeft as composerPaddingLeftFor,
   sendButtonClass,
 } from './chat/composerParts';
-import { EmoteSmileyButton } from './chat/EmoteSmileyButton';
+import { ComposerDeck } from './chat/ComposerDeck';
+import { desktopHints, nextHintEngaged, useGifsOffered } from './chat/composerHints';
+import { useLowPower } from '../utils/lowPower';
 
 interface ParsedMessage {
   username: string;
@@ -156,6 +161,7 @@ import { SegmentedSelect } from './settings/_primitives';
 import type { TwitchStream, HypeTrainData, MentionEntry } from '../types';
 
 import { Logger } from '../utils/logger';
+import { stopArgs, stopToast } from '../utils/dropsStop';
 
 // Unsent composer text per channel key, for the per-channel draft restore.
 const chatDrafts = new Map<string, string>();
@@ -1875,6 +1881,18 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const composerCheer = useCheerDraft(isTwitch ? (channelOverride?.user_login ?? currentStream?.user_login) : null, messageInput);
   const visiblePlaceholder = look.placeholder;
   const visiblePlaceholderNarrow = look.placeholderNarrow;
+  // The teaching placeholder (chat/ComposerDeck) rests on the plain prompt
+  // once the box has held anything, however it got there (typed, picked,
+  // Tab, history), until you leave the composer: an active chatter never sees
+  // it move under the caret after a send. Derived while rendering, so every
+  // writer counts.
+  const [hintEngaged, setHintEngaged] = useState(false);
+  const engagedNow = nextHintEngaged(hintEngaged, messageInput);
+  if (engagedNow !== hintEngaged) setHintEngaged(engagedNow);
+  const lowPower = useLowPower();
+  // The menu's GIFs section shows on the same answer (Rust caches it).
+  const gifsOffered = useGifsOffered(isTwitch, currentStream?.user_id);
+  const emoteOnlyRoom = !!roomState?.modes?.modes.some((m) => m.kind === 'emote_only');
   // A render that changes the prompt writes the full one onto the field; put
   // the short one back while the row is narrow (the row's width observer
   // covers resizes).
@@ -1997,6 +2015,22 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     .join('|');
   const blendSuggestionsUnseen = !!blendSuggestionsKey && blendSuggestionsKey !== seenBlendSuggestions;
   const blendActive = blendEnabled && blendOn && blendAttached.length > 0 && !!homeChannel;
+  // The rooms this panel shows, as composite keys, for the automations dot: a
+  // pane's own room, MultiNook's active tile, or the stream's chat (the dock
+  // swaps that one), plus every platform a combined chat draws in.
+  const automationKeys = useMemo(() => {
+    const own = channelOverride
+      ? makeKey(provider, channelOverride.user_login)
+      : isMultiNookActive && activeChatChannelId
+        ? activeChatChannelId
+        : currentStream?.user_login
+          ? makeKey('twitch', currentStream.user_login)
+          : null;
+    const keys = own ? [own] : [];
+    if (blendActive) for (const c of blendAttached) keys.push(makeKey(c.provider, c.channel));
+    return keys;
+  }, [channelOverride, provider, isMultiNookActive, activeChatChannelId, currentStream?.user_login, blendActive, blendAttached]);
+  const automationDot = useAutomationDot(automationKeys);
   const blendSources = useMemo<BlendCompanion[]>(
     () =>
       blendActive && homeChannel
@@ -2095,6 +2129,17 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // Never more than the room's own wait, even if the wall clock jumped back.
   const slowRemaining =
     slowUntil > 0 && slowTick.until === slowUntil ? Math.min(slowSeconds, slowTick.left) : 0;
+  // When the empty box teaches what the emote menu holds (chat/ComposerDeck).
+  const hintGate = desktopHints({
+    teaches: look.teaches,
+    empty: messageInput === '',
+    engaged: hintEngaged,
+    slowWait: slowRemaining,
+    replying: !!replyingTo,
+    remindOverlay: remindOverlayActive,
+    motionMode: settings.motion_mode,
+    lowPower,
+  });
   useEffect(() => {
     if (slowUntil <= 0) return;
     // Every count reads the clock against this deadline, including the first,
@@ -2605,6 +2650,9 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     };
     
     fetchResubNotification();
+    // Your sub here may have just changed (the subscribe page closed, or Twitch
+    // confirmed it): a resub only reaches chat once shared, so offer it again.
+    return onOwnSubSettled(currentStream?.user_login, () => void fetchResubNotification());
   }, [isTwitch, currentStream?.user_login, resubDismissed]);
 
   // Fetch watch streak milestone when entering a new channel. Skipped in
@@ -2765,9 +2813,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     const game = dropsCampaign.game_name;
     if (isDropProgressing) {
       try {
-        await invoke('plugins_invoke_action', { action: 'drops.stop', args: {} });
+        await invoke('plugins_invoke_action', { action: 'drops.stop', args: stopArgs(dropsCampaign.id) });
         setIsDropProgressing(false);
-        return { ok: true, message: `Stopped collecting drops for ${game}` };
+        return {
+          ok: true,
+          message: stopToast(useAppStore.getState().settings?.drops, `Stopped collecting drops for ${game}`),
+        };
       } catch (err) {
         Logger.error('[ChatWidget] Failed to stop collecting:', err);
         return { ok: false, message: typeof err === 'string' && err ? err : 'Could not stop collecting drops' };
@@ -5043,6 +5094,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     </motion.p>
                   )}
                 </AnimatePresence>
+                {automationDot && activeView !== 'modroom' && <AutomationDot state={automationDot} />}
                 {/* Which platforms this feed is drawing from, as one control: their
                     marks overlap in a fixed-size capsule (separate buttons cost
                     about 22px each and truncated the title at three), and its
@@ -5762,7 +5814,17 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               {/* In a narrow chat column the tools compress in place so the
                   field keeps a usable width (utils/composerNarrow.ts). */}
               {!composerHidden && (
-              <div ref={trackComposerWidth} className="sn-composer-row flex items-center gap-2 min-w-0">
+              <div
+                ref={trackComposerWidth}
+                className="sn-composer-row flex items-center gap-2 min-w-0"
+                // The empty box may teach again once focus leaves the
+                // composer row (Send, the deck and the tools are part of it).
+                onBlur={(e) => {
+                  if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                    setHintEngaged((prev) => nextHintEngaged(prev, messageInput, true));
+                  }
+                }}
+              >
                 {/* The channel wallet: points and bits, balances on the
                     button or on hover. While the watched channel has a bonus
                     chest ready and auto-collect is off, it becomes the claim
@@ -5813,13 +5875,27 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                 {/* Input container with emoji button inset on the left and
                     the room's chat-mode chip inset on the right. */}
                 <div className="sn-composer-field relative flex-1 min-w-0 flex items-center">
-                  {/* Emoji button — inset left inside the input */}
-                  {showEmoteButton && (
-                  <EmoteSmileyButton
+                  {/* The emote button (the deck), inset left inside the input,
+                      and the empty box's teaching hints over the field. */}
+                  <ComposerDeck
+                    showButton={showEmoteButton}
                     open={showEmotePicker}
+                    room={emoteMatchTarget.channel ? { provider, channel: emoteMatchTarget.channel } : null}
                     smiley={smiley.currentSmiley}
-                    transitioning={smiley.isSmileyTransitioning}
                     label={isTwitch ? 'Emotes, GIFs and commands' : 'Emotes and commands'}
+                    slash
+                    // A GIF sends nothing an emote-only room accepts.
+                    gifs={gifsOffered && !emoteOnlyRoom}
+                    text={messageInput}
+                    gate={hintGate}
+                    layerClassName="text-sm leading-[1.4] text-textSecondary"
+                    // The field's padding plus its 1px border, so the hints
+                    // sit exactly where its own placeholder does.
+                    layerStyle={{
+                      paddingTop: '9px',
+                      paddingLeft: `calc(${composerPaddingLeft} + 1px)`,
+                      paddingRight: 'calc(var(--sn-room-pad, 12px) + 1px)',
+                    }}
                     buttonRef={emoteButtonRef}
                     onClick={() => {
                       // Twitch only. A non-Twitch pane legitimately has an empty
@@ -5837,7 +5913,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     }}
                     onMouseLeave={smiley.cycleEmoteSmiley}
                   />
-                  )}
                   {/* Send-as account picker, just right of the emote button */}
                   {showSendAsPicker && (
                     <div className="absolute left-8 top-1/2 -translate-y-1/2 z-10">
@@ -5948,6 +6023,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
                     placeholder={visiblePlaceholder}
                     data-placeholder-wide={visiblePlaceholder}
                     data-placeholder-narrow={visiblePlaceholderNarrow}
+                    data-hint-layer={hintGate.layer ? '' : undefined}
                     // glass-exempt: the input is clear on purpose; the highlight layer under it carries the surface.
                     {...composerInputLook({
                       remindOverlay: remindOverlayActive,

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   ChevronDown,
   ChevronUp,
@@ -6,17 +6,13 @@ import {
   Trash2,
   Minus,
   BookOpen,
-  Search,
-  X,
 } from 'lucide-react';
 import { useAppStore } from '../../stores/AppStore';
 import { SettingsSection, SegmentedSelect } from './_primitives';
 import { IS_MOBILE } from '../../utils/platform';
-import {
-  useChannelSearch,
-  type ChannelItem,
-} from '../multi-nook/channelSearch';
-import { ChannelResultRow } from '../multi-nook/ChannelResultRow';
+import { ChannelPicker } from './ChannelPicker';
+import { ConvertedNote, MakeRuleButton } from './automations/ReminderRuleActions';
+import { automationsApi, errorText, type ReminderOp } from '../../utils/automations';
 import type {
   Reminder,
   ReminderTriggerType,
@@ -24,7 +20,6 @@ import type {
   ReminderKeywordFrom,
   ReminderChannelScope,
 } from '../../types';
-import type { ProviderId } from '../../types/providers';
 
 const MAX_REPEAT = 10;
 
@@ -154,153 +149,72 @@ const RepeatStepper: React.FC<{ value: number; onChange: (v: number) => void }> 
   );
 };
 
-/** Pinned at module scope so the array identity is stable across renders. */
-const TWITCH_ONLY: ProviderId[] = ['twitch'];
-
-// Inline channel search, reusing the same finder + row that back the MultiChat
-// pickers (live follows first, then Twitch search, with avatars and live dots).
-const ChannelPicker: React.FC<{
-  login?: string;
-  onPick: (login: string, id: string) => void;
-}> = ({ login, onPick }) => {
-  const [open, setOpen] = useState(false);
-  const exclude = useMemo(() => new Set<string>(), []);
-  // Twitch ONLY, deliberately. A reminder is stored as a bare channel_login and
-  // fired through Twitch IRC, so a Kick row picked here would set a reminder that
-  // silently never fires, or fires at a same-named Twitch channel instead.
-  const {
-    searchInput,
-    setSearchInput,
-    visibleItems,
-    highlightIndex,
-    setHighlightIndex,
-    listRef,
-    refreshFollowing,
-    reset,
-  } = useChannelSearch({ excludeKeys: exclude, providers: TWITCH_ONLY });
-
-  useEffect(() => {
-    if (open) void refreshFollowing();
-  }, [open, refreshFollowing]);
-
-  const select = (item: ChannelItem) => {
-    // Search hits without a resolved id fall back to login==id; don't persist
-    // that as a real channel id.
-    onPick(item.login, item.source === 'search' && item.id === item.login ? '' : item.id);
-    reset();
-    setOpen(false);
-  };
-
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setHighlightIndex((i) => Math.min(i + 1, Math.max(visibleItems.length - 1, 0)));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setHighlightIndex((i) => Math.max(i - 1, 0));
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      const target = visibleItems[highlightIndex];
-      if (target) select(target);
-    } else if (e.key === 'Escape') {
-      setOpen(false);
-    }
-  };
-
-  if (!open) {
-    return (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="inline-flex items-center gap-2 glass-input text-textPrimary text-sm px-2.5 py-1.5 hover:bg-white/[0.05] transition-colors"
-      >
-        <Search size={13} className="text-textMuted" />
-        {login ? `#${login}` : 'Choose a channel'}
-      </button>
-    );
-  }
-
-  return (
-    <div className="rounded-lg border border-borderSubtle bg-background/40 p-2">
-      <div className="relative mb-1.5">
-        <Search size={13} className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-textMuted" />
-        <input
-          autoFocus
-          type="text"
-          value={searchInput}
-          onChange={(e) => setSearchInput(e.target.value)}
-          onKeyDown={onKeyDown}
-          placeholder="Search channels"
-          className="w-full glass-input text-textPrimary text-sm pl-7 pr-7 py-1.5"
-          spellCheck={false}
-        />
-        <button
-          type="button"
-          onClick={() => {
-            reset();
-            setOpen(false);
-          }}
-          className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-textMuted hover:bg-white/[0.06] hover:text-textPrimary"
-          aria-label="Close"
-        >
-          <X size={12} />
-        </button>
-      </div>
-      <div ref={listRef} className="max-h-52 overflow-y-auto scrollbar-thin space-y-0.5">
-        {visibleItems.map((item, i) => (
-          <ChannelResultRow
-            key={`${item.login}-${i}`}
-            item={item}
-            index={i}
-            highlighted={highlightIndex === i}
-            onSelect={select}
-            onHover={setHighlightIndex}
-          />
-        ))}
-        {visibleItems.length === 0 && (
-          <div className="px-3 py-3 text-center text-[11px] text-textMuted">
-            {searchInput.trim() ? 'No channels found.' : 'Type to search, or pick a live follow.'}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-};
-
 const RemindersSettings = () => {
-  const { settings, updateSettings } = useAppStore();
+  const { settings, loadSettings, addToast } = useAppStore();
   const currentStream = useAppStore((s) => s.currentStream);
+  const openSettings = useAppStore((s) => s.openSettings);
   const [showDocs, setShowDocs] = useState(false);
+  // Reminders turned into rules (backend-owned list); each shows as "Now a rule".
+  const convertedIds = useMemo(
+    () => new Set(settings.automations?.converted_reminders ?? []),
+    [settings.automations],
+  );
+
+  // What was typed, by reminder id, shown over the stored value until its write has landed.
+  const [drafts, setDrafts] = useState<Record<string, Record<string, unknown>>>({});
 
   const reminders = useMemo(
-    () => settings.reminders?.reminders ?? [],
-    [settings.reminders],
+    () =>
+      (settings.reminders?.reminders ?? []).map((r) =>
+        drafts[r.id] ? ({ ...r, ...drafts[r.id] } as Reminder) : r,
+      ),
+    [settings.reminders, drafts],
   );
 
-  const writeReminders = (next: Reminder[]) => {
-    updateSettings({ ...settings, reminders: { reminders: next } });
+  // The write landed (or failed): forget the typed values the store now holds or never will.
+  const settleDraft = (id: string, written: Record<string, unknown>) => {
+    setDrafts((prev) => {
+      const held = prev[id];
+      if (!held) return prev;
+      const rest = { ...held };
+      for (const key of Object.keys(written)) {
+        if (rest[key] === written[key]) delete rest[key];
+      }
+      const others = { ...prev };
+      delete others[id];
+      return Object.keys(rest).length === 0 ? others : { ...others, [id]: rest };
+    });
+  };
+
+  const saveReminder = (op: ReminderOp, id: string, written: Record<string, unknown> = {}) => {
+    automationsApi
+      .setReminders(op)
+      .then(() => loadSettings())
+      .catch((e: unknown) => addToast(errorText(e), 'error'))
+      .finally(() => settleDraft(id, written));
   };
 
   const updateReminder = (id: string, patch: Partial<Reminder>) => {
-    writeReminders(reminders.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+    setDrafts((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+    // The writer merges key by key and a null removes the key, so a cleared field goes as null.
+    const fields = Object.fromEntries(Object.entries(patch).map(([key, value]) => [key, value ?? null]));
+    saveReminder({ op: 'upsert', reminder: { id, ...fields } }, id, patch);
   };
 
   const removeReminder = (id: string) => {
-    writeReminders(reminders.filter((r) => r.id !== id));
+    saveReminder({ op: 'remove', id }, id);
   };
 
+  // Move up and Move down: the writer takes the new 0-based place and clamps it, so no copy of the list is sent.
   const moveReminder = (id: string, direction: -1 | 1) => {
-    const idx = reminders.findIndex((r) => r.id === id);
-    if (idx === -1) return;
-    const target = idx + direction;
-    if (target < 0 || target >= reminders.length) return;
-    const next = reminders.slice();
-    [next[idx], next[target]] = [next[target], next[idx]];
-    writeReminders(next);
+    const index = reminders.findIndex((r) => r.id === id);
+    if (index === -1) return;
+    saveReminder({ op: 'move', id, to: index + direction }, id);
   };
 
   const addReminder = () => {
-    writeReminders([...reminders, makeDefaultReminder()]);
+    const made = makeDefaultReminder();
+    saveReminder({ op: 'upsert', reminder: { ...made } }, made.id);
   };
 
   const setScope = (reminder: Reminder, scope: ReminderChannelScope) => {
@@ -339,6 +253,17 @@ const RemindersSettings = () => {
           in chat. You can also fire one off instantly with <Tag>/remind now &lt;message&gt;</Tag>.
         </p>
         {!IS_MOBILE && referenceToggle}
+      </div>
+      <div className={IS_MOBILE ? 'px-4' : ''}>
+        <button
+          type="button"
+          onClick={() => openSettings('Automations', 'automation-reminders')}
+          className={`inline-flex items-center px-2 text-xs text-textSecondary hover:text-textPrimary transition-colors ${
+            IS_MOBILE ? 'min-h-8' : 'py-1'
+          }`}
+        >
+          Open in Automations
+        </button>
       </div>
 
       {showDocs && (
@@ -424,11 +349,15 @@ const RemindersSettings = () => {
         )}
 
         {reminders.map((reminder, idx) => (
-          <div key={reminder.id} className="bg-glass/30 rounded-lg p-3 space-y-3">
+          <div
+            key={reminder.id}
+            className={`bg-glass/30 rounded-lg p-3 space-y-3 ${convertedIds.has(reminder.id) ? 'opacity-70' : ''}`}
+          >
+            {convertedIds.has(reminder.id) && <ConvertedNote reminderId={reminder.id} />}
             {/* Header: enable · name · reorder · delete */}
             <div className="flex items-center gap-2">
               <button
-                onClick={() => updateReminder(reminder.id, { enabled: !reminder.enabled })}
+                onClick={() => saveReminder({ op: 'set_enabled', id: reminder.id, enabled: !reminder.enabled }, reminder.id)}
                 className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors flex-shrink-0 ${
                   reminder.enabled ? 'bg-accent' : 'bg-gray-600'
                 }`}
@@ -613,6 +542,12 @@ const RemindersSettings = () => {
                   updateReminder(reminder.id, { channel_login: login, channel_id: id || undefined })
                 }
               />
+            )}
+
+            {!convertedIds.has(reminder.id) && (
+              <div className="flex justify-end border-t border-borderSubtle/40 pt-2">
+                <MakeRuleButton reminderId={reminder.id} />
+              </div>
             )}
           </div>
         ))}

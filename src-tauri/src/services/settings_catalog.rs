@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct CatalogRow {
-    /// The settings page: `player`, `adFree`, `chat`, `moderation`, `theme`, `notifications`, `cache`, `support`.
+    /// The settings page: `player`, `adFree`, `chat`, `moderation`, `theme`, `notifications`, `automations`, `cache`, `support`.
     pub page: String,
     pub section: String,
     pub title: String,
@@ -54,6 +54,9 @@ fn build_has(need: &str) -> bool {
     }
     if let Some(notice) = need.strip_prefix("notice:") {
         return crate::services::notice_types::shows(notice);
+    }
+    if need == "smiley_style" {
+        return crate::services::twitch_smiley_style::row_shown();
     }
     crate::services::client_capabilities::has(need)
 }
@@ -104,7 +107,8 @@ pub fn rows() -> &'static [CatalogRow] {
 }
 
 /// The order pages are listed in, so ties read top to bottom like the You tab.
-const PAGE_ORDER: &[&str] = &["player", "adFree", "chat", "moderation", "theme", "notifications", "cache", "support"];
+const PAGE_ORDER: &[&str] =
+    &["player", "adFree", "chat", "moderation", "theme", "notifications", "automations", "cache", "support"];
 
 fn page_name(page: &str) -> &'static str {
     match page {
@@ -114,6 +118,7 @@ fn page_name(page: &str) -> &'static str {
         "moderation" => "moderation mod",
         "theme" => "theme",
         "notifications" => "notifications",
+        "automations" => "automations rules",
         "cache" => "cache",
         _ => "support",
     }
@@ -378,7 +383,7 @@ mod tests {
 
     #[test]
     fn every_need_names_a_real_capability() {
-        let known = ["combined_chat", "chat_dock", "scrollbar_marks", "spell_dictionary"];
+        let known = ["combined_chat", "chat_dock", "scrollbar_marks", "spell_dictionary", "smiley_style"];
         for row in rows() {
             for need in row.needs.iter().flat_map(|n| n.split('|')) {
                 let alert = need.strip_prefix("alert:").is_some_and(|id| crate::services::alert_types::ids().contains(&id));
@@ -517,6 +522,27 @@ mod tests {
             assert_eq!(titles(&changed), ["Style"], "ios {ios}");
         }
     }
+    #[test]
+    fn automation_rows_sit_on_their_own_page() {
+        for ios in [false, true] {
+            let hit = search_on("pace", 3, ios, &nothing);
+            assert_eq!((hit[0].page.as_str(), hit[0].title.as_str()), ("automations", "Messages a minute"), "ios {ios}");
+        }
+        let gap = rows().iter().find(|r| r.paths.iter().any(|p| p == "automation_prefs.other_channel_gap_seconds")).unwrap();
+        assert_eq!(gap.under.as_deref(), Some("Post in other channels"));
+        let changed = [
+            "automation_prefs.sends_per_minute".to_string(),
+            "chat_design.font_size".to_string(),
+            "live_notifications.push_notifications".to_string(),
+        ];
+        let pages: Vec<String> = changed_rows_on(&changed, false, &everything).into_iter().map(|r| r.page).collect();
+        let at = |page: &str| pages.iter().position(|p| p == page).unwrap();
+        assert!(at("chat") < at("notifications") && at("notifications") < at("automations"), "{pages:?}");
+        let defaults = crate::commands::settings_fields::default_settings_value();
+        assert_eq!(defaults["automation_prefs"]["sends_per_minute"], serde_json::json!(10));
+        assert_eq!(defaults["automation_prefs"]["chat_notes"], serde_json::json!(true));
+    }
+
     #[test]
     fn keep_screen_on_is_searchable_in_the_chats_tab_section() {
         let hit = search_on("keep screen on", 3, false, &nothing);

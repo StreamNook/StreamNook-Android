@@ -1221,6 +1221,23 @@ pub struct LiveRewindInfo {
     /// timeline's "you left here" mark. Never cached: it changes as they watch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub left_off_secs: Option<f64>,
+    /// The recording is restricted (`Video.restriction`, a subscriber-only
+    /// recording, say). Cached with the rest; whether it locks THIS viewer out
+    /// is decided per answer, since a subscription can start mid-broadcast.
+    #[serde(skip)]
+    pub restricted: bool,
+    /// Why rewind is unavailable, when `available` is false for a reason other
+    /// than "no recording" (the page's VODs-off words cover that one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// A restricted recording locks rewind for a viewer the channel state knows is
+/// not subscribed. Not yet known (the relationship has not loaded, or signed
+/// out and so unanswerable) never locks: a press still gets the plain-words
+/// refusal from `rewind_refusal`.
+pub fn rewind_locked(restricted: bool, subscribed: Option<bool>) -> bool {
+    restricted && subscribed == Some(false)
 }
 
 /// Per-channel answer cache so the player can ask at every live start
@@ -1244,6 +1261,17 @@ pub async fn get_live_rewind_info(channel: String) -> Result<LiveRewindInfo, Str
         return Err("No channel".to_string());
     }
     let mut info = live_rewind_lookup(&channel).await;
+    if info.available && info.restricted {
+        let subscribed = crate::services::channel_state::get(&channel)
+            .await
+            .and_then(|s| s.relationship)
+            .map(|r| r.subscribed);
+        if rewind_locked(true, subscribed) {
+            info.available = false;
+            info.reason = Some(format!("{channel} limits who can watch its recordings, so the broadcast can't be rewound"));
+            return Ok(info);
+        }
+    }
     if let (true, Some(id)) = (info.available, info.video_id.clone()) {
         crate::services::live_bookmark::note_archive(&channel, &id, info.recorded_at.as_deref());
         info.left_off_secs = left_off_secs(&channel, &id, info.recorded_at.as_deref()).await;
@@ -1289,12 +1317,16 @@ async fn live_rewind_lookup(channel: &str) -> LiveRewindInfo {
             video_id: Some(archive.video_id),
             recorded_at: archive.recorded_at,
             left_off_secs: None,
+            restricted: archive.restriction.is_some(),
+            reason: None,
         },
         Ok(None) => LiveRewindInfo {
             available: false,
             video_id: None,
             recorded_at: None,
             left_off_secs: None,
+            restricted: false,
+            reason: None,
         },
         Err(e) => {
             debug!("[Streaming] live rewind lookup for {} failed: {}", channel, e);
@@ -1303,6 +1335,8 @@ async fn live_rewind_lookup(channel: &str) -> LiveRewindInfo {
                 video_id: None,
                 recorded_at: None,
                 left_off_secs: None,
+                restricted: false,
+                reason: None,
             };
         }
     };
@@ -1358,7 +1392,18 @@ pub async fn rewind_live_stream(
         Some(position),
         want,
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        log::warn!(
+            "[Streaming] rewind {} → vod {} refused: {} (restriction={:?}, signed_in={})",
+            channel,
+            archive.video_id,
+            e,
+            archive.restriction,
+            oauth.is_some()
+        );
+        tr::rewind_refusal(&channel, &archive, &e)
+    })?;
     result.ticket = Some(ticket);
     if let Some(v) = result.vod.as_mut() {
         v.rewound_from_live = true;
@@ -1382,6 +1427,17 @@ pub async fn rewind_live_stream(
 
 #[tauri::command]
 pub async fn stop_stream() -> Result<(), String> {
+    stop_stream_if(&|| true).await
+}
+
+/// `stop_stream`, for a stop that is only still wanted while `still_current`
+/// holds (the main teardown: a main window reopened meanwhile owns the relay).
+/// It is checked first, because the next lines mint a start ticket, and again
+/// after the relay awaits, right before the server goes down.
+pub async fn stop_stream_if(still_current: &(impl Fn() -> bool + Sync)) -> Result<(), String> {
+    if !still_current() {
+        return Ok(());
+    }
     // Every close of a live stream comes through here, the tray close too
     // (it stops the stream but not the watch session).
     crate::services::live_bookmark::end(crate::services::live_bookmark::EndKind::Async);
@@ -1396,8 +1452,14 @@ pub async fn stop_stream() -> Result<(), String> {
     // Without it a stopped stream's session stayed registered, held its init
     // segments and cache, and counted against the relay cap.
     crate::services::youtube_dash::stop(crate::services::stream_server::SOLO_STREAM_ID).await;
+    if !still_current() {
+        return Ok(());
+    }
     // Same for the TikTok relay, and same reasoning: unknown ids are a no-op.
     crate::services::tiktok_relay::stop(crate::services::stream_server::SOLO_STREAM_ID);
+    if !still_current() {
+        return Ok(());
+    }
     StreamServer::stop().await.map_err(|e| e.to_string())
 }
 
@@ -1751,16 +1813,45 @@ pub async fn change_stream_view(
     Ok(result)
 }
 
+/// A window says the viewer is watching this channel (the predictions and
+/// bonus-chest sets). It runs under the lock every move of earning runs under,
+/// and does nothing once main is gone, so a late call from a closing window
+/// cannot undo the main teardown. No Rust code calls this command: Rust calls
+/// `register_active_channel_inner`, which takes no lock (`follow` already holds it).
 #[tauri::command]
 pub async fn register_active_channel(
     channel_id: String,
+    app: crate::rt::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _aim = crate::services::watch_start::earning_aim().await;
+    #[cfg(desktop)]
+    if !crate::services::window_visibility::window_open(&app, "main") {
+        return Ok(());
+    }
+    #[cfg(not(desktop))]
+    let _ = &app;
+    register_active_channel_inner(channel_id, &state).await
+}
+
+/// `register_active_channel`'s body, with no lock: the caller holds the earning
+/// lock already (re-entering that tokio mutex would deadlock).
+pub async fn register_active_channel_inner(channel_id: String, state: &AppState) -> Result<(), String> {
     let bg_service = state.background_service.lock().await;
     let ws_service_mutex = bg_service.websocket_service.clone();
     let ws_service = ws_service_mutex.lock().await;
     ws_service.register_active_channel(&channel_id).await;
     Ok(())
+}
+
+/// Empties the whole active-viewing set: main and its grid are its only
+/// writers, and both are gone (a channel a `follow` registered before its
+/// session existed, and grid tiles registered from the page, all go).
+pub async fn clear_active_channels(state: &AppState) {
+    let bg_service = state.background_service.lock().await;
+    let ws_service_mutex = bg_service.websocket_service.clone();
+    let ws_service = ws_service_mutex.lock().await;
+    ws_service.clear_active_channels().await;
 }
 
 #[tauri::command]
@@ -1916,6 +2007,19 @@ mod liveness_tests {
     #[test]
     fn slug_match_is_case_insensitive() {
         assert_eq!(verdict_for(&[row("bigaust", true)], "BigAust"), Liveness::Live);
+    }
+}
+
+#[cfg(test)]
+mod rewind_lock_tests {
+    use super::rewind_locked;
+
+    #[test]
+    fn only_a_restricted_recording_and_a_known_non_subscriber_lock_rewind() {
+        assert!(rewind_locked(true, Some(false)));
+        assert!(!rewind_locked(true, Some(true)), "a subscriber may rewind");
+        assert!(!rewind_locked(true, None), "not known yet never locks");
+        assert!(!rewind_locked(false, Some(false)), "a public recording never locks");
     }
 }
 

@@ -1374,6 +1374,28 @@
   {
    "page": "chat",
    "section": "Emotes",
+   "title": "Smiley style",
+   "paths": [],
+   "nested": false,
+   "logo": null,
+   "detail": "How :) ;) <3 look when you type them. This changes your Twitch account, so everyone sees your pick.",
+   "aliases": [
+    "smilies",
+    "smiley",
+    "faces",
+    "emoticons",
+    "robots",
+    "purple",
+    "monkeys",
+    "prime",
+    "turbo",
+    ":)"
+   ],
+   "needs": "smiley_style"
+  },
+  {
+   "page": "chat",
+   "section": "Emotes",
    "title": "Personal emotes",
    "paths": [
     "chat_design.show_personal_emotes"
@@ -1791,7 +1813,8 @@
     "drops",
     "drop progress",
     "rewards"
-   ]
+   ],
+   "hidden_on_ios": true
   },
   {
    "page": "chat",
@@ -2749,6 +2772,84 @@
    "hidden_on_ios": true
   },
   {
+   "page": "automations",
+   "section": "Limits",
+   "title": "Messages a minute",
+   "paths": [
+    "automation_prefs.sends_per_minute"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "The most messages your rules send in a minute, across all your devices.",
+   "aliases": [
+    "automations",
+    "rules",
+    "pace",
+    "messages per minute",
+    "rate"
+   ]
+  },
+  {
+   "page": "automations",
+   "section": "Limits",
+   "title": "Post in other channels",
+   "paths": [
+    "automation_prefs.other_channels"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "Rules may post in chats that aren't yours, at most once per chat in each gap.",
+   "aliases": [
+    "other chats",
+    "other channels",
+    "automations"
+   ]
+  },
+  {
+   "page": "automations",
+   "section": "Limits",
+   "title": "Gap",
+   "paths": [
+    "automation_prefs.other_channel_gap_seconds"
+   ],
+   "nested": true,
+   "logo": null,
+   "detail": "",
+   "aliases": []
+  },
+  {
+   "page": "automations",
+   "section": "Limits",
+   "title": "Chat notes",
+   "paths": [
+    "automation_prefs.chat_notes"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "A line only you see in chat when a rule acts, or would act in Test.",
+   "aliases": [
+    "automations",
+    "notes"
+   ]
+  },
+  {
+   "page": "automations",
+   "section": "Limits",
+   "title": "New people to whisper a day",
+   "paths": [
+    "automation_prefs.whisper_people_per_day"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "The most new people your rules may whisper in a day, across all your devices.",
+   "aliases": [
+    "whisper people a day",
+    "whispers",
+    "automations",
+    "dms"
+   ]
+  },
+  {
    "page": "chat",
    "section": "Event Highlights",
    "title": "First-time chatters",
@@ -2929,8 +3030,7 @@
    "nested": false,
    "detail": "Post a message into a chat on a timer or a keyword.",
    "logo": null,
-   "aliases": [],
-   "hidden_on_ios": true
+   "aliases": []
   },
   {
    "page": "moderation",

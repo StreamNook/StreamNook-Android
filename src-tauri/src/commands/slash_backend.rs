@@ -173,6 +173,12 @@ impl TauriBackend {
                 unit(crate::services::whisper_send::send(target, s(&a, "message"), None, None).await.map(|_| ()))
             }
             "stop_chat" => to(crate::services::chat_service::ChatService::stop(&self.window).await.map_err(|e| e.to_string())),
+            "automations_status" => to(crate::commands::account_automations::automations_status()),
+            "automations_set_run" => {
+                let state = serde_json::from_value(a["state"].clone()).map_err(|e| e.to_string())?;
+                unit(crate::commands::account_automations::automations_set_run(self.app.clone(), state))
+            }
+            "automations_set_away" => to(crate::commands::account_automations::automations_set_away(self.app.clone(), os(&a, "message"))),
             "get_chatters_by_role" => tw::get_chatters_by_role(self.state(), s(&a, "channelLogin")).await,
             "slash_role_list" => to(sl::slash_role_list(self.state(), s(&a, "channel"), s(&a, "role")).await),
             "get_channel_chatters" => tw::get_channel_chatters(self.state(), s(&a, "broadcasterId"), s(&a, "channelLogin")).await,
@@ -329,7 +335,8 @@ impl TauriBackend {
             }
             "post_reminder" => {
                 let copies = crate::services::reminder_service::clamp_repeat(a["repeat"].as_f64());
-                let posted =
+                // `/remind now` is a direct user send: it claims nothing and answers only whether it posted.
+                let (posted, _copies) =
                     crate::services::reminder_service::post_text(&s(&a, "channel"), os(&a, "channelId").as_deref(), &s(&a, "message"), copies).await;
                 Ok(json!(posted))
             }

@@ -2024,6 +2024,100 @@ html[data-motion="off"] .sn-bulb-rainbow stop {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* While the empty box's hints cycle (chat/ComposerHintLayer), the layer draws
+   the words; the field keeps its own placeholder for screen readers, unseen. */
+textarea[data-hint-layer]::placeholder {
+  color: transparent;
+}
+.sn-hint-narrow,
+.sn-composer-row[data-narrow] .sn-hint-wide {
+  display: none;
+}
+.sn-composer-row[data-narrow] .sn-hint-narrow {
+  display: inline;
+}
+/* The emote button's deck (chat/EmoteDeckButton): the cards wait behind the
+   face and fan out on hover or keyboard focus, each to its own `--sn-fan`.
+   Transform and opacity only. */
+.sn-deck-card {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 16px;
+  height: 20px;
+  margin: -10px 0 0 -8px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  /* A solid card stock on every theme (a light theme's surface token is a
+     tint, and a see-through card would show the face behind it). */
+  background: color-mix(in srgb, var(--color-text-primary) 12%, var(--color-background-tertiary));
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--color-text-primary) 30%, transparent),
+    0 2px 5px rgb(0 0 0 / 0.3);
+  color: var(--color-text-primary);
+  opacity: 0;
+  transform: scale(0.6);
+  transition:
+    transform 350ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 220ms ease;
+  pointer-events: none;
+}
+.sn-deck:hover .sn-deck-card,
+.sn-deck:focus-visible .sn-deck-card {
+  opacity: 1;
+  transform: var(--sn-fan);
+}
+html[data-motion='reduced'] .sn-deck-card {
+  transition: opacity 220ms ease;
+}
+html[data-motion='off'] .sn-deck-card,
+html[data-sn-perf] .sn-deck-card {
+  transition: none;
+}
+/* The slash card and the GIF chip, as faces and as fanned cards. */
+.sn-deck-chip {
+  display: grid;
+  place-items: center;
+  font-weight: 800;
+  line-height: 1;
+  color: currentColor;
+}
+.sn-deck-chip[data-size='inset'],
+.sn-deck-chip[data-size='phone'] {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--color-text-primary) 9%, transparent);
+  box-shadow: inset 0 0 0 1.25px color-mix(in srgb, currentColor 55%, transparent);
+}
+.sn-deck-slash[data-size='inset'] {
+  width: 13px;
+  height: 16px;
+  font-size: 11px;
+}
+.sn-deck-gif[data-size='inset'] {
+  width: 21px;
+  height: 14px;
+  font-size: 8px;
+  letter-spacing: 0.02em;
+}
+.sn-deck-slash[data-size='phone'] {
+  width: 17px;
+  height: 21px;
+  font-size: 14px;
+}
+.sn-deck-gif[data-size='phone'] {
+  width: 27px;
+  height: 18px;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+.sn-deck-slash[data-size='card'] {
+  font-size: 11px;
+}
+.sn-deck-gif[data-size='card'] {
+  font-size: 7px;
+  letter-spacing: 0.01em;
+}
 /* The room's chat modes, one chip at the field's trailing edge
    (chat/RoomModeIndicator). The field, its overlays and the length count read
    `--sn-room-pad`, which the chip sets to its own width, so the typed text
@@ -2720,14 +2814,20 @@ body {
   box-shadow: 0 6px 18px -8px color-mix(in srgb, var(--stream-glow, var(--color-accent)) 58%, transparent);
 }
 
-/* Settings card — a flat grouped slab, not a raised panel. Dropping the bevel,
-   drop shadow, border, and gradient stops a tab full of sections from reading as
-   a stack of competing floating boxes. The faint fill alone keeps each section
-   legible as its own group; spacing between sections does the rest. */
+/* Settings card: a grouped slab, not a raised panel (no bevel, drop shadow or
+   gradient, so a tab full of sections never reads as a stack of competing
+   floating boxes, and no ring, which read as an outline drawn around each
+   section). The fill is the theme's own ink, so each section steps above the
+   page on light themes as well as dark ones (a white fill vanished on light
+   themes and every section ran together). Light themes take a little more,
+   since dark ink on a light page steps less for the same mix. */
 .settings-card {
-  background: rgba(255, 255, 255, 0.02);
+  background: color-mix(in srgb, var(--color-text-primary) 6%, transparent);
   border-radius: 10px;
   overflow: hidden;
+}
+html[data-theme-tone='light'] .settings-card {
+  background-color: color-mix(in srgb, var(--color-text-primary) 7%, transparent);
 }
 
 .settings-row {
@@ -2735,9 +2835,9 @@ body {
   transition: background-color 100ms;
 }
 
-/* Bright enough to register against the slab fill above. */
+/* A step above the slab fill, in the theme's ink so it shows on light themes. */
 .settings-row:hover {
-  background: rgba(255, 255, 255, 0.05);
+  background: color-mix(in srgb, var(--color-text-primary) 5%, transparent);
 }
 
 /* The row a settings search result landed on: an accent wash that fades in and
@@ -2767,7 +2867,50 @@ body {
    enable-dependent sub-controls — rendered as children inside the same row — stay
    grouped with no internal line. */
 .settings-card .settings-row + .settings-row {
-  border-top: 1px solid color-mix(in srgb, var(--color-border-subtle) 55%, transparent);
+  border-top: 1px solid var(--settings-hairline, color-mix(in srgb, var(--color-border-subtle) 55%, transparent));
+}
+/* A settings card in the glaze: the chrome's own material (blur, the
+   accent-lit rim, the Glassiness floor) at a card's corner, with the same
+   hairlines between rows. A page opts in per section (SettingsSection
+   `glaze`); the Settings window's tabs still draw .settings-card. No
+   overflow clip, which would cut the rim's outer contour: the first and last
+   rows round their own hover to the card's corner instead. */
+.chrome-glaze.settings-glaze {
+  border-radius: 16px;
+  --glaze-frost: 22%;
+}
+.settings-glaze .settings-row + .settings-row {
+  border-top: 1px solid var(--settings-hairline, color-mix(in srgb, var(--color-border-subtle) 55%, transparent));
+}
+.settings-glaze > .settings-row:first-child {
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+}
+.settings-glaze > .settings-row:last-child {
+  border-bottom-left-radius: 16px;
+  border-bottom-right-radius: 16px;
+}
+html[data-theme-tone='light'] .settings-glaze {
+  --settings-hairline: color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+}
+
+/* The subtle border fades into a light theme's card fill: draw the hairline
+   in the theme's ink there. A variable, so the two-column builder's rule that
+   hides the line below still wins. */
+html[data-theme-tone='light'] .settings-card {
+  --settings-hairline: color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+}
+
+/* A card whose children are rows (the automation rule editor's groups): each
+   child is padded like a settings row and split from the next by the same
+   hairline, so a group reads as one card of rows without each field drawing
+   its own frame. */
+.automation-rows > * {
+  padding: 12px 16px;
+}
+.automation-rows > * + *,
+.automation-hairlines > * + * {
+  border-top: 1px solid var(--settings-hairline, color-mix(in srgb, var(--color-border-subtle) 55%, transparent));
 }
 
 /* The tabbed overlay builder: once its settings column is wide enough for two
@@ -2989,7 +3132,11 @@ body {
      an opaque tertiary base that fades in as the slider drops, so at 0% the modal
      is a fully solid panel rather than a see-through sheet. */
   background-color: color-mix(in srgb, var(--color-background-tertiary) calc((1 - var(--glass-strength)) * 100%), transparent);
-  background-image: linear-gradient(rgba(16, 16, 20, 0.35), rgba(16, 16, 20, 0.35));
+  /* The tint is dark on dark themes. A light theme tints with its own tertiary
+     instead: the fixed dark tint turned Latte's dialog mid-gray under dark text
+     (section descriptions under 3:1), at every Glassiness. */
+  --glass-panel-tint: rgba(16, 16, 20, 0.35);
+  background-image: linear-gradient(var(--glass-panel-tint), var(--glass-panel-tint));
   /* Top-lit with a bounce along the bottom inside edge, the way a lens sits
      on what is under it. The dual diagonal bevel this replaces put its
      brightest line down the LEFT side, which on the widest panel in the
@@ -3011,6 +3158,12 @@ body {
     border-color 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
     transform 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
     opacity 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* Nearly the whole tertiary: a light dialog blurs a page its own black scrim has
+   already darkened, so anything less leaves dark text on a mid-gray sheet at
+   full glass (measured on Latte and Solarized Sand). */
+html[data-theme-tone='light'] .liquid-glass-panel {
+  --glass-panel-tint: color-mix(in srgb, var(--color-background-tertiary) 92%, transparent);
 }
 
 /* The chat drops bar wears the chat column's glaze (the streak and resub
@@ -3114,6 +3267,11 @@ body {
    near-opaque base under the liquid tint and the bar's glaze takes a heavy
    frost, so a bright stream never reads through their text. */
 .chat-fullscreen-overlay .liquid-glass-panel.drops-drawer {
+  background-color: color-mix(in srgb, var(--color-background-tertiary) calc(92% + (1 - var(--glass-strength, 1)) * 8%), transparent);
+}
+/* The volume readout sits straight on the picture: the same near-opaque base,
+   so its numbers read on a bright or a dark frame in every theme. */
+.player-volume-osd .liquid-glass-panel {
   background-color: color-mix(in srgb, var(--color-background-tertiary) calc(92% + (1 - var(--glass-strength, 1)) * 8%), transparent);
 }
 .chat-fullscreen-overlay .chrome-glaze.drops-bar {
@@ -3815,10 +3973,16 @@ html[data-motion="reduced"] .sub-progress-fill {
   animation: sn-cosmetic-swap 560ms cubic-bezier(0.2, 0.9, 0.25, 1) both;
 }
 
+/* A painted name keeps its paint's drop-shadows and opacity. A running or held
+   animation beats the inline style, so this one holds no end frame (fill
+   backwards, not the both it would inherit) and carries the paint's filter and
+   opacity through every frame (`paintSwapStyle` sets the two variables), so the
+   glow is there during the swap and nothing jumps when it ends. */
 .sn-cosmetic-swap--name {
   display: inline-block;
   animation-name: sn-cosmetic-swap-name;
   animation-duration: 640ms;
+  animation-fill-mode: backwards;
 }
 
 @keyframes sn-cosmetic-swap {
@@ -3878,17 +4042,17 @@ html[data-motion="reduced"] .sub-progress-fill {
   0% {
     opacity: 0.35;
     transform: scale(0.97);
-    filter: blur(2px) brightness(1.7);
+    filter: blur(2px) brightness(1.7) var(--sn-paint-filter,);
   }
   45% {
-    opacity: 1;
+    opacity: var(--sn-paint-opacity, 1);
     transform: scale(1.025);
-    filter: blur(0) brightness(1.3);
+    filter: blur(0) brightness(1.3) var(--sn-paint-filter,);
   }
   100% {
-    opacity: 1;
+    opacity: var(--sn-paint-opacity, 1);
     transform: scale(1);
-    filter: none;
+    filter: blur(0) brightness(1) var(--sn-paint-filter,);
   }
 }
 
@@ -5651,23 +5815,31 @@ html[data-sn-still-chat] [class*="sn-bttv-anim-"] {
   font-size: 13px;
 }
 
-/* Menu styling */
+/* The settings menu (gear) wears the glaze flyout like every other menu in the
+   app (SN-277: its Quality and Speed lists were checkbox forms that looked
+   like a different program). VideoPlayer puts `glass-flyout` on Plyr's menu
+   container, which brings the material, the 12px shell and the 6px gutter;
+   this block only places it and draws the rows: 6px rows with no dividers, a
+   quiet hover, the chosen quality or speed as a check on a lightly tinted row.
+   The shell rules beat plyr.css by order (same specificity, later file). */
 .video-player-container .plyr__menu__container {
-  background: color-mix(in srgb, #000 calc(85% + (1 - var(--glass-strength, 1)) * 15%), transparent);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid var(--color-border-light);
-  border-radius: 4px;
   position: absolute;
   bottom: 100%;
   right: 0;
   margin-bottom: 10px;
   z-index: 10;
+  min-width: 200px;
+  color: var(--color-text-primary);
 }
 
-/* Quality submenu styling - matches Plyr's native submenu behavior */
-.video-player-container .plyr__menu__container [data-quality-menu] {
-  padding: 7px;
+/* Plyr's speech-bubble arrow: the glaze flyouts have none. */
+.video-player-container .plyr__menu__container::after {
+  display: none;
+}
+
+/* The shell's gutter is the only padding. */
+.video-player-container .plyr__menu__container [role="menu"] {
+  padding: 0;
 }
 
 .video-player-container .plyr__menu__container [data-quality-menu][hidden] {
@@ -5682,69 +5854,89 @@ html[data-sn-still-chat] [class*="sn-bttv-anim-"] {
 }
 
 .video-player-container .plyr__menu__container .plyr__control {
+  position: relative;
+  width: 100%;
+  margin-top: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  text-align: left;
+  color: var(--color-text-primary);
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+/* Theme ink, not white, so the hover and the hairline below read on light
+   themes too. */
+.video-player-container .plyr__menu__container .plyr__control:hover,
+.video-player-container .plyr__menu__container .plyr__control:focus-visible {
+  background: color-mix(in srgb, var(--color-text-primary) 7%, transparent);
   color: var(--color-text-primary);
 }
 
-.video-player-container .plyr__menu__container .plyr__control:hover {
-  background: var(--color-surface);
-  color: var(--color-accent);
+/* A row that opens a list: its current value, quieter, then a chevron. */
+.video-player-container .plyr__menu__container .plyr__control--forward {
+  padding-right: 26px;
 }
 
-.video-player-container
-  .plyr__menu__container
-  .plyr__control[role="menuitemradio"]::before {
-  content: "";
-  display: inline-block;
-  width: 16px;
-  height: 16px;
-  margin-right: 8px;
-  border-radius: 2px;
-  border: 1.5px solid var(--color-border);
-  background: transparent;
-  flex-shrink: 0;
-  transition: all 0.2s ease;
+.video-player-container .plyr__menu__container .plyr__control--forward::after {
+  right: 8px;
+  border-left-color: var(--color-text-muted);
 }
 
-.video-player-container
-  .plyr__menu__container
-  .plyr__control[role="menuitemradio"][aria-checked="true"]::before {
-  background: var(--color-info);
-  border-color: var(--color-info);
-  /* Checkmark using Unicode */
-  content: "✓";
-  color: white;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 12px;
-  font-weight: bold;
-  line-height: 1;
-}
-
-/* Hide Plyr's default radio button indicator */
-.video-player-container
-  .plyr__menu__container
-  .plyr__control[role="menuitemradio"]::after {
-  display: none !important;
-}
-
-.video-player-container .plyr__menu__container .plyr__control--back {
-  border-bottom: 1px solid var(--color-border-subtle);
-}
-
-.video-player-container .plyr__menu__container .plyr__control--back:hover {
-  background: var(--color-surface);
-}
-
-.video-player-container .plyr__menu__container .plyr__control--back > span {
-  margin-left: 4px;
-  text-align: center;
-  width: 100%;
-}
-
-/* Menu items */
 .video-player-container .plyr__menu__container .plyr__menu__value {
+  margin-right: 0;
+  padding-left: 20px;
   color: var(--color-text-muted);
+}
+
+/* A list's title row: back chevron and the list's name, then one hairline. */
+.video-player-container .plyr__menu__container .plyr__control--back {
+  width: 100%;
+  margin: 0 0 7px;
+  padding-left: 26px;
+  font-weight: 600;
+}
+
+.video-player-container .plyr__menu__container .plyr__control--back::after {
+  left: 8px;
+  border-right-color: var(--color-text-muted);
+}
+
+.video-player-container .plyr__menu__container .plyr__control--back::before {
+  left: 4px;
+  right: 4px;
+  margin-top: 3px;
+  background: color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+  box-shadow: none;
+}
+
+/* The choices: no boxes or dots. The rest read a step quieter; the chosen
+   one is full strength on a lightly tinted row with a check at its end. */
+.video-player-container .plyr__menu__container .plyr__control[role="menuitemradio"] {
+  padding-left: 10px;
+  padding-right: 32px;
+  color: var(--color-text-secondary);
+}
+
+.video-player-container .plyr__menu__container .plyr__control[role="menuitemradio"]::before {
+  display: none;
+}
+
+.video-player-container .plyr__menu__container .plyr__control[role="menuitemradio"][aria-checked="true"] {
+  color: var(--color-text-primary);
+  background: color-mix(in srgb, var(--color-accent) 14%, transparent);
+}
+
+.video-player-container .plyr__menu__container .plyr__control[role="menuitemradio"]::after {
+  left: auto;
+  right: 10px;
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 0;
+  background: var(--color-accent);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5l3.2 3.2L13 4.8' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3 8.5l3.2 3.2L13 4.8' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / contain no-repeat;
 }
 
 /* Loading spinner */
@@ -5892,18 +6084,6 @@ html[data-sn-still-chat] [class*="sn-bttv-anim-"] {
 .video-player-container .plyr__poster {
   background-color: #000;
   pointer-events: none;
-}
-
-/* Quality badge in menu */
-.video-player-container .plyr__menu__container [role="menu"] button {
-  padding: 8px 16px;
-  width: 100%;
-  text-align: left;
-  border-bottom: 1px solid var(--color-border-subtle);
-}
-
-.video-player-container .plyr__menu__container [role="menu"] button:last-child {
-  border-bottom: none;
 }
 
 /* Settings icon animation */

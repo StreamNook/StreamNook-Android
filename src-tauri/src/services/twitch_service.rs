@@ -540,7 +540,13 @@ pub(crate) fn twitch_pending_web_profile_dir() -> Result<PathBuf> {
 /// it is the staging profile the login window writes to.
 pub(crate) fn active_twitch_web_profile_dir() -> Result<PathBuf> {
     if let Some(primary) = crate::services::account_store::AccountStore::primary() {
-        adopt_pending_web_profile(&primary.user_id);
+        if !adopt_pending_web_profile(&primary.user_id) {
+            // The staged session could not move yet (the sign-in window still
+            // holds it, right after a switch): it is still the only place this
+            // account's session lives, so this window uses it. The next window
+            // tries the move again.
+            return twitch_pending_web_profile_dir();
+        }
         twitch_web_profile_dir(&primary.user_id)
     } else {
         twitch_pending_web_profile_dir()
@@ -571,24 +577,28 @@ fn web_profile_has_session(dir: &PathBuf) -> bool {
 /// the subscribe window stop disagreeing about which profile holds the session.
 ///
 /// No-ops unless there's a staged session to adopt and the target doesn't
-/// already have its own. Best-effort: a failure just leaves the user to
-/// re-login, it never breaks the window.
-pub(crate) fn adopt_pending_web_profile(account_id: &str) {
+/// already have its own. Returns false only when a staged session could NOT
+/// be moved (still locked by the sign-in window, right after an account
+/// switch): the caller then keeps using the stage, which still holds the
+/// session. A half-made copy is removed, because WebView2 cannot open a
+/// profile copied while in use ("Cannot create a file when that file already
+/// exists", os error 183), and that left the overlay blank with no way out.
+pub(crate) fn adopt_pending_web_profile(account_id: &str) -> bool {
     let base = match twitch_web_profiles_root() {
         Ok(b) => b,
-        Err(_) => return,
+        Err(_) => return true,
     };
     let pending = base.join("_pending");
     let target = base.join(account_id);
 
     // Nothing staged -> nothing to adopt.
     if !web_profile_has_session(&pending) {
-        return;
+        return true;
     }
     // Target already owns a session -> keep it, discard the stale stage.
     if web_profile_has_session(&target) {
         let _ = fs::remove_dir_all(&pending);
-        return;
+        return true;
     }
     // Move the staged session into place. Clear the empty placeholder first so
     // the rename has a clean destination (Windows rename fails if it exists).
@@ -601,11 +611,13 @@ pub(crate) fn adopt_pending_web_profile(account_id: &str) {
         // stranded, then drop the stage.
         debug!("[twitch-web] adopt rename failed ({e}); copying instead");
         if let Err(e) = copy_dir_recursive(&pending, &target) {
-            warn!("[twitch-web] could not adopt staged login session: {e}");
-            return;
+            warn!("[twitch-web] could not adopt staged login session yet: {e}; using the stage for now");
+            let _ = fs::remove_dir_all(&target);
+            return false;
         }
         let _ = fs::remove_dir_all(&pending);
     }
+    true
 }
 
 /// Minimal recursive directory copy (std has no equivalent). Only used as the
@@ -834,6 +846,103 @@ impl std::fmt::Display for HelixSendRefused {
 
 impl std::error::Error for HelixSendRefused {}
 
+/// A Helix answer that was not a success, carried inside the `anyhow::Error`
+/// by the engine doors (`*_engine`) so `door_outcome` can read the status.
+/// `Display` is `words`, the text the same call has always shown.
+#[derive(Debug)]
+pub struct HelixStatus {
+    pub status: u16,
+    pub body: String,
+    pub words: String,
+}
+
+impl HelixStatus {
+    /// A moderation or settings refusal, worded by `helix_refusal_text`.
+    pub(crate) fn plain(status: u16, body: String) -> HelixStatus {
+        let words = helix_refusal_text(status, &body);
+        HelixStatus { status, body, words }
+    }
+
+    /// `PATCH /channels` says the same thing for a 401 and a 403, as the
+    /// stream manager does.
+    pub(crate) fn channel(status: u16, body: String) -> HelixStatus {
+        let words = if status == 401 || status == 403 {
+            "Only the broadcaster can change the title or category".to_string()
+        } else {
+            helix_refusal_text(status, &body)
+        };
+        HelixStatus { status, body, words }
+    }
+}
+
+impl std::fmt::Display for HelixStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.words)
+    }
+}
+
+impl std::error::Error for HelixStatus {}
+
+/// How a typed door ended, read from its `anyhow::Result` (D290, D291).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DoorOutcome {
+    Sent,
+    /// Nothing happened: an answered 4xx or 429, or nothing left the device.
+    /// Carries the error text (`e.to_string()`), which Activity shows as
+    /// "Twitch refused it: <text>".
+    Refused(String),
+    /// Twitch refused the token itself (a 401): the caller drops the cached
+    /// token and remembers the account's failure, then treats it as Refused.
+    RefusedUnauthorized(String),
+    /// It may have happened: a 5xx, a 3xx, a failure after the request left,
+    /// any error that cannot be downcast.
+    Unknown,
+}
+
+/// The one mapping every Command, moderation and Announce door uses. Pure.
+pub fn door_outcome<T>(result: &anyhow::Result<T>) -> DoorOutcome {
+    let Err(e) = result else { return DoorOutcome::Sent };
+    for cause in e.chain() {
+        if let Some(h) = cause.downcast_ref::<HelixStatus>() {
+            return match h.status {
+                401 => DoorOutcome::RefusedUnauthorized(e.to_string()),
+                400..=499 => DoorOutcome::Refused(e.to_string()),
+                _ => DoorOutcome::Unknown,
+            };
+        }
+        if let Some(r) = cause.downcast_ref::<reqwest::Error>() {
+            return if r.is_connect() || r.is_builder() { DoorOutcome::Refused(e.to_string()) } else { DoorOutcome::Unknown };
+        }
+    }
+    DoorOutcome::Unknown
+}
+
+/// Why the `SetGame` category read failed (it is a read, never a write).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchFail {
+    /// A 401: drop the token and remember the failure, then skip.
+    Unauthorized,
+    Other(String),
+}
+
+/// A category read's result in the engine's terms. Pure.
+pub fn search_outcome(result: anyhow::Result<Vec<serde_json::Value>>) -> Result<Vec<serde_json::Value>, SearchFail> {
+    match result {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+            if e.chain().any(|c| c.downcast_ref::<HelixStatus>().is_some_and(|h| h.status == 401)) {
+                Err(SearchFail::Unauthorized)
+            } else {
+                Err(SearchFail::Other(e.to_string()))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "twitch_doors_tests.rs"]
+mod door_tests;
+
 /// Twitch's own reason from a refused Helix moderation call, in plain words
 /// where Twitch's are cryptic, so a command can say why it failed.
 pub fn helix_refusal_text(status: u16, body: &str) -> String {
@@ -878,6 +987,8 @@ impl TwitchService {
     /// holding the slot.
     pub(crate) fn bump_account_generation() {
         ACCOUNT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The old account's smiley style is forgotten at once, on every door.
+        crate::services::twitch_smiley_style::on_account_moved();
     }
 
     fn get_token_file_path() -> Result<PathBuf> {
@@ -916,8 +1027,10 @@ impl TwitchService {
     /// account generation.
     fn delete_token_file(_slot: &SlotGuard) -> Result<()> {
         let result = token_vault::remove(&Self::get_token_file_path()?);
-        crate::services::account_roster::set_twitch_identity(None);
+        // Bump first: whatever was read for the signed-out account is dropped
+        // before the identity goes.
         Self::bump_account_generation();
+        crate::services::account_roster::set_twitch_identity(None);
         #[cfg(mobile)]
         crate::services::push_alerts::server::token_changed(None);
         result
@@ -936,6 +1049,52 @@ impl TwitchService {
         #[cfg(mobile)]
         crate::services::push_alerts::server::token_changed(Some(&token_hash(&token.access_token)));
         Ok(())
+    }
+
+    /// The slot's answer from one file read: a token, nothing (no file, or a
+    /// damaged one), or an error when the credential store did not answer.
+    /// Pure over the load, so it is table-tested.
+    pub(crate) fn slot_read(load: Result<Option<StorableToken>>) -> std::result::Result<Option<StorableToken>, TokenError> {
+        match Self::token_error_for(&load) {
+            None => Ok(load.ok().flatten()),
+            Some(TokenError::NoToken) => Ok(None),
+            Some(other) => Err(other),
+        }
+    }
+
+    /// The token in the primary slot, for a comparison only, read under the
+    /// slot's own lock (D296): `load_token_from_file` can rewrite the file it
+    /// reads, and a read during a door's rename sees no file, which would read
+    /// as "the slot holds nothing". No refresh, no write of the caller's. The
+    /// guard is gone when this returns. Lock order for callers: an alt's
+    /// single-flight guard first, then this.
+    pub(crate) async fn read_slot_token() -> std::result::Result<Option<StorableToken>, TokenError> {
+        let _slot = Self::primary_slot().await;
+        Self::slot_read(Self::load_token_from_file())
+    }
+
+    /// The error a refresh gives when it was not attempted (the slot owns the
+    /// credential or could not be checked, an account change is running) or
+    /// its task failed: `TokenError::Unreachable` under today's network words,
+    /// so the sign-in is kept and the caller tries again.
+    pub(crate) fn refresh_unavailable(cause: &str) -> anyhow::Error {
+        TokenError::Unreachable.into_error(refresh_failure_message(RefreshFailure::Unreachable, cause))
+    }
+
+    /// What a failed token fetch means (D250): a `TokenError` anywhere in the
+    /// chain first; then a refresh Twitch answered, by status (5xx and 429 are
+    /// `Unreachable`, the rest `Refused`); any `reqwest` or `std::io` error is
+    /// `Unreachable`; and anything else is `Unreachable` too, so an unknown
+    /// failure never shows a false "sign in".
+    pub(crate) fn fetch_failure(e: &anyhow::Error) -> TokenError {
+        if let Some(kind) = e.chain().find_map(|c| c.downcast_ref::<TokenError>()) {
+            return *kind;
+        }
+        if let Some(refused) = e.chain().find_map(|c| c.downcast_ref::<RefreshRefused>()) {
+            return if refusal_is_transient(refused.status) { TokenError::Unreachable } else { TokenError::Refused };
+        }
+        // `reqwest::Error`, `std::io::Error` and everything unrecognized.
+        TokenError::Unreachable
     }
 
     /// Read whatever token currently occupies the primary slot. The account
@@ -1033,13 +1192,14 @@ impl TwitchService {
         app_handle: &crate::rt::AppHandle,
         storable_token: StorableToken,
     ) {
+        // The generation this sign-in moved to, read while the slot is held.
         let store_result = {
             let slot = Self::primary_slot().await;
             let stored = Self::persist_primary_token(&slot, &storable_token).await;
             if stored.is_ok() {
                 Self::bump_account_generation();
             }
-            stored
+            stored.map(|()| Self::account_generation())
         };
 
         // The web-session reads (stream resolver, follow/unfollow, entitlement
@@ -1058,11 +1218,18 @@ impl TwitchService {
         }
 
         match store_result {
-            Ok(()) => {
+            Ok(generation) => {
                 debug!("[LOGIN] Token stored");
                 // This token was granted every scope in SCOPES, so a sign-in
                 // StreamNook asked for is no longer owed.
                 crate::services::twitch_signin::clear();
+                // Record who signed in before announcing it, so every reader
+                // of the main account sees this one, not the one before.
+                crate::services::account_store::AccountStore::reconcile_after_sign_in(
+                    &storable_token,
+                    generation,
+                )
+                .await;
                 // A phone's go-live pushes register under the account
                 // that just signed in.
                 #[cfg(mobile)]
@@ -1186,12 +1353,15 @@ impl TwitchService {
             expires_at: expires_at.timestamp(),
         };
 
-        {
+        let generation = {
             let slot = Self::primary_slot().await;
             Self::persist_primary_token(&slot, &storable_token).await?;
             Self::bump_account_generation();
-        }
+            Self::account_generation()
+        };
         crate::services::twitch_signin::clear();
+        crate::services::account_store::AccountStore::reconcile_after_sign_in(&storable_token, generation)
+            .await;
         // A phone's go-live pushes register under the account that signed in.
         #[cfg(mobile)]
         crate::services::push_alerts::server::schedule();
@@ -1354,6 +1524,8 @@ impl TwitchService {
             let slot = Self::primary_slot().await;
             let _ = Self::delete_token_file(&slot);
         }
+        // The registry stops naming the account that left as the main one.
+        crate::services::account_store::AccountStore::forget_primary();
         #[cfg(mobile)]
         drop(runner);
 
@@ -1609,6 +1781,13 @@ impl TwitchService {
             // web-session cookie would be invisible to the stream resolver — the
             // "non-proxy mode requires a twitch login" dead-end even though the
             // user just logged in.
+            // One hook for every registered account, one shared wait, one
+            // guard held across the reset. A no-op guard when the engine is not
+            // running (the launch-time forced re-auth runs before it).
+            let _leaving = crate::services::account_automations::before_accounts_removed(
+                &crate::commands::accounts::reauth_hook_ids(),
+            )
+            .await;
             crate::services::account_store::AccountStore::reset_all().await;
 
             // Say why, to every window and across a relaunch, until the user
@@ -1951,7 +2130,8 @@ impl TwitchService {
     }
 
     pub async fn get_user_info() -> Result<UserInfo> {
-        let token = Self::get_token().await?;
+        // The token and the account generation it belongs to, read together.
+        let (token, generation) = Self::get_token_with_generation().await?;
         let info = Self::get_user_info_with_token(&token).await?;
         // The token check runs alongside this read and can clear every account
         // while it is in flight. A profile read from the token it just removed
@@ -1961,7 +2141,9 @@ impl TwitchService {
                 "Sign-in required: Twitch needs you to sign in again"
             ));
         }
-        crate::services::account_roster::set_twitch_identity(Some(info.clone()));
+        if !crate::services::account_roster::set_twitch_identity_at(Some(info.clone()), generation) {
+            return Err(anyhow::anyhow!("The Twitch account changed while it was being read"));
+        }
         // Every client confirms its member here, at start and after signing in.
         crate::services::member_signin::signed_in(&info);
         Ok(info)
@@ -3307,7 +3489,42 @@ impl TwitchService {
         }
     }
 
+    /// Last-broadcast end times for any number of channels. GQL `users(ids:)`
+    /// answers at most 100 ids, so a longer list goes out in batches of 100.
     pub async fn get_offline_last_broadcasts(
+        user_ids: Vec<String>,
+    ) -> Result<std::collections::HashMap<String, Option<String>>> {
+        use futures::StreamExt;
+        const GQL_USERS_MAX: usize = 100;
+        /// Batches in flight at once, so a long follow list is not a burst.
+        const IN_FLIGHT: usize = 4;
+        let answers: Vec<_> = futures::stream::iter(
+            user_ids
+                .chunks(GQL_USERS_MAX)
+                .map(|ids| Self::last_broadcasts_batch(ids.to_vec()))
+                .collect::<Vec<_>>(),
+        )
+        .buffer_unordered(IN_FLIGHT)
+        .collect()
+        .await;
+        let mut result_map = std::collections::HashMap::new();
+        let mut first_err = None;
+        for answer in answers {
+            match answer {
+                Ok(map) => result_map.extend(map),
+                Err(e) => {
+                    warn!("[TWITCH] last broadcasts batch failed: {e}");
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) if result_map.is_empty() => Err(e),
+            _ => Ok(result_map),
+        }
+    }
+
+    async fn last_broadcasts_batch(
         user_ids: Vec<String>,
     ) -> Result<std::collections::HashMap<String, Option<String>>> {
         let client = crate::services::http::client().clone();
@@ -5054,6 +5271,7 @@ impl TwitchService {
     }
 
     /// `update_chat_settings` as the account `token` belongs to (`moderator_id`).
+    /// Delegates to the engine twin with the shared client and the real base.
     pub(crate) async fn update_chat_settings_as(
         token: &str,
         moderator_id: &str,
@@ -5061,32 +5279,228 @@ impl TwitchService {
         settings: serde_json::Value,
     ) -> Result<()> {
         let client = crate::services::http::client().clone();
+        Self::update_chat_settings_engine(&client, "https://api.twitch.tv", token, moderator_id, broadcaster_id, &settings).await
+    }
 
-        let url = format!(
-            "https://api.twitch.tv/helix/chat/settings?broadcaster_id={}&moderator_id={}",
-            broadcaster_id, moderator_id
-        );
-
-        let response = client
-            .patch(&url)
-            .header("Client-Id", CLIENT_ID)
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .json(&settings)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let error_text = response.text().await.unwrap_or_default();
-            error!(
-                "[TwitchService] Failed to update chat settings: {}",
-                error_text
-            );
-            return Err(anyhow::anyhow!(helix_refusal_text(status, &error_text)));
+    /// Run one engine request and turn a non-success answer into a typed
+    /// `HelixStatus`. The only fallible step before `.send()` is reqwest's own
+    /// request building (CHECK-S11-R4 minor 7); a 3xx is not followed (the
+    /// engine client has no redirects) and reads as an answered non-success.
+    async fn engine_send(request: reqwest::RequestBuilder, make: fn(u16, String) -> HelixStatus) -> Result<reqwest::Response> {
+        let response = request.send().await?;
+        if response.status().is_success() {
+            return Ok(response);
         }
+        let status = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        Err(anyhow::Error::new(make(status, body)))
+    }
 
-        Ok(())
+    /// `PATCH /helix/chat/settings` on an injected client and base.
+    pub(crate) async fn update_chat_settings_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        moderator_id: &str,
+        broadcaster_id: &str,
+        settings: &serde_json::Value,
+    ) -> Result<()> {
+        let request = client
+            .patch(format!("{base}/helix/chat/settings"))
+            .query(&[("broadcaster_id", broadcaster_id), ("moderator_id", moderator_id)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(settings);
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
+    }
+
+    /// `POST /helix/streams/markers`. `description` None or empty sends no
+    /// `description` key; the broadcaster is the room's.
+    pub(crate) async fn create_stream_marker_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        broadcaster_id: &str,
+        description: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({ "user_id": broadcaster_id });
+        if let Some(d) = description.filter(|d| !d.is_empty()) {
+            body["description"] = serde_json::json!(d);
+        }
+        let request = client
+            .post(format!("{base}/helix/streams/markers"))
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(&body);
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
+    }
+
+    /// `PATCH /helix/channels?broadcaster_id=`: exactly the keys given (the
+    /// caller gives one, `title` or `game_id`).
+    pub(crate) async fn modify_channel_info_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        broadcaster_id: &str,
+        title: Option<&str>,
+        game_id: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        if let Some(t) = title {
+            body.insert("title".into(), serde_json::json!(t));
+        }
+        if let Some(g) = game_id {
+            body.insert("game_id".into(), serde_json::json!(g));
+        }
+        let request = client
+            .patch(format!("{base}/helix/channels"))
+            .query(&[("broadcaster_id", broadcaster_id)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(&serde_json::Value::Object(body));
+        Self::engine_send(request, HelixStatus::channel).await.map(|_| ())
+    }
+
+    /// The category read for `SetGame`: `GET /helix/games?name=<query>` (exact
+    /// name, any case Twitch accepts); `GET /helix/search/categories` runs only
+    /// when no exact row's name equals `query` ignoring case (CHECK-S11-R4 MJ3).
+    /// Both reads carry the verified token and check the status; either
+    /// failing, when it was needed, fails the search. Rows come exact first.
+    pub(crate) async fn search_categories_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        query: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        async fn rows(response: reqwest::Response) -> Result<Vec<serde_json::Value>> {
+            let v = response.json::<serde_json::Value>().await?;
+            Ok(v.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default())
+        }
+        let exact_request = client
+            .get(format!("{base}/helix/games"))
+            .query(&[("name", query)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        let mut found = rows(Self::engine_send(exact_request, HelixStatus::plain).await?).await?;
+        let wanted = query.trim();
+        if found.iter().any(|r| r["name"].as_str().is_some_and(|n| n.trim().eq_ignore_ascii_case(wanted))) {
+            return Ok(found);
+        }
+        let fuzzy_request = client
+            .get(format!("{base}/helix/search/categories"))
+            .query(&[("query", query), ("first", "10")])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        found.extend(rows(Self::engine_send(fuzzy_request, HelixStatus::plain).await?).await?);
+        Ok(found)
+    }
+
+    /// `POST /helix/chat/announcements` on the engine client (D270); 204 is
+    /// accepted (Twitch may still drop it).
+    pub(crate) async fn send_chat_announcement_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        moderator_id: &str,
+        broadcaster_id: &str,
+        message: &str,
+        color: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({ "message": message });
+        if let Some(c) = color {
+            body["color"] = serde_json::json!(c);
+        }
+        let request = client
+            .post(format!("{base}/helix/chat/announcements"))
+            .query(&[("broadcaster_id", broadcaster_id), ("moderator_id", moderator_id)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(&body);
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
+    }
+
+    /// `POST /helix/chat/shoutouts` from the room's broadcaster to `target_id`.
+    pub(crate) async fn send_shoutout_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        moderator_id: &str,
+        from_broadcaster_id: &str,
+        target_id: &str,
+    ) -> Result<()> {
+        let request = client
+            .post(format!("{base}/helix/chat/shoutouts"))
+            .query(&[("from_broadcaster_id", from_broadcaster_id), ("to_broadcaster_id", target_id), ("moderator_id", moderator_id)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
+    }
+
+    /// `PUT /helix/chat/pins`; `duration_seconds` None pins until the stream ends.
+    pub(crate) async fn pin_chat_message_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        moderator_id: &str,
+        broadcaster_id: &str,
+        message_id: &str,
+        duration_seconds: Option<u32>,
+    ) -> Result<()> {
+        let mut query = vec![
+            ("broadcaster_id", broadcaster_id.to_string()),
+            ("moderator_id", moderator_id.to_string()),
+            ("message_id", message_id.to_string()),
+        ];
+        if let Some(d) = duration_seconds {
+            query.push(("duration_seconds", d.to_string()));
+        }
+        let request = client
+            .put(format!("{base}/helix/chat/pins"))
+            .query(&query)
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
+    }
+
+    /// `POST /helix/moderation/bans`: a timeout of `seconds` (never a permanent ban).
+    pub(crate) async fn timeout_user_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        moderator_id: &str,
+        broadcaster_id: &str,
+        target_user_id: &str,
+        seconds: u32,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let mut data = serde_json::json!({ "user_id": target_user_id, "duration": seconds });
+        if let Some(r) = reason.filter(|r| !r.is_empty()) {
+            data["reason"] = serde_json::json!(r);
+        }
+        let request = client
+            .post(format!("{base}/helix/moderation/bans"))
+            .query(&[("broadcaster_id", broadcaster_id), ("moderator_id", moderator_id)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .json(&serde_json::json!({ "data": data }));
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
+    }
+
+    /// `DELETE /helix/moderation/chat?message_id=`.
+    pub(crate) async fn delete_chat_message_engine(
+        client: &Client,
+        base: &str,
+        token: &str,
+        moderator_id: &str,
+        broadcaster_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let request = client
+            .delete(format!("{base}/helix/moderation/chat"))
+            .query(&[("broadcaster_id", broadcaster_id), ("moderator_id", moderator_id), ("message_id", message_id)])
+            .header("Client-Id", CLIENT_ID)
+            .header(AUTHORIZATION, format!("Bearer {token}"));
+        Self::engine_send(request, HelixStatus::plain).await.map(|_| ())
     }
 
     /// Clear all messages from chat
@@ -7169,6 +7583,87 @@ pub(crate) fn helix_chat_color(typed: &str) -> String {
         .unwrap_or_else(|| typed.to_string())
 }
 
+/// Helix's base URL (the engine's helpers take it as a parameter so a test
+/// can point them at a fake server).
+pub const HELIX_BASE: &str = "https://api.twitch.tv/helix";
+
+/// One of a channel's channel point rewards, as the rule editor's picker lists it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct OwnReward {
+    pub id: String,
+    pub title: String,
+    pub cost: u64,
+    pub enabled: bool,
+    /// The reward asks the viewer for text.
+    pub needs_input: bool,
+}
+
+/// Why the reward list could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewardsError {
+    /// Twitch answered this status (and body).
+    Status(u16, String),
+    /// The request never completed, or the answer could not be read.
+    Transport(String),
+}
+
+/// Helix `GET /channel_points/custom_rewards?broadcaster_id=<id>` with the
+/// broadcaster's own token (`channel:read:redemptions` or
+/// `channel:manage:redemptions`, both in `SCOPES`): every reward of the
+/// channel, enabled or not, by title. Helix, not GQL. `client` and `base` are
+/// parameters so a test serves it from a fake server.
+pub async fn custom_rewards_engine(client: &Client, base: &str, token: &str, broadcaster_id: &str) -> Result<Vec<OwnReward>, RewardsError> {
+    let response = client
+        .get(format!("{base}/channel_points/custom_rewards?broadcaster_id={}", urlencoding::encode(broadcaster_id)))
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header("Client-Id", CLIENT_ID)
+        .send()
+        .await
+        .map_err(|e| RewardsError::Transport(e.to_string()))?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|e| RewardsError::Transport(e.to_string()))?;
+    if !(200..300).contains(&status) {
+        return Err(RewardsError::Status(status, body));
+    }
+    parse_custom_rewards(&body).ok_or_else(|| RewardsError::Transport("Twitch's answer could not be read".into()))
+}
+
+/// The rewards of a Helix answer, sorted by title (case-insensitive).
+fn parse_custom_rewards(body: &str) -> Option<Vec<OwnReward>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let mut rewards: Vec<OwnReward> = v["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|r| {
+            Some(OwnReward {
+                id: r["id"].as_str()?.to_string(),
+                title: r["title"].as_str().unwrap_or("").to_string(),
+                cost: r["cost"].as_u64().unwrap_or(0),
+                enabled: r["is_enabled"].as_bool().unwrap_or(true),
+                needs_input: r["is_user_input_required"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
+    rewards.sort_by_key(|r| r.title.to_lowercase());
+    Some(rewards)
+}
+
+/// A reward-list failure in the words the picker shows.
+pub fn rewards_error_words(e: &RewardsError) -> String {
+    match e {
+        RewardsError::Status(401, _) => "Sign in to Twitch again to see your rewards".into(),
+        RewardsError::Status(403 | 404, body) => {
+            let lower = body.to_ascii_lowercase();
+            if lower.contains("partner") || lower.contains("affiliate") {
+                "Channel point rewards need a Twitch affiliate or partner channel".into()
+            } else {
+                "StreamNook needs permission to read your rewards: sign out and back in to Twitch".into()
+            }
+        }
+        _ => "Twitch could not list your rewards right now".into(),
+    }
+}
+
 /// What a viewer reads when a role list could not be loaded.
 fn role_error_text(what: &str, error: &str, signed_in: bool) -> String {
     if !signed_in && error.eq_ignore_ascii_case("unauthenticated") {
@@ -8239,7 +8734,10 @@ mod role_list_tests {
 
 #[cfg(test)]
 mod refresh_failure_tests {
-    use super::{refresh_failure_kind, refresh_failure_message, refusal_is_transient, RefreshFailure, RefreshRefused};
+    use super::{
+        refresh_failure_kind, refresh_failure_message, refusal_is_transient, RefreshFailure, RefreshRefused, StorableToken, TokenError,
+        TwitchService,
+    };
     use std::time::Duration;
 
     /// The words the pages read a failure as the network by: `isNetworkAuthError`
@@ -8264,6 +8762,58 @@ mod refresh_failure_tests {
 
     fn refused(status: u16, body: &str) -> anyhow::Error {
         anyhow::anyhow!(RefreshRefused { status, body: body.to_string() })
+    }
+
+    #[test]
+    fn slot_read_table() {
+        let token = || StorableToken { access_token: "a".into(), refresh_token: "r".into(), expires_at: 0 };
+        assert!(matches!(TwitchService::slot_read(Ok(Some(token()))), Ok(Some(t)) if t.refresh_token == "r"));
+        assert!(matches!(TwitchService::slot_read(Ok(None)), Ok(None)));
+        let damaged = serde_json::from_str::<StorableToken>("{").unwrap_err();
+        assert!(matches!(TwitchService::slot_read(Err(damaged.into())), Ok(None)), "a damaged file is no token");
+        assert!(matches!(TwitchService::slot_read(Err(anyhow::anyhow!("keyring locked"))), Err(TokenError::VaultUnavailable)));
+    }
+
+    #[test]
+    fn a_refresh_that_was_not_attempted_reads_as_unreachable() {
+        let e = TwitchService::refresh_unavailable("slot unreadable");
+        assert_eq!(TwitchService::fetch_failure(&e), TokenError::Unreachable);
+        assert!(e.to_string().contains("network error"), "today's network wording: {e}");
+    }
+
+    #[test]
+    fn fetch_failure_table_built_with_real_constructors() {
+        // A TokenError anywhere in the chain wins, under any text.
+        for kind in [TokenError::NoToken, TokenError::VaultUnavailable, TokenError::Refused, TokenError::Unreachable] {
+            assert_eq!(TwitchService::fetch_failure(&kind.into_error("words")), kind);
+            assert_eq!(TwitchService::fetch_failure(&kind.into_error("inner").context("outer")), kind);
+        }
+        // A refresh Twitch answered: by status.
+        assert_eq!(TwitchService::fetch_failure(&refused(401, "x")), TokenError::Refused);
+        assert_eq!(TwitchService::fetch_failure(&refused(400, "x")), TokenError::Refused);
+        assert_eq!(TwitchService::fetch_failure(&refused(503, "x")), TokenError::Unreachable);
+        assert_eq!(TwitchService::fetch_failure(&refused(429, "x")), TokenError::Unreachable);
+        // Transport and io errors, and anything unknown, are Unreachable.
+        let builder = reqwest::Client::new().get("not a url").build().unwrap_err();
+        assert_eq!(TwitchService::fetch_failure(&builder.into()), TokenError::Unreachable);
+        let io = std::io::Error::new(std::io::ErrorKind::TimedOut, "slow");
+        assert_eq!(TwitchService::fetch_failure(&io.into()), TokenError::Unreachable);
+        assert_eq!(TwitchService::fetch_failure(&anyhow::anyhow!("something else")), TokenError::Unreachable);
+    }
+
+    #[test]
+    fn read_slot_token_is_a_pinned_delegation() {
+        let src = include_str!("twitch_service.rs").replace("\r\n", "\n");
+        let start = src.find("pub(crate) async fn read_slot_token()").unwrap();
+        let body = &src[start..start + src[start..].find("\n    }\n").unwrap()];
+        assert_eq!(body.matches("Self::primary_slot().await").count(), 1);
+        assert_eq!(body.matches("Self::slot_read(Self::load_token_from_file())").count(), 1);
+        assert!(body.find("Self::primary_slot().await").unwrap() < body.find("Self::slot_read(").unwrap());
+        for banned in ["refresh_token", "persist_primary_token", "tokio::spawn", "async_runtime::spawn", "token_vault::store", "token_vault::remove"] {
+            assert!(!body.contains(banned), "read_slot_token names {banned}");
+        }
+        // No lock but the slot's own.
+        assert_eq!(body.matches(".lock(").count(), 0);
     }
 
     #[test]
@@ -8482,6 +9032,37 @@ mod slot_tests {
         }
     }
 
+    /// Every door that moves the account also tells the account registry, so
+    /// `AccountStore::primary()` names the signed-in account (or nobody after
+    /// a sign-out) from that moment on, not from the next launch. A sign-in
+    /// that skipped this left the previous account as main for the rest of
+    /// the session; a sign-out left the departed account as main.
+    #[test]
+    fn every_account_door_leaves_the_registry_agreeing() {
+        let service = include_str!("twitch_service.rs").replace("\r\n", "\n");
+        let service = service.as_str();
+        for door in [
+            "pub(crate) async fn complete_primary_login(",
+            "pub async fn complete_device_login(",
+        ] {
+            assert!(
+                body(service, door).contains("AccountStore::reconcile_after_sign_in("),
+                "{door} records who signed in"
+            );
+        }
+        let logout = body(service, "pub async fn logout()");
+        assert!(logout.contains("AccountStore::forget_primary()"), "logout drops the main account");
+        assert!(
+            logout.find("delete_token_file(").unwrap() < logout.find("forget_primary()").unwrap(),
+            "the slot empties before the registry forgets"
+        );
+        // The registry's own doors write the registry themselves.
+        let store = include_str!("account_store.rs").replace("\r\n", "\n");
+        for door in ["pub async fn set_active(", "pub async fn sign_out_active("] {
+            assert!(body(&store, door).contains("Self::save("), "{door} records the new main");
+        }
+    }
+
     #[test]
     fn a_token_fingerprint_is_stable_and_not_the_token() {
         let h = token_hash("abc");
@@ -8573,5 +9154,66 @@ mod tag_stream_tests {
     fn category_info_without_data_is_an_error() {
         assert!(category_info_from(200, serde_json::json!({})).is_err());
         assert!(category_info_from(200, serde_json::json!({ "data": null })).is_err());
+    }
+
+    #[test]
+    fn rewards_are_read_and_sorted_by_title() {
+        let body = r#"{"data":[{"id":"b","title":"zebra","cost":50,"is_enabled":true,"is_user_input_required":true},{"id":"a","title":"Apple","cost":100,"is_enabled":false,"is_user_input_required":false},{"title":"no id"}]}"#;
+        let rewards = parse_custom_rewards(body).unwrap();
+        assert_eq!(rewards.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!((rewards[0].cost, rewards[0].enabled, rewards[0].needs_input), (100, false, false));
+        assert!(rewards[1].needs_input);
+        assert!(parse_custom_rewards("nope").is_none());
+        assert_eq!(parse_custom_rewards(r#"{"data":[]}"#), Some(vec![]));
+    }
+
+    #[test]
+    fn a_reward_list_failure_reads_in_plain_words() {
+        assert_eq!(rewards_error_words(&RewardsError::Status(401, String::new())), "Sign in to Twitch again to see your rewards");
+        assert!(rewards_error_words(&RewardsError::Status(403, r#"{"message":"channel is not a partner or affiliate"}"#.into())).contains("affiliate or partner"));
+        assert!(rewards_error_words(&RewardsError::Status(403, "{}".into())).contains("permission"));
+        assert!(rewards_error_words(&RewardsError::Status(500, String::new())).contains("could not list"));
+        assert!(rewards_error_words(&RewardsError::Transport("x".into())).contains("could not list"));
+    }
+
+    #[tokio::test]
+    async fn the_reward_list_is_one_get_with_the_owners_token_and_broadcaster_id() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            *log.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"data":[{"id":"rw-1","title":"Hydrate","cost":100,"is_enabled":true,"is_user_input_required":false}]}"#;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+        let rewards = custom_rewards_engine(&Client::new(), &base, "owner-token", "100").await.unwrap();
+        assert_eq!(rewards.len(), 1);
+        assert_eq!(rewards[0].title, "Hydrate");
+        let request = seen.lock().unwrap().clone();
+        assert!(request.starts_with("GET /channel_points/custom_rewards?broadcaster_id=100 "), "{request}");
+        assert!(request.to_ascii_lowercase().contains("authorization: bearer owner-token"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_reward_list_carries_its_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+            let _ = sock.shutdown().await;
+        });
+        let err = custom_rewards_engine(&Client::new(), &base, "stale", "100").await.unwrap_err();
+        assert!(matches!(err, RewardsError::Status(401, _)));
     }
 }

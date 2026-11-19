@@ -1,3 +1,5 @@
+pub mod account_automations;
+pub mod account_automations_p2;
 pub mod accounts;
 pub mod activity_history;
 pub mod announcements;
@@ -73,6 +75,7 @@ pub mod screen_capture;
 pub mod session;
 pub mod slash_commands;
 pub mod slash_backend;
+pub mod smiley_style;
 pub mod settings;
 pub mod settings_fields;
 pub mod settings_lists;

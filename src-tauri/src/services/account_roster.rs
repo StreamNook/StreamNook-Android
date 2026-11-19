@@ -132,10 +132,29 @@ pub fn twitch_user_id() -> Option<String> {
     TWITCH_IDENTITY.lock().ok().and_then(|c| c.as_ref().map(|u| u.id.clone()))
 }
 
-/// Record (or clear) who the primary Twitch account is.
+/// Whether the account id the identity names changed: Some to None, None to
+/// Some and a different id are changes; the same id (or none both times) is not.
+fn identity_id_changed(old: Option<&str>, new: Option<&str>) -> bool {
+    old != new
+}
+
+/// Record (or clear) who the primary Twitch account is, for the account as it is now.
 pub fn set_twitch_identity(info: Option<UserInfo>) {
-    let changed = match TWITCH_IDENTITY.lock() {
+    set_twitch_identity_at(info, crate::services::twitch_service::TwitchService::account_generation());
+}
+
+/// `set_twitch_identity` for a profile read under account generation `generation`.
+/// Sets nothing and answers false when the account has changed since (a profile
+/// read with the old account's token must not name the new account). Clearing
+/// is always right, so it never answers false.
+pub fn set_twitch_identity_at(info: Option<UserInfo>, generation: u64) -> bool {
+    if info.is_some() && generation != crate::services::twitch_service::TwitchService::account_generation() {
+        return false;
+    }
+    let account_id = info.as_ref().map(|u| u.id.clone());
+    let (changed, id_changed) = match TWITCH_IDENTITY.lock() {
         Ok(mut cell) => {
+            let id_changed = identity_id_changed(cell.as_ref().map(|u| u.id.as_str()), info.as_ref().map(|u| u.id.as_str()));
             // Another member (or none): their linked-account claims start over.
             if cell.as_ref().map(|u| u.id.as_str()) != info.as_ref().map(|u| u.id.as_str()) {
                 crate::services::linked_accounts::reset();
@@ -150,13 +169,24 @@ pub fn set_twitch_identity(info: Option<UserInfo>) {
                 _ => false,
             };
             *cell = info;
-            !same
+            (!same, id_changed)
         }
-        Err(_) => false,
+        Err(_) => (false, false),
     };
+    // The identity lock is released: the smiley style follows the account.
+    if let Some(id) = account_id {
+        crate::services::twitch_smiley_style::on_identity(&id, generation);
+    }
+    // A slot identity that became known or changed: the rules recompile their
+    // account ids and forget remembered failed fetches (a no-op before the
+    // engine starts; compile never sets the identity, so there is no loop).
+    if id_changed {
+        crate::services::account_automations::on_accounts_changed();
+    }
     if changed {
         notify();
     }
+    true
 }
 
 /// A platform's session was revoked or expired on the platform's side.
@@ -341,7 +371,13 @@ pub fn notify() {
         // The whisper socket follows the Twitch account on every platform:
         // listening while it is connected, closed on sign-out or once Twitch
         // needs the sign-in again.
-        crate::services::whisper_service::follow_account(&app, whisper_account(&roster));
+        let whisper_to = whisper_account(&roster);
+        if whisper_to.is_none() && crate::services::whisper_sync::current_scope().is_some() {
+            if let Some(row) = roster.main_account("twitch") {
+                log::warn!("[Roster] Twitch row is {:?} (reason {:?}): whispers stop", row.status, row.reason);
+            }
+        }
+        crate::services::whisper_service::follow_account(&app, whisper_to);
         if last.as_ref() == Some(&roster) {
             return;
         }
@@ -351,6 +387,26 @@ pub fn notify() {
         let _ = app.emit("account-roster-changed", &roster);
         *last = Some(roster);
     });
+}
+
+/// The inbox opened with no Twitch account followed for whispers. A phone
+/// process that lives for days can end up there with Twitch still signed in
+/// (its Whispers chip gone until a restart): confirm who the account is when
+/// Rust does not know, then rebuild the roster, which follows it again.
+/// Nothing happens while Twitch waits on a new sign-in.
+pub async fn refollow_twitch() {
+    use crate::services::twitch_service::TwitchService;
+    if twitch_signin::current().is_some() || !TwitchService::has_stored_credentials().await {
+        return;
+    }
+    log::warn!("[Roster] inbox opened with no whisper account while Twitch is signed in; following again");
+    if twitch_user_id().is_none() {
+        // A good read records the identity, which rebuilds the roster itself.
+        if let Err(e) = TwitchService::get_user_info().await {
+            log::warn!("[Roster] could not confirm the Twitch account: {e}");
+        }
+    }
+    notify();
 }
 
 /// Build the roster and follow its chat identities. Builds run side by
@@ -631,5 +687,56 @@ mod tests {
         assert!(!take_if_newer(&mut followed, 2));
         assert!(take_if_newer(&mut followed, 3));
         assert_eq!(followed, 3);
+    }
+}
+
+#[cfg(test)]
+mod identity_hook_tests {
+    use super::identity_id_changed;
+
+    #[test]
+    fn identity_id_changed_table() {
+        assert!(!identity_id_changed(Some("1"), Some("1")));
+        assert!(identity_id_changed(Some("1"), Some("2")));
+        assert!(identity_id_changed(Some("1"), None));
+        assert!(identity_id_changed(None, Some("1")));
+        assert!(!identity_id_changed(None, None));
+    }
+
+    #[test]
+    fn the_hook_sits_after_the_lock_and_only_on_an_id_change() {
+        let src = include_str!("account_roster.rs").replace("\r\n", "\n");
+        let start = src.find("pub fn set_twitch_identity_at").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let lock_end = body.find("(!same, id_changed)").unwrap();
+        let hook = body.find("crate::services::account_automations::on_accounts_changed()").unwrap();
+        assert!(lock_end < hook);
+        assert!(body[..hook].trim_end().ends_with("if id_changed {"));
+    }
+
+    /// A phone process alive for days lost its Whispers chip with Twitch still
+    /// signed in (Brandon, 2026-11-18): opening the inbox follows the account
+    /// again, only while Twitch is not waiting on a new sign-in, and a change
+    /// of the followed account makes an open inbox read again.
+    #[test]
+    fn an_inbox_with_no_whisper_account_follows_twitch_again() {
+        let body = |src: &str, sig: &str| {
+            let src = src.replace("\r\n", "\n");
+            let start = src.find(sig).unwrap_or_else(|| panic!("{sig}"));
+            src[start..start + src[start..].find("\n}\n").unwrap()].to_string()
+        };
+        let opened = body(include_str!("../commands/whispers.rs"), "pub async fn inbox_opened()");
+        let heal = opened.find("refollow_twitch().await").expect("inbox_opened heals");
+        assert!(opened[..heal].contains("if whisper_sync::current_scope().is_none() {"));
+        assert!(heal < opened.find("Reason::InboxOpened").unwrap(), "the sync runs for the followed account");
+
+        let refollow = body(include_str!("account_roster.rs"), "pub async fn refollow_twitch()");
+        let gate = refollow.find("twitch_signin::current().is_some()").unwrap();
+        assert!(gate < refollow.find("get_user_info()").unwrap() && gate < refollow.find("notify();").unwrap());
+
+        let follow = body(include_str!("whisper_sync.rs"), "pub fn follow_account(user_id: Option<String>)");
+        assert!(follow.contains("if before != after {\n        follow_changed(after.is_some());"));
+        let changed = body(include_str!("whisper_sync.rs"), "fn follow_changed(following: bool)");
+        assert!(changed.contains("mention_inbox::CHANGED_EVENT, ()"));
     }
 }

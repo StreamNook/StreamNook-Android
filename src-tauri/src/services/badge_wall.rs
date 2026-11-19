@@ -10,7 +10,8 @@
 
 use crate::commands::badges::HelixBadgesResponse;
 use crate::services::badge_earn::{EarnPath, EarnStep};
-use crate::services::badge_standing::{BadgeStanding, CatchUp, CollectionState, MissingBadge};
+use crate::services::badge_index;
+use crate::services::badge_standing::{AddedDate, BadgeArt, BadgeStanding, CatchUp, CollectionState, MissingBadge};
 use crate::services::badge_window::{self, WindowRun, WindowStatus};
 use crate::services::universal_cache_service::{self, CacheType, UniversalCacheEntry};
 use once_cell::sync::Lazy;
@@ -94,8 +95,16 @@ pub struct BadgeTile {
     /// "1,234 users have this badge".
     pub usage_label: Option<String>,
     pub info_url: Option<String>,
+    /// When Penrose first saw the badge, in ms; 0 when no source dates it.
     pub added_ms: i64,
+    /// "13 November 2026" or "March 2017", in UTC; the sheet writes "Added "
+    /// before it. None when undated.
+    pub added_label: Option<String>,
     pub usage: u64,
+    /// The sharp art of the version the tile shows (drawn only next to the
+    /// image it names); left out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub art: Option<BadgeArt>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -142,6 +151,10 @@ pub struct MissingRow {
     pub time_left: String,
     /// It closes within a day: the time left is drawn as a warning.
     pub urgent: bool,
+    /// The badge's sharp art (drawn only next to the image it names); left
+    /// out when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub art: Option<BadgeArt>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -337,7 +350,7 @@ fn channels_note(channels: &[String]) -> Option<String> {
     }
 }
 
-fn missing_row(badge: &MissingBadge, icons: &HashMap<String, String>, now: i64) -> MissingRow {
+fn missing_row(badge: &MissingBadge, icons: &HashMap<String, String>, art: Option<&BadgeArt>, now: i64) -> MissingRow {
     let EarnPath { steps, random_of, channels, .. } = &badge.earn;
     MissingRow {
         key: badge.key.clone(),
@@ -358,6 +371,7 @@ fn missing_row(badge: &MissingBadge, icons: &HashMap<String, String>, now: i64) 
         channels_note: channels.as_deref().and_then(channels_note),
         time_left: time_left(badge.ends_ms, now),
         urgent: badge.ends_ms.is_some_and(|end| end - now < 24 * 3_600_000),
+        art: art.cloned(),
     }
 }
 
@@ -384,7 +398,11 @@ pub fn missing_now(standing: &BadgeStanding, now: i64) -> MissingNow {
         closes: if list { closes_in(standing.missing_now[0].ends_ms, now) } else { String::new() },
         catch_up: if list { standing.catch_up.as_ref().and_then(catch_up_view) } else { None },
         rows: if list {
-            standing.missing_now.iter().map(|b| missing_row(b, &standing.earn_icons, now)).collect()
+            standing
+                .missing_now
+                .iter()
+                .map(|b| missing_row(b, &standing.earn_icons, standing.art.get(&b.key), now))
+                .collect()
         } else {
             Vec::new()
         },
@@ -465,18 +483,17 @@ fn digits(text: &str) -> u64 {
     d.parse().unwrap_or(0)
 }
 
-fn date_ms(text: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(text)
-        .map(|d| d.timestamp_millis())
-        .or_else(|_| {
-            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-                .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
-        })
-        .unwrap_or(0)
-}
-
 fn version_rank(id: &str) -> u64 {
     id.parse().unwrap_or(0)
+}
+
+/// A tile's place in the shared Newest First order (`standing.added`), and the
+/// lowercased `<set>-v<version>` key that settles a tile the standing has no
+/// place for yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rank {
+    pub order: Option<u32>,
+    pub key: String,
 }
 
 /// Tiles, merged by title: the same title in another set keeps the first; a
@@ -485,11 +502,13 @@ fn tiles(
     catalogue: &HelixBadgesResponse,
     metadata: &HashMap<String, UniversalCacheEntry>,
     windows: &HashMap<String, Vec<WindowRun>>,
+    added: &HashMap<String, AddedDate>,
+    art: &HashMap<String, BadgeArt>,
     owned: &HashSet<&str>,
     now: i64,
-) -> Vec<(BadgeTile, u32)> {
+) -> Vec<(BadgeTile, Rank)> {
     let mut order: Vec<String> = Vec::new();
-    let mut by_title: HashMap<String, (BadgeTile, u32, String, String)> = HashMap::new();
+    let mut by_title: HashMap<String, (BadgeTile, Rank, String, String)> = HashMap::new();
     for set in &catalogue.data {
         for v in &set.versions {
             let image = if !v.image_url_4x.is_empty() { &v.image_url_4x } else { &v.image_url_2x };
@@ -505,16 +524,16 @@ fn tiles(
                 meta: metadata.get(&metadata_key(&set.set_id, &v.id)),
             };
             let own_key = format!("{}/{}", set.set_id, v.id);
-            let (tile, position) = tile(&version, windows.get(&own_key), now);
+            let (tile, rank) = tile(&version, windows.get(&own_key), added.get(&own_key), art.get(&own_key), now);
             match by_title.get_mut(&v.title) {
                 None => {
                     order.push(v.title.clone());
-                    by_title.insert(v.title.clone(), (tile, position, set.set_id.clone(), v.id.clone()));
+                    by_title.insert(v.title.clone(), (tile, rank, set.set_id.clone(), v.id.clone()));
                 }
                 Some(prev) if prev.2 == set.set_id && version_rank(&v.id) > version_rank(&prev.3) => {
                     let mut keys = std::mem::take(&mut prev.0.keys);
                     keys.push(own_key);
-                    *prev = (BadgeTile { keys, ..tile }, position, set.set_id.clone(), v.id.clone());
+                    *prev = (BadgeTile { keys, ..tile }, rank, set.set_id.clone(), v.id.clone());
                 }
                 Some(prev) => prev.0.keys.push(own_key),
             }
@@ -523,12 +542,12 @@ fn tiles(
     order
         .into_iter()
         .filter_map(|t| by_title.remove(&t))
-        .map(|(mut tile, position, _, _)| {
+        .map(|(mut tile, rank, _, _)| {
             tile.owned = tile.keys.iter().any(|k| owned.contains(k.as_str()));
             let (word, sheet_word) = words(tile.owned, tile.status.as_deref());
             tile.word = word.into();
             tile.sheet_word = sheet_word.into();
-            (tile, position)
+            (tile, rank)
         })
         .collect()
 }
@@ -546,18 +565,15 @@ fn words(owned: bool, status: Option<&str>) -> (&'static str, &'static str) {
     }
 }
 
-fn tile(v: &Version, runs: Option<&Vec<WindowRun>>, now: i64) -> (BadgeTile, u32) {
+fn tile(
+    v: &Version,
+    runs: Option<&Vec<WindowRun>>,
+    added: Option<&AddedDate>,
+    art: Option<&BadgeArt>,
+    now: i64,
+) -> (BadgeTile, Rank) {
     let data = v.meta.map(|m| &m.data);
     let field = |key: &str| data.and_then(|d| d.get(key)).and_then(|x| x.as_str()).filter(|s| !s.is_empty());
-    // A pushed badge has no scraped date yet; its campaign window opening is
-    // an honest stand-in, so a fresh badge does not sort as ancient.
-    let added_ms = field("date_added").map(date_ms).filter(|ms| *ms > 0).unwrap_or_else(|| {
-        data.and_then(|d| d.get("enrichment"))
-            .and_then(|e| e.get("starts_utc"))
-            .and_then(|s| s.as_str())
-            .map(date_ms)
-            .unwrap_or(0)
-    });
     let usage = field("usage_stats").map(digits).unwrap_or(0);
     let status = runs.filter(|r| !r.is_empty()).map(|r| {
         match badge_window::status_at(r, now) {
@@ -586,18 +602,26 @@ fn tile(v: &Version, runs: Option<&Vec<WindowRun>>, now: i64) -> (BadgeTile, u32
         caveat,
         usage_label: (usage > 0).then(|| format!("{} users have this badge", grouped(usage))),
         info_url: field("info_url").map(str::to_string),
-        added_ms,
+        // The date is the standing's (the index, else the feed); no cached
+        // metadata date or campaign window stands in for it.
+        added_ms: added.and_then(|a| a.ms).unwrap_or(0),
+        added_label: added.and_then(|a| a.label.clone()),
         usage,
+        art: art.cloned(),
     };
-    (tile, v.meta.and_then(|m| m.position).unwrap_or(u32::MAX))
+    let rank = Rank {
+        order: added.map(|a| a.order),
+        key: badge_index::index_key(v.set_id, v.version),
+    };
+    (tile, rank)
 }
 
-/// Newest first by date added; the metadata rank breaks ties within a day; a
-/// badge with no date sorts last, and the key keeps the order stable.
-pub fn order(mut tiles: Vec<(BadgeTile, u32)>, sort: Sort) -> Vec<BadgeTile> {
-    tiles.sort_by(|(a, pa), (b, pb)| {
-        b.added_ms.cmp(&a.added_ms).then(pa.cmp(pb)).then_with(|| a.key.cmp(&b.key))
-    });
+/// Newest first, by the place Rust gave each badge in the shared Newest First
+/// order (`badge_index`), so the wall, the gallery and the site agree. A tile
+/// the standing has no place for yet leads, as an undated badge does, and the
+/// lowercased key settles those.
+pub fn order(mut tiles: Vec<(BadgeTile, Rank)>, sort: Sort) -> Vec<BadgeTile> {
+    tiles.sort_by(|(_, a), (_, b)| a.order.cmp(&b.order).then_with(|| a.key.cmp(&b.key)));
     let newest: Vec<BadgeTile> = tiles.into_iter().map(|(t, _)| t).collect();
     let lead = |status: &str, list: Vec<BadgeTile>| {
         let (mut first, rest): (Vec<_>, Vec<_>) = list.into_iter().partition(|t| t.status.as_deref() == Some(status));
@@ -616,6 +640,13 @@ pub fn order(mut tiles: Vec<(BadgeTile, u32)>, sort: Sort) -> Vec<BadgeTile> {
             list
         }
     }
+}
+
+/// True when the standing placed its own catalogue but some tile built from the
+/// wall's list has no place (the two reads saw different lists). An empty map
+/// means the dates task failed, and asking again would not change that.
+fn has_unplaced(added: &HashMap<String, AddedDate>, built: &[(BadgeTile, Rank)]) -> bool {
+    !added.is_empty() && built.iter().any(|(_, rank)| rank.order.is_none())
 }
 
 /// The wall in `sort`, from the standing and the caches. Kicks the session's
@@ -659,7 +690,14 @@ pub async fn get(app: &crate::rt::AppHandle, sort: Sort, force: bool) -> BadgeWa
     .and_then(Result::ok)
     .unwrap_or_default();
     let owned: HashSet<&str> = standing.owned.iter().map(String::as_str).collect();
-    let built = tiles(&catalogue, &metadata, &standing.windows, &owned, now);
+    let mut built = tiles(&catalogue, &metadata, &standing.windows, &standing.added, &standing.art, &owned, now);
+    // A badge in this list that the standing's own catalogue read lacked (a forced
+    // refresh landed between the two reads) has no place yet. Ask once more
+    // rather than lead the wall with it until the next re-read.
+    if has_unplaced(&standing.added, &built) {
+        let again = crate::services::badge_standing::get_standing(app, false).await;
+        built = tiles(&catalogue, &metadata, &again.windows, &again.added, &again.art, &owned, now);
+    }
     let owned_count = built.iter().filter(|(t, _)| t.owned).count();
     let total = built.len();
     start_backfill(app);
@@ -757,7 +795,7 @@ mod tests {
     #[test]
     fn tiles_merge_by_title_and_a_relaunch_replaces() {
         let owned: HashSet<&str> = HashSet::from(["other/1"]);
-        let built = tiles(&catalogue(), &HashMap::new(), &HashMap::new(), &owned, 0);
+        let built = tiles(&catalogue(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &owned, 0);
         let titles: Vec<&str> = built.iter().map(|(t, _)| t.title.as_str()).collect();
         assert_eq!(titles, ["GLHF", "Mouse"]);
         let glhf = &built[0].0;
@@ -769,7 +807,7 @@ mod tests {
         assert_eq!(glhf.image, "4x-GLHF-2");
     }
 
-    fn tile_at(key: &str, added: i64, usage: u64, status: Option<&str>) -> (BadgeTile, u32) {
+    fn tile_at(key: &str, order: Option<u32>, usage: u64, status: Option<&str>) -> (BadgeTile, Rank) {
         (
             BadgeTile {
                 key: key.into(),
@@ -785,10 +823,12 @@ mod tests {
                 caveat: None,
                 usage_label: None,
                 info_url: None,
-                added_ms: added,
+                added_ms: 0,
+                added_label: None,
                 usage,
+                art: None,
             },
-            u32::MAX,
+            Rank { order, key: key.to_lowercase() },
         )
     }
 
@@ -800,17 +840,153 @@ mod tests {
     fn the_five_orders() {
         let set = || {
             vec![
-                tile_at("a", 100, 5, None),
-                tile_at("b", 300, 1, Some("coming-soon")),
-                tile_at("c", 0, 9, Some("available")),
-                tile_at("d", 200, 5, Some("available")),
+                tile_at("a", Some(3), 5, None),
+                tile_at("b", Some(1), 1, Some("coming-soon")),
+                tile_at("c", None, 9, Some("available")),
+                tile_at("d", Some(2), 5, Some("available")),
             ]
         };
-        assert_eq!(keys(order(set(), Sort::Newest)), ["b", "d", "a", "c"]);
-        assert_eq!(keys(order(set(), Sort::Oldest)), ["c", "a", "d", "b"]);
-        assert_eq!(keys(order(set(), Sort::Available)), ["d", "c", "b", "a"]);
-        assert_eq!(keys(order(set(), Sort::Soon)), ["b", "d", "a", "c"]);
+        // "c" has no date yet: a badge Twitch just added, so it is the newest.
+        assert_eq!(keys(order(set(), Sort::Newest)), ["c", "b", "d", "a"]);
+        assert_eq!(keys(order(set(), Sort::Oldest)), ["a", "d", "b", "c"]);
+        assert_eq!(keys(order(set(), Sort::Available)), ["c", "d", "b", "a"]);
+        assert_eq!(keys(order(set(), Sort::Soon)), ["b", "c", "d", "a"]);
         assert_eq!(keys(order(set(), Sort::Usage)), ["c", "d", "a", "b"]);
+    }
+
+    const ORDER_FIXTURE: &str = include_str!("../../tests/fixtures/badgeOrder.fixture.json");
+
+    fn added_of(entries: &[(&str, u32, Option<&str>)]) -> HashMap<String, AddedDate> {
+        entries
+            .iter()
+            .map(|(key, order, label)| {
+                (
+                    key.to_string(),
+                    AddedDate {
+                        ms: label.map(|_| 1_774_828_800_000),
+                        precision: label.map(|_| "day".to_string()),
+                        label: label.map(String::from),
+                        order: *order,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn metadata_entry(id: &str, data: serde_json::Value) -> UniversalCacheEntry {
+        UniversalCacheEntry {
+            id: id.into(),
+            cache_type: CacheType::Badge,
+            data,
+            metadata: universal_cache_service::CacheMetadata {
+                timestamp: 0,
+                expiry_days: 1,
+                source: "badgebase".into(),
+                version: 1,
+            },
+            position: Some(5),
+        }
+    }
+
+    #[test]
+    fn a_merged_tile_takes_its_date_and_place_from_the_version_it_shows() {
+        // 30 March 2026 at midnight UTC, as the standing would hand it over.
+        let dates = added_of(&[("glhf/1", 0, None), ("glhf/2", 5, Some("30 March 2026")), ("other/1", 1, None)]);
+        let built = tiles(&catalogue(), &HashMap::new(), &HashMap::new(), &dates, &HashMap::new(), &HashSet::new(), 0);
+        let (glhf, rank) = &built[0];
+        // Version 2 replaced version 1 and the other set's copy merged in; the
+        // tile is dated and placed by the version it shows.
+        assert_eq!(glhf.key, "glhf-2");
+        assert_eq!(glhf.added_ms, 1_774_828_800_000);
+        assert_eq!(glhf.added_label.as_deref(), Some("30 March 2026"));
+        assert_eq!(rank, &Rank { order: Some(5), key: "glhf-v2".into() });
+    }
+
+    #[test]
+    fn an_undated_tile_shows_no_date_whatever_the_metadata_says() {
+        // The scraped date and the campaign window used to date a tile ("30 March
+        // 2026" read as 0 there, the window as a stand-in); neither is read now.
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "metadata:glhf-v2".to_string(),
+            metadata_entry(
+                "metadata:glhf-v2",
+                serde_json::json!({
+                    "date_added": "30 March 2026",
+                    "enrichment": { "starts_utc": "2026-03-01T00:00:00Z" }
+                }),
+            ),
+        );
+        let built = tiles(&catalogue(), &metadata, &HashMap::new(), &HashMap::new(), &HashMap::new(), &HashSet::new(), 0);
+        let (glhf, rank) = &built[0];
+        assert_eq!(glhf.added_ms, 0);
+        assert_eq!(glhf.added_label, None);
+        assert_eq!(rank.order, None);
+    }
+
+    #[test]
+    fn the_wall_sorts_newest_by_the_shared_places() {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            key: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            entries: Vec<Entry>,
+            expected: Vec<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            order: Vec<Case>,
+        }
+        let fixture: Fixture = serde_json::from_str(ORDER_FIXTURE).unwrap();
+        for case in fixture.order {
+            // Each key's place is its index in the expected list; fed in reverse,
+            // the wall must lay the tiles out by it.
+            let tiles: Vec<(BadgeTile, Rank)> = case
+                .entries
+                .iter()
+                .rev()
+                .map(|e| {
+                    let place = case.expected.iter().position(|k| *k == e.key).unwrap() as u32;
+                    tile_at(&e.key, Some(place), 0, None)
+                })
+                .collect();
+            assert_eq!(keys(order(tiles, Sort::Newest)), case.expected, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn tiles_with_no_place_lead_and_settle_by_key() {
+        let list = vec![
+            tile_at("b", Some(0), 0, None),
+            tile_at("z", None, 0, None),
+            tile_at("m", None, 0, None),
+        ];
+        assert_eq!(keys(order(list, Sort::Newest)), ["m", "z", "b"]);
+    }
+
+    #[test]
+    fn a_tile_with_no_place_asks_for_the_standing_once_more() {
+        let placed = vec![tile_at("a", Some(0), 0, None)];
+        let unplaced = vec![tile_at("a", Some(0), 0, None), tile_at("b", None, 0, None)];
+        let dates = added_of(&[("a/1", 0, None)]);
+        assert!(!has_unplaced(&dates, &placed));
+        assert!(has_unplaced(&dates, &unplaced));
+        // A standing whose dates task failed has no map at all: asking again is no help.
+        assert!(!has_unplaced(&HashMap::new(), &unplaced));
+    }
+
+    #[test]
+    fn the_wall_retries_the_standing_once_when_a_tile_has_no_place() {
+        let src = include_str!("badge_wall.rs").replace("\r\n", "\n");
+        let start = src.find("pub async fn get(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let check = body.find("if has_unplaced(&standing.added, &built) {").unwrap();
+        assert!(body[check..].contains("get_standing(app, false).await"));
+        // The first read and the single retry, nothing more.
+        assert_eq!(body.matches("get_standing(app,").count(), 2);
     }
 
     #[test]
@@ -857,5 +1033,60 @@ mod tests {
         assert_eq!(view.stats[0], Stat { value: "$17.97".into(), label: "in 3 subs".into() });
         assert_eq!(view.stats[1], Stat { value: "2h".into(), label: "of watching".into() });
         assert_eq!(view.notes.len(), 2);
+    }
+
+    const SHARP_A: &str = "34d2d3cad154dbffb1ce314ce9cbbaf767dccbfdce7c9acc739edb19eac42401.9801d687fca7d8744e77290e289a35535eeea91bac87bf28e3039d580ea7d605";
+
+    fn art_for(i: &str) -> BadgeArt {
+        BadgeArt { i: i.into(), a: SHARP_A.into() }
+    }
+
+    #[test]
+    fn tiles_and_missing_rows_carry_the_art_of_the_version_they_show() {
+        let art = HashMap::from([
+            ("glhf/2".to_string(), art_for("4x-GLHF-2")),
+            // glhf/1 is merged into the GLHF tile but not the version it shows, so its
+            // art must never reach that tile. (other/1 is also the Mouse tile's own key
+            // in this catalogue, so it cannot stand in for a merged-in version.)
+            ("glhf/1".to_string(), art_for("4x-GLHF-1")),
+        ]);
+        let built = tiles(&catalogue(), &HashMap::new(), &HashMap::new(), &HashMap::new(), &art, &HashSet::new(), 0);
+        let glhf = &built[0].0;
+        let mouse = &built[1].0;
+        // The merged tile shows glhf/2, so it carries glhf/2's art and never a
+        // merged-in version's.
+        assert_eq!(glhf.art, Some(art_for("4x-GLHF-2")));
+        assert_eq!(mouse.art, None);
+        let wire = serde_json::to_value(glhf).unwrap();
+        assert_eq!(wire["art"]["i"], "4x-GLHF-2");
+        assert_eq!(wire["art"]["a"], SHARP_A);
+        // Left out, not null, when there is none.
+        assert!(serde_json::to_value(mouse).unwrap().get("art").is_none());
+
+        let badge = MissingBadge {
+            key: "glhf/2".into(),
+            set_id: "glhf".into(),
+            version: "2".into(),
+            title: "GLHF".into(),
+            image_url: "4x-GLHF-2".into(),
+            ends_ms: None,
+            earn: crate::services::badge_earn::earn_path(None, None),
+            category: None,
+        };
+        let row = missing_row(&badge, &HashMap::new(), art.get(&badge.key), 0);
+        assert_eq!(row.art, Some(art_for("4x-GLHF-2")));
+        let bare = missing_row(&badge, &HashMap::new(), None, 0);
+        assert!(serde_json::to_value(&bare).unwrap().get("art").is_none());
+
+        // Every path hands the standing's art on: the strip and both wall reads.
+        let src = include_str!("badge_wall.rs").replace("\r\n", "\n");
+        let body_of = |head: &str| {
+            let start = src.find(head).unwrap();
+            src[start..start + src[start..].find("\n}\n").unwrap()].to_string()
+        };
+        assert!(body_of("pub fn missing_now(").contains("missing_row(b, &standing.earn_icons, standing.art.get(&b.key), now)"));
+        let body = body_of("pub async fn get(");
+        assert!(body.contains("&standing.added, &standing.art, &owned, now)"));
+        assert!(body.contains("&again.added, &again.art, &owned, now)"));
     }
 }

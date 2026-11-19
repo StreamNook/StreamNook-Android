@@ -16,7 +16,7 @@ use log::debug;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use crate::rt::AppHandle;
@@ -78,6 +78,12 @@ pub struct HostInner {
     pub active_channel: TokioRwLock<Option<ActiveChannel>>,
     pub notify_stamps: TokioMutex<HashMap<String, Vec<Instant>>>,
     pub shutting_down: AtomicBool,
+    /// One drops-settings push at a time, so two overlapping pushes reach the
+    /// plugin in the order their generations were taken.
+    pub push_lock: TokioMutex<()>,
+    /// Counts the host's own pushes; each carries the next number (taken under
+    /// `push_lock`) so the plugin can drop a page push that is older.
+    pub push_generation: AtomicU64,
 }
 
 pub struct PendingInstall {
@@ -85,7 +91,46 @@ pub struct PendingInstall {
     pub prepared: install::PreparedInstall,
 }
 
+/// The evolution locks the last drops-settings push carried, so a lock check
+/// pushes again only when they changed.
+static SENT_LOCKED: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// How old Twitch's second drops list may be when a drops plugin is told which
+/// evolution lines it can't work; also how often that is re-checked.
+pub(crate) const LOCKS_LIST_MAX_AGE_SECS: u64 = 300;
+
 impl HostInner {
+    /// Reads Twitch's second drops list again when it is older than
+    /// `LOCKS_LIST_MAX_AGE_SECS`. Which evolution lines are locked is worked out
+    /// from it, and nothing else reads it while Autopilot mines with nothing
+    /// playing in the app; before the first read the locks are empty and every
+    /// line looks workable. No Drops sign-in: nothing to read, and no plugin
+    /// mining either.
+    async fn freshen_second_list(&self) {
+        use tauri::Manager;
+        if crate::services::reward_drops::cached_within(LOCKS_LIST_MAX_AGE_SECS).is_some() {
+            return;
+        }
+        let Some(state) = self.app.try_state::<crate::models::settings::AppState>() else {
+            return;
+        };
+        let read = state.drops_service.lock().await.reward_campaigns(LOCKS_LIST_MAX_AGE_SECS).await;
+        if let Err(e) = read {
+            debug!("[PluginHost] second drops list for the evolution locks: {e}");
+        }
+    }
+
+    /// Pushes the drops settings again when the evolution lines this account
+    /// can't start changed since the last push (a fresh list, a badge earned).
+    pub async fn refresh_evolution_locks(&self) {
+        self.freshen_second_list().await;
+        let locked = crate::services::evolution::locked_stages(&self.app).await;
+        let changed = SENT_LOCKED.lock().map(|s| s.as_ref() != Some(&locked)).unwrap_or(true);
+        if changed {
+            self.push_drops_settings().await;
+        }
+    }
+
     /// True when at least one running plugin subscribed to the event.
     pub async fn any_hook(&self, event: &str) -> bool {
         self.running
@@ -103,8 +148,15 @@ impl HostInner {
     /// pushed too early (before the plugin was up) no longer matters. The
     /// settings are read when the push runs, so overlapping pushes all carry
     /// the latest copy.
+    ///
+    /// Pushes run one at a time (`push_lock`), the settings are read from the
+    /// drops service last, right before sending, and every push carries this
+    /// run's `host_session` and a rising `generation`, so a plugin that sees a
+    /// host session ignores a value that is older than a push it already
+    /// applied (and a page push that carries no generation at all).
     pub async fn push_drops_settings(&self) {
         use tauri::Manager;
+        let _push = self.push_lock.lock().await;
         let targets: Vec<mpsc::UnboundedSender<SupCmd>> = {
             let running = self.running.read().await;
             running
@@ -119,6 +171,16 @@ impl HostInner {
         let Some(state) = self.app.try_state::<crate::models::settings::AppState>() else {
             return;
         };
+        // Looked up before the settings are read, so the copy sent is the
+        // newest one at the moment of sending, not at the start of the lookups.
+        // The locks come from the second drops list, read first when stale:
+        // on a plugin's start it usually has not been read yet.
+        self.freshen_second_list().await;
+        let evolution_bases = crate::services::evolution::evolution_bases().await;
+        let evolution_locked = crate::services::evolution::locked_stages(&self.app).await;
+        if let Ok(mut sent) = SENT_LOCKED.lock() {
+            *sent = Some(evolution_locked.clone());
+        }
         let settings = state.drops_service.lock().await.get_settings().await;
         let Ok(mut values) = serde_json::to_value(&settings) else {
             return;
@@ -128,21 +190,29 @@ impl HostInner {
         if let Some(map) = values.as_object_mut() {
             map.insert(
                 "evolution_bases".into(),
-                json!(crate::services::evolution::evolution_bases().await),
+                json!(evolution_bases),
             );
             // Nor this: the evolution stages this account cannot earn yet, by
             // reward group, with the badge each needs first. A line whose
             // first form is not held is never worked or followed.
             map.insert(
                 "evolution_locked".into(),
-                json!(crate::services::evolution::locked_stages(&self.app).await),
+                json!(evolution_locked),
             );
         }
+        let generation = self.push_generation.fetch_add(1, Ordering::AcqRel) + 1;
         for tx in targets {
             let (reply, rx) = oneshot::channel();
             let sent = tx.send(SupCmd::Request {
                 method: "invoke_action".into(),
-                params: json!({ "action": DROPS_CONFIGURE_ACTION, "args": { "values": values } }),
+                params: json!({
+                    "action": DROPS_CONFIGURE_ACTION,
+                    "args": {
+                        "values": values,
+                        "host_session": host_session_id(),
+                        "generation": generation,
+                    }
+                }),
                 reply,
             });
             if sent.is_ok() {
@@ -245,7 +315,7 @@ pub struct SourceInfo {
 /// available with no manual add. If the user had already added the same URL as
 /// a community source, it is upgraded in place (marked built-in, re-pinned to
 /// the bundled operator key). Returns true when the registry changed.
-fn ensure_official_source(registry: &mut Registry) -> bool {
+pub(crate) fn ensure_official_source(registry: &mut Registry) -> bool {
     let Some((url, pubkey)) = install::OFFICIAL_INDEX else {
         return false;
     };
@@ -270,7 +340,7 @@ fn ensure_official_source(registry: &mut Registry) -> bool {
 /// "always". Enabling a plugin, with the consent shown at install or first
 /// enable, is the grant; re-prompting each launch was too much. Returns true
 /// when something changed.
-fn migrate_credential_consent(registry: &mut Registry) -> bool {
+pub(crate) fn migrate_credential_consent(registry: &mut Registry) -> bool {
     let mut changed = false;
     for plugin in &mut registry.plugins {
         for state in plugin.credential_consent.values_mut() {
@@ -286,6 +356,34 @@ fn migrate_credential_consent(registry: &mut Registry) -> bool {
 /// The action a drops-automation plugin takes the stored drops settings
 /// through (`HostInner::push_drops_settings`).
 pub const DROPS_CONFIGURE_ACTION: &str = "drops.configure";
+
+/// A uuid made once per app run. The plugin saves its session state against
+/// it, so a crash restart inside one run keeps what the viewer did (a Stop),
+/// and a new app run starts fresh. Sent in `initialize` and with every push.
+pub fn host_session_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Loads the registry, seeds the built-in source, upgrades legacy "ask"
+/// consent and saves it when either changed something. Setup calls this once,
+/// synchronously, before the background-launch decision (so the provider state
+/// is known), and hands the result to `PluginHost::startup`.
+pub fn load_prepared() -> Result<Registry> {
+    let mut loaded = registry::load()?;
+    // Seed the built-in StreamNook source so its curated catalog is
+    // available immediately, with no manual add; and upgrade any
+    // legacy per-session credential consent to the granted-at-enable
+    // model so plugins are not re-prompted every launch.
+    let mut dirty = ensure_official_source(&mut loaded);
+    dirty |= migrate_credential_consent(&mut loaded);
+    if dirty {
+        if let Err(e) = registry::save(&loaded) {
+            log::error!("[PluginHost] failed to persist registry on startup: {e}");
+        }
+    }
+    Ok(loaded)
+}
 
 pub struct PluginHost {
     inner: Arc<HostInner>,
@@ -310,48 +408,47 @@ impl PluginHost {
                 active_channel: TokioRwLock::new(None),
                 notify_stamps: TokioMutex::new(HashMap::new()),
                 shutting_down: AtomicBool::new(false),
+                push_lock: TokioMutex::new(()),
+                push_generation: AtomicU64::new(0),
             }),
         }
     }
 
-    /// Loads the registry, starts every enabled plugin, starts the emitters.
-    pub async fn startup(&self) {
-        match registry::load() {
-            Ok(mut loaded) => {
-                // Seed the built-in StreamNook source so its curated catalog is
-                // available immediately, with no manual add; and upgrade any
-                // legacy per-session credential consent to the granted-at-enable
-                // model so plugins are not re-prompted every launch.
-                let mut dirty = ensure_official_source(&mut loaded);
-                dirty |= migrate_credential_consent(&mut loaded);
-                if dirty {
-                    if let Err(e) = registry::save(&loaded) {
-                        log::error!("[PluginHost] failed to persist registry on startup: {e}");
-                    }
+    /// Starts every enabled plugin and the emitters. `loaded` is the registry
+    /// setup already read, seeded and migrated (`load_prepared`), used as it is;
+    /// with `None` (the phones, which have no background mode) it is loaded,
+    /// seeded and migrated here.
+    pub async fn startup(&self, loaded: Option<Registry>) {
+        let loaded = match loaded {
+            Some(loaded) => Some(loaded),
+            None => match load_prepared() {
+                Ok(loaded) => Some(loaded),
+                Err(e) => {
+                    log::error!("[PluginHost] registry load failed: {e}");
+                    None
                 }
-                // Only process plugins get a supervisor; ui plugins are
-                // loaded by the frontend, which reads the registry itself.
-                let enabled: Vec<String> = loaded
-                    .plugins
-                    .iter()
-                    .filter(|p| p.enabled && p.kind == "process")
-                    .map(|p| p.id.clone())
-                    .collect();
-                *self.inner.registry.lock().await = loaded;
-                for id in enabled {
-                    self.spawn_supervisor(id);
-                }
-                // Startup runs concurrently with the webview boot; this ping
-                // makes a window that listed plugins before the registry was
-                // ready re-sync (the ui-plugin loader listens for it).
-                let _ = self.inner.app.emit(
-                    "plugin://state-changed",
-                    json!({ "plugin_id": Value::Null, "running": false }),
-                );
+            },
+        };
+        if let Some(loaded) = loaded {
+            // Only process plugins get a supervisor; ui plugins are
+            // loaded by the frontend, which reads the registry itself.
+            let enabled: Vec<String> = loaded
+                .plugins
+                .iter()
+                .filter(|p| p.enabled && p.kind == "process")
+                .map(|p| p.id.clone())
+                .collect();
+            *self.inner.registry.lock().await = loaded;
+            for id in enabled {
+                self.spawn_supervisor(id);
             }
-            Err(e) => {
-                log::error!("[PluginHost] registry load failed: {e}");
-            }
+            // Startup runs concurrently with the webview boot; this ping
+            // makes a window that listed plugins before the registry was
+            // ready re-sync (the ui-plugin loader listens for it).
+            let _ = self.inner.app.emit(
+                "plugin://state-changed",
+                json!({ "plugin_id": Value::Null, "running": false }),
+            );
         }
         events::start_background_emitters(self.inner.clone());
         debug!("[PluginHost] started");

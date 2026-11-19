@@ -255,6 +255,63 @@ pub(crate) fn commit_vertical_view(
     Ok(true)
 }
 
+/// The one writer of `Settings.automations` (`commands::account_automations::edit`).
+/// `change` runs on a copy of the group under the settings lock; the copy is
+/// written back only when it answers true. Every other save keeps the group
+/// (`Settings::adopt_backend_owned`). Answers what `change` answered.
+pub(crate) fn commit_automations(
+    app: &AppHandle,
+    state: &AppState,
+    change: impl FnOnce(&mut crate::models::automations::Automations) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let mut group = state_settings.automations.clone();
+        if !change(&mut group)? {
+            return Ok(false);
+        }
+        state_settings.automations = group;
+        state_settings.clone()
+    };
+    after_settings_change(&settings, false, None);
+    write_settings_to_disk(&settings)?;
+    flush_now_if_phone_idle();
+    let keys = vec!["automations".to_string()];
+    let _ = app.emit(SETTINGS_UPDATED_EVENT, SettingsUpdated { source: None, keys });
+    Ok(true)
+}
+
+/// A write that spans more than one settings group (the reminders' convert and restore touch
+/// `automations` and `reminders` together; the Reminders writer touches `reminders`). `change`
+/// runs on a copy of the whole settings under the lock; the copy replaces the canonical one only
+/// when it answers `Ok(true)`, so a refusal leaves everything as it was. Then every save's side
+/// effects run (a reminder refresh reads the new `converted_reminders`, then the engine
+/// recompiles), the file is written, and every window hears the settings-updated event naming
+/// `keys`. Answers what `change` answered.
+pub(crate) fn commit_settings(
+    app: &AppHandle,
+    state: &AppState,
+    keys: &[&str],
+    change: impl FnOnce(&mut Settings) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let settings = {
+        let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let mut copy = state_settings.clone();
+        if !change(&mut copy)? {
+            return Ok(false);
+        }
+        let written = copy.clone();
+        *state_settings = copy;
+        written
+    };
+    after_settings_change(&settings, false, None);
+    write_settings_to_disk(&settings)?;
+    flush_now_if_phone_idle();
+    let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    let _ = app.emit(SETTINGS_UPDATED_EVENT, SettingsUpdated { source: None, keys });
+    Ok(true)
+}
+
 /// A backup or import that names `video_player` without `vertical_view` (one
 /// written before it existed) keeps the pick this install has (Z4): the field
 /// is portable, but its absence is not a choice.
@@ -910,6 +967,9 @@ fn after_settings_change(
     // Spawns or aborts the gifted-membership poll with the master switch.
     crate::services::membership_gifts::refresh(settings);
     crate::services::reminder_service::refresh(settings);
+    // Rules, run state, away and the preferences recompile (a no-op before
+    // the engine starts).
+    crate::services::account_automations::request_refresh();
     #[cfg(target_os = "ios")]
     crate::services::twitch_resolver::refresh_device_codecs(settings);
     // The phone's go-live push registration follows the switches and the mute list.
@@ -1037,7 +1097,12 @@ pub async fn share_settings_file(app: AppHandle, to: String, state: State<'_, Ap
 pub async fn import_settings_text(app: AppHandle, json: String, state: State<'_, AppState>) -> Result<(), String> {
     let incoming: serde_json::Value = serde_json::from_str(&json)
         .map_err(|_| "That file isn't a valid StreamNook settings backup.".to_string())?;
-    apply_imported_settings(&app, &state, &incoming)
+    // The import and the drops hand-off form one write: nothing saves drops
+    // settings in between (this machine's start_at_login and told_keep_running
+    // are kept by the import, the rest reaches the plugin and the tray).
+    let _write = crate::commands::drops::DROPS_SETTINGS_WRITE.lock().await;
+    let imported = apply_imported_settings(&app, &state, &incoming)?;
+    crate::commands::drops::apply_drops_settings(&app, &state, imported.drops, None).await
 }
 
 /// Apply a previously exported backup at `path`. Portable preferences from the
@@ -1053,7 +1118,9 @@ pub async fn import_settings(app: AppHandle, path: String, state: State<'_, AppS
         fs::read_to_string(&path).map_err(|e| format!("Couldn't read that file: {}", e))?;
     let incoming: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|_| "That file isn't a valid StreamNook settings backup.".to_string())?;
-    apply_imported_settings(&app, &state, &incoming)
+    let _write = crate::commands::drops::DROPS_SETTINGS_WRITE.lock().await;
+    let imported = apply_imported_settings(&app, &state, &incoming)?;
+    crate::commands::drops::apply_drops_settings(&app, &state, imported.drops, None).await
 }
 
 /// Put every portable key of a backup over the live settings (session and
@@ -1062,7 +1129,7 @@ pub(crate) fn apply_imported_settings(
     app: &AppHandle,
     state: &AppState,
     incoming: &serde_json::Value,
-) -> Result<(), String> {
+) -> Result<Settings, String> {
     let incoming_obj = incoming
         .as_object()
         .ok_or_else(|| "That file isn't a valid StreamNook settings backup.".to_string())?;
@@ -1092,10 +1159,15 @@ pub(crate) fn apply_imported_settings(
     imported.map_legacy_event_keys();
     keep_absent_vertical_view(incoming_obj, &current, &mut imported);
     favorite_channels::repair(&mut imported);
+    keep_this_machines_drops_fields(&current, &mut imported);
 
     let favorites_changed = favorite_channels::favorites_changed(&current, &imported);
     {
         let mut state_settings = state.settings.lock().map_err(|e| e.to_string())?;
+        // A restored file never brings rules back live, turns automations on
+        // or brings back an old away (reminders are untouched). Inside the
+        // settings lock, so no save sees the unpaused copy.
+        crate::commands::account_automations::pause_restored(&mut imported.automations);
         *state_settings = imported.clone();
     }
     // The backup's recent polls and predictions go in front of the ones kept
@@ -1111,7 +1183,16 @@ pub(crate) fn apply_imported_settings(
     // right after this returns and must find the imported file on disk.
     write_settings_to_disk_sync(&imported)?;
     let _ = app.emit(SETTINGS_UPDATED_EVENT, SettingsUpdated { source: None, keys });
-    Ok(())
+    Ok(imported)
+}
+
+/// Two drops fields belong to this machine and survive an import or a backup
+/// restore: whether it starts at login (another computer's choice means
+/// nothing here) and whether the "still running in the tray" notice was shown
+/// to this viewer here. Everything else in the drops group comes from the file.
+fn keep_this_machines_drops_fields(current: &Settings, imported: &mut Settings) {
+    imported.drops.start_at_login = current.drops.start_at_login;
+    imported.drops.told_keep_running = current.drops.told_keep_running;
 }
 
 #[tauri::command]
@@ -1584,8 +1665,8 @@ mod patch_tests {
     #[test]
     fn every_commit_path_flushes_a_background_phone_and_the_import_repairs() {
         let src = this_file();
-        // commit_settings_patch, commit_favorite_patch, commit_vertical_view.
-        assert_eq!(src.matches("    flush_now_if_phone_idle();\n").count(), 3);
+        // commit_settings_patch, commit_favorite_patch, commit_vertical_view, commit_automations, commit_settings (P5 reminders).
+        assert_eq!(src.matches("    flush_now_if_phone_idle();\n").count(), 5);
         let import = &src[src.find("pub(crate) fn apply_imported_settings(").unwrap()..];
         let import = &import[..import.find("\n}\n").unwrap()];
         assert!(import.contains("favorite_channels::repair(&mut imported);"));
@@ -1679,6 +1760,36 @@ mod patch_tests {
             .find("let rev = crate::services::home_snapshot::following_rev_now().await;")
             .expect("the door answers the revision from following_rev_now");
         assert!(commit < rev, "the revision is read after the write");
+    }
+
+    #[test]
+    fn an_import_keeps_this_machines_start_at_login() {
+        // This computer starts at login and has shown the tray notice.
+        let mut current = Settings::default();
+        current.drops.start_at_login = true;
+        current.drops.told_keep_running = true;
+        // A backup from another computer: login start off, notice not shown,
+        // Missing badges on.
+        let mut imported = Settings::default();
+        imported.drops.start_at_login = false;
+        imported.drops.told_keep_running = false;
+        imported.drops.collect_missing_badges = true;
+        keep_this_machines_drops_fields(&current, &mut imported);
+        assert!(imported.drops.start_at_login, "this computer's login start stays");
+        assert!(imported.drops.told_keep_running, "the notice shown here stays shown");
+        assert!(imported.drops.collect_missing_badges, "every other drops choice comes from the backup");
+        // The other way: an import never turns login start on.
+        let current = Settings::default();
+        let mut imported = Settings::default();
+        imported.drops.start_at_login = true;
+        keep_this_machines_drops_fields(&current, &mut imported);
+        assert!(!imported.drops.start_at_login);
+        // Import and backup restore both run it (both go through apply_imported_settings).
+        let src = this_file();
+        let import = &src[src.find("pub(crate) fn apply_imported_settings(").unwrap()..];
+        let import = &import[..import.find("\n}\n").unwrap()];
+        assert!(import.contains("keep_this_machines_drops_fields(&current, &mut imported);"));
+        assert!(import.ends_with("    Ok(imported)"));
     }
 
     #[test]

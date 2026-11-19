@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, lazy, Suspense } from 'react';
+import { useCallback, useEffect, useMemo, useState, useRef, lazy, Suspense } from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useShallow } from 'zustand/react/shallow';
@@ -56,6 +56,8 @@ import ErrorBoundary from './components/ErrorBoundary';
 import InputContextMenuHost from './components/InputContextMenuHost';
 import { listen } from '@tauri-apps/api/event';
 import { useMentionPing } from './hooks/useMentionPing';
+import { useAutomationStatus } from './hooks/useAutomationStatus';
+import { useAutomationNotify } from './hooks/useAutomationNotify';
 import { useTwitchSignInPrompt } from './hooks/useTwitchSignInPrompt';
 import { applyModerateEvent } from './utils/applyModerateEvent';
 import { handleSeventvEmoteSetUpdate, handleSeventvCosmeticUpdate, type EmoteSetUpdatePayload, type CosmeticUpdatePayload } from './services/seventvEventApi';
@@ -63,6 +65,18 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { useThemeBoot } from './boot/useThemeBoot';
 import { getLogicalInnerSize, clampToWorkArea } from './utils/windowSizing';
+import {
+  applyBadgeAnswer,
+  openBadgeLink,
+  resolveBadgeLink,
+  splitBadgeKey,
+  type BadgeLinkDeps,
+} from './utils/badgeLinkOpen';
+import BadgeDetailSlot, { makeCloseLinkSheet, type SelectedBadge } from './components/BadgeDetailSlot';
+import { exitPlayerFullscreen } from './utils/windowFullscreen';
+import { openInboundLink, startLinkDrain, type InboundLinkDeps } from './utils/inboundLinkOpen';
+import { makeCloseAppLayers } from './utils/closeAppLayers';
+import { noteLinkStamp, noticeWorkSettled, trackLinkPeek, watchBootActions } from './utils/noticeReport';
 import { isTitlebarDragActive } from './utils/titleBarDrag';
 import { getSelectedCompactViewPreset } from './constants/compactViewPresets';
 import { compactChatSlot } from './utils/compactView';
@@ -94,24 +108,11 @@ const SearchProfileModal = lazy(() =>
 );
 const DropsOverlay = lazy(() => import('./components/DropsOverlay'));
 const MarketplaceOverlay = lazy(() => import('./components/MarketplaceOverlay'));
-const BadgesOverlay = lazy(() => import('./components/BadgesOverlay'));
 const EmoteSetsOverlay = lazy(() => import('./components/EmoteSetsOverlay'));
-const BadgeDetailOverlay = lazy(() => import('./components/BadgeDetailOverlay'));
 const ChangelogOverlay = lazy(() => import('./components/ChangelogOverlay'));
 const SetupWizard = lazy(() => import('./components/SetupWizard'));
 const ClipModal = lazy(() => import('./components/ClipModal'));
 const ClipEditor = lazy(() => import('./components/ClipEditor'));
-interface BadgeVersion {
-  id: string;
-  image_url_1x: string;
-  image_url_2x: string;
-  image_url_4x: string;
-  title: string;
-  description: string;
-  click_action: string | null;
-  click_url: string | null;
-  set_id?: string;
-}
 
 // One-time migration flag for v4.9.1 webview features
 // This key is set after the force re-login to ensure it only happens once
@@ -215,6 +216,10 @@ function App() {
   useChatDockHold();
   // Plays the mention sound when Rust says a live message mentioned you.
   useMentionPing();
+  // Automations: the status every chat dot reads, and the toasts and sounds of
+  // the Notify actions this window wins.
+  useAutomationStatus();
+  useAutomationNotify();
   // Main window only: asks you to sign in to Twitch again, until you do, when
   // Rust signed you out itself (one prompt per app, not per window).
   useTwitchSignInPrompt();
@@ -492,9 +497,9 @@ function App() {
     : undefined;
   const [chatRevealed, setChatRevealed] = useState(false);
   const chatRevealTimer = useRef<number | null>(null);
-  // A streamnook:// deep link that landed while the app was still booting. Played
-  // once boot finishes (see the deep-link effects below).
-  const pendingWatchChannelRef = useRef<string | null>(null);
+  // The one link drain. The `[]` effect near the top of the effects below owns
+  // it; the `[isBooting]` effect asks it to take once boot ends.
+  const drainRef = useRef<{ drain: () => void; stop: () => void } | null>(null);
   const revealChat = () => {
     if (chatRevealTimer.current) { window.clearTimeout(chatRevealTimer.current); chatRevealTimer.current = null; }
     setChatRevealed(true);
@@ -523,7 +528,50 @@ function App() {
   const [isResizing, setIsResizing] = useState(false);
   const [isResizingModLogs, setIsResizingModLogs] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
-  const [selectedBadge, setSelectedBadge] = useState<{ badge: BadgeVersion; setId: string } | null>(null);
+  const [selectedBadge, setSelectedBadge] = useState<SelectedBadge>(null);
+  // Numbers every badge link lookup (a link's first read and each Try again), so an older lookup's
+  // answer can never land on a newer placeholder.
+  const badgeReadRef = useRef(0);
+  const badgeLinkDeps = useMemo<BadgeLinkDeps>(
+    () => ({
+      isPlayerFullscreen: () => useAppStore.getState().isPlayerFullscreen,
+      exitPlayerFullscreen,
+      // Badges opens on the Twitch tab behind the detail, so Back lands on that list.
+      showBadgeLink: (key) => {
+        const { setId, version } = splitBadgeKey(key);
+        useAppStore.getState().openTwitchBadge(setId, version);
+        badgeReadRef.current += 1;
+        const read = badgeReadRef.current;
+        setSelectedBadge({ kind: 'link', key, state: 'loading', read });
+        return read;
+      },
+      answerBadgeLink: (key, read, next) =>
+        setSelectedBadge((cur) => applyBadgeAnswer(cur, key, read, next)),
+    }),
+    [setSelectedBadge],
+  );
+  // Try again on a failed placeholder: a new read number, the placeholder back to loading, one more lookup.
+  const selectedBadgeRef = useRef(selectedBadge);
+  useEffect(() => {
+    selectedBadgeRef.current = selectedBadge;
+  }, [selectedBadge]);
+  const retryBadgeLink = useCallback(
+    (key: string) => {
+      const cur = selectedBadgeRef.current;
+      if (cur?.kind !== 'link' || cur.key !== key || cur.state !== 'failed') return;
+      badgeReadRef.current += 1;
+      const read = badgeReadRef.current;
+      setSelectedBadge({ kind: 'link', key, state: 'loading', read, retry: true });
+      resolveBadgeLink(key, (next) => badgeLinkDeps.answerBadgeLink(key, read, next));
+    },
+    [badgeLinkDeps, setSelectedBadge],
+  );
+  // What a link to another screen closes first: the detail or its placeholder, the Badges list behind
+  // it and a badge spotlight card.
+  const closeLinkSheet = useMemo(
+    () => makeCloseLinkSheet({ setSelectedBadge, setShowBadgesOverlay }),
+    [setSelectedBadge, setShowBadgesOverlay],
+  );
   
   // Persist savedWindowSize to localStorage so it survives app restarts. The
   // optional `maximized` flag is additive, so a stored value written before it
@@ -770,7 +818,7 @@ function App() {
   useEffect(() => {
     const handleBadgeDetail = (event: CustomEvent) => {
       const { badge, setId } = event.detail;
-      setSelectedBadge({ badge, setId });
+      setSelectedBadge({ kind: 'badge', badge, setId });
     };
 
     window.addEventListener('show-badge-detail', handleBadgeDetail as EventListener);
@@ -829,45 +877,59 @@ function App() {
     };
   }, []);
 
-  // streamnook:// deep links (the share links resolve here). The Rust handler
-  // emits `streamnook:watch` for links opened while we're running; the
-  // take_pending_watch_link command drains one the app was cold-started with.
-  // Either carries a startStream key Rust already cleaned: a bare Twitch login,
-  // or `provider:channel` (a YouTube video id in it is case-sensitive, so it is
-  // passed on as given). Playback defers until boot finishes so startStream has
-  // settings/auth loaded.
+  // The one door for streamnook:// links of every kind (watch, badge, category).
+  // Rust stores the link in one slot and emits `streamnook:link` with its stamp (a
+  // number); `take_pending_link` hands the slot's link over once, for the event
+  // and for a link the app was launched with. `startLinkDrain` owns the order:
+  // the listener first, then one take, so a link stored while the listener was
+  // registering is not lost. A link carries what Rust already cleaned: a watch
+  // key is a bare Twitch login or `provider:channel` (a YouTube video id in it
+  // is case-sensitive, so it is passed on as given).
   useEffect(() => {
-    const openChannel = (channel: string) => {
-      const login = channel.trim();
-      if (!login) return;
-      if (useAppStore.getState().isBooting) {
-        pendingWatchChannelRef.current = login;
-      } else {
+    const deps: InboundLinkDeps = {
+      startStream: (key) => {
+        const login = key.trim();
+        if (!login) return;
         void useAppStore.getState().startStream(login);
-      }
+      },
+      closeLinkSheet,
+      openBadge: (setId, version) => openBadgeLink({ setId, version }, badgeLinkDeps),
+      // Closes the layers only App holds (the changelog popup and the badge
+      // detail) before a category link opens. Built here, once, from a ref and
+      // setters; this effect runs once, so no memo is needed.
+      closeAppLayers: makeCloseAppLayers({ changelogRecordsSeenRef, setShowChangelog, setSelectedBadge }),
+      openCategory: (id) => useAppStore.getState().openCategoryFromLink(id),
     };
-
-    const unlistenPromise = listen<string>('streamnook:watch', (event) => {
-      if (event.payload) openChannel(event.payload);
+    drainRef.current = startLinkDrain({
+      // Tauri hands a listener an event object; the drain wants the bare payload (the stamp).
+      listen: (event, handler) => listen<unknown>(event, (e) => handler(e.payload)),
+      take: () => invoke<unknown>('take_pending_link'),
+      open: (link) => openInboundLink(link, deps),
+      // While the app boots a link is not taken: it stays in Rust's slot, where a
+      // notification click that opens something drops an older link, and the
+      // effect below takes once boot ends. Playback needs settings and auth loaded.
+      ready: () => !useAppStore.getState().isBooting,
+      // A notification click's report to Rust settles before a take.
+      beforeTake: noticeWorkSettled,
+      onStamp: noteLinkStamp,
+      peek: () => trackLinkPeek(invoke<unknown>('peek_pending_link_stamp')),
     });
-
-    // Cold start: the app was launched by the link before this listener existed.
-    invoke<string | null>('take_pending_watch_link')
-      .then((channel) => { if (channel) openChannel(channel); })
-      .catch(() => { /* older backend without the command; safe to ignore */ });
-
     return () => {
-      unlistenPromise.then((unlisten) => unlisten());
+      drainRef.current?.stop();
     };
+    // The three deps above are memoized once; a restart would only re-take an empty slot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Flush a deep link that arrived mid-boot, once the app is ready.
+  // Boot ended: take the link that waited in Rust's slot (none, usually). While
+  // booting, watch the person's own actions, so an older link does not open over
+  // what they just chose.
   useEffect(() => {
-    if (!isBooting && pendingWatchChannelRef.current) {
-      const channel = pendingWatchChannelRef.current;
-      pendingWatchChannelRef.current = null;
-      void useAppStore.getState().startStream(channel);
+    if (!isBooting) {
+      drainRef.current?.drain();
+      return undefined;
     }
+    return watchBootActions(useAppStore, invoke);
   }, [isBooting]);
 
   // The context-menu blocker lives in InputContextMenuHost (rendered below), so
@@ -1187,12 +1249,13 @@ function App() {
         addToast('Reserved stream went offline - token returned to rotation', 'info');
       });
 
-      // streamnook:// links are owned by Rust: its deep-link handler emits
-      // `streamnook:watch` (see the effect near the top of this component),
-      // and cold starts drain `take_pending_watch_link`. A second
-      // subscription here through the plugin's onOpenUrl started every warm
-      // link twice (two relay starts 20 to 40 ms apart, the outgoing hls.js
-      // instance erroring against a swapped upstream) until 2026-09-06.
+      // streamnook:// links are owned by Rust: its deep-link handler stores each
+      // link and emits `streamnook:link` (see the drain effect near the top of
+      // this component), and a cold start takes the stored link with
+      // `take_pending_link`. A second subscription here through the plugin's
+      // onOpenUrl started every warm link twice (two relay starts 20 to 40 ms
+      // apart, the outgoing hls.js instance erroring against a swapped upstream)
+      // until 2026-09-06.
     };
 
     initializeApp();
@@ -2460,35 +2523,19 @@ function App() {
           />
         </Suspense>
       )}
-      <AnimatePresence>
-        {showBadgesOverlay && !selectedBadge && (
-          <Suspense fallback={null}>
-            <BadgesOverlay
-              onClose={() => setShowBadgesOverlay(false)}
-              onBadgeClick={(badge, setId) => setSelectedBadge({ badge, setId })}
-              initialPaintId={badgesOverlayInitialPaintId}
-              initialBadgeId={badgesOverlayInitialBadgeId}
-              initialStreamNook={badgesOverlayInitialStreamNook}
-              initialTarget={badgesOverlayInitialTarget}
-            />
-          </Suspense>
-        )}
-      </AnimatePresence>
-      <AnimatePresence>
-        {selectedBadge && (
-        <Suspense fallback={null}>
-          <BadgeDetailOverlay
-            badge={selectedBadge.badge}
-            setId={selectedBadge.setId}
-            onClose={() => {
-              setSelectedBadge(null);
-              setShowBadgesOverlay(false);
-            }}
-            onBack={() => setSelectedBadge(null)}
-          />
-        </Suspense>
-        )}
-      </AnimatePresence>
+      <BadgeDetailSlot
+        selectedBadge={selectedBadge}
+        setSelectedBadge={setSelectedBadge}
+        showBadgesOverlay={showBadgesOverlay}
+        setShowBadgesOverlay={setShowBadgesOverlay}
+        overlayInitial={{
+          paintId: badgesOverlayInitialPaintId,
+          badgeId: badgesOverlayInitialBadgeId,
+          streamNook: badgesOverlayInitialStreamNook,
+          target: badgesOverlayInitialTarget,
+        }}
+        onRetryBadgeLink={retryBadgeLink}
+      />
       <AnimatePresence>
         {showChangelog && changelogVersion && (
           <Suspense fallback={null}>

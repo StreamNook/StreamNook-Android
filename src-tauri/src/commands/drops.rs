@@ -23,8 +23,45 @@ pub async fn get_drops_overview(
     state: State<'_, AppState>,
     reuse_campaigns: bool,
 ) -> Result<crate::services::drops_overview::DropsOverview, String> {
+    Ok(build_drops_overview(&app, &state, reuse_campaigns, !reuse_campaigns).await)
+}
+
+/// The last Drops page model built for this Drops sign-in, at any age, or None
+/// before the first. Answers at once (no drops lock, no network): the page
+/// draws it on open and calls `get_drops_overview` behind it for fresh numbers.
+#[tauri::command]
+pub fn get_cached_drops_overview() -> Option<crate::services::drops_overview::DropsOverview> {
+    crate::services::drops_overview::last()
+}
+
+/// Build the Drops page model a little after start-up, so even the first open
+/// of the Drops page draws at once. Quiet: no new-campaign announcements (the
+/// page's own read makes those), and nothing at all without a Drops sign-in.
+#[cfg(desktop)]
+pub fn warm_drops_overview(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // Off the start-up path: chat, the player and Home come first.
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        if crate::services::drops_overview::last().is_some() || !DropsAuthService::is_authenticated().await {
+            return;
+        }
+        let Some(state) = app.try_state::<AppState>() else { return };
+        let _ = build_drops_overview(&app, &state, false, false).await;
+    });
+}
+
+/// The Drops page model, kept as the one the page opens on next time.
+/// `announce` posts new campaigns in favourite games (the page's own reads).
+pub(crate) async fn build_drops_overview(
+    app: &AppHandle,
+    state: &AppState,
+    reuse_campaigns: bool,
+    announce: bool,
+) -> crate::services::drops_overview::DropsOverview {
     use crate::services::drops_overview;
 
+    let epoch = DropsAuthService::token_epoch();
+    let seq = drops_overview::next_build();
     let started = std::time::Instant::now();
     let gather = async {
         let drops_service = state.drops_service.lock().await;
@@ -37,26 +74,32 @@ pub async fn get_drops_overview(
         // Campaigns and inventory are independent reads; fetch them together.
         let campaigns = async {
             match cached {
-                Some(campaigns) => campaigns,
-                None => drops_service
-                    .get_all_active_campaigns_cached()
-                    .await
-                    .unwrap_or_default(),
+                Some(campaigns) => Some(campaigns),
+                None => match drops_service.get_all_active_campaigns_cached().await {
+                    Ok(campaigns) => Some(campaigns),
+                    Err(e) => {
+                        log::warn!("[Drops] overview: campaign list failed: {}", e);
+                        None
+                    }
+                },
             }
         };
         let (campaigns, inventory) = tokio::join!(campaigns, drops_service.fetch_inventory());
-        let inventory = inventory.ok();
+        let inventory = inventory
+            .map_err(|e| log::warn!("[Drops] overview: inventory failed: {}", e))
+            .ok();
         let statistics = Some(drops_service.get_statistics().await);
         let progress = drops_service.get_drop_progress().await;
         let favorites = drops_service.get_settings().await.favorite_games;
         (campaigns, statistics, inventory, progress, favorites, locked_ms)
     };
-    // Evolution stages this account cannot earn yet: Twitch reports them in
-    // progress, so the page would otherwise show Gengar filling up without Gastly.
+    // Rewards this account cannot earn yet: evolution stages Twitch reports in
+    // progress (Gengar filling up without Gastly), and tiers Twitch holds
+    // behind their campaign's other rewards (the Golden Iguana read as Ready).
     let ((campaigns, statistics, inventory, progress, favorites, locked_ms), known, locked) = tokio::join!(
         gather,
         drops_overview::badge_titles(),
-        crate::services::evolution::locked_stages(&app)
+        crate::services::evolution::locked_rewards(app)
     );
     log::debug!(
         "[Drops] overview in {} ms (waited {} ms for the drops lock)",
@@ -64,16 +107,32 @@ pub async fn get_drops_overview(
         locked_ms
     );
 
-    let overview = drops_overview::overview(&campaigns, progress, inventory, statistics, known, &locked);
-    if !reuse_campaigns {
-        let announce = state
+    // A read that failed (Twitch hiccup, offline) is not the page's new truth:
+    // the last whole model stays, so a refresh never blanks the page, is never
+    // kept for the next open, and never resets the favourites' seen list (an
+    // empty list there made the next good read announce every campaign).
+    let complete = campaigns.is_some() && inventory.is_some();
+    if !complete {
+        if let Some(last) = drops_overview::last() {
+            return last;
+        }
+    }
+    let campaigns = campaigns.unwrap_or_default();
+    let mut overview = drops_overview::overview(&campaigns, progress, inventory, statistics, known, &locked);
+    overview.favorite_games = favorites.clone();
+    if !complete {
+        return overview;
+    }
+    if announce {
+        let show = state
             .settings
             .lock()
             .map(|s| s.live_notifications.show_favorite_drops_notifications)
             .unwrap_or(false);
-        drops_overview::announce_new_favorite_campaigns(&app, &overview.games, &favorites, announce);
+        drops_overview::announce_new_favorite_campaigns(app, &overview.games, &favorites, show);
     }
-    Ok(overview)
+    drops_overview::remember(epoch, seq, &overview);
+    overview
 }
 
 /// The phones' Drops segment (services/rewards_drops.rs): in progress,
@@ -144,7 +203,7 @@ pub const DROPS_SETTINGS_UPDATED_EVENT: &str = "drops-settings-updated";
 
 /// Serializes drops-settings saves, so a patch's read-modify-write cannot
 /// interleave with another save and lose its keys.
-static DROPS_SETTINGS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static DROPS_SETTINGS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tauri::command]
 pub async fn update_drops_settings(
@@ -153,7 +212,7 @@ pub async fn update_drops_settings(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let _write = DROPS_SETTINGS_WRITE.lock().await;
-    save_drops_settings(&app, &state, settings).await
+    apply_drops_settings(&app, &state, settings, None).await
 }
 
 /// Changes only the named top-level drops settings, applied onto the copy Rust
@@ -169,8 +228,10 @@ pub async fn patch_drops_settings(
     let _write = DROPS_SETTINGS_WRITE.lock().await;
     let current = state.drops_service.lock().await.get_settings().await;
     let next = apply_drops_patch(&current, patch)?;
-    save_drops_settings(&app, &state, next.clone()).await?;
-    Ok(next)
+    apply_drops_settings(&app, &state, next, None).await?;
+    // The stored copy, not the patch result: `told_keep_running` is Rust's own,
+    // and a patch may have named it.
+    Ok(state.drops_service.lock().await.get_settings().await)
 }
 
 fn apply_drops_patch(
@@ -187,20 +248,35 @@ fn apply_drops_patch(
     serde_json::from_value(value).map_err(|e| format!("Invalid drops settings change: {e}"))
 }
 
-async fn save_drops_settings(
+/// The one way drops settings are saved: the drops service, the main settings,
+/// disk, the realtime points socket, the plugin hand-off, the event and, on
+/// desktop, the Missing badges background mode (autostart and tray).
+///
+/// It never takes `DROPS_SETTINGS_WRITE`: every caller holds it across its own
+/// read-modify-write and this call (the two drops commands, a settings import,
+/// a backup restore, `background_mode::mark_told`), so saves cannot interleave.
+/// `told_keep_running` is Rust's own: whatever the caller sent is replaced by
+/// the stored value, unless `told_override` names one (only `mark_told` does).
+pub async fn apply_drops_settings(
     app: &AppHandle,
-    state: &State<'_, AppState>,
-    settings: DropsSettings,
+    state: &AppState,
+    mut next: DropsSettings,
+    told_override: Option<bool>,
 ) -> Result<(), String> {
-    // Update the in-memory drops service settings
-    let drops_service = state.drops_service.lock().await;
-    drops_service.update_settings(settings.clone()).await;
-    drop(drops_service); // Release the lock before accessing main settings
+    // Update the in-memory drops service settings, keeping the copy it held for
+    // the background-mode hook below.
+    let previous = {
+        let drops_service = state.drops_service.lock().await;
+        let previous = drops_service.get_settings().await;
+        next.told_keep_running = told_override.unwrap_or(previous.told_keep_running);
+        drops_service.update_settings(next.clone()).await;
+        previous
+    };
 
     // Also persist to the main settings file so changes survive app restart
     {
         let mut app_settings = state.settings.lock().map_err(|e| e.to_string())?;
-        app_settings.drops = settings.clone();
+        app_settings.drops = next.clone();
     }
 
     // Save to disk through the shared (debounced) settings writer; the state
@@ -219,11 +295,15 @@ async fn save_drops_settings(
         .background_service
         .lock()
         .await
-        .set_automation_active(settings.auto_claim_channel_points)
+        .set_automation_active(next.auto_claim_channel_points)
         .await;
 
-    let _ = app.emit(DROPS_SETTINGS_UPDATED_EVENT, &settings);
+    let _ = app.emit(DROPS_SETTINGS_UPDATED_EVENT, &next);
     state.plugin_host.push_drops_settings();
+    #[cfg(desktop)]
+    crate::services::background_mode::on_drops_settings_saved(app, &previous, &next);
+    #[cfg(not(desktop))]
+    let _ = previous;
     Ok(())
 }
 
@@ -636,12 +716,22 @@ async fn report_active_channel(state: &State<'_, AppState>, channel_id: &str, lo
         .await;
 }
 
+/// A window pointing drops monitoring at its channel. It runs under the lock
+/// every move of earning runs under, and does nothing once main is gone, so a
+/// late call from a closing window cannot re-aim what the main teardown just
+/// stopped. No Rust code calls this command: Rust uses `monitor_watched_channel`,
+/// which takes no lock (its callers already hold it).
 #[tauri::command]
 pub async fn start_drops_monitoring(
     channel_id: String,
     channel_name: String,
     app_handle: AppHandle,
 ) -> Result<(), String> {
+    let _aim = crate::services::watch_start::earning_aim().await;
+    #[cfg(desktop)]
+    if !crate::services::window_visibility::window_open(&app_handle, "main") {
+        return Ok(());
+    }
     monitor_watched_channel(&app_handle, channel_id, channel_name).await;
     Ok(())
 }
@@ -661,6 +751,22 @@ pub async fn monitor_watched_channel(app: &AppHandle, channel_id: String, login:
 
 #[tauri::command]
 pub async fn stop_drops_monitoring(state: State<'_, AppState>) -> Result<(), String> {
+    stop_monitoring_for(&state).await;
+    Ok(())
+}
+
+/// `stop_drops_monitoring` for Rust code holding only the app handle (the main
+/// teardown). Nothing to stop when the app state is not registered.
+pub async fn stop_drops_monitoring_inner(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    stop_monitoring_for(&state).await;
+}
+
+/// What stopping drops monitoring does, on the state itself: the monitor, the
+/// heartbeat target (reported to the plugin host), the realtime channel.
+async fn stop_monitoring_for(state: &AppState) {
     {
         let drops_service = state.drops_service.lock().await;
         drops_service.stop_monitoring().await;
@@ -677,7 +783,6 @@ pub async fn stop_drops_monitoring(state: State<'_, AppState>) -> Result<(), Str
         .await
         .clear_watched_channel()
         .await;
-    Ok(())
 }
 
 #[tauri::command]

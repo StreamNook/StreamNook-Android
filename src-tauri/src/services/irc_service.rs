@@ -346,6 +346,8 @@ async fn confirm_join(key: &str) {
         record_lifecycle(&format!("JOIN #{} confirmed", key));
         // A reward that asks for text reaches chat with only its id.
         crate::services::channel_rewards::note_chat_joined(key);
+        // Other viewers' redemptions reach this room even with no stream playing.
+        crate::services::chat_room_redemptions::nudge();
     }
     refresh_join_hint(&t);
 }
@@ -364,6 +366,7 @@ async fn tracker_forget(key: &str) {
     let mut t = get_join_tracker().lock().await;
     t.forget(key);
     refresh_join_hint(&t);
+    crate::services::chat_room_redemptions::nudge();
 }
 
 async fn tracker_clear() {
@@ -402,6 +405,9 @@ fn parse_join_channel(line: &str) -> Option<String> {
 struct MessageSideEffects {
     msg: ChatMessage,
     add_history: bool,
+    /// The chat rules dropped the message (an ignore, a filter): it reaches
+    /// the log and plugins but never a window, and no automation answers it.
+    dropped: bool,
     /// Key the persisted history is stored under. Twitch uses the bare user id
     /// (so existing entries keep resolving); other platforms are namespaced
     /// `provider:id`, because platform id spaces overlap — Kick user 676 and
@@ -451,6 +457,7 @@ fn side_effect_lane() -> &'static Arc<SideEffectLane> {
                             host.emit_chat_message(chat_event_params(&se.msg)).await;
                         }
                     }
+                    hand_to_engine(&se);
                 }
                 // Caught up: make any saturation loss visible in the logs it hit.
                 let flushed: Vec<(String, u64)> = consumer
@@ -465,6 +472,20 @@ fn side_effect_lane() -> &'static Arc<SideEffectLane> {
         });
         lane
     })
+}
+
+/// What a test probe saw: (channel, dropped) per row the lane handed over.
+#[cfg(test)]
+static LANE_PROBE: std::sync::Mutex<Option<Vec<(String, bool)>>> = std::sync::Mutex::new(None);
+
+/// The lane's last step for a row: the account automations hear it, with the
+/// chat rules' verdict. One atomic load when no rule can fire.
+fn hand_to_engine(se: &MessageSideEffects) {
+    #[cfg(test)]
+    if let Some(seen) = LANE_PROBE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        seen.push((se.msg.channel.clone(), se.dropped));
+    }
+    crate::services::account_automations::on_chat(&se.msg, se.dropped);
 }
 
 fn enqueue_side_effect(se: MessageSideEffects) {
@@ -513,13 +534,14 @@ fn enqueue_side_effect(se: MessageSideEffects) {
 /// Provider adapters publish straight onto the broadcast, so they must go
 /// through here to be logged and recorded. Using the lane keeps chat-log
 /// line order intact and the file IO off the caller's task.
-pub fn run_message_side_effects(msg: ChatMessage) {
+pub fn run_message_side_effects(msg: ChatMessage, dropped: bool) {
     let add_history = !msg.user_id.is_empty();
     let history_key = history_key_for(&msg);
     enqueue_side_effect(MessageSideEffects {
         msg,
         add_history,
         history_key,
+        dropped,
     });
 }
 
@@ -970,6 +992,20 @@ pub async fn with_channel_emotes<R>(channel: &str, f: impl FnOnce(&EmoteSet) -> 
 /// A copy of the table held for the joined channel `key`, if any.
 pub(crate) async fn held_channel_emotes(key: &str) -> Option<EmoteSet> {
     get_channel_emotes().lock().await.get(key).cloned()
+}
+
+/// Puts the Twitch smilies of every held channel table in the signed-in
+/// account's own style, and rebuilds the parse table of each one that changed.
+pub(crate) async fn replace_own_smilies() {
+    let mut map = get_channel_emotes().lock().await;
+    let Some(swap) = crate::services::twitch_smilies::own_swap() else {
+        return;
+    };
+    for (key, set) in map.iter_mut() {
+        if crate::services::twitch_smilies::apply_swap(&mut set.twitch, &swap) {
+            rebuild_parse_lookup(key, set);
+        }
+    }
 }
 
 /// Run `f` over a user's 7TV personal emotes (name -> emote), which work in
@@ -1481,16 +1517,80 @@ fn release_window_holds(claims: &mut ChannelClaims, window: &str, keep: Option<&
     emptied
 }
 
-/// Whether any window other than `window` holds a channel.
+/// The label the automations engine claims rooms under. It is not a window.
+const ENGINE_LABEL: &str = crate::services::account_automations::AUTOMATIONS_LABEL;
+
+/// Whether any window other than `window` holds a channel. The engine's own
+/// claim is not a window: it never keeps a user's stop from taking its turn.
 fn held_by_another_window(claims: &ChannelClaims, window: &str) -> bool {
     claims
         .values()
-        .any(|holders| holders.iter().any(|w| w != window))
+        .any(|holders| holders.iter().any(|w| w != window && w != ENGINE_LABEL))
 }
 
 /// Whether `window` holds any channel.
 fn held_by(claims: &ChannelClaims, window: &str) -> bool {
     claims.values().any(|holders| holders.contains(window))
+}
+
+/// How many labels other than the engine hold `channel`.
+fn non_engine_holders(claims: &ChannelClaims, channel: &str) -> usize {
+    claims.get(channel).map_or(0, |h| h.iter().filter(|w| *w != ENGINE_LABEL).count())
+}
+
+/// Whether a label other than `label` holds `channel`.
+fn channel_held_by_other_than(claims: &ChannelClaims, channel: &str, label: &str) -> bool {
+    claims.get(channel).is_some_and(|h| h.iter().any(|w| w != label))
+}
+
+/// Rooms the stream warm-up joined without the engine's label ("ensured"):
+/// reminders count them as open. Cleared wherever today's room goes away.
+static ENSURED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+
+fn ensured() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    ENSURED.get_or_init(|| std::sync::Mutex::new(HashSet::new())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn ensured_set(key: &str) {
+    ensured().insert(key.to_string());
+    // Every place `ensured` is set (both `start` paths) lands here: a keyword reminder's refused
+    // answer for this chat, cached up to a second, is forgotten, so the chat is never gated.
+    crate::services::reminder_service::gate_forget(key);
+}
+
+fn ensured_has(key: &str) -> bool {
+    ensured().contains(key)
+}
+
+fn ensured_clear(key: &str) {
+    ensured().remove(key);
+}
+
+fn ensured_clear_all() {
+    ensured().clear();
+}
+
+/// Every room but `keep` stops being "ensured".
+fn ensured_keep_only(keep: &str) {
+    ensured().retain(|c| c == keep);
+}
+
+/// A reminder may post in `login` when a label other than the engine holds it,
+/// or the warm-up joined it and it is still joined (so every removal path,
+/// `msg_channel_suspended` included, closes it without a clear point).
+fn open_for_reminders_in(claims: &ChannelClaims, ensured: &HashSet<String>, joined: &HashSet<String>, login: &str) -> bool {
+    channel_held_by_other_than(claims, login, ENGINE_LABEL) || (ensured.contains(login) && joined.contains(login))
+}
+
+/// The engine's own leave never PARTs a room the warm-up joined.
+fn engine_leave_keeps_room(window: &str, ensured: bool) -> bool {
+    window == ENGINE_LABEL && ensured
+}
+
+/// A running IRC session with a bridge built before the last full stop needs
+/// the bridge rebuilt, or the port it hands out closes every socket at once.
+fn bridge_needs_rebuild(irc_alive: bool, ws_task_alive: bool, born: u64, generation: u64) -> bool {
+    irc_alive && ws_task_alive && born != generation
 }
 
 #[cfg(test)]
@@ -1928,6 +2028,18 @@ impl IrcService {
                 get_ws_server_handle().lock().await.as_ref(),
                 Some(h) if !h.is_finished()
             );
+            // IRC is up but the bridge was built before the last full stop:
+            // rebuild it (the IRC session stays, the broadcaster swaps), so no
+            // start hands out a port whose sockets close on connect.
+            if bridge_needs_rebuild(
+                irc_alive,
+                ws_alive,
+                WS_SERVER_BORN.load(std::sync::atomic::Ordering::SeqCst),
+                bridge_generation(),
+            ) {
+                record_lifecycle("start: IRC is up but the bridge predates the last full stop; rebuilding the bridge");
+                Self::ensure_local_ws_bridge().await?;
+            }
             let existing_port = *get_ws_port().lock().await;
             if irc_alive && ws_alive {
                 if let Some(port) = existing_port {
@@ -1950,6 +2062,11 @@ impl IrcService {
                         r
                     } else {
                         let r = Self::ensure_joined(&key).await;
+                        // Joined today without the engine's label: reminders
+                        // count it as open while it stays joined.
+                        if r.is_ok() {
+                            ensured_set(&key);
+                        }
                         // A warm-up means a stream is starting; any channel
                         // still joined with no consumer is a leftover from a
                         // previous warm-up that no UI ever claimed.
@@ -2019,11 +2136,21 @@ impl IrcService {
         {
             let mut consumers = get_channel_consumers().lock().await;
             consumers.clear();
+            ensured_clear_all();
             if claim {
                 consumers.insert(channel.to_lowercase(), HashSet::from([window.to_string()]));
                 crate::services::chat_recovery::note(channel, window, true);
             }
         }
+        // The fresh path joins through `run_irc_connection`, not `ensure_joined`,
+        // so the warm-up's flag is set here; a real claim by a window is what
+        // releases a room the engine adopted.
+        if !claim {
+            ensured_set(&channel.to_lowercase());
+        } else if window != ENGINE_LABEL {
+            crate::services::account_automations::note_window_claim(&channel.to_lowercase());
+        }
+        crate::services::account_automations::on_claims_reset();
 
         // Fast fail for the caller; the supervisor re-fetches per attempt.
         if TwitchService::get_token().await.is_err() {
@@ -2820,6 +2947,7 @@ impl IrcService {
                     history_key: history_key_for(&chat_msg),
                     msg: chat_msg,
                     add_history: true,
+                    dropped: verdict.drop,
                 });
             } else {
                 // Fallback to sending raw string if parsing fails
@@ -2911,6 +3039,7 @@ impl IrcService {
                     history_key: history_key_for(&chat_msg),
                     msg: chat_msg,
                     add_history: false,
+                    dropped: verdict.drop,
                 });
             } else {
                 // Fallback to raw string if parsing fails
@@ -3067,6 +3196,9 @@ impl IrcService {
                 if let Some(uid) = &clear.target_user_id {
                     ChatHistory::mark_user_cleared(ch, uid);
                 }
+                // A timeout or ban of one of your accounts holds it there.
+                let seconds = clear.ban_duration_secs.map(|s| i64::try_from(s).unwrap_or(i64::MAX));
+                crate::services::account_automations::on_clearchat(ch, clear.target_user_id.as_deref(), seconds);
             }
             send_to_bridge(BridgeFrame::maybe_channel(clear.channel.as_deref(), clear.frame().to_string()), false).await;
         } else if trimmed.contains("NOTICE") {
@@ -3081,6 +3213,10 @@ impl IrcService {
             // A running /spam or /pyramid there hears refusals and bans.
             if let (Some(id), Some(ch)) = (msg_id.as_deref(), extract_channel_from_irc_line(trimmed)) {
                 crate::services::chat_burst::note_notice(&ch, id);
+                // The main account's refusals hold its rules there; the engine
+                // reads a timeout's seconds from the notice text.
+                let text = trimmed.rfind(" :").map_or("", |i| &trimmed[i + 2..]);
+                crate::services::account_automations::on_notice(&ch, id, text);
                 // A send refused because of a warning locks the box behind
                 // its Acknowledge button.
                 if crate::services::chat_warning::is_warned_refusal(Some(id), None) {
@@ -3668,6 +3804,9 @@ impl IrcService {
         // which is what keeps claims from inflating: the set can never hold a
         // window twice, so releases always balance.
         let newly_claimed = claim_channel(&mut *get_channel_consumers().lock().await, &key, window);
+        if window != ENGINE_LABEL {
+            crate::services::account_automations::note_window_claim(&key);
+        }
         // Kept even when the JOIN below fails: a rebuild in flight clears this
         // claim with the dead connection and joins the room again from the note.
         crate::services::chat_recovery::note(&key, window, true);
@@ -3812,6 +3951,17 @@ impl IrcService {
         let remaining = release_channel_claim(&mut *get_channel_consumers().lock().await, &key, window);
         crate::services::chat_recovery::note(&key, window, false);
 
+        // The last non-engine holder let go: today's room is gone, even when
+        // the engine's claim keeps it joined.
+        if window != ENGINE_LABEL && non_engine_holders(&*get_channel_consumers().lock().await, &key) == 0 {
+            ensured_clear(&key);
+            crate::services::account_automations::note_window_release(&key);
+        }
+        // The engine never PARTs a room the warm-up joined.
+        if remaining == 0 && engine_leave_keeps_room(window, ensured_has(&key)) {
+            return Ok(());
+        }
+
         if remaining > 0 {
             debug!(
                 "[IRC Chat] leave_channel({}): {} consumer(s) remain, keeping JOIN",
@@ -3835,7 +3985,26 @@ impl IrcService {
     /// and on a fresh-claim `start_chat`, where any claims still recorded for
     /// the window belong to a previous JS context of it.
     pub async fn release_window_claims(window: &str, keep: Option<&str>) {
-        let emptied = release_window_holds(&mut *get_channel_consumers().lock().await, window, keep);
+        let emptied = {
+            let mut claims = get_channel_consumers().lock().await;
+            let held: Vec<String> = claims
+                .iter()
+                .filter(|(c, h)| h.contains(window) && keep != Some(c.as_str()))
+                .map(|(c, _)| c.clone())
+                .collect();
+            let emptied = release_window_holds(&mut claims, window, keep);
+            // Rooms the engine still holds lose "ensured" when this was the
+            // last non-engine holder.
+            if window != ENGINE_LABEL {
+                for room in held {
+                    if non_engine_holders(&claims, &room) == 0 {
+                        ensured_clear(&room);
+                        crate::services::account_automations::note_window_release(&room);
+                    }
+                }
+            }
+            emptied
+        };
 
         for channel in emptied {
             record_lifecycle(&format!(
@@ -3875,12 +4044,60 @@ impl IrcService {
         held
     }
 
+    /// Every label holding `channel`, sorted.
+    pub async fn holders(channel: &str) -> Vec<String> {
+        let claims = get_channel_consumers().lock().await;
+        let mut labels: Vec<String> = claims.get(&channel.to_lowercase()).map(|h| h.iter().cloned().collect()).unwrap_or_default();
+        labels.sort();
+        labels
+    }
+
+    /// Whether a label other than `label` holds `channel`.
+    pub async fn held_by_other_than(channel: &str, label: &str) -> bool {
+        channel_held_by_other_than(&*get_channel_consumers().lock().await, &channel.to_lowercase(), label)
+    }
+
+    /// Whether a reminder may post in `login`'s chat: a label other than the
+    /// engine holds it, or the stream warm-up joined it and it is still joined.
+    pub async fn open_for_reminders(login: &str) -> bool {
+        let login = login.to_lowercase();
+        let claims = get_channel_consumers().lock().await;
+        let joined = get_current_channels().lock().await;
+        open_for_reminders_in(&claims, &ensured(), &joined, &login)
+    }
+
+    /// Whether the IRC supervisor task is alive.
+    pub async fn is_connected() -> bool {
+        matches!(get_irc_handle().lock().await.as_ref(), Some(h) if !h.is_finished())
+    }
+
+    /// A user's stop when nothing but the engine keeps the connection: IRC
+    /// stays up for the engine's rooms, the caller's claims go, every room no
+    /// label holds PARTs, and no room stays "ensured". When the caller held a
+    /// Twitch room the page sockets close (mounted stores re-claim) and the
+    /// bridge is rebuilt so the next start gets a live port.
+    pub async fn stop_keeping_engine_rooms(window: &str) {
+        let held = Self::channels_held_by(window).await;
+        Self::release_window_claims(window, None).await;
+        Self::part_unclaimed("").await;
+        ensured_clear_all();
+        if !held.is_empty() {
+            close_page_sockets();
+            if let Err(e) = Self::ensure_local_ws_bridge().await {
+                log::warn!("[IRC Chat] bridge not rebuilt after a stop that kept the engine's rooms: {e}");
+            }
+        }
+        record_lifecycle(&format!("stop_chat from {window}: the engine's rooms stay joined, the rest PARTed"));
+    }
+
     /// PART any joined channel that no window claims, except `keep`. Joined-
     /// but-unclaimed channels come from the ensure-only paths: the stream
     /// warm-up JOINs before any chat UI mounts, and if no UI ever claims on
     /// top (chat hidden), there is no release to retire the room on a stream
     /// switch. The next warm-up reaps them here instead.
     async fn part_unclaimed(keep: &str) {
+        // A new warm-up retires every earlier one, whoever holds the room.
+        ensured_keep_only(keep);
         let joined: Vec<String> = get_current_channels()
             .lock()
             .await
@@ -3916,6 +4133,7 @@ impl IrcService {
         }
 
         get_current_channels().lock().await.remove(key);
+        ensured_clear(key);
         tracker_forget(key).await;
 
         // Drop per-channel caches so PARTed channels don't accumulate memory.
@@ -4074,7 +4292,7 @@ impl IrcService {
         // slow or down.
         let mut seeded = get_channel_emotes().lock().await.contains_key(&key);
         if !seeded {
-            if let Some(disk_set) = crate::services::emote_set_cache::load(user_id) {
+            if let Some(mut disk_set) = crate::services::emote_set_cache::load(user_id) {
                 let mut map = get_channel_emotes().lock().await;
                 if !map.contains_key(&key) {
                     debug!(
@@ -4082,6 +4300,8 @@ impl IrcService {
                         channel_name,
                         disk_set.seven_tv.len()
                     );
+                    // The saved dictionary may predate a switch of the account's smiley style.
+                    crate::services::twitch_smilies::wear_own(&mut disk_set.twitch);
                     rebuild_parse_lookup(&key, &disk_set);
                     map.insert(key.clone(), disk_set);
                     note_emote_table_installed(&key);
@@ -4289,6 +4509,9 @@ impl IrcService {
                 replayed_to,
                 &mut emote_set.seven_tv,
             );
+            // A switch of the account's smiley style since this fetch began
+            // must not be undone by its older answer.
+            crate::services::twitch_smilies::wear_own(&mut emote_set.twitch);
             rebuild_parse_lookup(key, &emote_set);
             map.insert(key.to_string(), emote_set);
             late
@@ -5662,6 +5885,9 @@ impl IrcService {
 
                 // Same rules as live rows: a hidden user's backfill is hidden
                 // too, and highlights are stamped so the row needs no matcher.
+                // Marked as history first, so what counts "right now" (the
+                // composer's emote of the moment) leaves it out.
+                chat_msg.metadata.from_backfill = true;
                 let verdict = ChatRules::evaluate(&mut chat_msg, &rules);
                 if verdict.drop {
                     continue;
@@ -5669,7 +5895,6 @@ impl IrcService {
                 // A mention from before you opened the chat still reaches the
                 // inbox (once: it dedupes by id), with no sound or notice.
                 crate::services::mention_inbox::on_backfill(&chat_msg, &verdict);
-                chat_msg.metadata.from_backfill = true;
                 crate::services::chat_row_view::stamp(&mut chat_msg);
                 results.push(chat_msg);
             }
@@ -5868,6 +6093,8 @@ impl IrcService {
         crate::services::channel_rewards::forget_all_rooms();
         get_pending_messages().lock().await.clear();
         get_channel_consumers().lock().await.clear();
+        ensured_clear_all();
+        crate::services::account_automations::on_claims_reset();
 
         // Drop all 7TV EventAPI subscriptions so the idle socket stops
         // receiving updates for channels nobody is viewing anymore.
@@ -5928,6 +6155,8 @@ impl IrcService {
         crate::services::channel_rewards::forget_all_rooms();
         get_pending_messages().lock().await.clear();
         get_channel_consumers().lock().await.clear();
+        ensured_clear_all();
+        crate::services::account_automations::on_claims_reset();
         crate::services::seventv_eventapi::clear_all().await;
         crate::services::eventsub_moderation::clear_all().await;
     }
@@ -5966,6 +6195,9 @@ impl IrcService {
                     }
                     Some(_) => {
                         record_lifecycle("WS bridge task is dead; rebuilding bridge");
+                        // Sockets left on the old broadcaster would stay open
+                        // and silent: close them so every page reconnects.
+                        close_page_sockets();
                         handle.take();
                         false
                     }
@@ -6246,7 +6478,12 @@ fn native_emote_positions(text: &str, twitch: &[Emote]) -> Vec<EmotePos> {
     let mut pos = 0usize;
     for word in text.split(' ') {
         let len = word.chars().count();
-        if let Some(id) = by_name.get(word).copied() {
+        // A smiley also takes the other forms its pattern allows (`:-)`).
+        let id = by_name
+            .get(word)
+            .copied()
+            .or_else(|| crate::services::twitch_smilies::smiley_for(word, twitch).map(|e| e.id.as_str()));
+        if let Some(id) = id {
             if len > 0 {
                 out.push(EmotePos {
                     id: id.to_string(),
@@ -6620,6 +6857,21 @@ mod own_message_tests {
         assert_eq!(own_emotes_tag("Kappa hi Kappa PogChamp", &set), "25:0-4,9-13/88:15-22");
         assert_eq!(own_emotes_tag("héllo Kappa", &set), "25:6-10");
         assert_eq!(own_emotes_tag("no emotes here", &set), "");
+    }
+
+    #[test]
+    fn a_sent_smiley_is_tagged_with_the_senders_set() {
+        // SN-272: Helix names smilies by pattern; a sent `;)` drew as text.
+        // The ids stand in for a set other than the robot faces: the row takes
+        // whatever ids Helix listed for the sender, i.e. the set they picked.
+        let mut set = vec![twitch_emote("25", "Kappa"), twitch_emote("498", r"\;-?\)"), twitch_emote("499", r"\:-?\)")];
+        for e in set.iter_mut().skip(1) {
+            e.emote_type = Some("smilies".into());
+        }
+        crate::services::twitch_smilies::tidy_names(&mut set);
+        assert_eq!(own_emotes_tag("night ;) Kappa", &set), "498:6-7/25:9-13");
+        assert_eq!(own_emotes_tag(":-) :)", &set), "499:0-2,4-5");
+        assert_eq!(own_emotes_tag("a;) :)b", &set), "");
     }
 
     #[test]
@@ -7732,6 +7984,31 @@ mod history_usernotice_tests {
     }
 
     #[tokio::test]
+    async fn history_rows_never_make_the_emote_of_the_moment() {
+        // No `historical` tag: the mark set before the rules run is what
+        // keeps a busy chat's backlog from counting as "right now".
+        let lines: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                format!(
+                    "@badge-info=;badges=;color=;display-name={u};emotes=25:0-4;id=hist-moment-{i};room-id=12;tmi-sent-ts=1700000004000;user-id=9{i} :{u}!{u}@{u}.tmi.twitch.tv PRIVMSG #momenthist :Kappa"
+                )
+            })
+            .collect();
+        let rows = IrcService::parse_historical_messages(lines).await;
+        assert_eq!(rows.len(), 3);
+        for row in &rows {
+            assert!(
+                row.segments.iter().any(|s| matches!(s, MessageSegment::Emote { content, .. } if content == "Kappa")),
+                "the row carries the emote it would count: {:?}",
+                row.segments
+            );
+        }
+        assert_eq!(crate::services::emote_moment::get("twitch", "momenthist").emote, None);
+    }
+
+    #[tokio::test]
     async fn history_usernotices_keep_their_text_like_live_ones() {
         let rows = IrcService::parse_historical_messages(
             [ANNOUNCEMENT, RESUB, RAID, BLANK, PRIVMSG].iter().map(|s| s.to_string()).collect(),
@@ -8323,4 +8600,134 @@ mod bridge_close_tests {
         let closed = tokio::time::timeout(Duration::from_millis(800), close_code(&mut socket)).await;
         assert!(closed.is_err(), "the socket stays open, got {closed:?}");
     }
+
+    // The dead-task arm used to drop the handle and rebuild, leaving the page
+    // sockets of the old broadcaster open with nothing feeding them.
+    #[tokio::test]
+    async fn a_dead_bridge_task_closes_its_page_sockets_before_the_rebuild() {
+        let _serial = serial().lock().await;
+        close_page_sockets();
+        let port = IrcService::ensure_local_ws_bridge().await.expect("bridge up");
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/"))
+            .await
+            .expect("page socket connects");
+        {
+            let handle = super::get_ws_server_handle().lock().await;
+            handle.as_ref().expect("task").abort();
+        }
+        for _ in 0..50 {
+            if super::get_ws_server_handle().lock().await.as_ref().is_some_and(|h| h.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rebuilt = IrcService::ensure_local_ws_bridge().await.expect("bridge rebuilt");
+        assert_ne!(rebuilt, port);
+        let code = tokio::time::timeout(Duration::from_secs(5), close_code(&mut socket))
+            .await
+            .expect("the old page socket closes");
+        assert_eq!(code, Some(1012));
+    }
 }
+
+#[cfg(test)]
+mod engine_wiring_tests {
+    use super::*;
+
+    fn claims(list: &[(&str, &[&str])]) -> ChannelClaims {
+        list.iter().map(|(c, ws)| (c.to_string(), ws.iter().map(|w| w.to_string()).collect())).collect()
+    }
+
+    fn set(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_engine_is_not_another_window() {
+        let c = claims(&[("xqc", &["main", "automations"])]);
+        assert!(!held_by_another_window(&c, "main"));
+        assert!(held_by_another_window(&claims(&[("xqc", &["main", "overlay-x"])]), "main"));
+        assert!(held_by(&c, "automations"));
+    }
+
+    #[test]
+    fn non_engine_holders_and_held_by_other_than() {
+        let c = claims(&[("a", &["automations"]), ("b", &["main", "automations"]), ("c", &["popout"])]);
+        assert_eq!(non_engine_holders(&c, "a"), 0);
+        assert_eq!(non_engine_holders(&c, "b"), 1);
+        assert_eq!(non_engine_holders(&c, "none"), 0);
+        assert!(!channel_held_by_other_than(&c, "a", ENGINE_LABEL));
+        assert!(channel_held_by_other_than(&c, "b", ENGINE_LABEL));
+        assert!(channel_held_by_other_than(&c, "b", "main"));
+    }
+
+    #[test]
+    fn a_reminder_needs_a_window_or_a_warm_up_room_that_is_still_joined() {
+        let c = claims(&[("held", &["main"]), ("engine", &["automations"])]);
+        let joined = set(&["held", "engine", "warm"]);
+        assert!(open_for_reminders_in(&c, &set(&[]), &joined, "held"));
+        assert!(!open_for_reminders_in(&c, &set(&[]), &joined, "engine"), "the engine's room is not opened by the viewer");
+        assert!(open_for_reminders_in(&c, &set(&["warm"]), &joined, "warm"));
+        // The room left the joined set by any path: closed with no clear point.
+        assert!(!open_for_reminders_in(&c, &set(&["warm"]), &set(&["held"]), "warm"));
+    }
+
+    #[test]
+    fn the_engine_leaves_a_warm_up_room_joined_and_a_window_does_not() {
+        assert!(engine_leave_keeps_room(ENGINE_LABEL, true));
+        assert!(!engine_leave_keeps_room(ENGINE_LABEL, false));
+        assert!(!engine_leave_keeps_room("main", true));
+    }
+
+    #[test]
+    fn ensured_clears_where_the_room_goes_away() {
+        ensured_clear_all();
+        ensured_set("ensured-a");
+        ensured_set("ensured-b");
+        assert!(ensured_has("ensured-a"));
+        ensured_keep_only("ensured-b");
+        assert!(!ensured_has("ensured-a") && ensured_has("ensured-b"));
+        ensured_clear("ensured-b");
+        assert!(!ensured_has("ensured-b"));
+        ensured_set("ensured-c");
+        ensured_clear_all();
+        assert!(!ensured_has("ensured-c"));
+    }
+
+    #[test]
+    fn only_a_running_session_with_an_old_bridge_is_rebuilt() {
+        assert!(bridge_needs_rebuild(true, true, 1, 2));
+        assert!(!bridge_needs_rebuild(true, true, 2, 2));
+        assert!(!bridge_needs_rebuild(false, true, 1, 2), "no session: the fresh path rebuilds");
+        assert!(!bridge_needs_rebuild(true, false, 1, 2), "a dead task takes the fresh path");
+    }
+
+    // The lane carries the chat rules' verdict to the engine hook.
+    #[tokio::test]
+    async fn the_lane_hands_an_ignored_row_to_the_engine_with_its_verdict() {
+        *LANE_PROBE.lock().unwrap() = Some(Vec::new());
+        let channel = "lane-probe-chan";
+        for dropped in [false, true] {
+            enqueue_side_effect(MessageSideEffects {
+                msg: crate::services::chat_outage::lost_row(channel, 1),
+                add_history: false,
+                history_key: String::new(),
+                dropped,
+            });
+        }
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            seen = LANE_PROBE.lock().unwrap().clone().unwrap_or_default().into_iter().filter(|(c, _)| c.trim_start_matches('#') == channel).collect::<Vec<_>>();
+            if seen.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        *LANE_PROBE.lock().unwrap() = None;
+        assert_eq!(seen.iter().map(|(_, d)| *d).collect::<Vec<_>>(), vec![false, true]);
+    }
+}
+
+#[cfg(test)]
+#[path = "irc_service_smiley_tests.rs"]
+mod smiley_ordering_tests;

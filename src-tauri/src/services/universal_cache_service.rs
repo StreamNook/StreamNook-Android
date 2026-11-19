@@ -2866,19 +2866,6 @@ const STREAMNOOK_ART_MAX_BYTES: usize = 24 * 1024 * 1024;
 /// Connections a resumable fetch may use for one file before it gives up.
 const RESUMABLE_ATTEMPTS: u32 = 8;
 
-// StreamNook's own art is a few large animated files, so it gets a client with
-// no total cap: at a slow link's speed the 20 s cap above never finishes one.
-// The read timeout still frees a stalled transfer, and the fetch resumes from
-// the bytes it already has.
-static LARGE_DOWNLOAD_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
-        .user_agent("StreamNook/1.0")
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(20))
-        .build()
-        .expect("failed to build large-download HTTP client")
-});
-
 /// Whether `url` is StreamNook art this cache will fetch.
 pub fn is_streamnook_art_url(url: &str) -> bool {
     url.starts_with(STREAMNOOK_ART_ORIGIN) && url.len() > STREAMNOOK_ART_ORIGIN.len()
@@ -2916,6 +2903,13 @@ fn content_range_start(value: &str) -> Option<(u64, Option<u64>)> {
 /// Some networks cut a long transfer to a host part way through, so a plain GET
 /// of a multi-MB file can fail every time while a resumed one gets there.
 /// Returns the body and its Content-Type.
+///
+/// `client` only builds each request. Every request goes out through
+/// `sn_transport::send_download`, so StreamNook's own hosts get the relay route
+/// when the direct one is blocked, on a client with no total cap (a large
+/// animated file on a slow link is never cut off while it moves) and a read
+/// timeout that frees a stalled transfer, which then resumes from the bytes it
+/// already has. Any other host (the tests' local server) is sent as it is.
 async fn fetch_resumable(
     client: &reqwest::Client,
     url: &str,
@@ -2936,7 +2930,7 @@ async fn fetch_resumable(
         if !body.is_empty() {
             request = request.header(header::RANGE, format!("bytes={}-", body.len()));
         }
-        let mut response = match request.send().await {
+        let mut response = match crate::services::sn_transport::send_download(request).await {
             Ok(response) => response,
             Err(e) => {
                 last_error = e.into();
@@ -3006,7 +3000,7 @@ pub async fn cache_streamnook_art(url: String) -> Result<String> {
         return Err(anyhow::anyhow!("not StreamNook art: {url}"));
     }
     let (bytes, content_type) = fetch_resumable(
-        &LARGE_DOWNLOAD_CLIENT,
+        crate::services::http::client(),
         &url,
         STREAMNOOK_ART_MAX_BYTES,
         RESUMABLE_ATTEMPTS,
@@ -3033,6 +3027,38 @@ pub async fn cache_streamnook_art(url: String) -> Result<String> {
     .await?;
     save_cached_item(entry).await?;
     Ok(path_str)
+}
+
+/// Forgets the disk copy of one piece of StreamNook art, for a copy a window
+/// could not decode: its manifest entry goes now and its file once the manifest
+/// without it is on disk, so the next session downloads the art again. Only
+/// StreamNook art is accepted, by the rule `cache_streamnook_art` fetches by.
+/// Returns whether there was a copy to forget.
+pub fn forget_streamnook_art(url: &str) -> Result<bool> {
+    if !is_streamnook_art_url(url) {
+        return Err(anyhow::anyhow!("not StreamNook art: {url}"));
+    }
+    let cache_root = get_universal_cache_dir()?;
+    let forgot = forget_streamnook_art_in(&MANIFEST_MEMORY, &PENDING_DELETES, &cache_root, url)?;
+    if forgot {
+        MANIFEST_DIRTY.store(true, Ordering::Release);
+        ensure_flush_task();
+    }
+    Ok(forgot)
+}
+
+/// `forget_streamnook_art` of `memory`, queueing the file in `pending` for
+/// deletion from its type folder under `cache_root`.
+fn forget_streamnook_art_in(
+    memory: &StdRwLock<UniversalCacheManifest>,
+    pending: &StdMutex<Vec<PendingDelete>>,
+    cache_root: &Path,
+    url: &str,
+) -> Result<bool> {
+    let key = format!("file:{url}");
+    let removed = take_entries_where(memory, |k, entry| k == key && entry.cache_type == CacheType::StreamNookArt)?;
+    queue_entry_files(pending, cache_root, &removed);
+    Ok(!removed.is_empty())
 }
 
 /// Download a file to disk and RETURN its manifest entry WITHOUT writing the
@@ -5479,7 +5505,12 @@ mod tests {
 
 #[cfg(test)]
 mod streamnook_art_tests {
-    use super::{content_range_start, fetch_resumable, is_streamnook_art_url, streamnook_art_file_name};
+    use super::{
+        content_range_start, fetch_resumable, forget_streamnook_art, forget_streamnook_art_in, is_streamnook_art_url,
+        streamnook_art_file_name, CacheMetadata, CacheType, UniversalCacheEntry, UniversalCacheManifest,
+    };
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -5607,6 +5638,95 @@ mod streamnook_art_tests {
         assert_ne!(v2, v3, "a re-upload under a new version gets its own file");
         let odd = streamnook_art_file_name("https://cdn.streamnook.app/badges/M%C3%B6bius:%20x.webp", "webp");
         assert!(odd.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)), "{odd}");
+    }
+
+    #[test]
+    fn art_fetches_go_through_the_streamnook_download_route() {
+        let src = include_str!("universal_cache_service.rs").replace("\r\n", "\n");
+        let body_of = |src: &str, head: &str| {
+            let start = src.find(head).unwrap();
+            src[start..start + src[start..].find("\n}\n").unwrap()].to_string()
+        };
+        let fetch = body_of(&src, "async fn fetch_resumable(");
+        assert_eq!(fetch.matches("crate::services::sn_transport::send_download(request).await").count(), 1);
+        assert!(!fetch.contains(".send()"), "every request goes through the relay-aware route");
+        assert!(body_of(&src, "pub async fn cache_streamnook_art(").contains("fetch_resumable("));
+        // The art's own client is gone; nothing names it any more.
+        assert!(!src.contains(concat!("LARGE_", "DOWNLOAD_CLIENT")));
+        // The download route executes on the transport's download client.
+        let transport = include_str!("sn_transport.rs").replace("\r\n", "\n");
+        assert!(body_of(&transport, "pub async fn send_download(").contains("send_on(&DOWNLOAD_CLIENT, builder).await"));
+        let send_on = body_of(&transport, "async fn send_on(");
+        assert!(send_on.contains("builder.build_split()"));
+    }
+
+    fn art_entry(url: &str, cache_type: CacheType, path: &str) -> UniversalCacheEntry {
+        UniversalCacheEntry {
+            id: format!("file:{url}"),
+            cache_type,
+            data: serde_json::json!({ "local_path": path, "url": url }),
+            metadata: CacheMetadata {
+                timestamp: super::get_current_timestamp(),
+                expiry_days: 0,
+                source: "universal_file".into(),
+                version: 1,
+            },
+            position: None,
+        }
+    }
+
+    #[test]
+    fn forgetting_refuses_anything_but_streamnook_art() {
+        for url in [
+            "https://static-cdn.jtvnw.net/badges/v1/x/3",
+            "http://cdn.streamnook.app/twitch-badges/a.png",
+            "https://cdn.streamnook.app.evil.test/twitch-badges/a.png",
+            "https://cdn.streamnook.app/",
+            "",
+        ] {
+            let refused = forget_streamnook_art(url).unwrap_err().to_string();
+            assert!(refused.contains("not StreamNook art"), "{url}: {refused}");
+        }
+    }
+
+    #[test]
+    fn forgetting_takes_out_only_that_art_copy_and_queues_its_file() {
+        let art = "https://cdn.streamnook.app/twitch-badges/large.png";
+        let other = "https://cdn.streamnook.app/twitch-badges/small.webp";
+        let mut entries = HashMap::new();
+        for (url, cache_type, path) in [
+            (art, CacheType::StreamNookArt, "C:/cache/streamnook-art/large-0123abcd.png"),
+            (other, CacheType::StreamNookArt, "C:/cache/streamnook-art/small-89abcdef.webp"),
+        ] {
+            entries.insert(format!("file:{url}"), art_entry(url, cache_type, path));
+        }
+        let memory = std::sync::RwLock::new(UniversalCacheManifest { version: 1, last_sync: None, entries });
+        let pending = std::sync::Mutex::new(Vec::new());
+        let root = Path::new("C:/cache");
+
+        assert!(forget_streamnook_art_in(&memory, &pending, root, art).unwrap());
+        let left: Vec<String> = memory.read().unwrap().entries.keys().cloned().collect();
+        assert_eq!(left, [format!("file:{other}")]);
+        assert_eq!(
+            *pending.lock().unwrap(),
+            [(root.join("streamnook-art"), PathBuf::from("C:/cache/streamnook-art/large-0123abcd.png"))]
+        );
+
+        // A second failure of the same copy finds nothing left to forget.
+        assert!(!forget_streamnook_art_in(&memory, &pending, root, art).unwrap());
+        assert_eq!(pending.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_leaves_an_entry_of_another_type_under_the_same_key() {
+        let url = "https://cdn.streamnook.app/badges/kindred.webp";
+        let mut entries = HashMap::new();
+        entries.insert(format!("file:{url}"), art_entry(url, CacheType::Cosmetic, "C:/cache/cosmetics/k.webp"));
+        let memory = std::sync::RwLock::new(UniversalCacheManifest { version: 1, last_sync: None, entries });
+        let pending = std::sync::Mutex::new(Vec::new());
+        assert!(!forget_streamnook_art_in(&memory, &pending, Path::new("C:/cache"), url).unwrap());
+        assert_eq!(memory.read().unwrap().entries.len(), 1);
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[test]
