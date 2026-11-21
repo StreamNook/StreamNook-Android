@@ -117,9 +117,55 @@ pub fn first_reward_image(drops: &[TimeBasedDrop]) -> String {
         .iter()
         .flat_map(|d| &d.benefit_edges)
         .map(|b| b.image_url.as_str())
-        .find(|u| !u.is_empty())
+        .find(|u| !u.is_empty() && !is_placeholder_art(u))
         .unwrap_or_default()
         .to_string()
+}
+
+/// Twitch's stand-in art for a reward with none of its own (a sword on grey):
+/// `twitch-quests-assets/REWARD/default.png`. GTAVI's GTA DVD Chest wears it.
+pub fn is_placeholder_art(url: &str) -> bool {
+    url.contains("twitch-quests-assets/REWARD/default")
+}
+
+/// A reward still wearing Twitch's stand-in art shows what it gives next (the
+/// chest shows its next chain), else the first real reward of its draw, else
+/// the campaign's art. Every surface reads the drop's own image, so this is the
+/// one place it is decided.
+fn unplaceholder(drops: &mut [TimeBasedDrop], campaign_art: &str) {
+    for d in drops.iter_mut() {
+        let next = d.next_reward.as_ref().map(|r| r.image_url.clone()).filter(|u| !u.is_empty() && !is_placeholder_art(u));
+        let pool = d.pool_rewards.iter().map(|r| r.image_url.clone()).find(|u| !u.is_empty() && !is_placeholder_art(u));
+        let stand_in = next.or(pool).unwrap_or_else(|| campaign_art.to_string());
+        for b in d.benefit_edges.iter_mut().filter(|b| is_placeholder_art(&b.image_url)) {
+            b.image_url = stand_in.clone();
+        }
+    }
+}
+
+/// The one category every tier of a campaign counts in, as that campaign's
+/// group, when Twitch lists the campaign itself with no game. None when the
+/// tiers name no category, or several (a campaign for many games keeps its
+/// own art and name).
+fn tier_category(detail: &Value) -> Option<DisplayGroup> {
+    let mut found: Option<&Value> = None;
+    for g in detail["rewardGroups"].as_array().into_iter().flatten() {
+        for cat in g["progressCriteria"]["categories"].as_array().into_iter().flatten() {
+            let id = text(cat, "id")?;
+            match found {
+                Some(f) if text(f, "id") != Some(id) => return None,
+                Some(_) => {}
+                None => found = Some(cat),
+            }
+        }
+    }
+    let cat = found?;
+    Some(DisplayGroup {
+        game_id: text(cat, "id")?.to_string(),
+        game_name: text(cat, "displayName")?.to_string(),
+        image_url: text(cat, "boxArtURL").unwrap_or_default().to_string(),
+        has_category: true,
+    })
 }
 
 fn parse_time(v: &Value) -> Option<DateTime<Utc>> {
@@ -169,8 +215,14 @@ fn group_drop(
     let mut pool_ids: Vec<String> = Vec::new();
     let mut unheld: Vec<&Value> = Vec::new();
     let mut pool_rewards: Vec<PoolReward> = Vec::new();
+    // A daily chest whose pool has one reward per day (GTAVI's six chains)
+    // is a ladder: each watched day gives the next one, in Twitch's order.
+    let mut ladder: Vec<&Value> = Vec::new();
     for reward in group["rewards"].as_array().into_iter().flatten() {
         let pool: Vec<&Value> = reward["pool"]["rewards"].as_array().into_iter().flatten().collect();
+        if !is_sub && repeats > 1 && pool.len() == repeats as usize {
+            ladder = pool.clone();
+        }
         if pool.len() > 1 {
             random_of = Some(pool.len() as u32);
             unheld.extend(pool.iter().copied().filter(|p| {
@@ -216,8 +268,19 @@ fn group_drop(
     // Twitch holds this tier until the campaign's other rewards are earned
     // (the GTAVI Golden Iguana, a Great Ball's watch tier before a ball is
     // held). It can still say CLAIMABLE once the minutes are in, and a claim
-    // then gives nothing, so it is never ready and never claimed.
-    let held_back = own.is_some_and(|s| s["hasPreconditionsMet"].as_bool() == Some(false));
+    // then gives nothing, so it is never ready and never claimed. Twitch does
+    // not always say so: the Iguana reads `hasPreconditionsMet: true` and
+    // IN_PROGRESS at 953 of its 60 minutes (read 2026-11-19). A one-day watch
+    // tier whose minutes are past its need while Twitch still holds it is
+    // waiting on something else, so it is held back too.
+    let held_back = own.is_some_and(|s| {
+        s["hasPreconditionsMet"].as_bool() == Some(false)
+            || (!is_sub
+                && repeats == 1
+                && required_minutes > 0
+                && s["status"].as_str() == Some("IN_PROGRESS")
+                && uint(&s["currentMinutesWatched"]) > required_minutes)
+    });
     let progress = own.and_then(|s| {
         let status = s["status"].as_str().unwrap_or_default();
         let minutes = uint(&s["currentMinutesWatched"]);
@@ -327,6 +390,23 @@ fn group_drop(
     };
     // One already held is simply claimed, whatever Twitch says it needs.
     let needs_earlier = held_back && !progress.as_ref().is_some_and(|p| p.is_claimed);
+    // What this tier gives next. A ladder gives the reward after the days
+    // already granted (`grantCount`), so the chest reads "Silver Chain" on
+    // day 3, not the chest. Otherwise, Twitch never repeats a reward from a
+    // pool, so one left unheld is what this draw will give (Squirtle once
+    // Bulbasaur and Charmander are out).
+    let granted = own.map(|s| uint(&s["grantCount"]) as usize).unwrap_or(0);
+    let next = if ladder.is_empty() {
+        (unheld.len() == 1).then(|| unheld[0])
+    } else {
+        ladder.get(granted).copied()
+    };
+    let next_reward = next.map(|r| DropBenefit {
+        id: r["id"].as_str().unwrap_or_default().to_string(),
+        name: r["name"].as_str().unwrap_or_default().to_string(),
+        image_url: r["thumbnailURL"].as_str().unwrap_or_default().to_string(),
+        distribution_type: None,
+    });
     // A claimed draw holds what came out of it, whether or not the account's
     // earned list (first 100) reached it yet.
     if let Some(p) = progress.as_ref().filter(|p| p.is_claimed) {
@@ -347,14 +427,7 @@ fn group_drop(
         required_subs,
         required_days,
         random_of,
-        // Twitch never repeats a reward from a pool, so one left unheld is what
-        // this draw will give (Squirtle once Bulbasaur and Charmander are out).
-        next_reward: (unheld.len() == 1).then(|| DropBenefit {
-            id: unheld[0]["id"].as_str().unwrap_or_default().to_string(),
-            name: unheld[0]["name"].as_str().unwrap_or_default().to_string(),
-            image_url: unheld[0]["thumbnailURL"].as_str().unwrap_or_default().to_string(),
-            distribution_type: None,
-        }),
+        next_reward,
         needs_earlier,
         pool_rewards,
         // Decided once every campaign is read (`mark_containers`).
@@ -458,9 +531,13 @@ pub fn build(
             continue;
         }
         let name = text(item, "name").unwrap_or(id);
-        let group = display_group(item).filter(|g| g.has_category).unwrap_or_else(|| {
-            no_category_group(text(item, "brand").unwrap_or(name))
-        });
+        // A campaign Twitch lists without a game (GTAVI's) whose tiers all count
+        // in one category is that category's: its name and box art, not the
+        // campaign's own art (Twitch's heist logo, or its default sword).
+        let group = display_group(item)
+            .filter(|g| g.has_category)
+            .or_else(|| tier_category(detail))
+            .unwrap_or_else(|| no_category_group(text(item, "brand").unwrap_or(name)));
 
         let mut drops: Vec<TimeBasedDrop> = detail["rewardGroups"]
             .as_array()
@@ -484,9 +561,11 @@ pub fn build(
             group.image_url.clone()
         } else {
             text(detail, "imageURL")
+                .filter(|u| !is_placeholder_art(u))
                 .map(str::to_string)
                 .unwrap_or_else(|| first_reward_image(&drops))
         };
+        unplaceholder(&mut drops, &image_url);
         firsts.push(first_tier);
         // Where it counts: every category any tier names, in Twitch's order.
         let mut category_ids: Vec<String> = Vec::new();
@@ -619,7 +698,7 @@ pub(crate) fn detail_chunks(count: usize) -> Vec<std::ops::Range<usize>> {
 /// (unaliased, so free under the cap; `merge_details` keeps the first).
 pub(crate) fn details_query(count: usize) -> String {
     let group = format!(
-        "rewardGroups {{ id name track lane progressCriteria {{ requirementType requirements {{ minutesWatched subs }} repeatableConfig {{ repeatableTimes }} categories {{ id }} }} {SELF_FIELDS} rewards {{ id name thumbnailURL pool {{ rewards {{ id name thumbnailURL distributionType }} }} }} }}"
+        "rewardGroups {{ id name track lane progressCriteria {{ requirementType requirements {{ minutesWatched subs }} repeatableConfig {{ repeatableTimes }} categories {{ id displayName boxArtURL }} }} {SELF_FIELDS} rewards {{ id name thumbnailURL pool {{ rewards {{ id name thumbnailURL distributionType }} }} }} }}"
     );
     let vars: Vec<String> = (0..count).map(|i| format!("$id{i}: ID!")).collect();
     let fields: Vec<String> = (0..count)
@@ -1128,6 +1207,94 @@ mod tests {
 
     fn the_iguana(c: &[DropCampaign]) -> TimeBasedDrop {
         c[0].time_based_drops.iter().find(|d| d.id == "g-iguana").cloned().unwrap()
+    }
+
+    #[test]
+    fn a_tier_twitch_holds_past_its_minutes_is_held_back_whatever_its_flag_says() {
+        // Twitch's real answer for Brandon's Golden Iguana (2026-11-19): still
+        // IN_PROGRESS at 953 of its 60 minutes, with hasPreconditionsMet true.
+        let held = json!({ "status": "IN_PROGRESS", "currentMinutesWatched": 953, "grantCount": 0, "hasPreconditionsMet": true });
+        let c = iguana(held);
+        let d = the_iguana(&c);
+        assert!(d.needs_earlier);
+        let p = d.progress.clone().unwrap();
+        assert!(!p.is_claimed && p.drop_instance_id.is_none());
+        assert_eq!(held_back(&c), ["g-iguana"]);
+        // Minutes still coming in are ordinary progress, held back by nothing.
+        let earning = json!({ "status": "IN_PROGRESS", "currentMinutesWatched": 40, "grantCount": 0, "hasPreconditionsMet": true });
+        assert!(!the_iguana(&iguana(earning)).needs_earlier);
+    }
+
+    #[test]
+    fn a_daily_chest_with_one_reward_a_day_names_the_next_one() {
+        // GTAVI's GTA DVD Drops as Twitch answered it on 2026-11-19: 60 min on
+        // each of 6 days, a chest whose pool is the six chains, day 2 in.
+        let chains = ["Purple Chain", "Bronze Chain", "Silver Chain", "Gold Chain", "Diamond Chain", "Miami Chain"];
+        let list = vec![json!({ "id": "gtavi", "name": "GTAVI Launch Celebration", "brand": "Rockstar Games",
+                                "startsAt": "2026-09-20T11:00:00Z", "endsAt": "2026-10-01T07:59:59Z", "game": null })];
+        let chest = |granted: u32| {
+            json!({
+                "c0": { "id": "gtavi", "imageURL": "https://art/gtavi.png", "rewardGroups": [
+                    { "id": "g-dvd", "name": "GTA DVD Drops",
+                      "progressCriteria": { "requirementType": "WATCH", "requirements": { "minutesWatched": 60, "subs": null },
+                                            "repeatableConfig": { "repeatableTimes": 6 } },
+                      "self": { "status": "IN_PROGRESS", "currentMinutesWatched": 60, "grantCount": granted, "hasPreconditionsMet": true },
+                      "rewards": [ { "id": "chest", "name": "GTA DVD Chest",
+                                     "thumbnailURL": "https://static-cdn.jtvnw.net/twitch-quests-assets/REWARD/default.png",
+                                     "pool": pool(&chains) } ] }
+                ] },
+                "currentUser": { "id": "u1", "inventory": { "viewerRewardDropCampaignsInProgress": [] } }
+            })
+        };
+        let next = |granted: u32| {
+            build(&list, &chest(granted), &mut HashMap::new(), now())[0].time_based_drops[0].next_reward.clone()
+        };
+        let day3 = next(2).expect("the third chain is next");
+        assert_eq!((day3.name.as_str(), day3.image_url.as_str()), ("Silver Chain", "https://art/Silver Chain.png"));
+        assert_eq!(next(0).unwrap().name, "Purple Chain");
+        assert!(next(6).is_none(), "every chain given");
+        // A pool of one over three days (the Poké Ball) is no ladder.
+        let ball = built(json!({ "status": "IN_PROGRESS", "currentMinutesWatched": 20, "grantCount": 1 }), json!([]));
+        assert!(ball[0].time_based_drops[0].next_reward.is_none());
+    }
+
+    #[test]
+    fn a_gameless_campaign_counting_in_one_category_is_that_categorys_and_never_wears_the_sword() {
+        // GTAVI as Twitch lists it (2026-11-21): no game on the campaign, its own
+        // art Twitch's heist logo, the chest on Twitch's default sword, every
+        // tier counting in Grand Theft Auto VI.
+        let chains = ["Purple Chain", "Bronze Chain"];
+        let list = vec![json!({ "id": "gtavi", "name": "GTAVI Launch Celebration", "brand": "Rockstar Games",
+                                "startsAt": "2026-09-20T11:00:00Z", "endsAt": "2026-10-01T07:59:59Z", "game": null })];
+        let gta = json!([{ "id": "1867279146", "displayName": "Grand Theft Auto VI", "boxArtURL": "https://box/gta6-285x380.jpg" }]);
+        let details = |categories: Value| {
+            json!({
+                "c0": { "id": "gtavi", "imageURL": "https://static-cdn.jtvnw.net/twilight-static-assets/heist-train-glitch.png", "rewardGroups": [
+                    { "id": "g-dvd", "name": "GTA DVD Drops",
+                      "progressCriteria": { "requirementType": "WATCH", "requirements": { "minutesWatched": 60, "subs": null },
+                                            "repeatableConfig": { "repeatableTimes": 2 }, "categories": categories },
+                      "self": { "status": "IN_PROGRESS", "currentMinutesWatched": 60, "grantCount": 1, "hasPreconditionsMet": true },
+                      "rewards": [ { "id": "chest", "name": "GTA DVD Chest",
+                                     "thumbnailURL": "https://static-cdn.jtvnw.net/twitch-quests-assets/REWARD/default.png",
+                                     "pool": pool(&chains) } ] }
+                ] },
+                "currentUser": { "id": "u1", "inventory": { "viewerRewardDropCampaignsInProgress": [] } }
+            })
+        };
+        let c = build(&list, &details(gta.clone()), &mut HashMap::new(), now());
+        assert_eq!((c[0].game_id.as_str(), c[0].game_name.as_str()), ("1867279146", "Grand Theft Auto VI"));
+        assert_eq!(c[0].image_url, "https://box/gta6-285x380.jpg");
+        // The chest shows the chain it gives next, never the sword.
+        let chest = &c[0].time_based_drops[0].benefit_edges[0];
+        assert_eq!(chest.name, "GTA DVD Chest");
+        assert_eq!(chest.image_url, "https://art/Bronze Chain.png");
+        // Tiers in two categories, or none: the campaign keeps its own name and art.
+        let two = json!([gta[0].clone(), { "id": "2", "displayName": "Other", "boxArtURL": "b" }]);
+        let mixed = build(&list, &details(two), &mut HashMap::new(), now());
+        assert_eq!(mixed[0].game_name, "Rockstar Games");
+        assert!(mixed[0].image_url.ends_with("heist-train-glitch.png"));
+        assert!(is_placeholder_art("https://static-cdn.jtvnw.net/twitch-quests-assets/REWARD/default.png"));
+        assert!(!is_placeholder_art("https://art/Bronze Chain.png"));
     }
 
     #[test]

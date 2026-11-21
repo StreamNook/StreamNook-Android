@@ -8,6 +8,7 @@
 // attaches the senders' pictures it has. This draws it, relays taps, and marks
 // the mention rows that were on screen read when it closes. A whisper
 // conversation is read only by opening it.
+import { mentionRowIdsOf, useInboxFocus } from '../../components/inbox/useInboxFocus';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Archive, ArrowLeft, BellSlash, Bell, Check, Trash } from 'phosphor-react';
 import { CheckCheck, ChevronDown } from 'lucide-react';
@@ -93,7 +94,9 @@ const MentionRow: React.FC<{
   now: number;
   mixed: boolean;
   onHold: (row: InboxItem) => void;
-}> = React.memo(({ row, now, mixed, onHold }) => {
+  /** A pinned mention asked for this row (SN-284). */
+  focused?: boolean;
+}> = React.memo(({ row, now, mixed, onHold, focused = false }) => {
   const [open, setOpen] = useState(false);
   const entry = row.entry;
   const where = whereWords(entry);
@@ -103,7 +106,12 @@ const MentionRow: React.FC<{
     () => openInboxRow(row),
   );
   return (
-    <div data-inbox-row={row.row_id} data-inbox-ids={seenIdsOf(row).join(' ')}>
+    <div
+      data-inbox-row={row.row_id}
+      data-inbox-ids={seenIdsOf(row).join(' ')}
+      data-mention-ids={mentionRowIdsOf(row).join(' ')}
+      className={focused ? 'bg-accent/15' : undefined}
+    >
       <button type="button" className={ROW_BUTTON} {...press}>
         <span className="mt-1 shrink-0 block">
           <InboxFace face={faceOfEntry(entry)} avatar={row.avatar} size={32} dim={read} />
@@ -362,11 +370,14 @@ export const InboxPanel: React.FC<{
     };
   }, []);
 
-  const loadMore = useCallback(() => {
-    if (!view?.has_more || loadingMore || view.cursor == null) return;
+  // Answers whether the page added rows (false: it failed or held nothing new), which the
+  // pinned-mention search reads so it never waits on a list that will not change.
+  const loadMore = useCallback((): Promise<boolean> => {
+    if (!view?.has_more || view.cursor == null) return Promise.resolve(false);
+    if (loadingMore) return Promise.resolve(true);
     setLoadingMore(true);
     const at = filter;
-    void getInboxView(at, view.cursor, PAGE_SIZE)
+    return getInboxView(at, view.cursor, PAGE_SIZE)
       .then((page) => {
         setView((cur) => {
           if (!cur || at !== filter) return cur;
@@ -374,8 +385,12 @@ export const InboxPanel: React.FC<{
           loaded.current = next.rows.length;
           return next;
         });
+        return page.rows.length > 0;
       })
-      .catch((err) => Logger.warn('[Inbox] older page failed:', err))
+      .catch((err) => {
+        Logger.warn('[Inbox] older page failed:', err);
+        return false;
+      })
       .finally(() => setLoadingMore(false));
   }, [view, loadingMore, filter]);
 
@@ -404,6 +419,15 @@ export const InboxPanel: React.FC<{
   }, []);
 
   const list = view?.rows ?? [];
+  // A pinned mention from another chat opens this inbox at its entry (SN-284).
+  const focusedRow = useInboxFocus({
+    rows: list,
+    hasMore: !!view?.has_more,
+    loadOlder: loadMore,
+    loaded: !!view,
+    container: scrollRef,
+    active: true,
+  });
   const mixed = new Set(mentionItems(list).map((r) => roomProvider(r.entry.room))).size > 1;
   const unread = view?.unread_total ?? 0;
   const chips = chipsOf(view);
@@ -436,7 +460,7 @@ export const InboxPanel: React.FC<{
       {!view && failed && <EmptyNote text="The inbox did not load." hint="Try again in a moment." />}
       {list.map((r) =>
         r.kind === 'mention' ? (
-          <MentionRow key={r.row_id} row={r} now={now} mixed={mixed} onHold={setHeld} />
+          <MentionRow key={r.row_id} row={r} now={now} mixed={mixed} onHold={setHeld} focused={focusedRow === r.row_id} />
         ) : (
           <WhisperRow key={r.row_id} row={r} now={now} roomy={filter === 'whispers'} onHold={setHeld} />
         ),

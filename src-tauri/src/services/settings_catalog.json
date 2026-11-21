@@ -128,6 +128,24 @@
   {
    "page": "player",
    "section": "Playback",
+   "title": "Picture-in-picture",
+   "paths": [
+    "video_player.pip_on_leave"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "Leaving the app while a stream plays floats the video in a small window. Off, the stream goes straight to Background play, or pauses when that is off.",
+   "aliases": [
+    "pip",
+    "floating window",
+    "mini player",
+    "audio only",
+    "background audio"
+   ]
+  },
+  {
+   "page": "player",
+   "section": "Playback",
    "title": "Background play",
    "paths": [
     "video_player.background_mode"
@@ -446,6 +464,38 @@
   },
   {
    "page": "chat",
+   "section": "Hype Train",
+   "title": "Confetti cleanup",
+   "paths": [
+    "chat_design.confetti_auto_clear"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "Confetti that lands on the message box fades away a few seconds after it settles. Off, it stays until you brush it away.",
+   "aliases": [
+    "confetti",
+    "clear confetti",
+    "hype train",
+    "level up"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Hype Train",
+   "title": "Delay",
+   "paths": [
+    "chat_design.confetti_clear_seconds"
+   ],
+   "nested": true,
+   "logo": null,
+   "detail": "",
+   "aliases": [
+    "confetti timer",
+    "seconds"
+   ]
+  },
+  {
+   "page": "chat",
    "section": "Combined Chat",
    "title": "Merged feed",
    "paths": [
@@ -599,6 +649,24 @@
    "aliases": [
     "channel points",
     "rewards"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Chat Events",
+   "title": "Redemption style",
+   "paths": [
+    "chat_events.redemption_style"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "How channel points messages, like Highlight My Message, stand out: a banded wash, one even tint, or a bar down the left side.",
+   "aliases": [
+    "highlighted message style",
+    "highlight my message",
+    "gradient",
+    "solid",
+    "edge"
    ]
   },
   {
@@ -1203,6 +1271,52 @@
   {
    "page": "chat",
    "section": "Mentions & Replies",
+   "title": "Pin mentions",
+   "paths": [
+    "chat_design.pin_mentions"
+   ],
+   "nested": false,
+   "logo": null,
+   "detail": "A mention, a reply to you, a highlight word or a gift sub stays pinned at the top of the chat you're reading, in case you were away when it landed.",
+   "aliases": [
+    "pinned mentions",
+    "keep mentions on top",
+    "missed mentions",
+    "pinned highlights"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Mentions & Replies",
+   "title": "For",
+   "paths": [
+    "chat_design.pin_mentions_minutes"
+   ],
+   "nested": true,
+   "logo": null,
+   "detail": "",
+   "aliases": [
+    "pin duration"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Mentions & Replies",
+   "title": "Most at once",
+   "paths": [
+    "chat_design.pin_mentions_max"
+   ],
+   "nested": true,
+   "logo": null,
+   "detail": "",
+   "aliases": [
+    "pin limit",
+    "maximum pinned mentions"
+   ]
+  },
+  {
+   "page": "chat",
+   "section": "Mentions & Replies",
    "title": "@name style",
    "paths": [],
    "nested": false,
@@ -1422,7 +1536,9 @@
     "emote names",
     "emote labels",
     "emote captions",
-    "readable chat"
+    "readable chat",
+    "7tv readability",
+    "name beside each emote"
    ]
   },
   {

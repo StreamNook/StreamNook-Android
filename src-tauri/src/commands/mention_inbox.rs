@@ -129,6 +129,20 @@ pub async fn clear_mention_inbox() {
     mention_inbox::clear();
 }
 
+/// DEPRECATED (v1 of the pins): replaced by `dismiss_mention_pins`
+/// (`commands::mention_pins`). Kept registered for one release so a page that
+/// is still v1 does not fail its invoke; v2 shells never call it.
+///
+/// The X on a pinned mention (SN-284): its pins (every copy of the same
+/// message) go everywhere, saved at once.
+#[tauri::command]
+pub async fn dismiss_mention_pin(id: String) {
+    if mention_inbox::dismiss_pin(&id) {
+        let _ = tokio::task::spawn_blocking(mention_inbox::flush_now).await;
+        crate::services::mention_pins::on_pins_ended();
+    }
+}
+
 /// Opening an entry (a row tap or a notification click): marks it read and
 /// returns it, so the page can open its chat and look for the message. A
 /// mention pushed while the app was away may not be here yet: it is pulled
@@ -136,6 +150,9 @@ pub async fn clear_mention_inbox() {
 #[tauri::command]
 pub async fn open_mention(id: String) -> Option<MentionEntry> {
     if let Some(entry) = mention_inbox::open(&id) {
+        // Opening dismisses its pin (SN-284): saved now, so a kill right after
+        // cannot bring the pin back. Writes nothing when nothing changed.
+        let _ = tokio::task::spawn_blocking(mention_inbox::flush_now).await;
         return Some(entry);
     }
     // A pull already running is waited for (its page may hold this very

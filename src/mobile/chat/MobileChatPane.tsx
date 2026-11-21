@@ -112,10 +112,11 @@ let lastBuzzed: string | null = null;
  * `paused`: the pane is mounted but out of sight (the Chats tab behind another
  * tab). It reads no room, so arriving messages render nothing until it shows.
  *
- * `top`: what sits between the tab strip and the list (the watch screen's
- * poll, prediction and drop stack). In the flow, so it takes room from the
- * list rather than painting over it, and under the tabs, since it belongs to
- * the room on screen.
+ * `top`: the top-of-chat stack (SN-284: the hype train, the poll and
+ * prediction, the channel's pin, the mention context card, the pinned
+ * mentions), floating over the top of the list under the tabs, since it
+ * belongs to the room on screen. It never takes room from the list: the host
+ * reads where the stack ends and gives the list that much spacer (`topInset`).
  *
  * `surface`: which chat this is (under the player, or the Chats tab), for the
  * inbox: its sheet opens in the chat whose tray was tapped, and a new
@@ -133,6 +134,8 @@ export const MobileChatPane: React.FC<{
    *  still and catches up in one render when seen again. */
   idle?: boolean;
   top?: React.ReactNode;
+  /** Where the floating stack ends, from the top of the list: the list's spacer. */
+  topInset?: number;
   /** A chat's own surface; `home` (browsing) has no chat. */
   surface?: Exclude<InboxSurface, 'home'>;
   /** The watch chat is not on screen (mini player, landscape with chat off): sheets that belong
@@ -154,6 +157,7 @@ export const MobileChatPane: React.FC<{
   paused = false,
   idle = false,
   top,
+  topInset = 0,
   surface = 'watch',
   hidden = false,
   vertical,
@@ -597,6 +601,9 @@ export const MobileChatPane: React.FC<{
   // jump gets undone before the glide finishes. `force` because a deliberate
   // navigation must beat the settle window that exists to swallow stray scroll
   // reports.
+  // The pane's own element: jumps look for their row only inside it (Chats
+  // stays mounted, hidden, under the full player on the same room).
+  const paneRef = useRef<HTMLDivElement | null>(null);
   const handleReplyClick = useCallback(
     (parentMsgId: string) => {
       pause(true, { force: true });
@@ -604,15 +611,17 @@ export const MobileChatPane: React.FC<{
       // enough to find it by eye, short enough not to read as a selection. The
       // same flash a mention jump uses, and it shows on a parent that is
       // itself a mention, which the row's own highlight prop could not.
-      const ok = scrollChatToMessage(parentMsgId, { align: 'center', flash: true });
+      const ok = scrollChatToMessage(parentMsgId, { align: 'center', flash: true, root: paneRef.current });
       if (!ok) addToast('Original message is no longer in chat history', 'info');
     },
     [pause, addToast],
   );
 
-  // Opening a mention (an inbox row or a notification) lands here once its
-  // chat is on screen: scroll and flash, or one backfill, or the context card.
+  // Opening a mention (an inbox row, a notification or a pin) lands here once
+  // its chat is on screen: scroll and flash, or one backfill, or the context
+  // card. Only inside this pane, and only while it is the one on screen.
   useMentionJump({
+    rootRef: paneRef,
     activeChannel,
     messages,
     getMessageId,
@@ -1070,7 +1079,6 @@ export const MobileChatPane: React.FC<{
   );
 
   // Rides above the composer's suggestion strip while it covers the list.
-  const paneRef = useRef<HTMLDivElement | null>(null);
   const overlayLift = useComposerRiserLift(paneRef, listRef, isPaused, surface);
   // The paused hint's column: the overlay's middle (the list less its 10 px and 56 px sides and
   // the badge's own 16 px of padding), at the hint's 10.5 px.
@@ -1112,10 +1120,21 @@ export const MobileChatPane: React.FC<{
     : undefined;
 
   return (
-    <div ref={paneRef} className="flex-1 min-h-0 flex flex-col">
+    <div ref={paneRef} data-stack-bottom={topInset} className="flex-1 min-h-0 flex flex-col">
       {strip && <ChatTabStrip />}
-      {top}
       <div className="flex-1 min-h-0 relative flex flex-col">
+      {top && (
+        // The stack floats over the list, never shrinking it. Over the video (the lower third)
+        // its cards wear the same dark ink as the rows under it; it takes touches only on its
+        // own cards and controls.
+        <div
+          data-top-stack-host=""
+          className={`pointer-events-none absolute inset-x-0 top-0 z-20 h-0 ${folded ? OVER_VIDEO_CLASS : ''}`}
+          style={lowerInk}
+        >
+          {top}
+        </div>
+      )}
       <div
         ref={listRef}
         // The lower third's rows take dark ink in every theme (overVideo.ts); the composer
@@ -1168,6 +1187,9 @@ export const MobileChatPane: React.FC<{
             // is only for telling sources apart in a combined chat.
             homeProvider={activeProvider}
             getMessageId={getMessageId}
+            // The list's top spacer: what the floating stack covers (never less than the
+            // 40 px the oldest row has always had under the top fade).
+            headerInset={Math.max(40, topInset)}
           />
           </NameColorToneContext.Provider>
         </HoldWhile>

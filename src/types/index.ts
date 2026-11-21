@@ -1,4 +1,5 @@
 import type { ProviderCategory, ProviderId } from './providers';
+import type { BackendChatMessage } from '../services/twitchChat';
 
 export interface AudioBoostSettings {
   enabled: boolean;
@@ -73,6 +74,10 @@ export interface VideoPlayerSettings {
    *           media notification that taps back into the app.
    */
   background_mode?: 'pip' | 'audio';
+  /** Phones only (SN-283): leaving the app floats the video in
+   *  picture-in-picture. Off goes straight to what Background play says
+   *  (the audio, or a pause). Default true. Typed in Rust. */
+  pip_on_leave?: boolean;
   /** Phones only: on its side the stream fills a long screen by trimming its
    *  top and bottom (never its sides, at most 1.5x). Set by a pinch on the
    *  video or the Player switch. Default false. Typed in Rust. */
@@ -245,6 +250,17 @@ export interface ChatDesignSettings {
   // Keep a mention or reply to you tinted the whole time it is on screen.
   // Typed in Rust (ChatDesignSettings), which owns the default: off.
   mention_hold?: boolean;
+  // SN-284: a mention, reply, highlight word or gift to you received live
+  // stays pinned at the top of the chat you are reading for
+  // pin_mentions_minutes of using StreamNook. Off by default. Typed in Rust
+  // (ChatDesignSettings); Rust decides the pins.
+  pin_mentions?: boolean;
+  // Minutes of use a pin stays: 1-60, default 1; 0 = "Until I close them"
+  // (a pin with no clock). Rust clamps anything else.
+  pin_mentions_minutes?: number;
+  // Most pins at once: 1-25, default 10. The oldest ends for good when a new
+  // one would pass it.
+  pin_mentions_max?: number;
   show_timestamps?: boolean; // Show timestamp next to each message
   show_timestamp_seconds?: boolean; // Include seconds in timestamps
   timestamp_format?: '12h' | '24h'; // Formatted in Rust; default 12h
@@ -342,6 +358,10 @@ export interface ChatDesignSettings {
   // Live predictions open collapsed to their strip. A prediction already closed
   // and waiting for its result starts collapsed either way. Default false.
   predictions_start_collapsed?: boolean;
+  /** Hype train confetti that landed on the message box fades away on its own. Default false: it stays until brushed away. */
+  confetti_auto_clear?: boolean;
+  /** Seconds a landed piece of confetti rests before it fades (3 to 15, default 5). */
+  confetti_clear_seconds?: number;
   /** Sound when a live message mentions you: a built-in tone id or `file:<id>`. Absent or empty: no sound. */
   mention_sound?: string;
   /** Mention sound volume, percent of the sound's own level (0-200, default 100). */
@@ -965,7 +985,44 @@ export interface MentionSettings {
 
 // One entry in the mentions inbox (services/mention_inbox.rs `MentionEntry`).
 // Rust files, reads and removes them; the pages only draw them.
-export type MentionKind = 'mention' | 'reply' | 'word';
+// `gift`: someone gifted you a sub (filed from the chat's gift notice).
+export type MentionKind = 'mention' | 'reply' | 'word' | 'gift';
+
+/** Where a pin's chat is, when it is not the surface's own chat (Rust
+ *  `mention_pins::ChannelMark`). */
+export interface MentionPinChannelMark {
+  room: string;
+  platform: string;
+  channel: string;
+}
+
+/** One pinned mention as a surface draws it (Rust `mention_pins::PinOut`). */
+export interface MentionPin {
+  /** The inbox entry (the newest copy of the message): opener data, kind, time. */
+  entry: MentionEntry;
+  /** The `ChatMessage`-shaped row Rust built from the filed message, with its
+   *  badges' art resolved (`badges_resolved`). Drawn by the shell's own row. */
+  row: BackendChatMessage;
+  channel_mark: MentionPinChannelMark | null;
+  /** `running`: counting down; `held`: not counting right now; `none`: until closed. */
+  clock: 'running' | 'held' | 'none';
+  /** The use time left; null for an until-closed pin. */
+  left_ms: number | null;
+  /** How many copies of the same message this pin stands for. */
+  run: number;
+  /** The row's hash: the shell redraws the row when it changes. */
+  rev: number;
+  /** The row shows its day: it was not filed today. */
+  day: boolean;
+}
+
+/** `get_mention_pins`: oldest first. */
+export interface MentionPins {
+  revision: number;
+  pins: MentionPin[];
+  /** Most at once. */
+  max: number;
+}
 
 export interface MentionEntry {
   /** The platform's message id. */
@@ -1015,6 +1072,9 @@ export type InboxFilterId = 'all' | 'mentions' | 'highlights' | 'whispers';
 export interface MentionArrival {
   entry: MentionEntry;
   avatar: string | null;
+  /** The pin surface that took this mention as a pin (SN-284), when it pinned:
+   *  a surface showing it on screen skips the card, which would say it twice. */
+  pin_surface?: string | null;
 }
 
 /** `get_mention_inbox` (commands/mention_inbox.rs `MentionPage`). */
@@ -1561,6 +1621,10 @@ export interface ChatEventSettings {
   // Hex tint of channel points rows (Highlight My Message, rewards that post
   // to chat); empty keeps the theme's cyan and blue.
   redemption_color?: string;
+  // How channel points rows wear that tint (SN-281): 'gradient' (default, the
+  // banded wash), 'solid' (one even tint), 'edge' (a bar down the left side
+  // over a faint tint).
+  redemption_style?: 'gradient' | 'solid' | 'edge';
   // Show Super Chat amounts converted to this currency code; empty = as sent.
   superchat_currency?: string;
   // Event categories to leave out, keyed "provider:category" (e.g. "twitch:gift").
@@ -1746,6 +1810,9 @@ export interface Settings {
   // What a newly hidden channel is hidden from besides browsing. Typed in Rust
   // (HiddenRealms), which owns the default: everything.
   hidden_channel_defaults?: HiddenRealms;
+  // Pokémon evolution campaigns whose strip the viewer closed, by campaign id.
+  // The board (Rust) leaves them out; edited only through set_evolution_closed.
+  evolution_closed?: string[];
   chat_design?: ChatDesignSettings;
   chat_highlights?: ChatHighlightSettings;
   chat_customization?: ChatCustomizationSettings;
@@ -1778,6 +1845,7 @@ export interface Settings {
   error_reporting_enabled?: boolean; // Local diagnostic log verbosity; nothing is sent off-device (default: true)
   setup_complete?: boolean; // Whether the first-time setup wizard has been completed
   first_run_look_adopted?: boolean; // Backend-owned: set once the install moved onto the first-run chat look
+  pin_mentions_enabled_at_ms?: number; // Backend-owned (SN-284): when Pin mentions was last turned on; never sent from a window, never in a backup
   auto_claim_points_watching?: boolean; // Auto-claim the bonus chest on the channel you're actively watching. On by default; when off, a clickable chest appears on the points button. Scoped to the watched channel only (background automation is a separate opt-in plugin).
   compact_view?: CompactViewSettings; // Compact view preset settings
   custom_themes?: CustomTheme[]; // User-created custom themes
@@ -2263,6 +2331,55 @@ export interface HypeTrainBulkStatus {
   is_active: boolean;
   level: number;
   is_golden_kappa: boolean;
+  /** The kind of train, for the badge's color and word. */
+  look?: HypeTrainLookData;
+}
+
+/** How a type of train is told apart (Rust `hype_train_kind::Palette`): the
+ *  card stays the app's glass; the type lives in the progress and the label. */
+export interface HypeTrainPalette {
+  /** The track's flowing gradient (one tile; first and last stop match),
+   *  also its glow, sparks and the card's faint tint. */
+  fill: string[];
+  /** The type words in the label, the timer ring, the level-up words. */
+  accent: string;
+  /** The stream card chip's one color. */
+  badge: string;
+}
+
+/** The kind of hype train and everything the bars say about it, decided in
+ *  Rust (`services/hype_train_kind.rs` `TrainLook`); the apps draw it and pick
+ *  no colors of their own. */
+export interface HypeTrainLookData {
+  /** regular | golden_kappa | treasure | mythic | community | pinata */
+  kind: string;
+  /** 'heist': a regular train in Twitch's GTA VI theme. */
+  theme: string | null;
+  shared: boolean;
+  all_time_high: boolean;
+  treasure: { discount_percent: number; unlock_level: number } | null;
+  /** "Hype Train", "Heist Train", "Shared Heist Train", ... */
+  name: string;
+  /** The card chip's word ("Heist", "Golden"); empty for a plain train. */
+  short_name: string;
+  /** What the bar says as the train starts ("The Heist Is On!"). */
+  kickoff: string | null;
+  /** "-35% gifts from L5": read out, and the chip's tooltip. */
+  treasure_words: string | null;
+  /** The type words before "· Level n" ("Heist Train", "Golden Kappa",
+   *  "Shared Heist Train"); empty for a plain train. */
+  bar_name: string;
+  /** The same words for a tight row ("Heist", "Shared Heist"). */
+  bar_name_short: string;
+  /** The bar's treasure chip: "-35% at L5". */
+  treasure_short: string | null;
+  /** null: the app's own rainbow (a regular train). */
+  palette: HypeTrainPalette | null;
+  /** Twitch's own mark for the kind, from its CDN; null for a plain train. */
+  icon: string | null;
+  /** Twitch's trophy for an all-time-high train. */
+  trophy_icon: string | null;
+  channel_color: string | null;
 }
 
 /** The Rust-owned Home snapshot (src-tauri/src/services/home_snapshot.rs):
@@ -3509,6 +3626,11 @@ export interface HypeTrainData {
   started_at: string;
   expires_at: string;
   is_golden_kappa?: boolean;
+  /** Twitch's gift sub art (the Sub Gifter badge), from Rust's watch; the
+   *  iPhone's subs mark. Desktop and Android read their own badge cache. */
+  gift_art?: string | null;
+  /** The kind of train and how the bar draws it (Rust's watch). */
+  look?: HypeTrainLookData;
 }
 
 /** A chatter's sub in a channel, with its words. Mirrors `SubStanding` in

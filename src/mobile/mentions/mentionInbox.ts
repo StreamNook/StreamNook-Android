@@ -11,6 +11,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useAppStore } from '../../stores/AppStore';
+import { arrivalPinnedOnScreen, pinSurfaces } from '../../utils/pinSurfaces';
 import { useChatTabsStore } from '../chat/chatTabsStore';
 import { useMobileNavStore } from '../navStore';
 import { Logger } from '../../utils/logger';
@@ -43,6 +44,7 @@ export const KIND_LABEL: Record<MentionEntry['kind'], string> = {
   mention: 'mentioned you',
   reply: 'replied to you',
   word: 'highlight',
+  gift: 'gifted you a sub',
 };
 
 /** A room key's platform: `kick:xqc` is Kick, a bare login is Twitch. */
@@ -258,6 +260,14 @@ export function openMentionEntry(entry: MentionEntry): void {
   }
 }
 
+/** A pinned mention tapped (SN-284): its chat is already the one on screen,
+ *  so nothing opens or moves; Rust reads it and drops its pin, and the pane on
+ *  screen scrolls to it (or shows the card). */
+export function openPinnedMention(entry: MentionEntry): void {
+  invoke('open_mention', { id: entry.id }).catch((err) => Logger.warn('[Mentions] open_mention for a pin failed:', err));
+  useMentionsStore.setState({ pendingJump: entry, contextCard: null });
+}
+
 /** A notification tap: Rust marks the entry read and hands it back. Right
  *  after a cold start the account may not be known yet, so a miss retries a
  *  few times before giving up. */
@@ -332,6 +342,8 @@ export function installMentionInbox(): () => void {
       if (!e.payload?.entry) return;
       Logger.debug('[Inbox] arrival', e.payload.entry.id);
       if (useMentionsStore.getState().sheetIn) return;
+      // Pinned on the surface in front: the pin says it, so no card does too.
+      if (arrivalPinnedOnScreen(e.payload.pin_surface, pinSurfaces.peek())) return;
       useMentionsStore.setState({
         arrival: { kind: 'mention', entry: e.payload.entry, avatar: e.payload.avatar ?? null, seq: ++seq },
       });

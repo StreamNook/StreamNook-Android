@@ -6,15 +6,17 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Check } from 'lucide-react';
+import { Check, X } from 'lucide-react';
 import { useAppStore } from '../../stores/AppStore';
 import { Logger } from '../../utils/logger';
 import {
+  EVOLUTION_CLOSED_TOAST,
   endsLabel,
   equipEvolutionLane,
   getEvolutionBoard,
   laneDetail,
   laneTarget,
+  setEvolutionClosed,
   shownLane,
   type EvolutionBoard,
   type EvolutionLane,
@@ -44,6 +46,17 @@ function lastHeight(): number {
   }
 }
 
+/** A day still to go: a soft white ring on dark themes; the text color on
+ *  light ones, where white vanishes into the card (about 1.1:1) and a line
+ *  two days into five would read as two of two. */
+const DAY_RING =
+  'ring-white/[0.35] [html[data-theme-tone=light]_&]:ring-[color:color-mix(in_srgb,var(--color-text-primary)_60%,transparent)]';
+
+/** Success green for the check and the Claim word: the theme's own on dark
+ *  themes, darker on light ones, where the plain green is about 2.5:1. */
+const SUCCESS_INK =
+  'text-success [html[data-theme-tone=light]_&]:text-[color-mix(in_srgb,var(--color-success)_60%,black)]';
+
 /** Days done as filled dots, the day under way (on the equipped line) as an
  *  accent ring, the rest as rings. Past five days, the count instead. */
 const DayDots = ({ done, total, today }: { done: number; total: number; today: boolean }) => {
@@ -64,7 +77,7 @@ const DayDots = ({ done, total, today }: { done: number; total: number; today: b
               ? 'bg-accent'
               : today && i === done
                 ? 'ring-1 ring-inset ring-accent'
-                : 'ring-1 ring-inset ring-white/[0.35]'
+                : `ring-1 ring-inset ${DAY_RING}`
           }`}
         />
       ))}
@@ -129,12 +142,12 @@ const LaneRow = ({
             onClick={() => onClaim(target.group_id, target.instance_id!)}
             className="pointer-events-auto shrink-0 -my-2 py-2 px-1 active:opacity-70 transition-opacity"
           >
-            <span className="glaze-inset glaze-chip bg-white/[0.10] inline-flex items-center h-[24px] px-2.5 text-[11.5px] font-medium text-success">
+            <span className={`glaze-inset glaze-chip bg-white/[0.10] inline-flex items-center h-[24px] px-2.5 text-[11.5px] font-medium ${SUCCESS_INK}`}>
               {target.claim_label}
             </span>
           </button>
         ) : done ? (
-          <Check size={14} className="shrink-0 self-start mt-[3px] text-success" aria-hidden />
+          <Check size={14} className={`shrink-0 self-start mt-[3px] ${SUCCESS_INK}`} aria-hidden />
         ) : showDays ? (
           <span className="shrink-0 self-start mt-[6px]">
             <DayDots done={target.days_done} total={target.total_days} today={equipped} />
@@ -203,6 +216,21 @@ export function MobileEvolution() {
     }
   };
 
+  // Gone at once; Rust remembers it and leaves the campaign off every board.
+  const close = async (track: EvolutionTrack) => {
+    setBoard((b) => (b ? (lastBoard = { ...b, tracks: b.tracks.filter((t) => t.track_id !== track.track_id) }) : b));
+    try {
+      await setEvolutionClosed(track.campaign_id, true);
+      useAppStore.getState().addToast(EVOLUTION_CLOSED_TOAST, 'info', {
+        label: 'Undo',
+        onClick: () => void setEvolutionClosed(track.campaign_id, false),
+      });
+    } catch (err) {
+      Logger.warn('[MobileEvolution] Close failed:', err);
+      void load(false);
+    }
+  };
+
   if (!board) {
     return placeholderPx > 0 ? (
       <section className="pb-3" aria-hidden style={{ height: placeholderPx }}>
@@ -210,7 +238,14 @@ export function MobileEvolution() {
           <span className="missing-now-title">Evolution</span>
           <p className="h-[17px]" />
         </header>
-        <div className="h-[52px] rounded-xl glass-panel animate-pulse" />
+        {/* As many bars as lines fitted last time (about 59 px of header
+            and padding, a line every 58), so the held room reads as lines
+            coming, not a blank band (the iPhone draws it the same way). */}
+        <div className="flex flex-col gap-1.5 animate-pulse">
+          {Array.from({ length: Math.max(1, Math.floor((placeholderPx - 59 + 6) / 58)) }, (_, i) => (
+            <div key={i} className="h-[52px] rounded-xl glass-panel" />
+          ))}
+        </div>
       </section>
     ) : null;
   }
@@ -224,7 +259,18 @@ export function MobileEvolution() {
         return (
           <section key={track.track_id} className="pb-3">
             <header className="pb-2.5">
-              <span className="missing-now-title">Evolution</span>
+              <div className="flex items-center justify-between gap-2">
+                <span className="missing-now-title">Evolution</span>
+                {/* A 36 px reach around a quiet 16 px mark, kept off the line height. */}
+                <button
+                  type="button"
+                  onClick={() => void close(track)}
+                  aria-label="Hide Evolution until the next Pokémon event"
+                  className="shrink-0 -my-2 -mr-2 p-2.5 text-textMuted active:opacity-60 transition-opacity"
+                >
+                  <X size={16} />
+                </button>
+              </div>
               <p className="text-[11.5px] text-textMuted truncate">
                 {progress ?? (active ? 'Evolving' : 'Pick a Pokémon to evolve · one at a time')}
                 {' · ends '}

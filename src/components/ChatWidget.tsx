@@ -64,13 +64,17 @@ import ErrorBoundary from './ErrorBoundary';
 import PredictionOverlay from './PredictionOverlay';
 import PollOverlay from './PollOverlay';
 import { ChatOverlayStack } from './chat/ChatOverlayStack';
-import { useChatTopStack } from './chat/chatTopStack';
+import { HypeStackCard } from './chat/HypeStackCard';
+import { jumpTarget, recenterAfterSearch, stackSpacer } from './chat/stackSpacer';
+import { useChatTopStack, type StackKind } from './chat/chatTopStack';
 import PollPredictionComposer from './chat/PollPredictionComposer';
 import StreamManagerPanel, { type ManagerPanelKind } from './chat/StreamManagerPanel';
 import ManageChannelWindow from './chat/ManageChannelWindow';
 import { acceptsComposerEvent, managesHere, mustCloseSurfaces, type PaneEventDetail } from './chat/managerStore';
 import { useManagerInterest, useStreamManager, useTwitchAccount, type PageId } from '../services/streamManager';
-import HypeTrainBanner from './HypeTrainBanner';
+
+import ConfettiBurst from './ConfettiBurst';
+import { useConfettiClearMs } from '../hooks/useConfettiClearMs';
 import ViewersPanel from './ViewersPanel';
 import ModRoomPane from './modroom/ModRoomPane';
 import { EmotePickerPanel, useSwappingSmiley } from './chat/EmotePickerPanel';
@@ -158,7 +162,10 @@ import { usemultiNookStore } from '../stores/multiNookStore';
 import { usePinStore } from '../stores/pinStore';
 import { useVodReplayStore, useVodReplaySnapshot, setVodReplayShowing } from '../stores/vodReplayStore';
 import { SegmentedSelect } from './settings/_primitives';
-import type { TwitchStream, HypeTrainData, MentionEntry } from '../types';
+import type { TwitchStream, HypeTrainData, MentionEntry, MentionPin } from '../types';
+import { DesktopPins } from './mentions/DesktopPins';
+import { setChatCover } from '../utils/chatCovers';
+import type { PinRoomRef } from '../utils/pinSurfaces';
 
 import { Logger } from '../utils/logger';
 import { stopArgs, stopToast } from '../utils/dropsStop';
@@ -221,6 +228,10 @@ export interface ChatWidgetProps {
    *  on. The pane owns the live value; MultiChat persists it per tab. */
   filterId?: string | null;
   onFilterIdChange?: (id: string | null) => void;
+  /** This chat's pin surface id (SN-284): `main-chat`, `dock`, `main-provider`
+   *  or `pane:<...>`. Absent: the main window's chat is `main-chat`, any other
+   *  override is a pane of its own room. */
+  surfaceId?: string;
 }
 
 // Minimum spacing between pause/resume transitions. Real gestures are hundreds
@@ -229,6 +240,10 @@ export interface ChatWidgetProps {
 // limit. `force` transitions (channel switch, navigation, Resume button) bypass
 // it. See `setChatPaused` in ChatWidget.
 const PAUSE_SETTLE_MS = 120;
+
+// What the top-of-chat stack keeps while another view replaces the chat (Viewers,
+// Mod Room) or search is open: the hype train, which must keep counting down.
+const HYPE_ONLY: readonly StackKind[] = ['hype'];
 
 // Structurally complete, empty, frozen. YouTube has no third-party emote fetch,
 // so `useChannelEmotes` returns null for it forever, but the picker still needs
@@ -676,7 +691,7 @@ const PausedNewCount = ({ sliceKeys, isPaused }: { sliceKeys: string; isPaused: 
   return delta > 0 ? <> ({fitCount(delta)} new)</> : null;
 };
 
-const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp, onFilterIdChange }: ChatWidgetProps = {}) => {
+const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp, onFilterIdChange, surfaceId: surfaceIdProp }: ChatWidgetProps = {}) => {
   // Single source of truth for the source platform. Twitch (the default) runs the
   // entire native path below unchanged; a non-twitch provider reads the shared
   // `provider:channel` slice and every Twitch-only effect early-returns on it.
@@ -900,6 +915,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // uses the global store value. Resolving it here means the banner, countdown
   // and level-up logic below all work per-pane with no further changes.
   const currentHypeTrain = channelOverride ? (hypeTrainOverride ?? null) : globalHypeTrain;
+  const hypeTrains = useMemo(() => (currentHypeTrain ? [currentHypeTrain] : []), [currentHypeTrain]);
   const isMultiNookActive = usemultiNookStore((s) => s.isMultiNookActive);
   // The chat dock, main window only (MultiNook picks its chat among tiles).
   // While anything is docked the window keeps several chats, so nothing here
@@ -1161,6 +1177,12 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     if (activeView === 'modroom' && !modRoomEligible) setActiveView('chat');
   }, [activeView, modRoomEligible, isTwitch]);
   const [showEmotePicker, setShowEmotePicker] = useState(false);
+  // The picker covers the pins' stack while it is open (chatSurfaceShown).
+  useEffect(() => {
+    if (!showEmotePicker) return;
+    setChatCover('emote-picker', true);
+    return () => setChatCover('emote-picker', false);
+  }, [showEmotePicker]);
   // The drops drawer and the emote picker share the space above the message
   // box: opening the drawer closes the picker, and the bar closes its drawer
   // when the picker opens.
@@ -1382,10 +1404,18 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const mountTimeRef = useRef<number>(Date.now());
   const [viewerCount, setViewerCount] = useState<number | null>(null);
   const streamUptimeRef = useRef<string>('');
-  // Hype train rendering (countdown, level-up, confetti) lives in HypeTrainBanner.
-  // We keep the chat container element so the banner can portal its level-up
-  // confetti to cover the full chat height.
+  // Hype train rendering (countdown, level-up) lives in HypeTrainBanner. Its
+  // level-up confetti is thrown here, over the whole chat column, so what lands
+  // on the composer's controls stays there (until hovered) after the bar's
+  // celebration, or the train itself, has ended. `burst` counts level-ups so
+  // each one throws another handful into the same canvas.
   const [chatContainerEl, setChatContainerEl] = useState<HTMLElement | null>(null);
+  const [hypeConfetti, setHypeConfetti] = useState<{ burst: number; golden: boolean; colors: string[] } | null>(null);
+  const throwHypeConfetti = useCallback((golden: boolean, colors: string[]) => {
+    setHypeConfetti((prev) => ({ burst: (prev?.burst ?? 0) + 1, golden, colors }));
+  }, []);
+  const hypeConfettiDone = useCallback(() => setHypeConfetti(null), []);
+  const confettiClearAfter = useConfettiClearMs();
   // How tall the floating chat header currently is. It is absolutely positioned
   // OVER this column, and its height moves: a hype train, an expanded pinned
   // message. The combined-chat bar has to sit flush under it to read as one
@@ -1458,21 +1488,48 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     ro.observe(blendBarEl);
     return () => ro.disconnect();
   }, [blendBarEl]);
-  // The poll / prediction column. The pinned message goes under it rather than
-  // at the same spot, so a live poll and a pin are both readable at once.
-  const [overlayStackEl, setOverlayStackEl] = useState<HTMLDivElement | null>(null);
-  const [overlayStackHeight, setOverlayStackHeight] = useState(0);
-  // The poll and prediction stack's layout, from Rust: order, the one open
-  // card, and a cap measured against this chat's height.
-  const topStack = useChatTopStack(chatContainerEl);
+  // The pin surface this chat is (SN-284), in the shape the open and folded
+  // choices and the pins' registry both key by.
+  const pinSurfaceId =
+    surfaceIdProp ??
+    (isMainSurface
+      ? channelOverride
+        ? 'main-provider'
+        : 'main-chat'
+      : `pane:${makeKey(provider, channelOverride?.user_login ?? '')}`);
+  // The channel's pinned message, open or folded. One store per chat: the
+  // header's pin button, the stack's strip and the card all write it, and the
+  // stack reads it for Rust's open choice.
+  const [isPinnedExpanded, setIsPinnedExpanded] = useState(
+    () => !(useAppStore.getState().settings.chat_design?.pinned_start_collapsed ?? true),
+  );
+  const seenPinIdRef = useRef<string | null>(null);
+  // The top-of-chat stack's layout, from Rust: the hype train, the poll and
+  // prediction, the channel's pin, the mention context card and the pinned
+  // mentions in one order, the one open card, and a cap measured against this
+  // chat's height. The other views of the column (Viewers, Mod Room, search)
+  // keep the hype train and nothing else.
+  const topStack = useChatTopStack(chatContainerEl, {
+    surface: pinSurfaceId,
+    provider,
+    channel: channelOverride?.user_login ?? currentStream?.user_login ?? null,
+    channelPinOpened: isPinnedExpanded,
+    onChannelPinOpen: setIsPinnedExpanded,
+    only: activeView === 'chat' && !searchOpen ? undefined : HYPE_ONLY,
+  });
+  // Where the stack's drawn bottom is in the column (0 when it draws nothing):
+  // the list's spacer, the other views' padding and the jumps read it.
+  const [stackBottom, setStackBottom] = useState(0);
+  // The floating stack never shrinks the list: the list gets a spacer as tall
+  // as what covers its top (zero where the combined-chat bar already cleared
+  // it), and the other views pad by the stack's bottom.
+  const listSpacer = stackSpacer({ header: chromeHeight, bar: blendBarEl ? blendBarBottom : 0, stack: stackBottom });
+  const paneTop = Math.max(chromeHeight, stackBottom);
+  // The jump below reads the spacer when it runs, not when it was made.
+  const listSpacerRef = useRef(0);
   useEffect(() => {
-    if (!overlayStackEl) return;
-    const sync = () => setOverlayStackHeight(Math.round(overlayStackEl.getBoundingClientRect().height));
-    sync();
-    const ro = new ResizeObserver(sync);
-    ro.observe(overlayStackEl);
-    return () => ro.disconnect();
-  }, [overlayStackEl]);
+    listSpacerRef.current = listSpacer;
+  }, [listSpacer]);
 
 
   const settings = useAppStore((s) => s.settings);
@@ -1788,10 +1845,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     () => new Set(pinnedMessages.map((m) => m.message_id).filter(Boolean)),
     [pinnedMessages],
   );
-  const [isPinnedExpanded, setIsPinnedExpanded] = useState(
-    () => !(useAppStore.getState().settings.chat_design?.pinned_start_collapsed ?? true),
-  );
-  const seenPinIdRef = useRef<string | null>(null);
 
   // Pinned-message bodies arrive as plain text with no emote ranges, so Rust
   // cuts each text chunk the pin draws (its non-link segments, and the whole
@@ -3114,43 +3167,17 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         // Find the scrollable chat container (ChatMessageList's container)
         const container = element.closest('.overflow-y-auto') as HTMLElement | null;
         if (container) {
-          // Calculate the element's position relative to the container
-          const elementTopRelative = element.offsetTop;
-          const containerScrollTop = container.scrollTop;
-          const containerHeight = container.clientHeight;
-          const elementHeight = element.offsetHeight;
-          
-          let targetScrollTop: number;
-          
-          if (align === 'center') {
-            // Center the element in the container
-            targetScrollTop = elementTopRelative - (containerHeight / 2) + (elementHeight / 2);
-          } else if (align === 'start') {
-            // Align element to the top of the container
-            targetScrollTop = elementTopRelative;
-          } else if (align === 'end') {
-            // Align element to the bottom of the container
-            targetScrollTop = elementTopRelative - containerHeight + elementHeight;
-          } else {
-            // 'auto' - scroll minimum distance to make element visible
-            const elementTopInView = elementTopRelative - containerScrollTop;
-            const elementBottomInView = elementTopInView + elementHeight;
-            
-            if (elementTopInView < 0) {
-              // Element is above viewport, scroll up
-              targetScrollTop = elementTopRelative;
-            } else if (elementBottomInView > containerHeight) {
-              // Element is below viewport, scroll down
-              targetScrollTop = elementTopRelative - containerHeight + elementHeight;
-            } else {
-              // Element is already in view, no scroll needed
-              targetScrollTop = containerScrollTop;
-            }
-          }
-          
-          // Clamp scroll position to valid range
-          targetScrollTop = Math.max(0, Math.min(targetScrollTop, container.scrollHeight - containerHeight));
-          
+          // The list's top is covered by the floating stack: land below it.
+          const targetScrollTop = jumpTarget({
+            align,
+            elementTop: element.offsetTop,
+            elementHeight: element.offsetHeight,
+            scrollTop: container.scrollTop,
+            containerHeight: container.clientHeight,
+            scrollHeight: container.scrollHeight,
+            inset: listSpacerRef.current,
+          });
+
           // Smooth scroll to the target position
           container.scrollTo({
             top: targetScrollTop,
@@ -3196,6 +3223,39 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   const mentionChannelId = isTwitch ? currentStream?.user_id : undefined;
   const mentionScrollRef = useRef(scrollToMessage);
   useEffect(() => { mentionScrollRef.current = scrollToMessage; }, [scrollToMessage]);
+  // A jump made from chat search lands while the stack shows only the hype
+  // train; the cards return as search closes and cover the list's top, so the
+  // row is centered again below them once they have settled.
+  const searchJumpRef = useRef<string | null>(null);
+  const searchWasOpenRef = useRef(false);
+  useEffect(() => {
+    if (searchOpen) {
+      searchWasOpenRef.current = true;
+      return;
+    }
+    if (!searchWasOpenRef.current) return;
+    searchWasOpenRef.current = false;
+    const id = searchJumpRef.current;
+    searchJumpRef.current = null;
+    if (!id) return;
+    const timer = setTimeout(() => {
+      // Only while the list is still paused where the jump left it and the row is
+      // in view: a viewer who scrolled or resumed since is never pulled back.
+      const row = document.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
+      const list = row?.closest<HTMLElement>('.overflow-y-auto');
+      const rect = (el: HTMLElement | null | undefined) => {
+        const r = el?.getBoundingClientRect();
+        return r ? { top: r.top, bottom: r.bottom } : null;
+      };
+      if (!recenterAfterSearch({ paused: isPausedRef.current, row: rect(row), list: rect(list) })) return;
+      mentionScrollRef.current(id, { highlight: false, align: 'center' });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [searchOpen]);
+  // Scrolling or resuming ends the search jump's claim on the list.
+  useEffect(() => {
+    if (!isPaused) searchJumpRef.current = null;
+  }, [isPaused]);
   useEffect(() => {
     if (!mentionRooms) return;
     const rooms = mentionRooms.split('|');
@@ -3244,6 +3304,46 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
     };
   }, [mentionRooms, mentionChannelId, getMessageId]);
   const shownMentionCard = mentionCard && mentionCard.rooms === mentionRooms ? mentionCard.entry : null;
+  const dismissMentionCard = useCallback(() => setMentionCard(null), []);
+
+  // A pinned mention clicked (SN-284): opened here, in this chat only (never
+  // through the window-wide jump hand-off, which another pane showing the
+  // same room could take). Rust marks it read and drops its pin; then it is
+  // scrolled to, or after one history fetch, or shown as the card.
+  // The chats this surface shows, in the (provider, channel) shape Rust
+  // builds its own room keys from.
+  const pinRooms = useMemo<PinRoomRef[]>(
+    () =>
+      (pausedCountKeys ? pausedCountKeys.split('|').filter(Boolean) : []).map((k) => {
+        const i = k.indexOf(':');
+        return i > 0 ? { provider: k.slice(0, i), channel: k.slice(i + 1) } : { provider: 'twitch', channel: k };
+      }),
+    [pausedCountKeys],
+  );
+  const openPinnedMention = useCallback(
+    async (pin: MentionPin) => {
+      const rooms = mentionRooms;
+      const { entry } = pin;
+      // Read it and drop its pin in Rust without waiting: the scroll is now.
+      invoke('open_mention', { id: entry.id }).catch((err) => {
+        Logger.warn('[ChatWidget] open_mention for a pin failed:', err);
+      });
+      const show = () =>
+        messagesRef.current.some((m) => getMessageId(m) === entry.id) &&
+        mentionScrollRef.current(entry.id, { highlight: true, align: 'center' });
+      if (show()) return;
+      if (entry.platform === 'twitch' && entry.channel_id) {
+        await ensureChannelHistory(entry.room, entry.channel_id);
+        // The backfilled rows still have to land: look for up to 1.5 s.
+        for (let i = 0; i < 6; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          if (show()) return;
+        }
+      }
+      setMentionCard({ rooms, entry });
+    },
+    [mentionRooms, getMessageId],
+  );
 
   // ---- Keyboard moderation controller --------------------------------------
   // Bridges the global keybinding engine to this chat. Only the primary chat
@@ -4705,6 +4805,8 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   }, [setChatPaused]);
 
   const handleListScroll = useCallback((distanceToBottom: number, isUserScroll: boolean) => {
+    // A viewer's own scroll ends a search jump's claim on the list.
+    if (isUserScroll) searchJumpRef.current = null;
     // Debug logging - to be removed after verification
     if (isUserScroll && distanceToBottom > 150) {
       Logger.debug('[ChatWidget] Potential Pause Trigger:', { distanceToBottom, isUserScroll, isPaused });
@@ -4768,7 +4870,6 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
   // poll / prediction cards, then the pinned message.
   const chromeBottom = Math.max(chromeHeight, blendBarEl ? blendBarBottom : 0);
   const overlayTop = chromeBottom + 8;
-  const pinnedTop = overlayTop + (overlayStackHeight > 0 ? overlayStackHeight + 8 : 0);
   // The action capsule only renders when it would hold at least one button.
   // Dock this chat (keep it open beside whatever stream plays), or close it
   // when it is a docked chat. `provider` is this widget's own platform, so a
@@ -4929,7 +5030,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             <span className="glass-panel rounded-full px-4 py-2 text-[13px] font-medium text-textPrimary">Drop to upload</span>
           </div>
         )}
-        {isMainSurface && !isMultiNookActive && <ChatDockPanel top={chromeHeight} />}
+        {isMainSurface && !isMultiNookActive && <ChatDockPanel top={paneTop} />}
         {/* Floating cards at the top of chat. Twitch allows a poll and a
             prediction at once, so they stack in one column, laid out by Rust:
             the user's order, one card open, and no more than its share of
@@ -4939,10 +5040,24 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             Kick slug / YouTube UC id that can never produce an event. */}
         <ChatOverlayStack
           top={overlayTop}
+          // Chat search takes the top of the column (its bar sits under the stack's
+          // layer): the cards stay mounted, hidden, and return as search closes.
+          hidden={searchOpen}
           maxHeight={topStack.maxHeight}
-          stackRef={setOverlayStackEl}
-          hidden={activeView !== 'chat'}
+          more={topStack.more}
+          onBottom={setStackBottom}
         >
+          {/* The hype train is the first card of the stack, under the header
+              (no longer inside it), and stays mounted on every view. */}
+          <HypeStackCard
+            trains={hypeTrains}
+            stack={topStack.control.hype}
+            measure={topStack.measure}
+            onLevelUp={throwHypeConfetti}
+            onExpire={() => {
+              if (!channelOverride) useAppStore.getState().setCurrentHypeTrain(null);
+            }}
+          />
           {isTwitch && settings.show_predictions !== false && (
             <PredictionOverlay
               key="prediction"
@@ -4959,34 +5074,91 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               stack={topStack.control.poll}
             />
           )}
+          {/* The channel's pinned message: open or the one-line bar, as Rust
+              says. The header's pin button, the card and the strip all write
+              the one open store. */}
+          <PinnedBar
+            pins={pinnedMessages}
+            expanded={isPinnedExpanded}
+            onExpand={(pinId) => {
+              setIsPinnedExpanded(true);
+              seenPinIdRef.current = pinId;
+            }}
+            onCollapse={() => setIsPinnedExpanded(false)}
+            provider={provider}
+            channelId={currentStream?.user_id}
+            top={0}
+            stack={topStack.control.channel_pin}
+            measure={topStack.measure}
+            onUnpin={
+              isModerator && currentStream?.user_id
+                ? async (messageId) => {
+                    try {
+                      await invoke('unpin_chat_message', { broadcasterId: currentStream.user_id, messageId });
+                      usePinStore.getState().requestRefresh();
+                    } catch (err) {
+                      Logger.error('[ChatWidget] Failed to unpin message:', err);
+                    }
+                  }
+                : undefined
+            }
+            onBadgeClick={handleBadgeClick}
+            renderText={renderPinTextWithEmotes}
+          />
+          {/* A mention older than this chat's history, pinned above the
+              messages until the viewer puts it away. */}
+          {shownMentionCard && (
+            <MentionContextCard
+              entry={shownMentionCard}
+              onDismiss={dismissMentionCard}
+              stack={topStack.control.mention_context}
+              measure={topStack.measure}
+            />
+          )}
+          {/* Pinned mentions (SN-284): the last card, so the others never move
+              when they come and go. */}
+          <DesktopPins
+            surfaceId={pinSurfaceId}
+            rooms={pinRooms}
+            active={channelOverride ? channelOverride.is_active !== false : true}
+            chatViewActive={activeView === 'chat' && !(isVodReplay && chatMode === 'replay')}
+            searchOpen={searchOpen}
+            onOpenOwn={openPinnedMention}
+            stack={topStack.control.mention_pins}
+            measure={topStack.measure}
+          />
         </ChatOverlayStack>
 
+        {/* Level-up confetti over the whole column; some lands on the
+            composer's controls and is brushed off when the pointer passes over one. */}
+        {hypeConfetti && (
+          <ConfettiBurst
+            burst={hypeConfetti.burst}
+            golden={hypeConfetti.golden}
+            colors={hypeConfetti.colors}
+            perchOn=".sn-composer-row"
+            onDone={hypeConfettiDone}
+            clearAfterMs={confettiClearAfter}
+          />
+        )}
         {/* Chat header - transforms when Hype Train active */}
         {/* While the dock's tab row is unfolded the header rises above the pinned
             message (z-15) and the poll stack (z-40): the unfolded lines live
             inside the header's own stacking context and could not otherwise
             draw over them. */}
-        {/* flex-col-reverse keeps the stream-info row on top while the hype bar
-            (declared first below) renders underneath it */}
-        {/* The tint follows Glassiness: 10% of the rows show through at full
-            glass, none at 0%, where the blur is stripped too. */}
-        <div ref={setChromeEl} onWheel={forwardHeaderWheel} className={`absolute top-0 left-0 right-0 px-3 py-1.5 border-b backdrop-blur-ultra z-10 has-[.sn-tabs-unfolded]:z-[45] shadow-[0_8px_18px_-12px_rgba(0,0,0,0.7)] overflow-x-clip flex flex-col-reverse ${
-          isSharedChat && !currentHypeTrain ? 'iridescent-border' : 'border-borderSubtle'
-        }`} style={{ backgroundColor: 'color-mix(in srgb, var(--color-background) calc(100% - 10% * var(--glass-strength, 1)), transparent)' }}>
-          {currentHypeTrain && (
-            <HypeTrainBanner
-              train={currentHypeTrain}
-              confettiTarget={chatContainerEl}
-              onExpire={() => {
-                if (!channelOverride) useAppStore.getState().setCurrentHypeTrain(null);
-              }}
-            />
-          )}
-          {/* The dock's tab row, right under the stream-info row (the column is
-              reversed, so declared here it sits between that row and the hype
-              bar). The header is measured, so the chat below makes room for it. */}
-          {dockTabs && <ChatDockTabs />}
-          {/* Stream-info header, always visible; sits as the top row, above the hype bar */}
+        {/* The header area is measured as a whole (the chat below and the
+            overlays make room for all of it) but paints nothing itself: the
+            shelf (the stream-info row and the dock's tabs) wears the bar's
+            background, edge and shadow, and the hype train card floats under
+            it as its own glaze card, never sitting on that square shelf. The
+            gap around the card passes clicks through to the chat. */}
+        <div ref={setChromeEl} onWheel={forwardHeaderWheel} className="pointer-events-none absolute top-0 left-0 right-0 z-10 has-[.sn-tabs-unfolded]:z-[45] overflow-x-clip flex flex-col">
+          {/* The tint follows Glassiness: 10% of the rows show through at full
+              glass, none at 0%, where the blur is stripped too. */}
+          <div className={`pointer-events-auto px-3 py-1.5 border-b backdrop-blur-ultra shadow-[0_8px_18px_-12px_rgba(0,0,0,0.7)] ${
+            isSharedChat && !currentHypeTrain ? 'iridescent-border' : 'border-borderSubtle'
+          }`} style={{ backgroundColor: 'color-mix(in srgb, var(--color-background) calc(100% - 10% * var(--glass-strength, 1)), transparent)' }}>
+          {/* Stream-info header, always visible; the top row */}
           <div className="relative z-10">
               <div
                 ref={setHeaderRowEl}
@@ -5363,54 +5535,16 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
               </div>
               {/* Pinned messages are now rendered in a floating modal outside the header */}
           </div>
-        </div>
-
-        {/* A mention older than this chat's history, pinned above the
-            messages (over the pin, which it outranks while it is up). */}
-        {shownMentionCard && activeView === 'chat' && (
-          <div
-            className="absolute left-3 right-3 z-[16] pointer-events-none flex flex-col items-center"
-            style={{ top: pinnedTop }}
-          >
-            <MentionContextCard entry={shownMentionCard} onDismiss={() => setMentionCard(null)} />
+          {/* The dock's tab row, right under the stream-info row, on the shelf. */}
+          {dockTabs && <ChatDockTabs />}
           </div>
-        )}
-
-        {/* Free Floating Pinned Message Modal (chat/PinnedBar, which Settings >
-            Chat's preview draws too). */}
-        <PinnedBar
-          pins={pinnedMessages}
-          expanded={isPinnedExpanded}
-          onExpand={(pinId) => {
-            setIsPinnedExpanded(true);
-            seenPinIdRef.current = pinId;
-          }}
-          onCollapse={() => setIsPinnedExpanded(false)}
-          provider={provider}
-          channelId={currentStream?.user_id}
-          top={pinnedTop}
-          hidden={activeView !== 'chat'}
-          onUnpin={
-            isModerator && currentStream?.user_id
-              ? async (messageId) => {
-                  try {
-                    await invoke('unpin_chat_message', { broadcasterId: currentStream.user_id, messageId });
-                    usePinStore.getState().requestRefresh();
-                  } catch (err) {
-                    Logger.error('[ChatWidget] Failed to unpin message:', err);
-                  }
-                }
-              : undefined
-          }
-          onBadgeClick={handleBadgeClick}
-          renderText={renderPinTextWithEmotes}
-        />
+        </div>
 
         {/* Staging area removed - using direct rendering with ResizeObserver */}
 
         {/* Viewers list - replaces chat when active */}
         {activeView === 'viewers' && currentStream && (
-          <div className="flex-1 overflow-hidden animate-panel-slide-up" style={{ paddingTop: chromeHeight }}>
+          <div className="flex-1 overflow-hidden animate-panel-slide-up" style={{ paddingTop: paneTop }}>
             <ViewersPanel
               key={currentStream.user_id}
               broadcasterId={currentStream.user_id}
@@ -5426,7 +5560,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             <motion.div
               key="modroom-pane"
               className="flex-1 overflow-hidden"
-              style={{ paddingTop: chromeHeight }}
+              style={{ paddingTop: paneTop }}
               initial={{ opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 8 }}
@@ -5449,7 +5583,10 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
         {activeView === 'chat' && searchOpen && (
           <ChatSearchBar
             channelKey={panelChannelKey}
-            onJumpTo={(id) => scrollToMessage(id, { highlight: true, align: 'center' })}
+            onJumpTo={(id) => {
+              searchJumpRef.current = id;
+              return scrollToMessage(id, { highlight: true, align: 'center' });
+            }}
             onClose={() => setSearchOpen(false)}
           />
         )}
@@ -5524,8 +5661,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
             isModerator={isModerator}
             broadcasterId={currentStream?.user_id}
             hoveringRef={isHoveringChatRef}
-            headerSpaceReserved={blendEnabled}
-            headerInset={chromeHeight}
+            headerInset={listSpacer}
             pinnedIds={pinnedIds}
             scrollToBottomRef={listScrollToBottomRef}
             pausedPill={
@@ -5560,7 +5696,7 @@ const ChatWidget = ({ channelOverride, hypeTrainOverride, filterId: filterIdProp
           <DropsChatBar
             channelId={(channelOverride ? channelOverride.user_id : currentStream?.user_id) ?? ''}
             login={(channelOverride ? channelOverride.user_login : currentStream?.user_login) ?? ''}
-            headerInset={chromeHeight}
+            headerInset={paneTop}
             emotePickerOpen={showEmotePicker}
             onDrawerOpen={closeEmotePicker}
           />

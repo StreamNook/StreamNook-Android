@@ -3641,21 +3641,24 @@ html[data-motion="reduced"] .sub-progress-fill {
 /* Mention Flash Animation (Red-shift effect). Only the wash fades: the row's
    color edge is its own inline style and stays put, so it never fades out over
    the last half second and snaps back when the animation ends. */
+/* It fades to --flash-rest: a row's is transparent, but a card with its own
+   ground (the gift card for you) sets it to that ground, or the card would
+   show the panel through it while flashing and snap darker at the end. */
 @keyframes mention-flash {
   0% {
-    background-color: color-mix(in srgb, var(--flash-accent-color) 50%, transparent);
+    background-color: color-mix(in srgb, var(--flash-accent-color) 50%, var(--flash-rest, transparent));
   }
   25% {
-    background-color: color-mix(in srgb, var(--flash-accent-color) 40%, transparent);
+    background-color: color-mix(in srgb, var(--flash-accent-color) 40%, var(--flash-rest, transparent));
   }
   50% {
-    background-color: color-mix(in srgb, var(--flash-accent-color) 30%, transparent);
+    background-color: color-mix(in srgb, var(--flash-accent-color) 30%, var(--flash-rest, transparent));
   }
   75% {
-    background-color: color-mix(in srgb, var(--flash-accent-color) 20%, transparent);
+    background-color: color-mix(in srgb, var(--flash-accent-color) 20%, var(--flash-rest, transparent));
   }
   100% {
-    background-color: transparent;
+    background-color: var(--flash-rest, transparent);
   }
 }
 
@@ -4242,9 +4245,12 @@ html[data-motion="reduced"] .sub-progress-fill {
   .sn-ft-anim-bar::after { animation: none !important; opacity: 0 !important; }
 }
 
+/* The gradient lives in --sn-sub-wash so a held mention tint on a gift to you
+   lies over it (ChatMessage layers both) instead of replacing it, and
+   --flash-rest lets the mention flash end on this card's own ground. */
 .subscription-gradient {
-  background-color: var(--color-background);
-  background-image: linear-gradient(
+  --flash-rest: var(--color-background);
+  --sn-sub-wash: linear-gradient(
     90deg,
     color-mix(in srgb, var(--color-highlight-pink) 15%, transparent) 0%,
     color-mix(in srgb, var(--color-highlight-purple) 12%, transparent) 20%,
@@ -4253,6 +4259,8 @@ html[data-motion="reduced"] .sub-progress-fill {
     color-mix(in srgb, var(--color-highlight-yellow) 10%, transparent) 80%,
     color-mix(in srgb, var(--color-highlight-pink) 15%, transparent) 100%
   );
+  background-color: var(--color-background);
+  background-image: var(--sn-sub-wash);
   background-size: 100% 100%;
   /* Static by design: the built-in Twitch event styles keep their color but no
      motion. Animated/living cosmetics are reserved for StreamNook subscribers
@@ -4261,8 +4269,7 @@ html[data-motion="reduced"] .sub-progress-fill {
 }
 
 .subscription-gradient:hover {
-  background-color: var(--color-background);
-  background-image: linear-gradient(
+  --sn-sub-wash: linear-gradient(
     90deg,
     color-mix(in srgb, var(--color-highlight-pink) 20%, transparent) 0%,
     color-mix(in srgb, var(--color-highlight-purple) 17%, transparent) 20%,
@@ -4271,6 +4278,8 @@ html[data-motion="reduced"] .sub-progress-fill {
     color-mix(in srgb, var(--color-highlight-yellow) 15%, transparent) 80%,
     color-mix(in srgb, var(--color-highlight-pink) 20%, transparent) 100%
   );
+  background-color: var(--color-background);
+  background-image: var(--sn-sub-wash);
   background-size: 100% 100%;
 }
 
@@ -4460,6 +4469,54 @@ html[data-motion="reduced"] .sub-progress-fill {
   background-size: 100% 100%;
 }
 
+/* Redemption style Solid and Edge (SN-281). Both paint with background-image
+   (a flat one-stop gradient), as the banded style does, so the row's
+   hover:bg-glass background-color never fights them. Edge draws its bar as an
+   inset shadow: the row's inline left border belongs to mentions and
+   highlight rules. */
+.highlight-message-solid,
+.highlight-message-edge {
+  --sn-redeem-a: var(--sn-redeem, var(--color-highlight-cyan));
+  background-color: var(--color-background);
+}
+
+/* The "Redeemed ..." line and its cost wear the row's Redemption color, so a
+   pink row is not labeled in cyan. */
+.sn-redeem-ink {
+  color: var(--sn-redeem, var(--color-highlight-cyan));
+}
+
+.highlight-message-solid {
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--sn-redeem-a) 15%, transparent),
+    color-mix(in srgb, var(--sn-redeem-a) 15%, transparent)
+  );
+}
+
+.highlight-message-solid:hover {
+  background-image: linear-gradient(
+    color-mix(in srgb, var(--sn-redeem-a) 22%, transparent),
+    color-mix(in srgb, var(--sn-redeem-a) 22%, transparent)
+  );
+}
+
+.highlight-message-edge {
+  box-shadow: inset 3px 0 0 var(--sn-redeem-a);
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--sn-redeem-a) 10%, transparent),
+    transparent 60%
+  );
+}
+
+.highlight-message-edge:hover {
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--sn-redeem-a) 16%, transparent),
+    transparent 70%
+  );
+}
+
 /* Custom ultra-blur for floating header */
 /* Parameterized so the radius can be A/B'd live (devtools: set
    --sn-ultra-blur on :root). The chat header carries this class OVER the
@@ -4595,16 +4652,37 @@ html[data-motion="reduced"] .sub-progress-fill {
   );
 }
 
-/* The remaining/time label on the strip, stepped down by fitHeaderDensity
-   while it overflows its side: the subs go first, then the bits; the timer
-   always stays. Whole words leave, so no number is ever cut. */
-.hype-train-need[data-density='1'] .hype-train-subs,
-.hype-train-need[data-density='2'] .hype-train-left {
+/* The bar's top row, stepped down by fitHeaderDensity while it overflows:
+   the subs go first, then the bits; "Level n" and the timer always stay.
+   Whole words leave, so no number is ever cut. */
+.hype-train-level[data-density='1'] .hype-train-subs,
+.hype-train-level[data-density='2'] .hype-train-subs,
+.hype-train-level[data-density='2'] .hype-train-togo,
+.hype-train-level[data-density='3'] .hype-train-subs,
+.hype-train-level[data-density='3'] .hype-train-togo,
+.hype-train-level[data-density='3'] .hype-train-treasure,
+.hype-train-level[data-density='4'] .hype-train-subs,
+.hype-train-level[data-density='4'] .hype-train-togo,
+.hype-train-level[data-density='4'] .hype-train-treasure,
+.hype-train-level[data-density='4'] .hype-train-name-long,
+.hype-train-level[data-density='5'] .hype-train-subs,
+.hype-train-level[data-density='5'] .hype-train-togo,
+.hype-train-level[data-density='5'] .hype-train-treasure,
+.hype-train-level[data-density='5'] .hype-train-name,
+.hype-train-name-short {
   display: none;
 }
-/* The level side the same way: the train icon goes, "LVL n" stays whole. */
-.hype-train-level[data-density='1'] .hype-train-icon {
-  display: none;
+/* The short type words ("Heist") stand in for the long ones at step 4. */
+.hype-train-level[data-density='4'] .hype-train-name-short {
+  display: inline;
+}
+/* The type words wear the type's color (Rust's accent), darker on a light
+   theme's pale glass so they keep their contrast. */
+.hype-train-type {
+  color: var(--hype-accent, var(--color-text-primary));
+}
+html[data-theme-tone='light'] .hype-train-type {
+  color: color-mix(in srgb, var(--hype-accent, var(--color-text-primary)) 62%, black);
 }
 
 /* The emote picker's source tabs, stepped down by fitHeaderDensity when the
@@ -4658,108 +4736,304 @@ html[data-motion="reduced"] .sub-progress-fill {
    Hype Train Level-Up Celebration Animations
    ============================================ */
 
-/* Flash effect - quick white flash on level-up */
-@keyframes hype-flash {
-  0% { opacity: 0.6; }
-  100% { opacity: 0; }
-}
-
-.animate-hype-flash {
-  animation: hype-flash 0.5s ease-out forwards;
-}
-
-/* Scrolling marquee for HYPE text */
+/* The level-up words cross the strip once: in from its right edge
+   (--hype-from, the strip's width) until their own end has left on the left
+   (--hype-to, minus their width), at a steady pace (--hype-dur, from
+   HypeTrainBanner's WORDS_PX_PER_S), and the celebration ends as they leave.
+   The old fixed 12 s run outlasted the 8 s celebration, so the words were
+   always torn away two-thirds across. */
 @keyframes hype-marquee {
-  0% { transform: translateX(100%); }
-  100% { transform: translateX(-100%); }
+  from { transform: translateX(var(--hype-from, 100%)); }
+  to { transform: translateX(var(--hype-to, -100%)); }
 }
 
 .animate-hype-marquee {
-  animation: hype-marquee 12s linear forwards;
+  animation: hype-marquee var(--hype-dur, 7s) linear forwards;
 }
 
-/* Animated wavy edge for hype train progress bar.
-   This used to animate `mask-position` on the element itself, which forces the
-   compositor to re-rasterize the SVG mask every single frame, forever, once per
-   banner (and MultiChat renders one banner per blended channel with a live
-   train). The mask tile is 100px tall and repeats vertically, so translating the
-   whole masked layer by exactly one tile is visually identical and runs as a
-   cheap compositor transform instead. The layer overscans 100px above and below
-   so the wrap is seamless; the banner's own overflow-hidden clips it. */
-@keyframes wave-flow {
-  from { transform: translateY(0); }
-  to   { transform: translateY(100px); }
+/* The hype train bar (HypeTrainBanner): a flat glaze card with a level row
+   over an inset track, the train riding the fill's leading edge. A train of
+   any kind but a plain regular one is painted from Rust's palette
+   (utils/hypeTrainLook.ts paletteStyle: --hype-bg, --hype-accent, --hype-fill
+   on the card, `[data-themed]`); `data-look` names the kind or theme. */
+
+/* What the next level needs, as a quiet chip: a recess in the card like the
+   track, the bits gem and sub star with their counts, a hairline between. */
+.hype-train-need {
+  background: color-mix(in srgb, var(--color-text-primary) 8%, transparent);
+  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--color-text-primary) 10%, transparent);
+}
+.hype-train-need-divider {
+  background: color-mix(in srgb, var(--color-text-primary) 22%, transparent);
+}
+.hype-train-sub-gift {
+  color: #a970ff;
 }
 
-/* Frosted track behind the WHOLE bar.
-   The wave used to float directly on whatever sat behind the banner, which left
-   the level on the left and the bits/subs/time on the right standing on
-   nothing. One full-width frost gives that text a surface. Built from the theme
-   background rather than a literal colour, so a light theme gets a light frost
-   instead of a dark hole punched through it. */
-.hype-train-track {
-  background: color-mix(in srgb, var(--color-background) calc(62% + (1 - var(--glass-strength, 1)) * 38%), transparent);
-  -webkit-backdrop-filter: blur(12px) saturate(115%);
-  backdrop-filter: blur(12px) saturate(115%);
-  border: 1px solid var(--color-border-subtle);
+/* The timer: its chip's outline is the countdown, drawn around the recess
+   (so the chip drops its own hairline), lit with a soft glow. The digits and
+   the line take their color inline from the heat (HypeTrainBanner's
+   heatColor: the bar's blue, through amber, to red); each second's small step
+   blends over that second (color 1 s linear), as the line's length does, so
+   neither the color nor the length ever jumps. */
+.hype-train-clock {
+  --hype-clock-base: var(--color-highlight-blue);
+  box-shadow: none;
+  transition: color 1s linear;
+}
+.hype-train-card[data-themed] .hype-train-clock {
+  --hype-clock-base: var(--hype-accent);
+}
+.hype-train-clock-line {
+  transition: color 1s linear;
+}
+.hype-train-clock-track {
+  stroke: color-mix(in srgb, var(--color-text-primary) 18%, transparent);
+}
+.hype-train-clock-left {
+  filter: drop-shadow(0 0 2px currentColor);
+  transition: stroke-dashoffset 1s linear;
 }
 
-/* The fill's wavy leading edge, CARVED with a mask. Nothing is painted.
+/* The inset track: a recess in the card, the fill revealed along it by a
+   clip (the gradient stays put, so the colors say how far along it is). */
+.hype-train-meter {
+  background: color-mix(in srgb, var(--color-text-primary) 12%, transparent);
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, 0.22);
+}
+.hype-train-meter-fill {
+  transition: clip-path 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* The glow under the fill: the bar's colors, still, blurred once. Only its
+   clip moves with the progress, so the blur is never redrawn per frame. */
+.hype-train-meter-glow {
+  background: linear-gradient(
+    90deg,
+    var(--color-highlight-blue),
+    var(--color-highlight-pink) 35%,
+    var(--color-highlight-purple) 70%,
+    var(--color-highlight-cyan)
+  );
+  filter: blur(5px);
+  opacity: 0.5;
+  transition: clip-path 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.hype-train-card[data-themed] .hype-train-meter-glow {
+  background: var(--hype-fill-gradient);
+}
 
-   Earlier versions painted a 20px band across the fill's leading edge in
-   opaque `var(--color-background)` and used the band's silhouette as the wave.
-   That only looks right when whatever sits behind the bar IS that flat colour;
-   over anything else (translucent surfaces, atmospheres, a stream) it reads as
-   a black shape sliding in front of the wave. A painted band can only ever
-   approximate what is behind it; the only band you cannot see is one that does
-   not exist.
+/* Every few seconds one light runs the length of the fill (the first 28% of
+   the cycle), then rests off the end until the next. */
+.hype-train-shimmer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 22%;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.7), rgba(255, 255, 255, 0));
+  transform: translateX(-110%);
+  animation: hype-train-shimmer 4.5s cubic-bezier(0.45, 0, 0.25, 1) 1.2s infinite;
+}
+@keyframes hype-train-shimmer {
+  0% { transform: translateX(-110%); }
+  28%, 100% { transform: translateX(470%); }
+}
 
-   So this masks the fill instead. The catch that made earlier attempts avoid
-   masking: the note on `wave-flow` above is right that animating
-   `mask-position` re-rasterizes the SVG every frame, once per banner, and
-   MultiChat renders one per channel. But a transform works here for a reason
-   that is easy to miss - the fill gradient is `linear-gradient(90deg, ...)`,
-   so it is UNIFORM VERTICALLY. Translating the masked layer down by exactly one
-   100px mask tile moves the wavy edge while the gradient underneath looks
-   completely unchanged. Same trick the old band used; it just needed the
-   realisation that it applies to the gradient too, not only to a flat colour.
-
-   Two mask layers: a solid rectangle for everything but the last 19px, plus the
-   wave tile down the leading edge. The tile is the MIRROR of the band's (it
-   fills to the LEFT of the wavy boundary) because it now says where the fill
-   ENDS rather than where the cover-up began. */
-.hype-train-fill-wave {
-  /* Overscan, so translating by one whole tile wraps seamlessly. The banner's
-     own overflow-hidden clips it. */
-  top: -100px;
-  bottom: -100px;
-  -webkit-mask-image:
-    linear-gradient(#000, #000),
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 100'%3E%3Cpath d='M10,0 Q20,25 10,50 Q0,75 10,100 L0,100 L0,0 Z' fill='black'/%3E%3C/svg%3E");
-  mask-image:
-    linear-gradient(#000, #000),
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 100'%3E%3Cpath d='M10,0 Q20,25 10,50 Q0,75 10,100 L0,100 L0,0 Z' fill='black'/%3E%3C/svg%3E");
-  -webkit-mask-size: calc(100% - 19px) 100%, 20px 100px;
-  mask-size: calc(100% - 19px) 100%, 20px 100px;
-  -webkit-mask-repeat: no-repeat, repeat-y;
-  mask-repeat: no-repeat, repeat-y;
-  -webkit-mask-position: left top, right top;
-  mask-position: left top, right top;
+/* The leading edge rides a full-width rail moved by a transform. */
+.hype-train-tip-rail {
+  transition: transform 600ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* The train, mirrored to face the way it travels, its wheels on the track
+   (the rail is the track's 6 px box). It glows a little and keeps a dark
+   contact edge, so it reads on light themes where it runs past the fill. */
+.hype-train-rider {
+  position: absolute;
+  /* Its nose on the fill's end, so at 100% it stops at the track's end. */
+  right: -2px;
+  bottom: -1px;
+  width: 15px;
+  height: 13px;
+  color: #fff;
+  transform: scaleX(-1);
+  filter: drop-shadow(0 0 2px rgba(255, 255, 255, 0.7)) drop-shadow(0 1px 1px rgba(0, 0, 0, 0.55));
+}
+/* A type of train (Rust's palette, `.hype-train-card[data-themed]`): the card
+   stays the app's glaze in the theme's own ink; the type lives in the fill
+   (its flowing gradient, glow and sparks), in the label's type words and the
+   ring (its accent), and in a faint tint of the fill under the glass. */
+.hype-train-tint {
+  background: var(--hype-tint);
+  opacity: 0.12;
+  border-radius: inherit;
+  pointer-events: none;
+}
+.hype-train-mark {
+  color: var(--hype-accent, #ffc83d);
+}
+/* The type's gradient rides the same flowing layer as the rainbow (the rule
+   above), so a heist's blue, pink and orange move the way the rainbow does. */
+.hype-train-progress-themed {
+  overflow: hidden;
+}
+.hype-train-progress-themed::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 400%;
+  background-image: var(--hype-fill-gradient);
+  background-size: 50% 100%;
   will-change: transform;
-  animation: wave-flow 3s linear infinite;
+  animation: hype-train-flow-x 15s linear infinite;
+}
+.hype-train-card[data-themed] .hype-train-sparks > i {
+  background: color-mix(in srgb, var(--hype-spark) 55%, white);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .hype-train-fill-wave { animation: none; }
+/* The comet's flash at the train's nose: a white core in a light halo,
+   breathing. A light halo, a touch lavender: the fill's color under it keeps
+   moving, and a colored halo reads as a dark ring over the wrong one. */
+.hype-train-flash {
+  position: absolute;
+  top: 50%;
+  /* Small, and centered just behind the train's front, so the halo ends
+     inside its nose instead of running ahead of it. */
+  right: -1px;
+  width: 12px;
+  height: 12px;
+  margin-top: -7px;
+  border-radius: 999px;
+  background: radial-gradient(
+    circle,
+    rgba(255, 255, 255, 0.95) 0 18%,
+    color-mix(in srgb, color-mix(in srgb, var(--color-highlight-purple) 35%, white) 60%, transparent) 40%,
+    transparent 70%
+  );
+  animation: hype-train-flash 1.6s ease-in-out infinite;
+}
+.hype-train-card[data-themed] .hype-train-flash {
+  background: radial-gradient(circle, rgba(255, 255, 255, 0.95) 0 18%, color-mix(in srgb, var(--hype-accent) 60%, transparent) 40%, transparent 70%);
+}
+@keyframes hype-train-flash {
+  0%, 100% { opacity: 0.65; transform: scale(0.9); }
+  50% { opacity: 0.95; transform: scale(1.06); }
 }
 
-/* Glow text shadow for celebration text */
-.drop-shadow-glow {
-  text-shadow: 
-    0 0 10px rgba(255, 255, 255, 0.8),
-    0 0 20px rgba(255, 255, 255, 0.6),
-    0 0 40px rgba(168, 85, 247, 0.5),
-    0 0 80px rgba(168, 85, 247, 0.3);
+/* The comet's tail: a cone, tight and bright at the train and fanning out
+   wider and fainter behind it, softened so its edges dissolve, flickering
+   slightly. Its width is capped at the fill's length inline, so it never
+   pokes out past the track's start. */
+.hype-train-comet {
+  position: absolute;
+  top: 50%;
+  right: 2px;
+  width: 64px;
+  height: 18px;
+  margin-top: -9px;
+  background: linear-gradient(
+    to left,
+    rgba(255, 255, 255, 0.9),
+    color-mix(in srgb, color-mix(in srgb, var(--color-highlight-purple) 40%, white) 55%, transparent) 30%,
+    transparent
+  );
+  clip-path: polygon(0 0, 100% 40%, 100% 60%, 0 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 38%, #000 62%, transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 38%, #000 62%, transparent);
+  filter: blur(1px);
+  transform-origin: right center;
+  animation: hype-train-comet 0.9s ease-in-out infinite;
+}
+.hype-train-card[data-themed] .hype-train-comet {
+  background: linear-gradient(to left, rgba(255, 255, 255, 0.95), color-mix(in srgb, var(--hype-accent) 70%, transparent) 30%, transparent);
+}
+@keyframes hype-train-comet {
+  0%, 100% { transform: scaleX(1); opacity: 0.9; }
+  50% { transform: scaleX(0.82); opacity: 1; }
+}
+
+/* Sparks shed off the train's back, drifting behind it and going out. At
+   rest they are hidden (opacity 0), so a stopped loop shows none. Their box
+   is capped at the fill's length inline, like the trail. */
+.hype-train-sparks {
+  position: absolute;
+  top: -8px;
+  bottom: -8px;
+  right: 0;
+  width: 44px;
+  overflow: hidden;
+}
+.hype-train-sparks > i {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  width: 2px;
+  height: 2px;
+  margin-top: -1px;
+  border-radius: 999px;
+  background: #fff;
+  opacity: 0;
+  animation: hype-train-spark-drift 1.1s linear infinite;
+}
+.hype-train-sparks > i:nth-child(1) { --dy: -5px; animation-delay: 0s; }
+.hype-train-sparks > i:nth-child(2) { --dy: 4px; animation-delay: 0.28s; }
+.hype-train-sparks > i:nth-child(3) { --dy: -2px; animation-delay: 0.55s; }
+.hype-train-sparks > i:nth-child(4) { --dy: 6px; animation-delay: 0.83s; }
+@keyframes hype-train-spark-drift {
+  0% { opacity: 0; transform: translate(0, 0) scale(1); }
+  15% { opacity: 1; }
+  100% { opacity: 0; transform: translate(-36px, var(--dy, 0)) scale(0.4); }
+}
+
+/* A soft light along the fill's top, so it reads as a lit bar, not a stripe. */
+.hype-train-meter-fill::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0) 70%);
+}
+
+/* The level-up sheen: one light sweeps along the brimming track. It lives
+   in the track, not on the card: a moving layer over the card's glaze
+   darkened the glaze ahead of it. */
+.hype-train-sheen {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  pointer-events: none;
+}
+.hype-train-sheen::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 30%;
+  background: linear-gradient(90deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0));
+  transform: translateX(-110%);
+  animation: hype-train-sheen 1200ms cubic-bezier(0.4, 0, 0.2, 1) 250ms forwards;
+}
+@keyframes hype-train-sheen {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(340%); }
+}
+
+/* The level-up words fade in and out at both edges of their strip instead of
+   meeting a hard cut. "Level n!" wears the bar's colors. */
+.hype-train-words {
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 16px, #000 calc(100% - 16px), transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 16px, #000 calc(100% - 16px), transparent);
+}
+.hype-train-words-lead {
+  background: linear-gradient(90deg, var(--color-highlight-pink), var(--color-highlight-purple), var(--color-highlight-blue));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+/* A type's level-up words lead in its own gradient, as the fill. */
+.hype-train-card[data-themed] .hype-train-words-lead {
+  background-image: var(--hype-fill-gradient);
 }
 
 /* Heart break animation for unfavoriting */
@@ -5695,17 +5969,21 @@ html[data-sn-low-power] .sn-aurora-2,
 html[data-sn-low-power] .sn-atm-breathe-1,
 html[data-sn-low-power] .sn-atm-breathe-2,
 html[data-sn-low-power] .cologne-wash,
-html[data-sn-low-power] .hype-train-fill-wave,
+html[data-sn-low-power] .hype-train-shimmer,
+html[data-sn-low-power] .hype-train-sparks > i,
 html[data-sn-low-power] .hype-train-progress-rainbow::before,
 html[data-sn-low-power] .hype-train-progress-golden::before,
+html[data-sn-low-power] .hype-train-progress-themed::before,
 html[data-motion="off"] .sn-aurora-1,
 html[data-motion="off"] .sn-aurora-2,
 html[data-motion="off"] .sn-atm-breathe-1,
 html[data-motion="off"] .sn-atm-breathe-2,
 html[data-motion="off"] .cologne-wash,
-html[data-motion="off"] .hype-train-fill-wave,
+html[data-motion="off"] .hype-train-shimmer,
+html[data-motion="off"] .hype-train-sparks > i,
 html[data-motion="off"] .hype-train-progress-rainbow::before,
-html[data-motion="off"] .hype-train-progress-golden::before {
+html[data-motion="off"] .hype-train-progress-golden::before,
+html[data-motion="off"] .hype-train-progress-themed::before {
   animation: none !important;
 }
 html[data-sn-low-power] .card-chip-shine > span,
@@ -7469,6 +7747,7 @@ html[data-engine="webkitgtk"] .hype-train-header,
 html[data-engine="webkitgtk"] .hype-train-progress-bar,
 html[data-engine="webkitgtk"] .hype-train-progress-golden::before,
 html[data-engine="webkitgtk"] .hype-train-progress-rainbow::before,
+html[data-engine="webkitgtk"] .hype-train-progress-themed::before,
 html[data-engine="webkitgtk"] .blue-drop-animation,
 html[data-engine="webkitgtk"] .green-drop-animation,
 html[data-engine="webkitgtk"] .rainbow-drop-animation,
@@ -9351,4 +9630,10 @@ html[data-sn-low-power] .sn-tbt-pointer {
 }
 :root[data-theme-tone='light'] .sn-error-text {
   color: color-mix(in srgb, var(--color-error) 75%, black);
+}
+
+/* The channel pin's unpainted name lifts off dark glass with a shadow; on a light theme the same shadow
+   smears a dark halo round the letters, so a light theme draws the name crisp (SN-284 polish). */
+html[data-theme-tone='light'] {
+  --pin-name-shadow: none;
 }

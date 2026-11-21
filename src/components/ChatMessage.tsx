@@ -13,7 +13,8 @@ import { mentionHoldBackground } from './chat/mentionHold';
 import { withEmoteWord } from './chat/emoteWords';
 import { deletedBodyStyle, deletedRowDimmed, DEFAULT_DELETED_STYLE } from './chat/deletedMessage';
 import { ModerationTag } from './chat/ModerationTag';
-import { eventCardClass as eventCardClassFor, eventCardStyle as eventCardStyleFor } from './chat/eventCard';
+import { eventCardClass as eventCardClassFor, eventCardStyle as eventCardStyleFor, redemptionRowClass, redemptionRowStyle } from './chat/eventCard';
+import { RedemptionLabel } from './chat/RedemptionLabel';
 import { mentionBoxClass, mentionBoxStyle, mentionLook, mentionTextStyle } from './chat/mentionStyle';
 
 // Emote previews open almost at once: a quick pass over an emote should still
@@ -568,8 +569,25 @@ import type { LineButton } from './chat/modLine';
 import { INLINE_TIME_STYLE, OWN_LINE_TIME_STYLE, timestampOnOwnLine } from './chat/chatTimestamp';
 import { WatchStreakFlame } from './icons/WatchStreakFlame';
 
+/**
+ * The pinned-mention variant of a row (SN-284, D14). A pin is the real row of
+ * the chat it was said in, drawn outside the chat list: no flash, no link
+ * previews, no giant emote, the body held to two lines, and the time always
+ * shown, with the day when the message is not from today. The host passes no
+ * moderation, reply or copy callbacks, so the hover dock, mod line and slider
+ * never mount.
+ */
+export interface PinnedRowInfo {
+  /** The row's hash from Rust: the memo redraws the row when it changes. */
+  rev: number;
+  /** "Mon 3:04 PM"-style day prefix, or null when the message is from today. */
+  dayLabel: string | null;
+}
+
 interface ChatMessageProps {
   message: string | BackendChatMessage; // Raw IRC message or Backend Message Object
+  /** Set only by the pinned mentions block. */
+  pinned?: PinnedRowInfo;
   onUsernameClick?: (
     userId: string,
     username: string,
@@ -802,6 +820,9 @@ const chatMessageAreEqual = (prevProps: ChatMessageProps, nextProps: ChatMessage
     }
   }
   if (prevProps.sourceMark !== nextProps.sourceMark) return false;
+  // The pinned variant: its row hash and day label decide the redraw.
+  if (prevProps.pinned?.rev !== nextProps.pinned?.rev || prevProps.pinned?.dayLabel !== nextProps.pinned?.dayLabel) return false;
+  if ((prevProps.pinned === undefined) !== (nextProps.pinned === undefined)) return false;
   // Who may act on the row. Mod status usually lands after the join's history
   // rows are drawn, and the line buttons show without a hover, so those rows
   // must repaint when it does. Each changes about once per channel.
@@ -828,6 +849,14 @@ const chatMessageAreEqual = (prevProps: ChatMessageProps, nextProps: ChatMessage
   // All other props (callbacks) can be ignored for re-render decisions
   // since they don't affect the visual output of the message
   return true;
+};
+
+/** A pin's body: two lines, then cut. */
+const PINNED_CLAMP_STYLE: React.CSSProperties = {
+  display: '-webkit-box',
+  WebkitBoxOrient: 'vertical',
+  WebkitLineClamp: 2,
+  overflow: 'hidden',
 };
 
 // Stable empty reference for the third-party badge read below, so the zustand
@@ -939,7 +968,7 @@ function UsernameWithCosmetics({
   );
 }
 
-const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, onReplyClick, isHighlighted = false, moderationContext = null, onEmoteRightClick, onEmoteOpen, onMessageCopy, onUsernameRightClick, onBadgeClick, emotes, isModerator = false, broadcasterId, homeProvider = 'twitch', sourceMark, modLine = null }: ChatMessageProps) {
+const ChatMessage = memo(function ChatMessageInner({ message, pinned, onUsernameClick, onReplyClick, isHighlighted = false, moderationContext = null, onEmoteRightClick, onEmoteOpen, onMessageCopy, onUsernameRightClick, onBadgeClick, emotes, isModerator = false, broadcasterId, homeProvider = 'twitch', sourceMark, modLine = null }: ChatMessageProps) {
   // Field selectors, NOT a whole-store subscription. This component is mounted
   // once per chat row, so subscribing to the entire store made every row
   // re-render on every unrelated store tick (hours-watched, viewer count, etc.).
@@ -1025,6 +1054,13 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // Zero Date parsing on main thread!
   const timestampOwnLine = timestampOnOwnLine(chatDesign?.timestamp_position);
   const formattedTimestamp = (() => {
+    // A pin always shows its time (when it was said), with the day when it
+    // was not said today, whatever the chat's own timestamp setting.
+    if (pinned) {
+      const time = parsed.metadata?.formatted_timestamp;
+      if (!time) return pinned.dayLabel;
+      return pinned.dayLabel ? `${pinned.dayLabel} ${time}` : time;
+    }
     if (!chatDesign?.show_timestamps) return null;
 
     // Use pre-computed timestamps from Rust metadata
@@ -1204,11 +1240,13 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // allowlist. Passed into extraction so those links auto-expand too.
   const userTrustedDomains = chatDesign?.link_preview_trusted_domains;
   const linkPreviewItems = useMemo(() => {
-    if (!linkPreviewsEnabled) return [];
+    // A pin is a compact line: previews never load for it (Rust builds pin
+    // rows with link previews off, and this keeps a stale row off the network).
+    if (!linkPreviewsEnabled || pinned) return [];
     const links: RowLink[] = [];
     for (const s of parsed.segments ?? []) if (s.type === 'link') links.push(s);
     return previewUrlsFromLinks(links, 2, userTrustedDomains);
-  }, [linkPreviewsEnabled, parsed.segments, userTrustedDomains]);
+  }, [linkPreviewsEnabled, pinned, parsed.segments, userTrustedDomains]);
   // Only trusted links suppress their inline URL in clean mode (their card is
   // the link). Untrusted links keep the inline link and add a load-on-click chip.
   const trustedPreviewUrls = useMemo(
@@ -2419,8 +2457,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // A reward with no text, which Rust builds as its own row (body = the
   // reward's title): one line, "<name> redeemed <title> <cost>", like Twitch.
   const isRewardEventRow = !!parsed.tags.get('sn-reward-title');
+  // A pin never draws the giant emote: it stays one inline line.
   const isGigantifiedEmote =
-    msgId === 'gigantified-emote-message' || sourceMsgId === 'gigantified-emote-message';
+    !pinned && (msgId === 'gigantified-emote-message' || sourceMsgId === 'gigantified-emote-message');
   const isAnimatedMessage =
     msgId === 'animated-message' || sourceMsgId === 'animated-message';
   const isSubModeBypass =
@@ -2736,7 +2775,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             className="flex-1 min-w-0 flex flex-col leading-relaxed"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
-            <p className="text-white font-semibold leading-relaxed">
+            <p className="text-textPrimary font-semibold leading-relaxed">
               {sourceMarkEl}
               {sharedCardFaceEl}
               {renderBadges()}
@@ -2894,7 +2933,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             className="flex-1 min-w-0 flex flex-col leading-relaxed"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
-            <p className="text-white font-semibold leading-relaxed">
+            <p className="text-textPrimary font-semibold leading-relaxed">
               {sourceMarkEl}
               {sharedCardFaceEl}
               {renderBadges()}
@@ -3002,7 +3041,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             className="flex-1 min-w-0 flex flex-col"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
-            <p className="text-white font-semibold leading-relaxed flex items-center flex-wrap gap-1">
+            <p className="text-textPrimary font-semibold leading-relaxed flex items-center flex-wrap gap-1">
               {sourceMarkEl}
               {sharedCardFaceEl}
               {renderBadges()}
@@ -3199,8 +3238,35 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
     // Use dynamic spacing from user settings
     const eventPadding = calculateHalfPadding(chatDesign?.message_spacing ?? 8);
 
+    // A sub gifted to you: Rust stamps the card a mention (chat_rules
+    // `gift_to_me`), so it wears a mention's edge, flash and hold like any
+    // row that names you.
+    const giftEdge = isMentioned ? chatDesign?.mention_color ?? '#ff4444' : null;
+    const giftHold =
+      giftEdge && chatDesign?.mention_hold === true
+        ? mentionHoldBackground(giftEdge, Math.max(0, Math.min(100, chatHighlights?.appearance?.opacity ?? 20)))
+        : undefined;
+    // The edge takes its 4 px out of the padding, so the card's content holds
+    // the same column as the gift cards around it. Outline cards are rounded:
+    // there the edge is the card's own ring, in the mention color. The hold
+    // tint lies over the card's gradient (--sn-sub-wash), not instead of it.
+    const giftOutline = (chatEvents?.event_style ?? 'cards') === 'outline';
+    const giftEdgeStyle: React.CSSProperties = giftOutline
+      ? ({ '--sn-event-outline': giftEdge } as React.CSSProperties)
+      : { borderLeftColor: giftEdge ?? undefined, borderLeftWidth: '4px', borderLeftStyle: 'solid', paddingLeft: 'calc(0.75rem - 4px)' };
+    const giftFrame: React.CSSProperties = giftEdge
+      ? {
+          ...({ '--flash-accent-color': giftEdge } as React.CSSProperties),
+          ...giftEdgeStyle,
+          ...(giftHold ? { backgroundImage: `${giftHold}, var(--sn-sub-wash, none)` } : {}),
+        }
+      : {};
+    const giftFlash = giftEdge && chatDesign?.mention_animation !== false ? ' animate-mention-flash' : '';
+
     return (
-      <div key={messageId} className={`px-3 border-t border-borderSubtle ${eventCardClass('subscription-gradient')}${sharedCardClass}`} style={{ ...eventCardStyle, ...sharedCardVars, paddingTop: `${eventPadding}px`, paddingBottom: `${eventPadding}px` }}>
+      // A gift to you drops the Shared Chat partner edge, as a mention row
+      // does (one stripe, not two); the partner's face still marks the card.
+      <div key={messageId} className={`px-3 border-t border-borderSubtle ${eventCardClass('subscription-gradient')}${giftEdge ? '' : sharedCardClass}${giftFlash}`} style={{ ...eventCardStyle, ...sharedCardVars, ...giftFrame, paddingTop: `${eventPadding}px`, paddingBottom: `${eventPadding}px` }}>
         <div className="flex items-center gap-2.5">
           <div className="flex-shrink-0">
             {/* Prime logo for Prime subs, Twitch's gift for other subs */}
@@ -3216,7 +3282,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             className="flex-1 min-w-0 flex flex-col leading-relaxed"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
-            <p className="text-white font-semibold leading-relaxed">
+            <p className="text-textPrimary font-semibold leading-relaxed">
               {sourceMarkEl}
               {sharedCardFaceEl}
               {parseSystemMessageWithClickableNames(displayMessage)}
@@ -3299,7 +3365,7 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             className="flex-1 min-w-0 flex flex-col leading-relaxed"
             style={{ fontSize: `${chatDesign?.font_size ?? 14}px` }}
           >
-            <p className="text-white font-semibold leading-relaxed">
+            <p className="text-textPrimary font-semibold leading-relaxed">
               {sourceMarkEl}
               {sharedCardFaceEl}
               {raidTemplate ? (
@@ -3411,6 +3477,8 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   } else if (isHighlighted) {
     animationClass = 'animate-highlight-flash';
   }
+  // A pin is on screen for a while and never flashes.
+  if (pinned) animationClass = '';
 
   // Alternating row backgrounds are handled in CSS (.chat-striped > row:nth-child)
   // so they cost zero React re-renders. See ChatMessageList + globals.css.
@@ -3421,7 +3489,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   // when a new message arrives, the "absolute bottom" of the chat has no
   // 1px line that needs to move with the layout. Removes a tiny vertical
   // shimmer at the bottom edge.
-  const borderClass = chatDesign?.show_dividers !== false ? 'border-t border-borderSubtle' : '';
+  // A pinned row draws no divider of its own: the pins block draws one per row, the width of
+  // its card and never above the first row, so the lines meet both edges evenly.
+  const borderClass = !pinned && chatDesign?.show_dividers !== false ? 'border-t border-borderSubtle' : '';
 
   // StreamNook badge: regular-message render path (the 5th badge render site).
   // Bits, donation, watchstreak, and subscription messages each have their own
@@ -3533,17 +3603,15 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
   return (
     <div
       className={`group relative isolate px-3 hover:bg-glass transition-colors ${borderClass} ${animationClass
-        }${ftClass} ${isRedemption ? 'highlight-message-gradient' : ''
+        }${ftClass} ${isRedemption ? redemptionRowClass(chatEvents) : ''
         } ${isFromSharedChat && !ownLeftBorder ? 'sn-shared-row' : ''
         } ${moderationContext && deletedRowDimmed(deletedStyle) ? 'opacity-50' : ''}`}
       style={{
         ...messageStyle,
         // A partner row's channel color (sn-shared-row's edge and wash).
         ...(isFromSharedChat && sharedSource ? ({ '--sn-src': sharedSource.color } as React.CSSProperties) : {}),
-        // The viewer's own tint for channel points rows (highlight-message-gradient).
-        ...(isRedemption && chatEvents?.redemption_color
-          ? ({ '--sn-redeem': chatEvents.redemption_color } as React.CSSProperties)
-          : {}),
+        // The viewer's own tint for channel points rows (redemptionRowClass).
+        ...(isRedemption ? redemptionRowStyle(chatEvents) : {}),
         ...(mentionHoldBg ?? builtInEventBg ? { backgroundImage: mentionHoldBg ?? builtInEventBg } : {}),
         ...(ftRing ? ({ '--sn-ft-color': builtInEventColor } as React.CSSProperties) : {}),
         borderLeftColor: (isMentioned || isReplyToMe)
@@ -3630,14 +3698,9 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
       )}
       {/* Channel points redemption indicator (highlight, gigantify, animate, skip-subs-mode, custom reward) */}
       {redemptionLabel && !isRewardEventRow && (
-        <div className="flex min-w-0 items-center justify-end gap-1">
-          <svg className="w-3 h-3 flex-shrink-0 text-highlight-cyan opacity-60" viewBox="0 0 20 20" fill="currentColor">
-            <path d="M10 6a4 4 0 014 4h-2a2 2 0 00-2-2V6z" />
-            <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-2 0a6 6 0 11-12 0 6 6 0 0112 0z" clipRule="evenodd" />
-          </svg>
-          <span className="min-w-0 truncate text-xs text-highlight-cyan font-normal opacity-60">{redemptionLabel}</span>
+        <RedemptionLabel label={redemptionLabel}>
           {redeemedTitle && redeemedCost && (
-            <span className="inline-flex flex-shrink-0 items-center gap-0.5 text-xs text-highlight-cyan/80 font-medium tabular-nums">
+            <span className="sn-redeem-ink inline-flex flex-shrink-0 items-center gap-0.5 text-xs font-medium tabular-nums opacity-80">
               {redemptionPointsIcon ? (
                 <img
                   src={redemptionPointsIcon}
@@ -3646,12 +3709,12 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
                   onError={(e) => { e.currentTarget.style.display = 'none'; }}
                 />
               ) : (
-                <ChannelPointsIcon size={12} className="text-highlight-cyan/80" />
+                <ChannelPointsIcon size={12} />
               )}
               {Number(redeemedCost).toLocaleString()}
             </span>
           )}
-        </div>
+        </RedemptionLabel>
       )}
       {/* Reply indicator */}
       {parsed.replyInfo && replyStyle === 'full' && (
@@ -3705,7 +3768,12 @@ const ChatMessage = memo(function ChatMessageInner({ message, onUsernameClick, o
             moving the name away from the badges. */}
         <div
           className={atmosphereFrost ? `inline-block max-w-full -ml-1.5 -my-0.5 rounded-md px-1.5 py-0.5 ${frostClass}` : 'min-w-0'}
-          style={{ fontSize: `${chatDesign?.font_size ?? 14}px`, lineHeight: 1.625 }}
+          style={{
+            fontSize: `${chatDesign?.font_size ?? 14}px`,
+            lineHeight: 1.625,
+            // A pin holds to two lines.
+            ...(pinned ? PINNED_CLAMP_STYLE : {}),
+          }}
         >
           {/* The time leads the row's inline flow, on the text's baseline, so
               wrapped text still starts at the left edge; "own_line" gives it a

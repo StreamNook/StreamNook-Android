@@ -20,6 +20,11 @@ import { usePinStore } from '../../stores/pinStore';
 import { Logger } from '../../utils/logger';
 import { useChatTabsStore } from '../chat/chatTabsStore';
 import { isModeratorFrom } from '../chat/modActions';
+import { StackCard } from '../../components/chat/ChatOverlayStack';
+import { FadeScroller } from '../../components/chat/FadeScroller';
+import { BANNER_STYLE, GLAZE_BANNER } from '../../components/ui/glazeButtons';
+import { pinnedStackId } from '../../components/chat/PinnedBar';
+import type { StackCardControl, StackKind } from '../../components/chat/chatTopStack';
 
 export interface PinnedItem {
   id: string;
@@ -41,10 +46,15 @@ interface Props {
   channelId?: string;
   /** Chat > Pinned Messages > Style: `hidden` draws nothing while the pin is folded. */
   collapsedStyle?: 'bar' | 'hidden';
+  /** The pin as the `channel_pin` card of the top-of-chat stack (SN-284): Rust
+   *  says whether it is open or a strip, a tap goes through the stack (which
+   *  writes the one open store back), and `expanded` is only the store's value. */
+  stack?: StackCardControl;
+  measure?: (kind: StackKind, form: 'strip' | 'open' | 'line', height: number) => void;
 }
 
 // Lifts an unpainted name off the glass; a 7TV paint brings its own shadow.
-const NAME_SHADOW = { textShadow: '0 1px 2px rgba(0,0,0,0.8)' } as const;
+const NAME_SHADOW = { textShadow: 'var(--pin-name-shadow, 0 1px 2px rgba(0,0,0,0.8))' } as const;
 
 // Unpin, as the desktop's pinned card offers it: moderators and the
 // broadcaster only, read off your own badges in the room on screen.
@@ -67,7 +77,24 @@ const UnpinButton: React.FC<{ broadcasterId: string; messageId: string }> = ({ b
   </button>
 );
 
-export const PinnedBanner: React.FC<Props> = ({ pins, expanded, onToggle, channelId, collapsedStyle = 'bar' }) => {
+export const PinnedBanner: React.FC<Props> = ({
+  pins,
+  expanded: storeOpen,
+  onToggle: onStoreToggle,
+  channelId,
+  collapsedStyle = 'bar',
+  stack,
+  measure,
+}) => {
+  const onPresence = stack?.onPresence;
+  const stackId = pinnedStackId(pins, storeOpen, collapsedStyle);
+  React.useEffect(() => {
+    onPresence?.(stackId);
+  }, [onPresence, stackId]);
+  React.useEffect(() => () => onPresence?.(null), [onPresence]);
+  // In the stack Rust's form says whether it is open; a tap goes through it.
+  const expanded = stack ? stack.placed && stack.form === 'open' : storeOpen;
+  const onToggle = stack ? stack.onToggle : onStoreToggle;
   const activeRoom = useChatTabsStore((s) => {
     const t = s.tabs.find((tab) => tab.channel === s.activeChannel);
     return t?.provider === 'twitch' ? t.channel : null;
@@ -79,17 +106,21 @@ export const PinnedBanner: React.FC<Props> = ({ pins, expanded, onToggle, channe
   const markInside = useOutsidePress(expanded && pins.length > 0, [rootRef], onToggle);
   if (pins.length === 0) return null;
   const [first, ...rest] = pins;
+  // Held to the height Rust gave it, the glass takes that as its max-height and its body scrolls.
+  const cap = stack && stack.placed && stack.form === 'open' && stack.height > 0 ? stack.height : 0;
 
   // Hidden: nothing over chat while folded, as on the desktop. The composer
   // menu's "Pinned message" opens it (the desktop's is the pin in its header).
   if (!expanded && collapsedStyle === 'hidden') return null;
+  if (stack && (!stack.placed || stack.form === 'folded')) return null;
 
-  return (
+  const box = (
     // The single container. Everything below lives inside this one box.
     <div
       ref={rootRef}
       onPointerDownCapture={markInside}
-      className="sn-popover sn-popover--static pointer-events-auto w-full overflow-hidden"
+      className={`${GLAZE_BANNER} relative flex flex-col pointer-events-auto w-full overflow-hidden`}
+      style={{ ...BANNER_STYLE, maxHeight: cap > 0 ? cap : undefined }}
     >
       <button
         type="button"
@@ -148,9 +179,9 @@ export const PinnedBanner: React.FC<Props> = ({ pins, expanded, onToggle, channe
             animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            className="overflow-hidden"
+            className="flex min-h-0 flex-col overflow-hidden"
           >
-            <div className="px-2.5 pb-2 pt-0.5 flex flex-col gap-2">
+            <FadeScroller className="px-2.5 pb-2 pt-0.5 flex flex-col gap-2">
               {/* First pin: text only. Its author is already the header. */}
               <div className="flex items-start gap-2">
                 <div className="flex-1 min-w-0 text-[13px] leading-relaxed text-textPrimary">
@@ -182,10 +213,17 @@ export const PinnedBanner: React.FC<Props> = ({ pins, expanded, onToggle, channe
                   {canUnpin && channelId && <UnpinButton broadcasterId={channelId} messageId={pin.message_id} />}
                 </div>
               ))}
-            </div>
+            </FadeScroller>
           </motion.div>
         )}
       </AnimatePresence>
     </div>
+  );
+  return stack ? (
+    <StackCard kind="channel_pin" control={stack} measure={measure} scrollOpen>
+      {box}
+    </StackCard>
+  ) : (
+    box
   );
 };

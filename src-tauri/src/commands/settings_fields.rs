@@ -60,6 +60,7 @@ pub fn frontend_owned_defaults() -> Value {
             "event_animate_repeat": false,
             "cheer_display": "card",
             "redemption_color": "",
+            "redemption_style": "gradient",
             "hidden_provider_events": [],
         },
         "chat_render": {
@@ -104,6 +105,8 @@ pub fn frontend_owned_defaults() -> Value {
         "chat_design": {
             "polls_start_collapsed": false,
             "predictions_start_collapsed": false,
+            "confetti_auto_clear": false,
+            "confetti_clear_seconds": 5,
             "pinned_start_collapsed": true,
             "mention_sound": "",
             "mention_sound_volume": 100,

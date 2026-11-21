@@ -14,7 +14,12 @@ import ChatMessageList from '../ChatMessageList';
 import { ProviderLogo } from '../ProviderLogo';
 import { useChatConnectionStore } from '../../stores/chatConnectionStore';
 import { useChatUserStore } from '../../stores/chatUserStore';
-import { parseKey } from '../../utils/providerKey';
+import { parseKey, sliceLookupKey } from '../../utils/providerKey';
+import { invoke } from '@tauri-apps/api/core';
+import { DesktopPins } from '../mentions/DesktopPins';
+import type { PinRoomRef } from '../../utils/pinSurfaces';
+import { MentionContextCard } from '../mentions/MentionContextCard';
+import type { MentionEntry, MentionPin } from '../../types';
 import { openProfilePopup } from '../../utils/openProfilePopup';
 import { PROVIDERS, PROVIDER_IDS, type ProviderId } from '../../types/providers';
 import { parseMessage, type BackendChatMessage } from '../../services/twitchChat';
@@ -22,7 +27,10 @@ import { sendToSource, sourceKeyOf, sourceProviderOf } from '../../utils/sendToS
 import { useBlendedChatSource } from '../../hooks/useBlendedChatSource';
 import { initializeBadgeCache } from '../../services/twitchBadges';
 import { usePlatformAccountStore } from '../../stores/platformAccountStore';
-import HypeTrainBanner from '../HypeTrainBanner';
+import { ChatOverlayStack } from '../chat/ChatOverlayStack';
+import { HypeStackCard } from '../chat/HypeStackCard';
+import { useChatTopStack } from '../chat/chatTopStack';
+import { jumpTarget } from '../chat/stackSpacer';
 import { useBlendedHypeTrains } from './useBlendedHypeTrains';
 import { Logger } from '../../utils/logger';
 import { Tooltip } from '../ui/Tooltip';
@@ -48,6 +56,9 @@ const noop = () => {};
 // but it caps the machine-speed scroll/auto-scroll oscillation a fast chat produces.
 // `force` transitions (Resume button, reply-jump) bypass it.
 const PAUSE_SETTLE_MS = 120;
+/** The list's own top room (what it reserved before the stack floated over it): the stack's
+ *  drawn bottom raises it, an empty stack never takes it away. */
+const BLENDED_TOP_INSET_PX = 40;
 
 // The provider/key helpers and the send router are shared with the main chat
 // panel (utils/sendToSource), so both surfaces route a reply the same way.
@@ -84,8 +95,13 @@ export function BlendedChatPane({
   channels,
   readOnly = false,
   transparent = false,
+  pins = false,
 }: {
   channels: BlendedChannel[];
+  /** The MultiChat host's blended chat registers as the `blended` pin surface
+   *  (SN-284). The click-through overlay window never passes it: it shows no
+   *  pins and reports no surface. */
+  pins?: boolean;
   /** No composer: the overlay window is a viewer, not a place to type. */
   readOnly?: boolean;
   /** No own background: the host paints the (glass) ground. */
@@ -109,6 +125,16 @@ export function BlendedChatPane({
   // A level-up's confetti rains over the whole feed, so the shared banner portals
   // it into this element.
   const [feedEl, setFeedEl] = useState<HTMLElement | null>(null);
+  // The top-of-chat stack floats over the merged feed (SN-284): the hype train
+  // (one strip per train), the mention context card and the pinned mentions in
+  // Rust's one order. The feed keeps its whole height and gets a spacer.
+  const topStack = useChatTopStack(feedEl, { surface: 'blended' });
+  const [stackBottom, setStackBottom] = useState(0);
+  const stackBottomRef = useRef(0);
+  useEffect(() => {
+    stackBottomRef.current = stackBottom;
+  }, [stackBottom]);
+  const trainList = useMemo(() => [...hypeTrains.values()], [hypeTrains]);
 
   // Stable view of the current feed + source map for the row callbacks, so those
   // callbacks keep a fixed identity (they read the ref) and don't defeat the row
@@ -260,9 +286,17 @@ export function BlendedChatPane({
         ) as HTMLElement | null;
         const container = el?.closest('.overflow-y-auto') as HTMLElement | null;
         if (el && container) {
-          const target = el.offsetTop - container.clientHeight / 2 + el.offsetHeight / 2;
+          // Below the floating stack, which covers the feed's top.
           container.scrollTo({
-            top: Math.max(0, Math.min(target, container.scrollHeight - container.clientHeight)),
+            top: jumpTarget({
+              align: 'center',
+              elementTop: el.offsetTop,
+              elementHeight: el.offsetHeight,
+              scrollTop: container.scrollTop,
+              containerHeight: container.clientHeight,
+              scrollHeight: container.scrollHeight,
+              inset: stackBottomRef.current,
+            }),
             behavior: 'smooth',
           });
         }
@@ -271,6 +305,43 @@ export function BlendedChatPane({
       highlightTimer.current = setTimeout(() => setHighlightedMessageId(null), 2000);
     },
     [getMessageId, setChatPaused],
+  );
+
+  // Pinned mentions over the merged feed (SN-284): the same pins as each
+  // source's own chat, opened here. A message no longer in the feed shows as
+  // the "Older than chat history" card instead.
+  const pinRooms = useMemo(
+    () => (readOnly || !pins ? '' : channels.map((c) => sliceLookupKey(provOf(c), c.channel)).join('|')),
+    [channels, readOnly, pins],
+  );
+  const pinRoomRefs = useMemo<PinRoomRef[]>(
+    () => channels.map((c) => ({ provider: provOf(c), channel: c.channel })),
+    [channels],
+  );
+  // The card belongs to the rooms it was opened in: another set of chats
+  // never shows it.
+  const [pinCardFor, setPinCardFor] = useState<{ rooms: string; entry: MentionEntry } | null>(null);
+  const pinCard = pinCardFor && pinCardFor.rooms === pinRooms ? pinCardFor.entry : null;
+  const setPinCard = useCallback(
+    (entry: MentionEntry | null) => setPinCardFor(entry ? { rooms: pinRooms, entry } : null),
+    [pinRooms],
+  );
+  const dismissPinCard = useCallback(() => setPinCard(null), [setPinCard]);
+  const openPinnedMention = useCallback(
+    (pin: MentionPin) => {
+      const { entry } = pin;
+      // Read it and drop its pin in Rust without waiting: the scroll is now.
+      invoke('open_mention', { id: entry.id }).catch((err) => {
+        Logger.warn('[BlendedChat] open_mention for a pin failed:', err);
+      });
+      if (messagesRef.current.some((m) => getMessageId(m) === entry.id)) {
+        setPinCard(null);
+        handleReplyClick(entry.id);
+      } else {
+        setPinCard(entry);
+      }
+    },
+    [getMessageId, handleReplyClick, setPinCard],
   );
 
   // ----- composer -----------------------------------------------------------
@@ -541,20 +612,6 @@ export function BlendedChatPane({
 
   return (
     <div ref={paneRef} className={`flex h-full min-h-0 min-w-0 flex-1 flex-col ${transparent ? 'bg-transparent' : 'bg-secondary'}`}>
-      {[...hypeTrains.values()].map((t) => (
-        <div
-          key={t.broadcaster_user_login}
-          className="flex-shrink-0 border-b border-borderSubtle px-3 pb-2"
-        >
-          <div className="flex items-center gap-1.5 pt-1.5">
-            <ProviderLogo provider="twitch" size={12} className="flex-shrink-0" />
-            <span className="truncate text-[11px] font-semibold text-textPrimary">
-              {t.broadcaster_user_name || t.broadcaster_user_login}
-            </span>
-          </div>
-          <HypeTrainBanner train={t} confettiTarget={feedEl} />
-        </div>
-      ))}
       <div ref={setFeedEl} className="relative min-h-0 flex-1 overflow-hidden">
         <ChatMessageList
           messages={messages}
@@ -574,8 +631,47 @@ export function BlendedChatPane({
           emotes={null}
           getMessageId={getMessageId}
           showSource={channels.length > 1}
+          headerInset={Math.max(stackBottom, BLENDED_TOP_INSET_PX)}
           scrollToBottomRef={listScrollToBottomRef}
         />
+        {/* The top-of-chat stack, over the feed: a strip per hype train, the
+            card for a mention too old to scroll to, then the pinned mentions. */}
+        <ChatOverlayStack top={8} maxHeight={topStack.maxHeight} more={topStack.more} onBottom={setStackBottom}>
+          <HypeStackCard
+            trains={trainList}
+            stack={topStack.control.hype}
+            measure={topStack.measure}
+            confettiTarget={feedEl}
+            renderLabel={(t) => (
+              <div className="flex items-center gap-1.5 px-1 pb-0.5">
+                <ProviderLogo provider="twitch" size={12} className="flex-shrink-0" />
+                <span className="truncate text-[11px] font-semibold text-textPrimary">
+                  {t.broadcaster_user_name || t.broadcaster_user_login}
+                </span>
+              </div>
+            )}
+          />
+          {pinCard && (
+            <MentionContextCard
+              entry={pinCard}
+              onDismiss={dismissPinCard}
+              stack={topStack.control.mention_context}
+              measure={topStack.measure}
+            />
+          )}
+          {pins && !readOnly && (
+            <DesktopPins
+              surfaceId="blended"
+              rooms={pinRoomRefs}
+              active
+              chatViewActive
+              searchOpen={false}
+              onOpenOwn={openPinnedMention}
+              stack={topStack.control.mention_pins}
+              measure={topStack.measure}
+            />
+          )}
+        </ChatOverlayStack>
         {/* Identical to the core app's paused indicator (ChatWidget) so the resume
             affordance reads the same everywhere. */}
         {paused && (

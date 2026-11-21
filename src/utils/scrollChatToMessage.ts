@@ -23,6 +23,20 @@ export interface ScrollToMessageOptions {
   smooth?: boolean;
   /** Flash the row once it lands (~2 s), so it is findable by eye. */
   flash?: boolean;
+  /** Look only inside this element (a chat pane). A phone keeps a hidden
+   *  surface mounted with the same room, whose row would match first. */
+  root?: ParentNode | null;
+  /** The height at the top of the list that the floating top-of-chat stack
+   *  covers (its drawn bottom minus the list's top). The message lands in the
+   *  part below it, never under a card (SN-284). Default: what the pane around
+   *  the list says in `data-stack-bottom` (the phone chat pane), else 0. */
+  topInset?: number;
+}
+
+/** The stack height a pane states for its list (`data-stack-bottom`), 0 without one. */
+export function stackInsetOf(el: Element): number {
+  const v = Number(el.closest<HTMLElement>('[data-stack-bottom]')?.dataset.stackBottom);
+  return Number.isFinite(v) && v > 0 ? v : 0;
 }
 
 /** How long a jumped-to row flashes. Matches the CSS animation. */
@@ -38,23 +52,25 @@ export const JUMP_FLASH_MS = 2000;
  * pseudo-element animating opacity only (mobile.css), so it never repaints the
  * row's text.
  */
-export function flashChatMessage(messageId: string): void {
+export function flashChatMessage(messageId: string, root: ParentNode | null = null): void {
   const sel = `[data-message-id="${CSS.escape(messageId)}"]`;
-  const el = document.querySelector<HTMLElement>(sel);
+  const scope = root ?? document;
+  const el = scope.querySelector<HTMLElement>(sel);
   if (!el) return;
   el.removeAttribute('data-sn-flash');
   // Restart the animation when the same row is flashed twice in a row.
   void el.offsetWidth;
   el.setAttribute('data-sn-flash', '');
   window.setTimeout(() => {
-    document.querySelector<HTMLElement>(sel)?.removeAttribute('data-sn-flash');
+    scope.querySelector<HTMLElement>(sel)?.removeAttribute('data-sn-flash');
   }, JUMP_FLASH_MS + 100);
 }
 
-function targetFor(
+export function targetFor(
   container: HTMLElement,
   el: HTMLElement,
   align: 'start' | 'center' | 'end',
+  topInset = 0,
 ): number {
   // Rect-based rather than offsetTop: offsetTop is relative to the nearest
   // positioned ancestor, which is not guaranteed to be the scroller. Rects are
@@ -64,12 +80,14 @@ function targetFor(
   const offsetWithin = eRect.top - cRect.top + container.scrollTop;
 
   let target: number;
+  // The visible part of the list is what the stack leaves below it.
+  const inset = Math.max(0, Math.min(topInset, container.clientHeight));
   if (align === 'start') {
-    target = offsetWithin;
+    target = offsetWithin - inset;
   } else if (align === 'end') {
     target = offsetWithin - container.clientHeight + eRect.height;
   } else {
-    target = offsetWithin - container.clientHeight / 2 + eRect.height / 2;
+    target = offsetWithin - inset - (container.clientHeight - inset) / 2 + eRect.height / 2;
   }
   return Math.max(0, Math.min(target, container.scrollHeight - container.clientHeight));
 }
@@ -87,9 +105,10 @@ export function scrollChatToMessage(
   messageId: string,
   options?: ScrollToMessageOptions,
 ): boolean {
-  const { align = 'center', smooth = true, flash = false } = options ?? {};
+  const { align = 'center', smooth = true, flash = false, root = null } = options ?? {};
+  const scope = root ?? document;
 
-  const el = document.querySelector<HTMLElement>(
+  const el = scope.querySelector<HTMLElement>(
     `[data-message-id="${CSS.escape(messageId)}"]`,
   );
   if (!el) return false;
@@ -98,8 +117,10 @@ export function scrollChatToMessage(
   if (!container) return false;
 
   const behavior: ScrollBehavior = smooth ? 'smooth' : 'auto';
-  container.scrollTo({ top: targetFor(container, el, align), behavior });
-  if (flash) flashChatMessage(messageId);
+  // Read again on the correction pass: the stack may have moved since.
+  const insetFor = (row: Element) => options?.topInset ?? stackInsetOf(row);
+  container.scrollTo({ top: targetFor(container, el, align, insetFor(el)), behavior });
+  if (flash) flashChatMessage(messageId, root);
 
   // One correction pass, and it is not optional on mobile.
   //
@@ -109,12 +130,12 @@ export function scrollChatToMessage(
   // heights resolve, every row below shifts, and the target drifts off centre -
   // further the longer the jump. Re-measuring after layout settles fixes it.
   window.setTimeout(() => {
-    const again = document.querySelector<HTMLElement>(
+    const again = scope.querySelector<HTMLElement>(
       `[data-message-id="${CSS.escape(messageId)}"]`,
     );
     const c = again?.closest<HTMLElement>('.overflow-y-auto');
     if (!again || !c) return;
-    const target = targetFor(c, again, align);
+    const target = targetFor(c, again, align, insetFor(again));
     // Only correct a drift worth correcting; a second glide over a few pixels
     // reads as a wobble.
     if (Math.abs(c.scrollTop - target) > 8) {

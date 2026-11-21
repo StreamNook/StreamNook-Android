@@ -21,6 +21,8 @@ import {
 } from '../utils/noticeReport';
 import { MENTION_NOTIFY_EVENT, toggleMentionChatMuted, useInboxCounts } from '../stores/mentionInboxStore';
 import { useInboxView } from './inbox/useInboxView';
+import { mentionRowIdsOf, useInboxFocus } from './inbox/useInboxFocus';
+import { useMentionFocus } from '../stores/mentionFocusStore';
 import {
     dropRows,
     foldedLine,
@@ -98,11 +100,15 @@ const MENTION_KIND_WORDS: Record<MentionKind, string> = {
     mention: 'mentioned you',
     reply: 'replied to you',
     word: 'matched a highlight',
+    gift: 'gifted you a sub',
 };
 
 // The kind is the mark: an @ for a mention, the reply arrow for a reply, the
-// highlighter for one of your highlight words.
+// highlighter for one of your highlight words, and the gift sub rows' own
+// pink gift for a sub gifted to you.
 const MentionGlyph = ({ kind, size }: { kind: MentionKind; size: number }) => {
+    // One step up, the size the gift-sub rows draw it at.
+    if (kind === 'gift') return <Gift size={size + 1} className="text-pink-400 flex-shrink-0" />;
     const Icon = kind === 'reply' ? Reply : kind === 'word' ? Highlighter : AtSign;
     // The reply arrow's ink is short and wide; a step up matches the @'s weight.
     return <Icon size={kind === 'reply' ? Math.round(size * 1.2) : size} className="text-accent flex-shrink-0" />;
@@ -133,7 +139,9 @@ const MentionRowBody = ({ entry, foldedCount, showPlatform }: { entry: MentionEn
                     </span>
                     <span className="sr-only">{MENTION_KIND_WORDS[entry.kind]}</span>
                     {/* Smaller type than the name, nudged onto its baseline. */}
-                    <span className="flex-shrink-0 translate-y-px text-[12.5px] text-white/40">in</span>
+                    <span className="flex-shrink-0 translate-y-px text-[12.5px] text-white/40">
+                        {entry.kind === 'gift' ? 'gifted you a sub in' : 'in'}
+                    </span>
                     <span className="flex min-w-0 items-center gap-1 text-[12.5px] text-white/70">
                         {platform && <ProviderIcon provider={platform} size="12px" />}
                         <span className="truncate translate-y-px">{entry.channel_login}</span>
@@ -352,6 +360,7 @@ const getPreviewText = (n: IslandItem): string => {
             const { sender_name: name, channel_login: channel, kind } = n.data;
             if (kind === 'reply') return `${name} replied to you in ${channel}`;
             if (kind === 'word') return `${name} in ${channel}`;
+            if (kind === 'gift') return `${name} gifted you a sub in ${channel}`;
             return `${name} mentioned you in ${channel}`;
         }
         case 'live': {
@@ -2013,6 +2022,26 @@ const DynamicIsland = () => {
         () => mergeIslandHistory(notifications, inbox.rows, inbox.hasMore),
         [notifications, inbox.rows, inbox.hasMore],
     );
+    // A pinned mention from another chat opens this history at its entry
+    // (SN-284): expanded, scrolled to the row and highlighting it.
+    const historyRef = useRef<HTMLDivElement>(null);
+    const mentionFocus = useMentionFocus();
+    const mentionFocusNonce = mentionFocus?.nonce;
+    useEffect(() => {
+        if (mentionFocusNonce !== undefined && !IS_MOBILE) setIsExpanded(true);
+    }, [mentionFocusNonce]);
+    const focusedMentionRow = useInboxFocus({
+        rows: inbox.rows,
+        hasMore: inbox.hasMore,
+        loadOlder: inbox.loadOlder,
+        loaded: inbox.loaded,
+        container: historyRef,
+        active: isExpanded,
+    });
+    const focusedMentionIds = useMemo(() => {
+        const row = focusedMentionRow === null ? null : inbox.rows.find((r) => r.row_id === focusedMentionRow);
+        return row ? new Set(mentionRowIdsOf(row)) : null;
+    }, [focusedMentionRow, inbox.rows]);
     // A platform mark beside the chat only where mentions from more than one
     // platform share the list.
     const mentionPlatformsMix = useMemo(
@@ -2347,7 +2376,7 @@ const DynamicIsland = () => {
                                         <span ref={previewTextRef} className="text-white text-[11px] font-medium truncate min-w-0">
                                             {getPreviewText(latestNotification)}
                                             {/* A mention also says what was said, quieter, after its line. */}
-                                            {latestNotification.type === 'mention' && !latestNotification.data.removed && !!latestNotification.data.text && (
+                                            {latestNotification.type === 'mention' && latestNotification.data.kind !== 'gift' && !latestNotification.data.removed && !!latestNotification.data.text && (
                                                 <span className="ml-1.5 font-normal text-white/55">{latestNotification.data.text}</span>
                                             )}
                                             {latestNotification.type === 'whisper_row' && !!latestNotification.data.last_text && (
@@ -2446,6 +2475,7 @@ const DynamicIsland = () => {
 
                                 {/* Notifications List */}
                                 <div
+                                    ref={historyRef}
                                     // Rows running past the rim fade out rather
                                     // than being cut; the list's bottom padding
                                     // is what sits under the fade at the end.
@@ -2501,8 +2531,17 @@ const DynamicIsland = () => {
                                                         e.preventDefault();
                                                         open();
                                                     }}
+                                                    data-mention-ids={
+                                                        notification.type === 'mention'
+                                                            ? [notification.data.id, ...notification.folded.map((f) => f.id)].join(' ')
+                                                            : undefined
+                                                    }
                                                     className={`sn-notif-row group ${
                                                         notification.read ? '' : 'sn-notif-row--unread'
+                                                    }${
+                                                        notification.type === 'mention' && focusedMentionIds?.has(notification.data.id)
+                                                            ? ' bg-accent/15'
+                                                            : ''
                                                     }`}
                                                 >
                                                     {notification.type === 'mention' ? (

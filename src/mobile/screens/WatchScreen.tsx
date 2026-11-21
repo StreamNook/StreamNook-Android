@@ -50,20 +50,22 @@ import { keepsAudioAfterPip } from '../player/lockScreenAudio';
 import { MobileChatPane } from '../chat/MobileChatPane';
 import { PHONE_SIDE_CHAT_MIN, composerFolds, sideChatShownWidth } from '../watch/sideChat';
 import {
-  CHAT_TAB_STRIP_H,
   useActiveChatChannelId,
-  useChatTabsVisible,
   useViewingStreamChat,
 } from '../chat/ChatTabStrip';
-import { useMentionsStore } from '../mentions/mentionInbox';
+import { roomName, roomProvider, useMentionsStore } from '../mentions/mentionInbox';
 import { MentionContextCard } from '../mentions/MentionContextCard';
+import { PhonePins, usePhonePins } from '../chat/PhonePins';
+import { watchPinSurface } from '../chat/pinSurfaceRules';
 import { PinnedBanner } from '../watch/PinnedBanner';
 import { usePinsOpen } from '../watch/pinsOpen';
-import HypeTrainBanner from '../../components/HypeTrainBanner';
+import { HypeStackCard } from '../../components/chat/HypeStackCard';
+import ConfettiBurst from '../../components/ConfettiBurst';
+import { useConfettiClearMs } from '../../hooks/useConfettiClearMs';
 import PollOverlay from '../../components/PollOverlay';
 import PredictionOverlay from '../../components/PredictionOverlay';
 import { ChatOverlayStack } from '../../components/chat/ChatOverlayStack';
-import { useChatTopStack } from '../../components/chat/chatTopStack';
+import { useChatTopStack, type StackKind } from '../../components/chat/chatTopStack';
 import {
   consumePipClosed,
   getMediaVolume,
@@ -101,7 +103,7 @@ import {
   type TallRegion,
   type VerticalChatState,
 } from '../watch/verticalView';
-import { VerticalChatButton, VerticalChatHandle, VerticalMentionStrip } from '../watch/VerticalChat';
+import { VerticalChatButton, VerticalChatHandle } from '../watch/VerticalChat';
 import { foldedStack, VERTICAL_CHROME } from '../watch/verticalChatParts';
 import { DialIndicator, ZoomIndicator, type DialAxis, type DialReading } from '../watch/DialIndicator';
 import { dialCanStart, swipeDialsOn } from '../watch/dialZone';
@@ -114,7 +116,7 @@ import {
   type BrightnessDial,
 } from '../watch/brightnessDial';
 import { ChatOverlayChrome } from '../watch/ChatOverlayChrome';
-import type { FullscreenChatSettings } from '../../types';
+import type { FullscreenChatSettings, HypeTrainData } from '../../types';
 import { hapticStep, hapticTick } from '../ui/haptics';
 import { readInsets, type ResolvedInsets } from '../nativeInsets';
 import { swallowTrailingClick } from '../ui/trailingClick';
@@ -189,8 +191,9 @@ function clampMini(
 }
 
 const TAP_SLOP_PX = 8;
-// The tall layout's grown chat handle (VerticalChatHandle), SN-40.
-const VERTICAL_HANDLE_H = 22;
+// Over the video only the mentions pinned for you are asked of the stack.
+const PINS_ONLY: readonly StackKind[] = ['mention_pins'];
+const NO_TRAINS: readonly HypeTrainData[] = [];
 // Travel before the shrink is fully previewed. A fraction of the screen, not a
 // fixed pixel count, so the gesture feels the same on a compact phone and an
 // unfolded Fold.
@@ -232,32 +235,24 @@ export const WatchScreen: React.FC = () => {
   const [largeChatHidden, setLargeChatHidden] = useState(false);
   const [watchLayout, setWatchLayout] = useState<WatchLayout>(readWatchLayout);
   const [chatSplit, setChatSplit] = useState<number | null>(readWatchSplit);
+  // The hype train's level-up confetti, thrown over the chat column as on
+  // desktop (ChatWidget): some lands on the composer's controls and stays
+  // until a finger brushes or taps it off. `burst` counts level-ups.
+  const [hypeConfetti, setHypeConfetti] = useState<{ burst: number; golden: boolean; colors: string[] } | null>(null);
+  const throwHypeConfetti = useCallback((golden: boolean, colors: string[]) => {
+    setHypeConfetti((prev) => ({ burst: (prev?.burst ?? 0) + 1, golden, colors }));
+  }, []);
+  const hypeConfettiDone = useCallback(() => setHypeConfetti(null), []);
+  const confettiClearAfter = useConfettiClearMs();
   const [pip, setPip] = useState(false);
   // A pin opens or folds per channel: each channel starts as Chat > Pinned
   // Messages > Collapsed says, and a tap holds until the chat switches.
   const pins = usePinsOpen();
-  // The poll, prediction and drop cards: one stack in the chat column's flow,
-  // laid out by Rust against the column's height. Opened together on a short
-  // column (a foldable's side-docked chat) they used to leave no room to read
-  // or type, and the drop card painted over the poll's fold control.
+  // The chat column, whose height caps the top-of-chat stack (Rust lays it out
+  // further down, once the layout is known).
   const [chatColumnEl, setChatColumnEl] = useState<HTMLDivElement | null>(null);
-  const topStack = useChatTopStack(chatColumnEl);
-  const chatTabsVisible = useChatTabsVisible();
-  // The hype train and pinned message float over chat just under the stack:
-  // where the stack ends inside the chat column (its offset parent), or null
-  // while it is empty. Re-read when the tab strip above it comes or goes,
-  // which moves it without resizing it.
-  const [topStackEl, setTopStackEl] = useState<HTMLDivElement | null>(null);
-  const [topStackBottom, setTopStackBottom] = useState<number | null>(null);
-  useEffect(() => {
-    if (!topStackEl) return;
-    const read = () =>
-      setTopStackBottom(topStackEl.offsetHeight > 0 ? topStackEl.offsetTop + topStackEl.offsetHeight : null);
-    read();
-    const ro = new ResizeObserver(read);
-    ro.observe(topStackEl);
-    return () => ro.disconnect();
-  }, [topStackEl, chatTabsVisible]);
+  // Where the floating stack ends, from the top of the list: the list's spacer.
+  const [stackBottom, setStackBottom] = useState(0);
   const chatTabsOpen = useChatTabsStore((s) => s.tabs.length > 0);
   const viewingStreamChat = useViewingStreamChat();
   // Hype train, drops, polls and predictions are Twitch contracts keyed by a
@@ -270,6 +265,7 @@ export const WatchScreen: React.FC = () => {
   const showMentionCard = !!mentionCard && mentionCard.room === activeChatRoom;
   // The viewer picked the audio-only rendition: there is no picture to float.
   const audioOnly = useAppStore((s) => s.activeQuality === 'audio_only');
+  const pipOnLeave = useAppStore((s) => s.settings.video_player?.pip_on_leave) !== false;
   // The landscape chat overlay shares its knobs with the desktop overlay:
   // opacity, width and side are one preference however big the screen is.
   const fsChat = useAppStore((s) => s.settings.fullscreen_chat);
@@ -535,6 +531,7 @@ export const WatchScreen: React.FC = () => {
   const replayShown = useVodReplayStore((s) => s.active && s.showing === 'replay');
   const verticalLower = tall && verticalChat === 'lower';
   const verticalGrown = tall && verticalChat === 'expanded';
+  const verticalCleared = tall && verticalChat === 'cleared';
   // Read at a touch, so a gesture decides from the layout it began in.
   const tallRef = useRef(tall);
   useLayoutEffect(() => {
@@ -932,12 +929,14 @@ export const WatchScreen: React.FC = () => {
     // stream drops to its audio rendition behind the media notification; off,
     // it pauses (lockScreenAudio). The audio-only rendition has no picture,
     // so it never floats.
-    setPipEligible(playingHere && !audioOnly);
+    // The Picture-in-picture switch off (SN-283) skips the window: leaving
+    // goes straight to the audio, or a pause, as Background play says.
+    setPipEligible(playingHere && !audioOnly && pipOnLeave);
     return () => {
       setPreferredRefreshRate(0);
       setPipEligible(false);
     };
-  }, [playingHere, audioOnly]);
+  }, [playingHere, audioOnly, pipOnLeave]);
 
   // Landscape is a viewing posture, never a browsing one: while the full watch
   // layer is up on a screen wider than it is tall, the status bar and the
@@ -1020,11 +1019,29 @@ export const WatchScreen: React.FC = () => {
       void setSettingsFields({ 'fullscreen_chat.vertical_open': next !== 'cleared' }).catch(() => {});
     }
   }, []);
+  // The top-of-chat stack (SN-284): the hype train, the poll and prediction, the
+  // channel's pinned message, the mention context card and the pinned mentions,
+  // laid out by Rust against the column's height and floating over the list.
+  // Over the video (the landscape overlay) only the pinned mentions are asked
+  // for; the lower third asks for strips only. The pin's open state is the one
+  // per-room store the composer's menu and the Chats screen write too.
+  const stackRoom = activeChatRoom ?? null;
+  const topStack = useChatTopStack(chatColumnEl, {
+    surface: 'phone-watch',
+    phone: true,
+    provider: stackRoom ? roomProvider(stackRoom) : null,
+    channel: stackRoom ? roomName(stackRoom) : null,
+    stripsOnly: verticalLower || verticalCleared,
+    channelPinOpened: pins.open,
+    onChannelPinOpen: pins.setOpen,
+    // Cleared, the pins alone stay, as strips over the video (the iPhone does the same).
+    only: chatOverlay || verticalCleared ? PINS_ONLY : undefined,
+  });
   // The poll and prediction cards in the lower third: one-line strips, and a
   // tap grows the chat with that card open.
   const stackControl = useMemo(
-    () => foldedStack(topStack.control, verticalLower, () => moveVerticalChat('expanded')),
-    [topStack.control, verticalLower, moveVerticalChat],
+    () => foldedStack(topStack.control, verticalLower || verticalCleared, () => moveVerticalChat('expanded')),
+    [topStack.control, verticalLower, verticalCleared, moveVerticalChat],
   );
   // On every entry to the tall layout the chat starts as it was last left (the
   // saved choice, read again); leaving it (a turn, the mini box, PiP, another
@@ -1873,7 +1890,32 @@ export const WatchScreen: React.FC = () => {
   // The player's chat out of sight (the mini box, PiP, landscape with chat away): its composer
   // gives up the keyboard (keys would go into a composer nobody can see, over the tabs or the
   // video), and its menus stop taking taps meant for what is on screen (the column's mark below).
-  const chatOutOfSight = mini || chatClass === 'hidden';
+  // With no stream the layer draws nothing though these hooks still run, so it is out of sight too.
+  // Mentions pinned over the chat on screen (SN-284): Rust's list for the
+  // `phone-watch` surface, whose mode follows the layout (a rotation or a fold
+  // changes the mode, never the id). Over the video only the pins' own card
+  // is drawn, in the dark ink; the lower third and the cleared chat show
+  // strips only, and a tap on one grows the chat.
+  const pinSurface = watchPinSurface({
+    show,
+    mini,
+    pip,
+    chatClass,
+    chatOverlay,
+    verticalLower,
+    verticalGrown,
+    verticalCleared,
+    sideBySide,
+  });
+  const chatOutOfSight = pinSurface.chatOutOfSight;
+  const mentionPins = usePhonePins({
+    surfaceId: 'phone-watch',
+    room: activeChatRoom ?? null,
+    mode: pinSurface.mode,
+    chatOutOfSight: pinSurface.pinsOutOfSight,
+    stripsOnly: pinSurface.stripsOnly,
+    overVideo: pinSurface.overVideo,
+  });
   useEffect(() => {
     if (!chatOutOfSight || !chatColumnEl) return;
     const field = focusUnder<Element>(chatColumnEl, document.activeElement);
@@ -2250,79 +2292,19 @@ export const WatchScreen: React.FC = () => {
                     : undefined
           }
         >
-          {/* Chat header carries only live, transient signal now: the hype
-              train and the pinned message. The persistent stream info lives in
-              the player overlay, so chat keeps its full height. The poll,
-              prediction and drop cards are not in here: they are the stack in
-              the chat pane's flow below, and this header starts under it, so
-              nothing paints over a card's fold control. */}
-            <div
-              className={
-                // The floating landscape column is for reading the room, so
-                // the stream's own banners (pins, hype train) stay out of it;
-                // they are all still one rotation away.
-                !chatOverlay && ((streamScoped && currentHypeTrain) || pinned.length > 0 || showMentionCard)
-                  ? // Pure layout now: no background, no border, no blur, no
-                    // shadow. Each child already carries its own container
-                    // (PinnedBanner is an sn-popover, the hype train draws its
-                    // own filled bar), so wrapping them in a full-width panel
-                    // put a box inside a box and killed any sense of the pinned
-                    // message floating over chat.
-                    //
-                    // z-20 keeps these cards ABOVE the player's cast, so the
-                    // glow passes behind them instead of washing across them.
-                    'absolute left-0 right-0 px-2.5 pt-1.5 pb-2 z-20 pointer-events-none flex flex-col-reverse gap-1'
-                  : 'hidden'
-              }
-              style={{
-                // Sits BELOW the chat tab strip when several rooms are open,
-                // and below the card stack under it. This header is absolutely
-                // positioned over the top of the chat column, so at top:0 it
-                // covered the tabs completely.
-                // The lower third has no tab strip; the grown chat's handle sits
-                // over its strip (SN-40).
-                top:
-                  topStackBottom ??
-                  (verticalLower
-                    ? 0
-                    : (chatTabsVisible ? CHAT_TAB_STRIP_H : 0) + (verticalGrown ? VERTICAL_HANDLE_H : 0)),
-              }}
-            >
-              {/* The hype train belongs to the STREAM, not to whichever chat
-                  tab you are reading. Showing it over another room's chat
-                  credits it to the wrong channel. */}
-              {streamScoped && currentHypeTrain && (
-                <HypeTrainBanner
-                  train={currentHypeTrain}
-                  onExpire={() => useAppStore.getState().setCurrentHypeTrain(null)}
-                />
-              )}
-              {/* Folded to its line in the lower third: a tap grows the chat
-                  with the pin open (SN-40). */}
-              <PinnedBanner
-                pins={pinned}
-                channelId={chatChannelId ?? undefined}
-                expanded={pins.open && !verticalLower}
-                onToggle={
-                  verticalLower
-                    ? () => {
-                        pins.setOpen(true);
-                        moveVerticalChat('expanded');
-                      }
-                    : () => pins.setOpen(!pins.open)
-                }
-                collapsedStyle={pins.style}
-              />
-              {/* Last in DOM, so first on screen: the mention you just opened. */}
-              {showMentionCard &&
-                mentionCard &&
-                (verticalLower ? (
-                  <VerticalMentionStrip onOpen={() => moveVerticalChat('expanded')} />
-                ) : (
-                  <MentionContextCard entry={mentionCard} />
-                ))}
-            </div>
-
+          {/* Level-up confetti over the whole chat column; some lands on the
+              composer's controls (`.sn-m-composer-row`). Only while the chat
+              shows the stream's own room, like the hype bar. */}
+          {hypeConfetti && !chatOverlay && streamScoped && (
+            <ConfettiBurst
+              burst={hypeConfetti.burst}
+              golden={hypeConfetti.golden}
+              colors={hypeConfetti.colors}
+              perchOn=".sn-m-composer-row"
+              onDone={hypeConfettiDone}
+              clearAfterMs={confettiClearAfter}
+            />
+          )}
           {/* The grown chat's handle (SN-40): a tap or a drag down folds it. */}
           {verticalGrown && (
             <VerticalChatHandle
@@ -2367,17 +2349,37 @@ export const WatchScreen: React.FC = () => {
                 />
               ) : undefined
             }
+            topInset={stackBottom}
             top={
-              // Poll + prediction cards are exactly the desktop components:
-              // they self-fetch off the channel. Either can be turned off.
-              // Rust orders the stack, keeps one card open and caps its
-              // height. Stream scoped, like the hype train. Drops progress is
-              // not a card here: it is the lip on the composer (MobileDropsLip).
+              // The top-of-chat stack (SN-284), floating over the list in Rust's order: the
+              // hype train, the poll and prediction (exactly the desktop components: they
+              // self-fetch off the channel, either can be turned off, stream scoped), the
+              // channel's pinned message, the mention you just opened and the mentions
+              // pinned for you. Drops progress is not a card here: it is the lip on the
+              // composer (MobileDropsLip). The landscape column is for reading the room, so
+              // the stream's own cards stay out of it; the mentions pinned for you belong to
+              // the room, so they show there too, in the dark ink.
               <ChatOverlayStack
+                top={6}
+                phone
                 maxHeight={topStack.maxHeight}
-                stackRef={setTopStackEl}
-                className="px-2.5 pt-1.5 pb-1 transition-[padding] duration-200 empty:py-0"
+                more={topStack.more}
+                onBottom={setStackBottom}
+                className="!left-2.5 !right-2.5"
               >
+                {!chatOverlay && (
+                  // The hype train belongs to the STREAM, not to whichever chat tab you are
+                  // reading: shown over another room's chat it would be credited to the
+                  // wrong channel. One compact strip, in the lower third too.
+                  <HypeStackCard
+                    trains={streamScoped && currentHypeTrain ? [currentHypeTrain] : NO_TRAINS}
+                    stack={stackControl.hype}
+                    measure={topStack.measure}
+                    compact
+                    onLevelUp={throwHypeConfetti}
+                    onExpire={() => useAppStore.getState().setCurrentHypeTrain(null)}
+                  />
+                )}
                 {currentStream && streamScoped && !chatOverlay && showPredictions && (
                   <PredictionOverlay
                     channelId={currentStream.user_id}
@@ -2390,6 +2392,48 @@ export const WatchScreen: React.FC = () => {
                     channelId={currentStream.user_id}
                     channelLogin={currentStream.user_login}
                     stack={stackControl.poll}
+                  />
+                )}
+                {!chatOverlay && (
+                  // Folded to its line in the lower third: a tap grows the chat with the
+                  // pin open (SN-40).
+                  <PinnedBanner
+                    pins={pinned}
+                    channelId={chatChannelId ?? undefined}
+                    expanded={pins.open}
+                    onToggle={() => pins.setOpen(!pins.open)}
+                    collapsedStyle={pins.style}
+                    stack={stackControl.channel_pin}
+                    measure={topStack.measure}
+                  />
+                )}
+                {!chatOverlay && showMentionCard && mentionCard && (
+                  <MentionContextCard
+                    entry={mentionCard}
+                    stack={stackControl.mention_context}
+                    measure={topStack.measure}
+                    // Opening it in the lower third would grow the chat with no tap.
+                    autoOpen={!verticalLower}
+                  />
+                )}
+                {/* Last: the pinned mentions never move the cards above them. A tap opens the
+                    mention in this chat (the pane on screen takes the jump); in the lower
+                    third it grows the chat first. Cleared, the column is not drawn: the
+                    pins are drawn over the video below instead. */}
+                {!verticalCleared && (
+                  <PhonePins
+                    key={activeChatRoom ?? ''}
+                    pins={mentionPins.pins}
+                    shown={mentionPins.shown}
+                    reportVisible={mentionPins.reportVisible}
+                    reportForm={mentionPins.reportForm}
+                    inboxSurface="watch"
+                    overVideo={chatOverlay || verticalLower}
+                    stack={stackControl.mention_pins}
+                    measure={topStack.measure}
+                    onBeforeOpen={() => {
+                      if (verticalLower) moveVerticalChat('expanded');
+                    }}
                   />
                 )}
               </ChatOverlayStack>
@@ -2431,6 +2475,29 @@ export const WatchScreen: React.FC = () => {
             composer's 10 px foot over the gesture bar, its 40 px row), its
             ink on the row's 10 px gutter. Outside the chat, so it stays while
             chat is cleared, carrying the count of what arrived since. */}
+        {/* The cleared tall chat keeps the mentions pinned for you (SN-284): strips over the
+            video, above the chat button, wearing the dark ink. A tap grows the chat and opens
+            the mention. The column itself is not drawn while cleared. */}
+        {pinSurface.clearedOverVideo && mentionPins.pins.length > 0 && (
+          <div
+            data-cleared-pins=""
+            className="pointer-events-none absolute left-0 right-0 z-40 flex flex-col px-2.5 [&>*]:pointer-events-auto"
+            style={{ bottom: 'calc(var(--sn-kb, 0px) + var(--sn-safe-b, 0px) + 56px)' }}
+          >
+            <PhonePins
+              key={activeChatRoom ?? ''}
+              pins={mentionPins.pins}
+              shown={mentionPins.shown}
+              reportVisible={mentionPins.reportVisible}
+              reportForm={mentionPins.reportForm}
+              inboxSurface="watch"
+              overVideo
+              stack={stackControl.mention_pins}
+              measure={topStack.measure}
+              onBeforeOpen={() => moveVerticalChat('expanded')}
+            />
+          </div>
+        )}
         {tall && (
           <div
             className="pointer-events-none absolute right-[10px] z-40"

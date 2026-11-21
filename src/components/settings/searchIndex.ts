@@ -1,5 +1,14 @@
 import { IS_MOBILE } from '../../utils/platform';
 import { settingNeedMet } from '../../utils/settingNeeds';
+import {
+  conceptsRequired,
+  fieldHasAlike,
+  normalizeSearchText,
+  queryConcepts,
+  searchField,
+  type SearchConcept,
+  type SearchField,
+} from './searchWords';
 export interface SettingsIndexEntry {
   tab: string;
   section: string;
@@ -15,8 +24,72 @@ export interface SettingsIndexEntry {
   needs?: string;
 }
 
-const tokenize = (s: string): string[] =>
-  s.toLowerCase().split(/\s+/).filter(Boolean);
+/** An entry's searchable texts, read once (the index never changes). */
+interface PreparedEntry {
+  title: SearchField;
+  parent: SearchField;
+  description: SearchField;
+  section: SearchField;
+  tab: SearchField;
+  haystack: string;
+  /** Every field's words, space-padded, to tell a word's start from its middle. */
+  padded: string;
+}
+
+const prepared = new WeakMap<SettingsIndexEntry, PreparedEntry>();
+
+const prepare = (entry: SettingsIndexEntry): PreparedEntry => {
+  let p = prepared.get(entry);
+  if (!p) {
+    const title = searchField(entry.title);
+    const parent = searchField(entry.parent);
+    const description = searchField(entry.description);
+    const section = searchField(entry.section);
+    const tab = searchField(entry.tab);
+    p = {
+      title,
+      parent,
+      description,
+      section,
+      tab,
+      haystack: `${title.raw} ${parent.raw} ${description.raw} ${section.raw} ${tab.raw}`,
+      padded: `${title.padded}${parent.padded}${description.padded}${section.padded}${tab.padded}`,
+    };
+    prepared.set(entry, p);
+  }
+  return p;
+};
+
+/** Points for a concept typed exactly as the entry says it, or -1 when it does not.
+ *  Found only inside a longer word ("ads" in "uploads") it still counts, last. */
+const literalPoints = (p: PreparedEntry, token: string): number => {
+  if (!p.haystack.includes(token)) return -1;
+  const key = normalizeSearchText(token);
+  if (key && !p.padded.includes(` ${key}`)) return 1;
+  if (p.title.raw.startsWith(token)) return 100;
+  if (p.title.raw.includes(token)) return 50;
+  if (p.parent.raw.includes(token)) return 30;
+  if (p.section.raw.includes(token)) return 20;
+  if (p.description.raw.includes(token)) return 10;
+  if (p.tab.raw.includes(token)) return 5;
+  return 0;
+};
+
+/** Points for a concept the entry says in other words: three quarters of an exact hit. */
+const alikePoints = (p: PreparedEntry, concept: SearchConcept): number => {
+  if (concept.alike.length === 0) return 0;
+  const fields: [SearchField, number][] = [
+    [p.title, 50],
+    [p.parent, 30],
+    [p.section, 20],
+    [p.description, 10],
+    [p.tab, 5],
+  ];
+  for (const [field, points] of fields) {
+    if (fieldHasAlike(field, concept)) return Math.round((points * 3) / 4);
+  }
+  return 0;
+};
 
 export const searchSettings = (
   query: string,
@@ -25,40 +98,41 @@ export const searchSettings = (
   // settings, which only has the Chat panel) search just its own settings.
   allowTabs?: string[],
 ): SettingsIndexEntry[] => {
-  const tokens = tokenize(query);
-  if (tokens.length === 0) return [];
+  const concepts = queryConcepts(query);
+  if (concepts.length === 0) return [];
+  const required = conceptsRequired(concepts.length);
 
-  const scored: { entry: SettingsIndexEntry; score: number }[] = [];
+  const scored: { entry: SettingsIndexEntry; score: number; matched: number; exact: number }[] = [];
 
   for (const entry of SETTINGS_INDEX) {
     if (allowTabs && !allowTabs.includes(entry.tab)) continue;
     if (entry.needs && !settingNeedMet(entry.needs)) continue;
-    const title = entry.title.toLowerCase();
-    const description = entry.description?.toLowerCase() ?? '';
-    const section = entry.section.toLowerCase();
-    const parent = entry.parent?.toLowerCase() ?? '';
-    const tab = entry.tab.toLowerCase();
-    const haystack = `${title} ${parent} ${description} ${section} ${tab}`;
+    const p = prepare(entry);
 
-    let allMatch = true;
+    let matched = 0;
+    let exact = 0;
     let score = 0;
-    for (const token of tokens) {
-      if (!haystack.includes(token)) {
-        allMatch = false;
-        break;
+    for (const concept of concepts) {
+      const lit = literalPoints(p, concept.literal);
+      if (lit >= 0) {
+        matched++;
+        exact++;
+        score += lit;
+        continue;
       }
-      if (title.startsWith(token)) score += 100;
-      else if (title.includes(token)) score += 50;
-      else if (parent.includes(token)) score += 30;
-      else if (section.includes(token)) score += 20;
-      else if (description.includes(token)) score += 10;
-      else if (tab.includes(token)) score += 5;
+      const alike = alikePoints(p, concept);
+      if (alike > 0) {
+        matched++;
+        score += alike;
+      }
     }
 
-    if (allMatch) scored.push({ entry, score });
+    if (matched >= required) scored.push({ entry, score, matched, exact });
   }
 
-  scored.sort((a, b) => b.score - a.score);
+  // Most ideas answered first, then most typed exactly as the row says them,
+  // then where they landed (title over description).
+  scored.sort((a, b) => b.matched - a.matched || b.exact - a.exact || b.score - a.score);
   return scored.slice(0, limit).map((s) => s.entry);
 };
 
@@ -526,10 +600,30 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Chat',
+    section: 'Hype Train',
+    title: 'Confetti cleanup',
+    description: 'Hype train confetti that lands on the message box fades away a few seconds after it settles; off, it stays until you brush it away. Clear confetti on its own, auto clear, remove confetti, confetti stays, level up confetti.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Hype Train',
+    title: 'Delay',
+    parent: 'Confetti cleanup',
+    description: 'How many seconds landed confetti rests before it fades, from 3 to 15. Confetti timer, how long confetti stays.'
+  },
+  {
+    tab: 'Chat',
     section: 'Chat Events',
     sectionId: 'settings-section-chat-events',
     title: 'Redemptions',
     description: 'Shows a chat row when someone redeems a reward that does not post its own message, like a no-input reward. Previously "Channel point redemptions".'
+  },
+  {
+    tab: 'Chat',
+    section: 'Chat Events',
+    sectionId: 'settings-section-chat-events',
+    title: 'Redemption style',
+    description: 'How channel points messages, like Highlight My Message, stand out: a banded wash (Gradient), one even tint (Solid), or a bar down the left side (Edge). Highlighted message style.'
   },
   {
     tab: 'Chat',
@@ -615,6 +709,26 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     section: 'Mentions & Replies',
     title: 'Mentions & Replies',
     description: 'How a message that mentions you stands out, the mention and reply colors, the mention sound, how @mentions look (weight, italic, pill, color), inline paint on @mentions, and how a reply shows its parent.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Mentions & Replies',
+    title: 'Pin mentions',
+    description: "A mention, a reply to you, a highlight word or a gift sub stays pinned at the top of the chat you're reading, in case you were away when it landed. Click a pin to jump to it; X puts one away and Clear all puts them all away. A pin's time counts while you're using StreamNook. Pinned highlights, keep mentions on top, missed mentions."
+  },
+  {
+    tab: 'Chat',
+    section: 'Mentions & Replies',
+    title: 'For',
+    parent: 'Pin mentions',
+    description: 'How long a pin counts down while you use StreamNook: 1, 2, 5, 10, 15, 30 or 60 minutes, or until you close it. Pin duration, how long mentions stay pinned, until I close them.'
+  },
+  {
+    tab: 'Chat',
+    section: 'Mentions & Replies',
+    title: 'Most at once',
+    parent: 'Pin mentions',
+    description: 'The most pins at the top of a chat, 1 to 25. When a new one would pass it, the oldest ends. Pin limit, maximum pinned mentions.'
   },
   {
     tab: 'Chat',
@@ -1330,6 +1444,12 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
   },
   {
     tab: 'Chat',
+    section: 'Hype Train',
+    title: 'Hype Train',
+    description: 'The hype train bar at the top of chat and its level-up confetti: whether landed confetti clears itself, and how soon.'
+  },
+  {
+    tab: 'Chat',
     section: 'Polls & Predictions',
     title: 'Collapsed',
     parent: 'Polls',
@@ -1489,7 +1609,7 @@ export const SETTINGS_INDEX: SettingsIndexEntry[] = [
     tab: 'Chat',
     section: 'Emotes',
     title: 'Emote words',
-    description: 'Show the word typed with each emote, under it, after it or in a chip, so emote-heavy chat reads as sentences. Emote names, emote labels, emote captions, readable chat.'
+    description: 'Show the word typed with each emote, under it, after it or in a chip, so emote-heavy chat reads as sentences. Emote names, emote labels, emote captions, readable chat, 7TV readability, the name beside each emote.'
   },
   {
     tab: 'Chat',
